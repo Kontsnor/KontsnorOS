@@ -112,32 +112,122 @@ pub fn create_user_page_table() -> Result<u64, &'static str> {
     Ok(pml4_phys)
 }
 
-/// Clone a parent page table by allocating a new PML4 frame and copying
-/// all 512 entries from the parent's PML4 table.
+/// Clone a parent page table by allocating a new PML4 frame and recursively
+/// deep-cloning all user page table structures (PML4, PDPT, PD, PT) for user
+/// space entries (0..256), while marking writable entries as Copy-on-Write (COW).
 pub fn clone_parent_page_table(parent_pml4_phys: u64) -> Result<u64, &'static str> {
-    let child_pml4_phys = super::physical::allocate_frame()
-        .ok_or("Failed to allocate physical frame for child PML4")?;
+    // 1. Create a clean child PML4 pre-populated with kernel entries
+    let child_pml4_phys = create_user_page_table()?;
 
-    let child_pml4_virt = VirtAddr::new(child_pml4_phys + phys_mem_offset());
-    let new_pml4: &mut PageTable = unsafe { &mut *child_pml4_virt.as_mut_ptr() };
-
-    // Clear the table first to avoid any garbage mappings
-    new_pml4.zero();
-
-    // Copy all mappings (entries 0 to 511) from the parent PML4
     let parent_pml4_virt = VirtAddr::new(parent_pml4_phys + phys_mem_offset());
     let parent_pml4: &PageTable = unsafe { &*parent_pml4_virt.as_ptr() };
 
-    for i in 0..512 {
-        if i == 255 {
-            // Do not clone parent's stack page table entry to avoid parent/child
-            // sharing Level 3/2/1 page tables for the stack.
-            // Fresh, independent page tables will be dynamically allocated
-            // for the child's stack in sys_fork.
+    let child_pml4_virt = VirtAddr::new(child_pml4_phys + phys_mem_offset());
+    let child_pml4: &mut PageTable = unsafe { &mut *child_pml4_virt.as_mut_ptr() };
+
+    let pml4_index = (phys_mem_offset() >> 39) & 0x1FF;
+
+    // 2. Deep-clone only user-space PML4 entries (0..256)
+    for i in 0..256 {
+        // Skip the physical memory offset entry if it lies in user space index region
+        if i == pml4_index as usize {
             continue;
         }
-        new_pml4[i] = parent_pml4[i].clone();
+
+        let parent_pml4_entry = &parent_pml4[i];
+        if parent_pml4_entry.is_unused() {
+            continue;
+        }
+
+        // Allocate a new child PDPT (Level 3)
+        let child_pdpt_phys = super::physical::allocate_frame()
+            .ok_or("Failed to allocate child PDPT frame")?;
+        let child_pdpt_virt = VirtAddr::new(child_pdpt_phys + phys_mem_offset());
+        let child_pdpt: &mut PageTable = unsafe { &mut *child_pdpt_virt.as_mut_ptr() };
+        child_pdpt.zero();
+
+        // Copy parent PML4 entry flags
+        child_pml4[i].set_addr(PhysAddr::new(child_pdpt_phys), parent_pml4_entry.flags());
+
+        // Map parent PDPT
+        let parent_pdpt_phys = parent_pml4_entry.frame().map_err(|_| "Invalid frame in parent PML4")?.start_address().as_u64();
+        let parent_pdpt_virt = VirtAddr::new(parent_pdpt_phys + phys_mem_offset());
+        let parent_pdpt: &PageTable = unsafe { &*parent_pdpt_virt.as_ptr() };
+
+        for j in 0..512 {
+            let parent_pdpt_entry = &parent_pdpt[j];
+            if parent_pdpt_entry.is_unused() {
+                continue;
+            }
+
+            // Allocate a new child PD (Level 2)
+            let child_pd_phys = super::physical::allocate_frame()
+                .ok_or("Failed to allocate child PD frame")?;
+            let child_pd_virt = VirtAddr::new(child_pd_phys + phys_mem_offset());
+            let child_pd: &mut PageTable = unsafe { &mut *child_pd_virt.as_mut_ptr() };
+            child_pd.zero();
+
+            // Copy PDPT flags
+            child_pdpt[j].set_addr(PhysAddr::new(child_pd_phys), parent_pdpt_entry.flags());
+
+            // Map parent PD
+            let parent_pd_phys = parent_pdpt_entry.frame().map_err(|_| "Invalid frame in parent PDPT")?.start_address().as_u64();
+            let parent_pd_virt = VirtAddr::new(parent_pd_phys + phys_mem_offset());
+            let parent_pd: &PageTable = unsafe { &*parent_pd_virt.as_ptr() };
+
+            for k in 0..512 {
+                let parent_pd_entry = &parent_pd[k];
+                if parent_pd_entry.is_unused() {
+                    continue;
+                }
+
+                // Allocate a new child PT (Level 1)
+                let child_pt_phys = super::physical::allocate_frame()
+                    .ok_or("Failed to allocate child PT frame")?;
+                let child_pt_virt = VirtAddr::new(child_pt_phys + phys_mem_offset());
+                let child_pt: &mut PageTable = unsafe { &mut *child_pt_virt.as_mut_ptr() };
+                child_pt.zero();
+
+                // Copy PD flags
+                child_pd[k].set_addr(PhysAddr::new(child_pt_phys), parent_pd_entry.flags());
+
+                // Map parent's PT (get mutable reference so we can write protect entries too)
+                let parent_pt_phys = parent_pd_entry.frame().map_err(|_| "Invalid frame in parent PD")?.start_address().as_u64();
+                let parent_pt_virt = VirtAddr::new(parent_pt_phys + phys_mem_offset());
+                let parent_pt_mut: &mut PageTable = unsafe { &mut *parent_pt_virt.as_mut_ptr() };
+
+                for l in 0..512 {
+                    let parent_pt_entry = &mut parent_pt_mut[l];
+                    if parent_pt_entry.is_unused() {
+                        continue;
+                    }
+
+                    let frame = parent_pt_entry.frame().map_err(|_| "Invalid frame in parent PT")?;
+                    let phys_addr = frame.start_address().as_u64();
+
+                    let mut flags = parent_pt_entry.flags();
+                    let is_writable = flags.contains(PageTableFlags::WRITABLE);
+                    let is_cow = flags.contains(PageTableFlags::BIT_9);
+
+                    if is_writable || is_cow {
+                        // Mark as Copy-on-Write: clear WRITABLE, add BIT_9
+                        flags.remove(PageTableFlags::WRITABLE);
+                        flags.insert(PageTableFlags::BIT_9);
+
+                        parent_pt_entry.set_addr(PhysAddr::new(phys_addr), flags);
+
+                        // Increment physical page frame reference count
+                        super::physical::increment_ref(phys_addr);
+                    }
+
+                    child_pt[l].set_addr(PhysAddr::new(phys_addr), flags);
+                }
+            }
+        }
     }
+
+    // Broadcast TLB shootdown to notify other CPU cores
+    crate::arch::x86_64::smp::shootdown_tlb();
 
     Ok(child_pml4_phys)
 }

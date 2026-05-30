@@ -3,8 +3,6 @@
 use super::{Errno, SyscallResult};
 use crate::kprintln;
 use crate::process::scheduler;
-use x86_64::{PhysAddr, VirtAddr};
-use x86_64::structures::paging::{Page, PhysFrame, PageTableFlags, Size4KiB};
 
 /// `getpid()` — Get the process ID of the calling process.
 pub fn sys_getpid() -> SyscallResult {
@@ -49,58 +47,6 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
         Ok(pt) => pt,
         Err(_) => return Errno::ENOMEM.into(),
     };
-
-    // Clone parent's user stack physically to give the child its own independent stack space!
-    {
-        use x86_64::structures::paging::Translate;
-        let stack_size = 64 * 1024;
-        let stack_bottom = crate::process::elf::USER_STACK_TOP - stack_size;
-        let stack_start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(stack_bottom));
-        let stack_end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(crate::process::elf::USER_STACK_TOP - 1));
-
-        for page in Page::range_inclusive(stack_start_page, stack_end_page) {
-            // Allocate a new physical frame for the child stack page
-            let child_phys_addr = match crate::memory::physical::allocate_frame() {
-                Some(addr) => addr,
-                None => return Errno::ENOMEM.into(),
-            };
-
-            // Translate the parent's virtual stack page address to get its physical frame
-            let parent_phys_addr = {
-                let mapper = unsafe { crate::memory::r#virtual::active_page_table() };
-                mapper.translate_addr(page.start_address())
-                    .map(|p| p.as_u64())
-            };
-
-            // If the page is mapped in the parent, copy its contents; otherwise zero-initialize
-            let dest_ptr = (child_phys_addr + crate::memory::r#virtual::phys_mem_offset()) as *mut u8;
-            let dest_slice = unsafe { core::slice::from_raw_parts_mut(dest_ptr, 4096) };
-
-            if let Some(parent_phys) = parent_phys_addr {
-                let src_ptr = (parent_phys + crate::memory::r#virtual::phys_mem_offset()) as *const u8;
-                let src_slice = unsafe { core::slice::from_raw_parts(src_ptr, 4096) };
-                dest_slice.copy_from_slice(src_slice);
-            } else {
-                dest_slice.fill(0);
-            }
-
-            // Map the page in the child's page table pointing to the new physical frame
-            // Build flags: PRESENT, WRITABLE, USER_ACCESSIBLE, NO_EXECUTE
-            let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE;
-            
-            unsafe {
-                // Unmap the page from child's page table (since clone_parent_page_table cloned it pointing to parent's frame)
-                let _ = crate::memory::r#virtual::unmap_user_page(child_page_table, page);
-                
-                crate::memory::r#virtual::map_user_page(
-                    child_page_table,
-                    page,
-                    PhysFrame::containing_address(PhysAddr::new(child_phys_addr)),
-                    flags
-                ).expect("Failed to map cloned user stack page");
-            }
-        }
-    }
 
     // ── Allocate new PID and build child TCB ──────────────────────────────────
     let child_pid = pid::allocate();
@@ -494,6 +440,18 @@ pub fn sys_getegid() -> SyscallResult { 0 }
 pub fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
     if code == 0x1002 { // ARCH_SET_FS
         x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(addr));
+        
+        let current_pid = match scheduler::current_pid() {
+            Some(p) => p,
+            None => return Errno::ESRCH.into(),
+        };
+        
+        let mut sched = scheduler::SCHEDULER.lock();
+        if let Some(ref mut sched) = *sched {
+            if let Some(task) = sched.get_task_mut(current_pid) {
+                task.context.fs_base = addr;
+            }
+        }
         0
     } else {
         Errno::EINVAL.into()
@@ -505,3 +463,4 @@ pub fn sys_set_tid_address(_tidptr: *mut i32) -> SyscallResult {
     let pid = crate::process::scheduler::current_pid().map(|p| p.as_u64()).unwrap_or(0);
     pid as i64
 }
+

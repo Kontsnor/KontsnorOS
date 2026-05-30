@@ -53,6 +53,8 @@ pub struct CpuContext {
     pub rflags: u64,
     /// CR3 (page table root) — for address space switching.
     pub cr3: u64,
+    /// FS_BASE MSR (for Thread Local Storage) — offset 0x50.
+    pub fs_base: u64,
 }
 
 impl Default for CpuContext {
@@ -68,6 +70,7 @@ impl Default for CpuContext {
             rip: 0,
             rflags: 0x202, // IF (Interrupt Flag) set
             cr3: 0,
+            fs_base: 0,
         }
     }
 }
@@ -81,6 +84,7 @@ impl CpuContext {
             rsp: stack_pointer,
             cr3: page_table,
             rflags: 0x202, // Interrupts enabled
+            fs_base: 0,
             ..Default::default()
         }
     }
@@ -144,6 +148,13 @@ pub unsafe extern "C" fn switch_context(
         "mov rax, cr3",
         "mov [rdi + 0x48], rax",
 
+        // Save FS_BASE MSR
+        "mov ecx, 0xC0000100",          // FS_BASE MSR
+        "rdmsr",                        // Reads MSR into edx:eax
+        "shl rdx, 32",
+        "or rax, rdx",                  // Full 64-bit value in rax
+        "mov [rdi + 0x50], rax",        // Save to old context
+
         // ── Restore new context ────────────────────────────────────
         // rsi = new_ctx pointer
 
@@ -164,6 +175,13 @@ pub unsafe extern "C" fn switch_context(
         "mov rax, [rsi + 0x40]",
         "push rax",
         "popfq",
+
+        // Restore FS_BASE MSR
+        "mov rax, [rsi + 0x50]",
+        "mov rdx, rax",
+        "shr rdx, 32",                  // High 32 bits in edx
+        "mov ecx, 0xC0000100",          // FS_BASE MSR
+        "wrmsr",                        // Writes edx:eax to MSR
 
         // Restore callee-saved registers
         "mov rbx, [rsi + 0x00]",

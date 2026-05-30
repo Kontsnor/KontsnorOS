@@ -15,6 +15,7 @@ use crate::sync::spinlock::TicketLock;
 use crate::kprintln;
 
 use super::PAGE_SIZE;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 /// Maximum supported physical memory: 4 GiB initially.
 /// This gives us 1M frames, requiring a 128 KiB bitmap.
@@ -22,6 +23,41 @@ const MAX_FRAMES: usize = 1024 * 1024;
 
 /// Bitmap size in bytes.
 const BITMAP_SIZE: usize = MAX_FRAMES / 8;
+
+/// Array tracking the reference counts of all physical memory frames.
+/// Each entry represents a 4 KiB frame.
+pub static FRAME_REFS: [AtomicU8; MAX_FRAMES] = {
+    const ATOMIC_ZERO: AtomicU8 = AtomicU8::new(0);
+    [ATOMIC_ZERO; MAX_FRAMES]
+};
+
+/// Increment the reference count of a physical frame.
+pub fn increment_ref(phys_addr: u64) {
+    let index = (phys_addr / PAGE_SIZE as u64) as usize;
+    if index < MAX_FRAMES {
+        FRAME_REFS[index].fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Decrement the reference count of a physical frame.
+/// Returns the new reference count.
+pub fn decrement_ref(phys_addr: u64) -> u8 {
+    let index = (phys_addr / PAGE_SIZE as u64) as usize;
+    if index < MAX_FRAMES {
+        let old = FRAME_REFS[index].load(Ordering::SeqCst);
+        if old == 0 {
+            return 0;
+        }
+        let old = FRAME_REFS[index].fetch_sub(1, Ordering::SeqCst);
+        if old > 0 {
+            old - 1
+        } else {
+            0
+        }
+    } else {
+        0
+    }
+}
 
 /// The global physical frame allocator.
 static FRAME_ALLOCATOR: TicketLock<FrameAllocator> = TicketLock::new(FrameAllocator::new());
@@ -181,36 +217,46 @@ pub fn init(memory_regions: &MemoryRegions) {
 /// Returns the physical address of the allocated frame, or `None` if
 /// no free frames are available.
 pub fn allocate_frame() -> Option<u64> {
-    let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
-    if apic_id < 32 {
-        let mut cache = CORE_CACHES[apic_id].lock();
-        if cache.count > 0 {
-            cache.count -= 1;
-            let frame = cache.frames[cache.count];
-            return Some(frame);
-        }
-
-        // Cache is empty; bulk allocate from the global FRAME_ALLOCATOR
-        let mut global_alloc = FRAME_ALLOCATOR.lock();
-        let mut first_frame = None;
-        for _ in 0..8 {
-            if let Some(f) = global_alloc.allocate() {
-                if first_frame.is_none() {
-                    first_frame = Some(f);
-                } else {
-                    let count = cache.count;
-                    cache.frames[count] = f;
-                    cache.count += 1;
-                }
+    let frame = {
+        let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
+        if apic_id < 32 {
+            let mut cache = CORE_CACHES[apic_id].lock();
+            if cache.count > 0 {
+                cache.count -= 1;
+                let frame = cache.frames[cache.count];
+                Some(frame)
             } else {
-                break;
+                // Cache is empty; bulk allocate from the global FRAME_ALLOCATOR
+                let mut global_alloc = FRAME_ALLOCATOR.lock();
+                let mut first_frame = None;
+                for _ in 0..8 {
+                    if let Some(f) = global_alloc.allocate() {
+                        if first_frame.is_none() {
+                            first_frame = Some(f);
+                        } else {
+                            let count = cache.count;
+                            cache.frames[count] = f;
+                            cache.count += 1;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                first_frame
             }
+        } else {
+            // Fallback direct global allocation
+            FRAME_ALLOCATOR.lock().allocate()
         }
-        return first_frame;
-    }
+    };
 
-    // Fallback direct global allocation
-    FRAME_ALLOCATOR.lock().allocate()
+    if let Some(f) = frame {
+        let idx = (f / PAGE_SIZE as u64) as usize;
+        if idx < MAX_FRAMES {
+            FRAME_REFS[idx].store(1, Ordering::SeqCst);
+        }
+    }
+    frame
 }
 
 /// Free a previously allocated physical frame.
@@ -222,6 +268,19 @@ pub fn allocate_frame() -> Option<u64> {
 /// - The frame is no longer in use by any page table or data structure
 /// - The frame is not freed more than once
 pub fn deallocate_frame(phys_addr: u64) {
+    let frame_index = (phys_addr / PAGE_SIZE as u64) as usize;
+    if frame_index < MAX_FRAMES {
+        let old = FRAME_REFS[frame_index].load(Ordering::SeqCst);
+        if old == 0 {
+            return;
+        }
+        let old = FRAME_REFS[frame_index].fetch_sub(1, Ordering::SeqCst);
+        if old > 1 {
+            // Still referenced by other page tables. Do not reclaim yet!
+            return;
+        }
+    }
+
     let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
     if apic_id < 32 {
         let mut cache = CORE_CACHES[apic_id].lock();

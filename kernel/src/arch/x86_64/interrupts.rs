@@ -189,13 +189,109 @@ extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
-    use x86_64::registers::control::Cr2;
+    use x86_64::registers::control::{Cr2, Cr3};
+    use x86_64::{VirtAddr, PhysAddr};
+    use x86_64::structures::paging::{PageTable, PageTableFlags};
 
-    kprintln!("[EXCEPTION] Page Fault");
-    kprintln!("  Accessed Address: {:?}", Cr2::read());
+    let fault_addr = Cr2::read().unwrap();
+
+    // Check if the fault was caused by a write operation
+    if error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE) {
+        let (pml4_frame, _) = Cr3::read();
+        let pml4_phys = pml4_frame.start_address().as_u64();
+        let phys_mem_offset = crate::memory::r#virtual::phys_mem_offset();
+
+        let pml4_virt = VirtAddr::new(pml4_phys + phys_mem_offset);
+        let pml4: &PageTable = unsafe { &*pml4_virt.as_ptr() };
+
+        let pml4_idx = fault_addr.p4_index();
+        let pdpt_idx = fault_addr.p3_index();
+        let pd_idx = fault_addr.p2_index();
+        let pt_idx = fault_addr.p1_index();
+
+        let pml4_entry = &pml4[pml4_idx];
+        if !pml4_entry.is_unused() {
+            if let Ok(pdpt_frame) = pml4_entry.frame() {
+                let pdpt_phys = pdpt_frame.start_address().as_u64();
+                let pdpt_virt = VirtAddr::new(pdpt_phys + phys_mem_offset);
+                let pdpt: &PageTable = unsafe { &*pdpt_virt.as_ptr() };
+
+                let pdpt_entry = &pdpt[pdpt_idx];
+                if !pdpt_entry.is_unused() {
+                    if let Ok(pd_frame) = pdpt_entry.frame() {
+                        let pd_phys = pd_frame.start_address().as_u64();
+                        let pd_virt = VirtAddr::new(pd_phys + phys_mem_offset);
+                        let pd: &PageTable = unsafe { &*pd_virt.as_ptr() };
+
+                        let pd_entry = &pd[pd_idx];
+                        if !pd_entry.is_unused() {
+                            if let Ok(pt_frame) = pd_entry.frame() {
+                                let pt_phys = pt_frame.start_address().as_u64();
+                                let pt_virt = VirtAddr::new(pt_phys + phys_mem_offset);
+                                let pt: &mut PageTable = unsafe { &mut *pt_virt.as_mut_ptr() };
+
+                                let pt_entry = &mut pt[pt_idx];
+                                if !pt_entry.is_unused() {
+                                    let mut flags = pt_entry.flags();
+                                    if flags.contains(PageTableFlags::BIT_9) {
+                                        // This is a Copy-on-Write page!
+                                        if let Ok(old_frame) = pt_entry.frame() {
+                                            let old_phys = old_frame.start_address().as_u64();
+
+                                            // Safely read reference count from AtomicU8 array
+                                            use core::sync::atomic::Ordering;
+                                            let refs = crate::memory::physical::FRAME_REFS[(old_phys / 4096) as usize].load(Ordering::SeqCst);
+
+                                            if refs == 1 {
+                                                // Not shared anymore! Mark as writable directly
+                                                flags.remove(PageTableFlags::BIT_9);
+                                                flags.insert(PageTableFlags::WRITABLE);
+                                                pt_entry.set_addr(PhysAddr::new(old_phys), flags);
+
+                                                // Flush local TLB for this virtual address
+                                                x86_64::instructions::tlb::flush(fault_addr);
+                                                // Broadcast TLB shootdown to notify other CPU cores
+                                                crate::arch::x86_64::smp::shootdown_tlb();
+                                                return; // Fault resolved!
+                                            } else if refs > 1 {
+                                                // Shared page! Allocate a new page frame, copy contents, and map writable
+                                                if let Some(new_phys) = crate::memory::physical::allocate_frame() {
+                                                    let src_ptr = (old_phys + phys_mem_offset) as *const u8;
+                                                    let dest_ptr = (new_phys + phys_mem_offset) as *mut u8;
+
+                                                    unsafe {
+                                                        core::ptr::copy_nonoverlapping(src_ptr, dest_ptr, 4096);
+                                                    }
+
+                                                    // Decrement old frame's reference count
+                                                    crate::memory::physical::decrement_ref(old_phys);
+
+                                                    flags.remove(PageTableFlags::BIT_9);
+                                                    flags.insert(PageTableFlags::WRITABLE);
+                                                    pt_entry.set_addr(PhysAddr::new(new_phys), flags);
+
+                                                    // Flush local TLB and broadcast shootdown
+                                                    x86_64::instructions::tlb::flush(fault_addr);
+                                                    crate::arch::x86_64::smp::shootdown_tlb();
+                                                    return; // Fault resolved!
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    kprintln!("[EXCEPTION] Unhandled Page Fault");
+    kprintln!("  Accessed Address: {:?}", fault_addr);
     kprintln!("  Error Code: {:?}", error_code);
     kprintln!("{:#?}", stack_frame);
-    panic!("Unhandled page fault");
+    panic!("Unhandled page fault — system cannot recover");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

@@ -19,6 +19,7 @@ pub mod gpu;
 pub mod keyboard;
 pub mod traits;
 pub mod ramdisk;
+pub mod block;
 
 use alloc::vec::Vec;
 use spin::Mutex;

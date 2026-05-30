@@ -49,8 +49,15 @@ echo ""
 echo "Building bootable disk image..."
 bootloader_linker build "$KERNEL_BIN" -o "$PROJECT_DIR" -s
 
+DISK_IMG="$PROJECT_DIR/disk.img"
+if [ ! -f "$DISK_IMG" ]; then
+    echo "Creating 10MB blank persistent hard drive image..."
+    dd if=/dev/zero of="$DISK_IMG" bs=1M count=10 2>/dev/null
+fi
+
 qemu-system-x86_64 \
     -drive format=raw,file="$PROJECT_DIR/bios.img" \
+    -drive format=raw,file="$DISK_IMG",index=1,media=disk \
     -serial stdio \
     -display none \
     -m 256M \

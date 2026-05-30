@@ -40,13 +40,62 @@ pub fn init() {
     // Create the RAM disk pre-populated with our ext2 filesystem
     let ramdisk = crate::drivers::ramdisk::create_ext2_ramdisk();
     
-    // Mount it using the ext2 driver
-    if let Ok(ext2_fs) = ext2::Ext2FileSystem::mount(ramdisk) {
-        vfs::mount(alloc::string::String::from("/disk"), ext2_fs.clone());
-        vfs::mount(alloc::string::String::from("/"), ext2_fs);
-        kprintln!("[fs] Pre-populated ext2 RAM disk mounted at /disk and /.");
-    } else {
-        kprintln!("[fs] Failed to mount ext2 RAM disk.");
+    let mut mounted_ata = false;
+
+    // Probe the physical ATA Primary Slave drive
+    if let Some(ata_drive) = crate::drivers::block::ata::init_ata_drive() {
+        let mut buf = [0u8; 512];
+        if ata_drive.read_block(2, &mut buf).is_ok() {
+            let magic = u16::from_le_bytes([buf[56], buf[57]]);
+            if magic != 0xEF53 {
+                kprintln!("[fs] ATA drive is unformatted (magic: {:#X}). Formatting with live ext2 image...", magic);
+                let mut success = true;
+                for block_idx in 0..256 {
+                    let mut block_data = [0u8; 512];
+                    if ramdisk.read_block(block_idx as u64, &mut block_data).is_ok() {
+                        if ata_drive.write_block(block_idx as u64, &block_data).is_err() {
+                            kprintln!("[fs] Failed to write block {} to ATA drive.", block_idx);
+                            success = false;
+                            break;
+                        }
+                    } else {
+                        kprintln!("[fs] Failed to read block {} from RAM disk.", block_idx);
+                        success = false;
+                        break;
+                    }
+                }
+                if success {
+                    if let Err(e) = ata_drive.flush() {
+                        kprintln!("[fs] Failed to flush ATA drive: {:?}", e);
+                    } else {
+                        kprintln!("[fs] ATA drive formatted and flushed successfully.");
+                    }
+                }
+            } else {
+                kprintln!("[fs] ATA drive is already formatted (magic: 0xEF53).");
+            }
+        }
+
+        // Try mounting the physical ATA drive
+        if let Ok(ext2_fs) = ext2::Ext2FileSystem::mount(ata_drive) {
+            vfs::mount(alloc::string::String::from("/disk"), ext2_fs.clone());
+            vfs::mount(alloc::string::String::from("/"), ext2_fs);
+            kprintln!("[fs] Persistent ext2 ATA drive mounted at /disk and /.");
+            mounted_ata = true;
+        } else {
+            kprintln!("[fs] Failed to mount ext2 ATA drive. Falling back to RAM disk.");
+        }
+    }
+
+    if !mounted_ata {
+        // Mount it using the ext2 driver
+        if let Ok(ext2_fs) = ext2::Ext2FileSystem::mount(ramdisk) {
+            vfs::mount(alloc::string::String::from("/disk"), ext2_fs.clone());
+            vfs::mount(alloc::string::String::from("/"), ext2_fs);
+            kprintln!("[fs] Pre-populated ext2 RAM disk mounted at /disk and /.");
+        } else {
+            kprintln!("[fs] Failed to mount ext2 RAM disk.");
+        }
     }
 
     kprintln!("[fs] VFS initialized with devfs, tmpfs, procfs, ext2.");

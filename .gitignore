@@ -5,6 +5,7 @@ Cargo.lock
 # Disk images and bootloader builds
 bios.img
 uefi.img
+disk.img
 
 # Logs
 *.log

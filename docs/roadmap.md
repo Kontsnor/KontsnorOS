@@ -51,14 +51,14 @@ gantt
 ### 💾 Phase B: Writable Filesystems & Crash Consistency
 *We currently boot from a read-only ext2 RAM disk mount. This phase transitions the OS to support dynamic local storage and writable block devices.*
 
-#### Phase 31: Writable ext2 Filesystem Implementation
-- **VFS Write Support**: Implement full `write`, `create`, `mkdir`, and `truncate` methods inside the `ext2` filesystem driver.
-- **Dynamic Block Allocation**: Add block and inode allocator bitmaps, dynamically locating free blocks from the Group Descriptor blocks on the disk image.
-- **VFS File Sync (`fsync`)**: Wire standard POSIX file descriptor flushing to ensure cached filesystem blocks are written back to physical disk.
+#### Phase 31: Writable ext2 Filesystem Implementation [Completed]
+- **VFS Write Support**: Implement full `write`, `create`, `mkdir`, and `truncate` methods inside the `ext2` filesystem driver. [Completed]
+- **Dynamic Block Allocation**: Add block and inode allocator bitmaps, dynamically locating free blocks from the Group Descriptor blocks on the disk image. [Completed]
+- **VFS File Sync (`fsync`)**: Wire standard POSIX file descriptor flushing to ensure cached filesystem blocks are written back to physical disk. [Completed]
 
-#### Phase 32: RAM Disk Persistence & Hard Drive IDE/AHCI Drivers
-- **IDE/SATA Block Drivers**: Implement high-performance, asynchronous block drivers for standard PCI IDE or AHCI (SATA) disk controllers.
-- **Disk Partitioning**: Support parsing Master Boot Record (MBR) and GUID Partition Tables (GPT) to mount partitions.
+#### Phase 32: Writable IDE/ATA PIO Hard Drive Driver
+- **IDE/ATA Block Driver**: Implement a high-performance, interrupt-safe block device driver (`AtaDrive`) for standard Primary Slave IDE hard disks using LBA28/LBA48 Port PIO.
+- **VFS Storage Persistence**: Route file writes directly to physical disk media and automatically format blank drives with live ext2 system structures on first boot to guarantee native persistency across reboots.
 
 #### Phase 33: Crash Consistency & Simple Journaling
 - **Directory Inode Consistency**: Implement write-ordering rules and soft updates (or a lightweight metadata journal) to ensure the filesystem remains mountable and free of corruption in the event of an abrupt system reset.

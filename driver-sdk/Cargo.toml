@@ -1,0 +1,12 @@
+[package]
+name = "kontsnor-driver-sdk"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "KontsnorOS Driver SDK — Write drivers for KontsnorOS with safe, stable APIs"
+readme = "README.md"
+
+[dependencies]
+# The SDK re-exports stable types from these crates
+bitflags = { workspace = true }

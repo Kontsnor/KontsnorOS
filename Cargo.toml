@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "driver-sdk",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["KontsnorOS Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kontsnor/KontsnorOS"
+description = "A Unix-compatible operating system kernel written in Rust"
+
+[workspace.dependencies]
+# Shared dependency versions across workspace
+spin = "0.9"
+bitflags = "2.9"
+log = "0.4"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = 2

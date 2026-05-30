@@ -1,0 +1,16 @@
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Disk images and bootloader builds
+bios.img
+uefi.img
+
+# Logs
+*.log
+qemu_output.log
+
+# IDE and environment files
+.antigravity/
+.vscode/
+.idea/

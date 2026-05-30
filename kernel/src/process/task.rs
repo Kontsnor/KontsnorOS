@@ -1,0 +1,205 @@
+//! Task Control Block (TCB) definition.
+//!
+//! A Task represents a thread of execution in the kernel. Each process
+//! has at least one task (the main thread), and may have additional tasks
+//! for multi-threading.
+//!
+//! ## Task States
+//!
+//! ```text
+//! ┌──────────┐    schedule()    ┌─────────┐
+//! │  Ready   │ ──────────────→ │ Running │
+//! └──────────┘                 └─────────┘
+//!      ↑                            │
+//!      │                            │ block() / yield()
+//!      │                            ↓
+//!      │    wake_up()         ┌──────────┐
+//!      └───────────────────── │ Blocked  │
+//!                             └──────────┘
+//!                                   │
+//!                                   │ exit()
+//!                                   ↓
+//!                             ┌──────────┐
+//!                             │  Zombie  │
+//!                             └──────────┘
+//! ```
+
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use super::context::CpuContext;
+use super::pid::Pid;
+use crate::fs::inode::InodeOps;
+
+/// The state of a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    /// Task is ready to run and waiting in the scheduler queue.
+    Ready,
+    /// Task is currently executing on a CPU.
+    Running,
+    /// Task is blocked waiting for an event (I/O, sleep, lock, etc.).
+    Blocked,
+    /// Task has exited but hasn't been waited on by its parent yet.
+    Zombie,
+}
+
+/// Priority levels for the multi-level feedback queue scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum Priority {
+    /// Highest priority — real-time / interrupt processing.
+    RealTime = 0,
+    /// High priority — interactive tasks.
+    High = 1,
+    /// Normal priority — most user processes.
+    Normal = 2,
+    /// Low priority — batch / background tasks.
+    Low = 3,
+    /// Lowest priority — idle tasks.
+    Idle = 4,
+}
+
+impl Default for Priority {
+    fn default() -> Self {
+        Priority::Normal
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct SigAction {
+    pub sa_handler: u64,
+    pub sa_flags: u64,
+    pub sa_restorer: u64,
+    pub sa_mask: u64,
+}
+
+/// A Task Control Block (TCB).
+///
+/// Contains all the information the kernel needs to manage a task:
+/// - Identity (PID, name)
+/// - Scheduling state and priority
+/// - CPU register context (for context switching)
+/// - Memory management info (page table root, kernel stack)
+/// - File descriptor table (up to 64 open files)
+pub struct Task {
+    /// Unique process identifier.
+    pub pid: Pid,
+
+    /// Human-readable task name (for debugging).
+    pub name: String,
+
+    /// Current task state.
+    pub state: TaskState,
+
+    /// Scheduling priority.
+    pub priority: Priority,
+
+    /// Saved CPU context for context switching.
+    pub context: CpuContext,
+
+    /// Physical address of this task's page table root (CR3 value).
+    pub page_table_root: u64,
+
+    /// Base address of the kernel stack for this task.
+    pub kernel_stack_base: u64,
+
+    /// Size of the kernel stack in bytes.
+    pub kernel_stack_size: usize,
+
+    /// Exit code (set when task transitions to Zombie state).
+    pub exit_code: Option<i32>,
+
+    /// Parent PID (0 for the init process).
+    pub parent_pid: Pid,
+
+    /// CPU time consumed (in timer ticks).
+    pub cpu_ticks: u64,
+
+    /// Open file descriptor table.
+    ///
+    /// Index corresponds to the file descriptor number (fd 0 = stdin, 1 = stdout, 2 = stderr).
+    /// Pre-populated with standard I/O TTY devices for Ring 3 tasks.
+    pub fd_table: Vec<Option<Arc<dyn InodeOps>>>,
+
+    /// Current program break — top of the user-space heap (used by `brk()`).
+    pub brk: u64,
+
+    /// Current working directory (always an absolute normalized path).
+    pub cwd: String,
+
+    /// Current mmap bump allocator pointer.
+    pub mmap_bump: u64,
+
+    /// Pending signals mask.
+    pub pending_signals: u64,
+
+    /// Blocked signals mask.
+    pub blocked_signals: u64,
+
+    /// Registered signal actions.
+    pub sigactions: [SigAction; 64],
+
+    /// File seek offsets (parallel to fd_table).
+    pub fd_offsets: Vec<u64>,
+}
+
+impl Task {
+    /// Create a new task with the given PID and name.
+    pub fn new(pid: Pid, name: String, page_table_root: u64) -> Self {
+        // Pre-populate the standard I/O file descriptors for every task.
+        // Kernel threads won't use these but they don't hurt.
+        let mut fd_table: Vec<Option<Arc<dyn InodeOps>>> = Vec::new();
+        fd_table.push(Some(crate::fs::tty::make_stdin()));   // fd 0: stdin
+        fd_table.push(Some(crate::fs::tty::make_stdout()));  // fd 1: stdout
+        fd_table.push(Some(crate::fs::tty::make_stderr()));  // fd 2: stderr
+
+        let mut fd_offsets = Vec::new();
+        fd_offsets.resize(3, 0);
+
+        Self {
+            pid,
+            name,
+            state: TaskState::Ready,
+            priority: Priority::default(),
+            context: CpuContext::default(),
+            page_table_root,
+            kernel_stack_base: 0,
+            kernel_stack_size: 0,
+            exit_code: None,
+            parent_pid: Pid::IDLE,
+            cpu_ticks: 0,
+            fd_table,
+            brk: 0,
+            cwd: String::from("/"),
+            mmap_bump: 0x0000_5000_0000_0000u64,
+            pending_signals: 0,
+            blocked_signals: 0,
+            sigactions: [SigAction { sa_handler: 0, sa_flags: 0, sa_restorer: 0, sa_mask: 0 }; 64],
+            fd_offsets,
+        }
+    }
+
+    /// Create the kernel idle task (PID 0).
+    pub fn idle() -> Self {
+        Self::new(Pid::IDLE, String::from("idle"), 0)
+    }
+
+    /// Check if this task is runnable.
+    pub fn is_runnable(&self) -> bool {
+        matches!(self.state, TaskState::Ready | TaskState::Running)
+    }
+}
+
+impl core::fmt::Debug for Task {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Task")
+            .field("pid", &self.pid)
+            .field("name", &self.name)
+            .field("state", &self.state)
+            .field("priority", &self.priority)
+            .finish()
+    }
+}

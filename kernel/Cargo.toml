@@ -1,0 +1,42 @@
+[package]
+name = "kontsnor-kernel"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "KontsnorOS kernel — a Unix-compatible hybrid kernel written in Rust"
+
+[dependencies]
+# Workspace dependencies
+spin = { workspace = true }
+bitflags = { workspace = true }
+log = { workspace = true }
+
+# x86_64 hardware abstractions
+x86_64 = "0.15"
+
+# UART serial port
+uart_16550 = "0.3"
+
+# PIC interrupt controller
+pic8259 = "0.11"
+
+# Kernel heap allocator
+linked_list_allocator = "0.10"
+
+# Volatile memory access (for MMIO)
+volatile = "0.6"
+
+# Port I/O
+# (provided by x86_64 crate)
+
+[dependencies.lazy_static]
+version = "1.5"
+features = ["spin_no_std"]
+
+[dependencies.bootloader_api]
+version = "0.11"
+
+[features]
+default = []
+test = []

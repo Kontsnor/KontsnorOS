@@ -188,11 +188,32 @@ impl Scheduler {
     /// Terminate a task.
     pub fn exit_task(&mut self, pid: Pid, exit_code: i32) {
         let idx = pid.as_u64() as usize;
+        let mut parent_pid = None;
         if let Some(Some(task)) = self.tasks.get_mut(idx) {
             task.state = TaskState::Zombie;
             task.exit_code = Some(exit_code);
             task.fd_table.clear();
             task.fd_offsets.clear();
+            parent_pid = Some(task.parent_pid);
+        }
+
+        if let Some(parent) = parent_pid {
+            // Wake the parent task if it was blocked waiting
+            self.wake_task(parent);
+
+            // Deliver SIGCHLD (17) to the parent's pending signals
+            let parent_idx = parent.as_u64() as usize;
+            if parent_idx < self.tasks.len() {
+                if let Some(Some(ref mut parent_task)) = self.tasks.get_mut(parent_idx) {
+                    parent_task.pending_signals |= 1 << (17 - 1);
+                    // Wake parent task from blocked state if it was waiting
+                    if parent_task.state == TaskState::Blocked {
+                        parent_task.state = TaskState::Ready;
+                        let priority = parent_task.priority as usize;
+                        self.queues[priority].push_back(parent);
+                    }
+                }
+            }
         }
     }
 
@@ -417,3 +438,18 @@ pub fn set_bootstrap_thread(task: Task) {
         }
     }
 }
+
+/// Block a task.
+pub fn block_task(pid: Pid) {
+    if let Some(ref mut scheduler) = *SCHEDULER.lock() {
+        scheduler.block_task(pid);
+    }
+}
+
+/// Wake up a blocked task.
+pub fn wake_task(pid: Pid) {
+    if let Some(ref mut scheduler) = *SCHEDULER.lock() {
+        scheduler.wake_task(pid);
+    }
+}
+

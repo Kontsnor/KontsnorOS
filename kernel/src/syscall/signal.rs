@@ -201,6 +201,7 @@ pub struct SignalFrame {
     pub r13: u64,
     pub r14: u64,
     pub r15: u64,
+    pub mask: u64, // Saved signal mask (blocked_signals)
 }
 
 /// Delivers pending unblocked signals to the current process.
@@ -212,7 +213,7 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
         None => return,
     };
     
-    let (sig, action) = {
+    let (sig, action, old_mask) = {
         let mut sched_lock = scheduler::SCHEDULER.lock();
         let scheduler = match sched_lock.as_mut() {
             Some(s) => s,
@@ -243,6 +244,7 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
         task.pending_signals &= !(1 << (active_sig - 1));
         
         let action = task.sigactions[(active_sig - 1) as usize];
+        let old_mask = task.blocked_signals;
         
         if (action.sa_flags & 0x40000000) == 0 {
             task.blocked_signals |= 1 << (active_sig - 1);
@@ -250,7 +252,7 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
         task.blocked_signals |= action.sa_mask;
         task.blocked_signals &= !((1 << 8) | (1 << 18));
         
-        (active_sig, action)
+        (active_sig, action, old_mask)
     };
     
     if action.sa_handler == 1 { // SIG_IGN
@@ -290,6 +292,7 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
             r13: unsafe { (*regs).r13 },
             r14: unsafe { (*regs).r14 },
             r15: unsafe { (*regs).r15 },
+            mask: old_mask,
         };
         
         unsafe {
@@ -334,6 +337,19 @@ pub fn sys_rt_sigreturn(regs: *mut super::SavedRegisters) -> SyscallResult {
         (*regs).r15 = frame.r15;
         
         (*regs).rsp = frame.rsp;
+        
+        // Restore saved signal mask!
+        use crate::process::scheduler;
+        if let Some(current_pid) = scheduler::current_pid() {
+            let mut sched_lock = scheduler::SCHEDULER.lock();
+            if let Some(ref mut sched) = *sched_lock {
+                if let Some(task) = sched.get_task_mut(current_pid) {
+                    task.blocked_signals = frame.mask;
+                    // SIGKILL (9) and SIGSTOP (19) cannot be blocked
+                    task.blocked_signals &= !((1 << 8) | (1 << 18));
+                }
+            }
+        }
         
         kprintln!("[signal] sys_rt_sigreturn: restored execution context to RIP={:#x}, RSP={:#x}", frame.rip, frame.rsp);
         

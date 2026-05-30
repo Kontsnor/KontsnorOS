@@ -319,14 +319,18 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
             };
 
             let mut found = None;
+            let mut has_children = false;
             for slot in sched.tasks.iter_mut() {
                 if let Some(task) = slot {
                     let is_child = task.parent_pid == current_pid;
                     let matches_pid = pid == -1 || task.pid.as_u64() as i32 == pid;
-                    if is_child && matches_pid && task.state == TaskState::Zombie {
-                        crate::kprintln!("[syscall] wait4: found zombie child PID {}", task.pid);
-                        found = Some((task.pid, task.exit_code.unwrap_or(0)));
-                        break;
+                    if is_child && matches_pid {
+                        has_children = true;
+                        if task.state == TaskState::Zombie {
+                            crate::kprintln!("[syscall] wait4: found zombie child PID {}", task.pid);
+                            found = Some((task.pid, task.exit_code.unwrap_or(0)));
+                            break;
+                        }
                     }
                 }
             }
@@ -341,18 +345,26 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
                 if let Some(slot) = sched.tasks.get_mut(idx) {
                     *slot = None;
                 }
-                Some(child_pid.as_u64() as SyscallResult)
+                Some(Ok(child_pid.as_u64() as SyscallResult))
+            } else if !has_children {
+                Some(Err(Errno::ECHILD))
             } else {
+                // We have children, but none are zombies yet. Block parent task!
+                if let Some(parent_task) = sched.get_task_mut(current_pid) {
+                    parent_task.state = TaskState::Blocked;
+                }
                 None
             }
         };
 
-        if let Some(ret) = result {
-            return ret;
+        match result {
+            Some(Ok(ret)) => return ret,
+            Some(Err(err)) => return err.into(),
+            None => {
+                // Parent blocked — trigger reschedule to yield CPU cleanly
+                scheduler::schedule();
+            }
         }
-
-        // No zombie child yet — yield and retry
-        scheduler::yield_now();
     }
 }
 

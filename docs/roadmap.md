@@ -60,8 +60,8 @@ gantt
 - **IDE/ATA Block Driver**: Implement a high-performance, interrupt-safe block device driver (`AtaDrive`) for standard Primary Slave IDE hard disks using LBA28/LBA48 Port PIO. [Completed]
 - **VFS Storage Persistence**: Route file writes directly to physical disk media and automatically format blank drives with live ext2 system structures on first boot to guarantee native persistency across reboots. [Completed]
 
-#### Phase 33: Crash Consistency & Simple Journaling
-- **Directory Inode Consistency**: Implement write-ordering rules and soft updates (or a lightweight metadata journal) to ensure the filesystem remains mountable and free of corruption in the event of an abrupt system reset.
+#### Phase 33: Crash Consistency & Simple Journaling [Completed]
+- **Directory Inode Consistency**: Implement write-ordering rules and soft updates (or a lightweight metadata journal) to ensure the filesystem remains mountable and free of corruption in the event of an abrupt system reset. [Completed]
 
 ---
 

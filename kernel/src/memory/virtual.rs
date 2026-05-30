@@ -77,6 +77,7 @@ pub unsafe fn map_page(
             .map_to(page, frame, flags, &mut frame_alloc)
             .map_err(|_| "Failed to map page")?
             .flush();
+        crate::arch::x86_64::smp::shootdown_tlb();
     }
 
     Ok(())
@@ -166,6 +167,7 @@ pub unsafe fn map_user_page(
             .map_to(page, frame, flags, &mut frame_alloc)
             .map_err(|_| "Failed to map user page")?
             .flush();
+        crate::arch::x86_64::smp::shootdown_tlb();
     }
 
     Ok(())
@@ -206,6 +208,7 @@ pub unsafe fn unmap_user_page(
     match mapper.unmap(page) {
         Ok((frame, flush)) => {
             flush.flush();
+            crate::arch::x86_64::smp::shootdown_tlb();
             Ok(frame.start_address().as_u64())
         }
         Err(_) => Err("Page not mapped"),

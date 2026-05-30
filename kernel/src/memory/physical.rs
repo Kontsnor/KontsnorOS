@@ -26,6 +26,25 @@ const BITMAP_SIZE: usize = MAX_FRAMES / 8;
 /// The global physical frame allocator.
 static FRAME_ALLOCATOR: TicketLock<FrameAllocator> = TicketLock::new(FrameAllocator::new());
 
+struct CoreFrameCache {
+    frames: [u64; 16],
+    count: usize,
+}
+
+impl CoreFrameCache {
+    const fn new() -> Self {
+        Self {
+            frames: [0; 16],
+            count: 0,
+        }
+    }
+}
+
+static CORE_CACHES: [TicketLock<CoreFrameCache>; 32] = {
+    const CACHE: TicketLock<CoreFrameCache> = TicketLock::new(CoreFrameCache::new());
+    [CACHE; 32]
+};
+
 /// A bitmap-based physical frame allocator.
 ///
 /// Each bit in the bitmap represents a 4 KiB physical frame.
@@ -162,6 +181,35 @@ pub fn init(memory_regions: &MemoryRegions) {
 /// Returns the physical address of the allocated frame, or `None` if
 /// no free frames are available.
 pub fn allocate_frame() -> Option<u64> {
+    let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
+    if apic_id < 32 {
+        let mut cache = CORE_CACHES[apic_id].lock();
+        if cache.count > 0 {
+            cache.count -= 1;
+            let frame = cache.frames[cache.count];
+            return Some(frame);
+        }
+
+        // Cache is empty; bulk allocate from the global FRAME_ALLOCATOR
+        let mut global_alloc = FRAME_ALLOCATOR.lock();
+        let mut first_frame = None;
+        for _ in 0..8 {
+            if let Some(f) = global_alloc.allocate() {
+                if first_frame.is_none() {
+                    first_frame = Some(f);
+                } else {
+                    let count = cache.count;
+                    cache.frames[count] = f;
+                    cache.count += 1;
+                }
+            } else {
+                break;
+            }
+        }
+        return first_frame;
+    }
+
+    // Fallback direct global allocation
     FRAME_ALLOCATOR.lock().allocate()
 }
 
@@ -174,6 +222,32 @@ pub fn allocate_frame() -> Option<u64> {
 /// - The frame is no longer in use by any page table or data structure
 /// - The frame is not freed more than once
 pub fn deallocate_frame(phys_addr: u64) {
+    let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
+    if apic_id < 32 {
+        let mut cache = CORE_CACHES[apic_id].lock();
+        if cache.count < 16 {
+            let count = cache.count;
+            cache.frames[count] = phys_addr;
+            cache.count += 1;
+            return;
+        }
+
+        // Cache is full; bulk free half of the cache back to the global FRAME_ALLOCATOR
+        let mut global_alloc = FRAME_ALLOCATOR.lock();
+        for _ in 0..8 {
+            cache.count -= 1;
+            let f = cache.frames[cache.count];
+            global_alloc.deallocate(f);
+        }
+
+        // Cache now has space; push the new frame to the local cache
+        let count = cache.count;
+        cache.frames[count] = phys_addr;
+        cache.count += 1;
+        return;
+    }
+
+    // Fallback direct global deallocation
     FRAME_ALLOCATOR.lock().deallocate(phys_addr);
 }
 

@@ -53,6 +53,8 @@ pub enum InterruptIndex {
     IpiReschedule = 34,
     /// IPI Halt interrupt (vector 35).
     IpiHalt = 35,
+    /// IPI TLB Shootdown interrupt (vector 36).
+    IpiTlbShootdown = 36,
 }
 
 impl InterruptIndex {
@@ -99,6 +101,7 @@ lazy_static! {
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
         idt[InterruptIndex::IpiReschedule.as_u8()].set_handler_fn(ipi_reschedule_handler);
         idt[InterruptIndex::IpiHalt.as_u8()].set_handler_fn(ipi_halt_handler);
+        idt[InterruptIndex::IpiTlbShootdown.as_u8()].set_handler_fn(ipi_tlb_shootdown_handler);
         idt[255].set_handler_fn(spurious_interrupt_handler);
 
         idt
@@ -244,6 +247,11 @@ extern "x86-interrupt" fn ipi_halt_handler(_stack_frame: InterruptStackFrame) {
     loop {
         x86_64::instructions::hlt();
     }
+}
+
+extern "x86-interrupt" fn ipi_tlb_shootdown_handler(_stack_frame: InterruptStackFrame) {
+    super::apic::lapic_eoi();
+    x86_64::instructions::tlb::flush_all();
 }
 
 /// Returns the number of timer ticks since boot.

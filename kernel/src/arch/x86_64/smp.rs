@@ -78,3 +78,11 @@ pub fn get_cpu_count() -> usize {
 pub fn current_lapic_id() -> u8 {
     super::apic::get_lapic_id()
 }
+
+/// Broadcast a TLB shootdown interrupt to all other logical CPU cores.
+pub fn shootdown_tlb() {
+    if get_cpu_count() > 1 {
+        super::apic::broadcast_ipi_all_excluding_self(36);
+    }
+}
+

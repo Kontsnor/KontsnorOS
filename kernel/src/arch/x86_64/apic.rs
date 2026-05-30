@@ -218,3 +218,21 @@ pub fn send_ipi(target_lapic_id: u8, vector: u8) {
         }
     }
 }
+
+/// Broadcast an Inter-Processor Interrupt (IPI) to all other cores (excluding self).
+pub fn broadcast_ipi_all_excluding_self(vector: u8) {
+    unsafe {
+        // High 32 bits of ICR is 0 when using shorthand
+        lapic_write(LAPIC_REG_ICR_HIGH, 0);
+
+        // Destination Shorthand: 11 (All Excluding Self) -> bits 18-19 set to 3.
+        // Delivery Mode: 000 (Fixed), Dest Mode: 0 (Physical), Level: 1 (Assert) -> bit 14 set to 1.
+        lapic_write(LAPIC_REG_ICR_LOW, vector as u32 | (1 << 14) | (3 << 18));
+
+        // Wait until the Delivery Status bit (bit 12) becomes 0 (idle)
+        while (lapic_read(LAPIC_REG_ICR_LOW) & (1 << 12)) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+

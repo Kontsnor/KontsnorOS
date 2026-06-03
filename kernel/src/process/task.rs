@@ -30,7 +30,7 @@ use alloc::vec::Vec;
 
 use super::context::CpuContext;
 use super::pid::Pid;
-use crate::fs::inode::InodeOps;
+use crate::fs::file::{FileDescription, OpenFlags};
 
 /// The state of a task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,7 +122,7 @@ pub struct Task {
     ///
     /// Index corresponds to the file descriptor number (fd 0 = stdin, 1 = stdout, 2 = stderr).
     /// Pre-populated with standard I/O TTY devices for Ring 3 tasks.
-    pub fd_table: Vec<Option<Arc<dyn InodeOps>>>,
+    pub fd_table: Vec<Option<Arc<FileDescription>>>,
 
     /// Current program break — top of the user-space heap (used by `brk()`).
     pub brk: u64,
@@ -142,8 +142,8 @@ pub struct Task {
     /// Registered signal actions.
     pub sigactions: [SigAction; 64],
 
-    /// File seek offsets (parallel to fd_table).
-    pub fd_offsets: Vec<u64>,
+    /// Wait queue for child process state changes (e.g. wait4).
+    pub child_wait_queue: Arc<crate::sync::wait_queue::WaitQueue>,
 }
 
 impl Task {
@@ -151,13 +151,19 @@ impl Task {
     pub fn new(pid: Pid, name: String, page_table_root: u64) -> Self {
         // Pre-populate the standard I/O file descriptors for every task.
         // Kernel threads won't use these but they don't hurt.
-        let mut fd_table: Vec<Option<Arc<dyn InodeOps>>> = Vec::new();
-        fd_table.push(Some(crate::fs::tty::make_stdin()));   // fd 0: stdin
-        fd_table.push(Some(crate::fs::tty::make_stdout()));  // fd 1: stdout
-        fd_table.push(Some(crate::fs::tty::make_stderr()));  // fd 2: stderr
-
-        let mut fd_offsets = Vec::new();
-        fd_offsets.resize(3, 0);
+        let mut fd_table: Vec<Option<Arc<FileDescription>>> = Vec::new();
+        fd_table.push(Some(Arc::new(FileDescription::new(
+            crate::fs::tty::make_stdin(),
+            OpenFlags(OpenFlags::O_RDONLY),
+        )))); // fd 0: stdin
+        fd_table.push(Some(Arc::new(FileDescription::new(
+            crate::fs::tty::make_stdout(),
+            OpenFlags(OpenFlags::O_WRONLY),
+        )))); // fd 1: stdout
+        fd_table.push(Some(Arc::new(FileDescription::new(
+            crate::fs::tty::make_stderr(),
+            OpenFlags(OpenFlags::O_WRONLY),
+        )))); // fd 2: stderr
 
         Self {
             pid,
@@ -178,7 +184,7 @@ impl Task {
             pending_signals: 0,
             blocked_signals: 0,
             sigactions: [SigAction { sa_handler: 0, sa_flags: 0, sa_restorer: 0, sa_mask: 0 }; 64],
-            fd_offsets,
+            child_wait_queue: Arc::new(crate::sync::wait_queue::WaitQueue::new()),
         }
     }
 
@@ -201,5 +207,22 @@ impl core::fmt::Debug for Task {
             .field("state", &self.state)
             .field("priority", &self.priority)
             .finish()
+    }
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        // Free the kernel stack if allocated
+        if self.kernel_stack_base != 0 && self.kernel_stack_size != 0 {
+            let layout = alloc::alloc::Layout::from_size_align(self.kernel_stack_size, 16).unwrap();
+            unsafe {
+                alloc::alloc::dealloc(self.kernel_stack_base as *mut u8, layout);
+            }
+        }
+
+        // Free the page table root and all mapping tables (if it's a user address space)
+        if self.page_table_root != 0 && self.page_table_root != crate::memory::r#virtual::kernel_pml4_phys() {
+            let _ = crate::memory::r#virtual::free_user_page_table(self.page_table_root);
+        }
     }
 }

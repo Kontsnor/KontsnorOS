@@ -23,6 +23,7 @@ pub enum SyscallNumber {
     Fstat = 5,
     Lseek = 8,
     Mmap = 9,
+    Mprotect = 10,
     Munmap = 11,
     Brk = 12,
     Getpid = 39,
@@ -77,6 +78,7 @@ pub enum Errno {
     ENOSYS = -38,
     ENOTEMPTY = -39,
     ENOEXEC = -8,
+    ELOOP = -40,
 }
 
 impl From<Errno> for SyscallResult {
@@ -233,9 +235,13 @@ pub fn init() {
         efer_msr.write(efer | 1);
 
         // 2. Set STAR segment selectors
+        // For SYSRET in 64-bit mode: SS is loaded from STAR[63:48] + 8, CS from STAR[63:48] + 16.
+        // Since user_data is immediately followed by user_code in our GDT, setting STAR[63:48]
+        // to (user_data - 8) | 3 (which points to kernel_data but with user RPL 3) causes
+        // SYSRET to load user_data into SS (base + 8) and user_code into CS (base + 16).
         let kernel_code = crate::arch::x86_64::gdt::kernel_code_selector().0;
         let user_data = crate::arch::x86_64::gdt::user_data_selector().0;
-        let star = ((kernel_code as u64) << 32) | (((user_data | 3) as u64) << 48);
+        let star = ((kernel_code as u64) << 32) | ((((user_data - 8) | 3) as u64) << 48);
         star_msr.write(star);
 
         // 3. Set LSTAR fast-syscall entry point (RIP)
@@ -247,10 +253,14 @@ pub fn init() {
         // 4. Set FMASK flags to clear (clear Interrupt Flag IF, Direction Flag DF)
         fmask_msr.write(0x200 | 0x400); 
 
-        // 5. Configure IA32_KERNEL_GS_BASE MSR to point to CPU_SCRATCH
-        let mut kernel_gs_msr = Msr::new(0xC0000102);
+        // 5. Configure IA32_GS_BASE (active GS base in kernel) to point to CPU_SCRATCH
+        let mut gs_base_msr = Msr::new(0xC0000101);
         let scratch_addr = core::ptr::addr_of!(CPU_SCRATCH) as u64;
-        kernel_gs_msr.write(scratch_addr);
+        gs_base_msr.write(scratch_addr);
+
+        // 6. Configure IA32_KERNEL_GS_BASE MSR to 0 (swapped GS base, initially 0 for user space)
+        let mut kernel_gs_msr = Msr::new(0xC0000102);
+        kernel_gs_msr.write(0);
     }
 
     kprintln!("[syscall] Syscall MSR registers configured. Syscall interface ready.");
@@ -290,6 +300,7 @@ pub fn dispatch(
         269 => fs::sys_faccessat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as i32),
         // Memory
         9  => memory::sys_mmap(arg0, arg1 as usize, arg2 as i32, arg3 as i32, _arg4 as i32, _arg5 as i64),
+        10 => memory::sys_mprotect(arg0, arg1 as usize, arg2 as i32),
         11 => memory::sys_munmap(arg0, arg1 as usize),
         12 => memory::sys_brk(arg0),
         // Process

@@ -151,6 +151,9 @@ impl InodeOps for PipeWriter {
         while written < data.len() {
             // Check if readers are closed
             if self.state.readers.load(Ordering::SeqCst) == 0 {
+                if let Some(current_pid) = crate::process::scheduler::current_pid() {
+                    crate::syscall::signal::deliver_signal(current_pid, 13); // SIGPIPE = 13
+                }
                 return Err(-32); // EPIPE
             }
 

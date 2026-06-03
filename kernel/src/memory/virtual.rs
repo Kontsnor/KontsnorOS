@@ -25,17 +25,29 @@ use x86_64::{PhysAddr, VirtAddr};
 /// allowing the kernel to access any physical address by adding this offset.
 static PHYS_MEM_OFFSET: Mutex<Option<u64>> = Mutex::new(None);
 
+/// The kernel's active PML4 page table root physical address.
+static KERNEL_PML4_PHYS: Mutex<Option<u64>> = Mutex::new(None);
+
 /// Initialize the virtual memory manager.
 ///
 /// `phys_mem_offset` is the virtual address where physical memory is
 /// mapped by the bootloader.
 pub fn init(phys_mem_offset: u64) {
     *PHYS_MEM_OFFSET.lock() = Some(phys_mem_offset);
+    let (level_4_table_frame, _) = Cr3::read();
+    *KERNEL_PML4_PHYS.lock() = Some(level_4_table_frame.start_address().as_u64());
 }
 
 /// Get the physical memory offset.
 pub fn phys_mem_offset() -> u64 {
     PHYS_MEM_OFFSET
+        .lock()
+        .expect("Virtual memory not initialized")
+}
+
+/// Get the kernel PML4 physical address.
+pub fn kernel_pml4_phys() -> u64 {
+    KERNEL_PML4_PHYS
         .lock()
         .expect("Virtual memory not initialized")
 }
@@ -215,16 +227,19 @@ pub fn clone_parent_page_table(parent_pml4_phys: u64) -> Result<u64, &'static st
                         flags.insert(PageTableFlags::BIT_9);
 
                         parent_pt_entry.set_addr(PhysAddr::new(phys_addr), flags);
-
-                        // Increment physical page frame reference count
-                        super::physical::increment_ref(phys_addr);
                     }
+
+                    // Increment physical page frame reference count for all user pages
+                    super::physical::increment_ref(phys_addr);
 
                     child_pt[l].set_addr(PhysAddr::new(phys_addr), flags);
                 }
             }
         }
     }
+
+    // Flush local CPU TLB since we modified parent page write flags to COW
+    x86_64::instructions::tlb::flush_all();
 
     // Broadcast TLB shootdown to notify other CPU cores
     crate::arch::x86_64::smp::shootdown_tlb();
@@ -303,5 +318,96 @@ pub unsafe fn unmap_user_page(
         }
         Err(_) => Err("Page not mapped"),
     }
+}
+
+/// Update flags of a virtual page in a targeted, non-active PML4 page table.
+///
+/// # Safety
+///
+/// The caller must ensure that the targeted PML4 physical address is valid.
+pub unsafe fn update_user_page_flags(
+    pml4_phys: u64,
+    page: Page<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<(), &'static str> {
+    let pml4_virt = VirtAddr::new(pml4_phys + phys_mem_offset());
+    let pml4: &mut PageTable = unsafe { &mut *pml4_virt.as_mut_ptr() };
+    let mut mapper = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(phys_mem_offset())) };
+
+    use x86_64::structures::paging::Mapper;
+    match unsafe { mapper.update_flags(page, flags) } {
+        Ok(flush) => {
+            flush.flush();
+            crate::arch::x86_64::smp::shootdown_tlb();
+            Ok(())
+        }
+        Err(_) => Err("Failed to update page flags"),
+    }
+}
+
+/// Recursively unmaps and deallocates user space page tables and leaf pages.
+pub fn free_user_page_table(pml4_phys: u64) -> Result<(), &'static str> {
+    let pml4_virt = VirtAddr::new(pml4_phys + phys_mem_offset());
+    let pml4: &PageTable = unsafe { &*pml4_virt.as_ptr() };
+    let pml4_index = (phys_mem_offset() >> 39) & 0x1FF;
+
+    for i in 0..256 {
+        if i == pml4_index as usize {
+            continue;
+        }
+        let pml4_entry = &pml4[i];
+        if pml4_entry.is_unused() {
+            continue;
+        }
+
+        let pdpt_phys = pml4_entry.frame().map_err(|_| "Invalid frame in PML4")?.start_address().as_u64();
+        let pdpt_virt = VirtAddr::new(pdpt_phys + phys_mem_offset());
+        let pdpt: &PageTable = unsafe { &*pdpt_virt.as_ptr() };
+
+        for j in 0..512 {
+            let pdpt_entry = &pdpt[j];
+            if pdpt_entry.is_unused() {
+                continue;
+            }
+
+            let pd_phys = pdpt_entry.frame().map_err(|_| "Invalid frame in PDPT")?.start_address().as_u64();
+            let pd_virt = VirtAddr::new(pd_phys + phys_mem_offset());
+            let pd: &PageTable = unsafe { &*pd_virt.as_ptr() };
+
+            for k in 0..512 {
+                let pd_entry = &pd[k];
+                if pd_entry.is_unused() {
+                    continue;
+                }
+
+                let pt_phys = pd_entry.frame().map_err(|_| "Invalid frame in PD")?.start_address().as_u64();
+                let pt_virt = VirtAddr::new(pt_phys + phys_mem_offset());
+                let pt: &PageTable = unsafe { &*pt_virt.as_ptr() };
+
+                for l in 0..512 {
+                    let pt_entry = &pt[l];
+                    if pt_entry.is_unused() {
+                        continue;
+                    }
+
+                    let leaf_phys = pt_entry.frame().map_err(|_| "Invalid frame in PT")?.start_address().as_u64();
+                    super::physical::deallocate_frame(leaf_phys);
+                }
+
+                super::physical::deallocate_frame(pt_phys);
+            }
+
+            super::physical::deallocate_frame(pd_phys);
+        }
+
+        super::physical::deallocate_frame(pdpt_phys);
+    }
+
+    super::physical::deallocate_frame(pml4_phys);
+
+    // Broadcast TLB shootdown to notify other CPU cores
+    crate::arch::x86_64::smp::shootdown_tlb();
+
+    Ok(())
 }
 

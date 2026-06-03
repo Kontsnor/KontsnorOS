@@ -193,7 +193,6 @@ impl Scheduler {
             task.state = TaskState::Zombie;
             task.exit_code = Some(exit_code);
             task.fd_table.clear();
-            task.fd_offsets.clear();
             parent_pid = Some(task.parent_pid);
         }
 
@@ -204,6 +203,17 @@ impl Scheduler {
             // Deliver SIGCHLD (17) to the parent's pending signals
             let parent_idx = parent.as_u64() as usize;
             if parent_idx < self.tasks.len() {
+                // Clone the child wait queue Arc to avoid holding a mutable borrow of self.tasks
+                let child_wait_queue = if let Some(Some(ref parent_task)) = self.tasks.get(parent_idx) {
+                    Some(parent_task.child_wait_queue.clone())
+                } else {
+                    None
+                };
+
+                if let Some(wq) = child_wait_queue {
+                    wq.wake_all_locked(self);
+                }
+
                 if let Some(Some(ref mut parent_task)) = self.tasks.get_mut(parent_idx) {
                     parent_task.pending_signals |= 1 << (17 - 1);
                     // Wake parent task from blocked state if it was waiting

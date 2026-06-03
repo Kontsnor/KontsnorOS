@@ -59,7 +59,11 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
         if let Some(ref mut sched) = *sched {
             if let Some(parent_task) = sched.get_task(current_pid) {
                 child_task.fd_table = parent_task.fd_table.clone();
-                child_task.fd_offsets = parent_task.fd_offsets.clone();
+                for slot in &child_task.fd_table {
+                    if let Some(ref file_desc) = slot {
+                        *file_desc.ref_count.lock() += 1;
+                    }
+                }
                 child_task.sigactions = parent_task.sigactions.clone();
                 child_task.blocked_signals = parent_task.blocked_signals;
                 child_task.brk = parent_task.brk;
@@ -152,6 +156,90 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
     match inode.read(0, &mut elf_buf) {
         Ok(_) => {},
         Err(e) => return e as SyscallResult,
+    }
+
+    let mut path = path;
+    let mut argv = argv;
+    let mut loop_count = 0;
+
+    while elf_buf.starts_with(b"#!") {
+        loop_count += 1;
+        if loop_count > 4 {
+            kprintln!("[syscall] execve: shebang loop limit exceeded");
+            return Errno::ELOOP.into();
+        }
+
+        // Find the first line
+        let first_line = match elf_buf.split(|&b| b == b'\n').next() {
+            Some(line) => line,
+            None => &elf_buf,
+        };
+
+        // Parse interpreter and optional argument
+        let content = &first_line[2..];
+        
+        let mut parts = content.split(|&b| b == b' ' || b == b'\t').filter(|part| !part.is_empty());
+        let interp_bytes = match parts.next() {
+            Some(i) => i,
+            None => return Errno::ENOEXEC.into(),
+        };
+        let interp_str = match core::str::from_utf8(interp_bytes) {
+            Ok(s) => s,
+            Err(_) => return Errno::ENOEXEC.into(),
+        };
+
+        let mut new_argv = alloc::vec![alloc::string::String::from(interp_str)];
+        
+        // Find if there is an optional argument.
+        // Skip interpreter in content
+        let offset = interp_bytes.as_ptr() as usize - content.as_ptr() as usize + interp_bytes.len();
+        let mut rest = &content[offset..];
+        // Trim leading and trailing spaces/tabs/newlines
+        while rest.starts_with(b" ") || rest.starts_with(b"\t") {
+            rest = &rest[1..];
+        }
+        while rest.ends_with(b" ") || rest.ends_with(b"\t") || rest.ends_with(b"\r") || rest.ends_with(b"\n") {
+            rest = &rest[..rest.len() - 1];
+        }
+        if !rest.is_empty() {
+            let opt_arg = match core::str::from_utf8(rest) {
+                Ok(s) => alloc::string::String::from(s),
+                Err(_) => return Errno::ENOEXEC.into(),
+            };
+            new_argv.push(opt_arg);
+        }
+
+        // Add the script path as the next argument
+        new_argv.push(path.clone());
+
+        // Add the original script arguments (excluding argv[0])
+        for arg in argv.iter().skip(1) {
+            new_argv.push(arg.clone());
+        }
+
+        path = alloc::string::String::from(interp_str);
+        argv = new_argv;
+
+        // Load the interpreter file
+        let interp_inode = match crate::fs::vfs::lookup(&path) {
+            Some(i) => i,
+            None => {
+                kprintln!("[syscall] execve: interpreter not found: {}", path);
+                return Errno::ENOENT.into();
+            }
+        };
+
+        let interp_size = interp_inode.inode().size as usize;
+        if interp_size == 0 {
+            return Errno::ENOEXEC.into();
+        }
+        let mut new_buf = alloc::vec![0u8; interp_size];
+        match interp_inode.read(0, &mut new_buf) {
+            Ok(_) => {
+                elf_buf = new_buf;
+            },
+            Err(e) => return e as SyscallResult,
+        }
     }
 
     // Parse the ELF
@@ -258,7 +346,7 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
     let entry = elf_info.entry_point;
 
     // Reset signal state and update page table root for execve
-    {
+    let old_page_table = {
         let current_pid = match scheduler::current_pid() {
             Some(p) => p,
             None => return Errno::ESRCH.into(),
@@ -272,10 +360,28 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
                     }
                 }
                 task.pending_signals = 0;
+                let old = task.page_table_root;
                 task.page_table_root = new_page_table;
                 task.brk = initial_brk; // Dynamically calculated start of heap
+                old
+            } else {
+                0
             }
+        } else {
+            0
         }
+    };
+
+    if old_page_table != 0 && old_page_table != crate::memory::r#virtual::kernel_pml4_phys() {
+        // Switch to the new page table first so the CPU is no longer using the old one.
+        unsafe {
+            x86_64::registers::control::Cr3::write(
+                x86_64::structures::paging::PhysFrame::containing_address(x86_64::PhysAddr::new(new_page_table)),
+                x86_64::registers::control::Cr3Flags::empty(),
+            );
+        }
+        // Now safely free all resources of the old page table
+        let _ = crate::memory::r#virtual::free_user_page_table(old_page_table);
     }
 
     kprintln!("[syscall] execve: loading OK, entry={:#x}, jumping to Ring 3...", entry);
@@ -349,10 +455,6 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
             } else if !has_children {
                 Some(Err(Errno::ECHILD))
             } else {
-                // We have children, but none are zombies yet. Block parent task!
-                if let Some(parent_task) = sched.get_task_mut(current_pid) {
-                    parent_task.state = TaskState::Blocked;
-                }
                 None
             }
         };
@@ -361,8 +463,14 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
             Some(Ok(ret)) => return ret,
             Some(Err(err)) => return err.into(),
             None => {
-                // Parent blocked — trigger reschedule to yield CPU cleanly
-                scheduler::schedule();
+                // Sleep on our child_wait_queue until a child exits
+                let wait_queue = {
+                    let sched = scheduler::SCHEDULER.lock();
+                    let sched = sched.as_ref().unwrap();
+                    let task = sched.get_task(current_pid).unwrap();
+                    task.child_wait_queue.clone()
+                };
+                wait_queue.wait();
             }
         }
     }

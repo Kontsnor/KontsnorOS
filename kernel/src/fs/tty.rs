@@ -24,6 +24,16 @@ pub struct Termios {
     pub c_ospeed: u32,
 }
 
+/// POSIX winsize structure for TIOCGWINSZ.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Winsize {
+    pub ws_row: u16,
+    pub ws_col: u16,
+    pub ws_xpixel: u16,
+    pub ws_ypixel: u16,
+}
+
 /// Global active TTY termios settings.
 /// Default: ICANON (0x02) | ECHO (0x08) | ISIG (0x01)
 pub static TTY_TERMIOS: Mutex<Termios> = Mutex::new(Termios {
@@ -38,6 +48,9 @@ pub static TTY_TERMIOS: Mutex<Termios> = Mutex::new(Termios {
 });
 
 // ── /dev/stdin ────────────────────────────────────────────────────────────────
+
+/// Global lock to serialize reads from `/dev/stdin`.
+static STDIN_LOCK: Mutex<()> = Mutex::new(());
 
 /// `/dev/stdin` character device.
 pub struct DevStdin {
@@ -55,68 +68,90 @@ impl InodeOps for DevStdin {
             return Ok(0);
         }
 
-        let termios = TTY_TERMIOS.lock();
-        let icanon = (termios.c_lflag & 0x00000002) != 0;
-        let echo = (termios.c_lflag & 0x00000008) != 0;
-        let isig = (termios.c_lflag & 0x00000001) != 0;
-        drop(termios);
-
         // Wait cooperatively for input
         loop {
-            // Check if any character is available on serial
-            if let Some(mut byte) = crate::arch::x86_64::serial::try_read_byte() {
-                if byte == b'\r' {
-                    byte = b'\n';
-                }
+            let mut got_input = false;
+            let mut raw_char = None;
+            let mut interrupted = None;
 
-                // If ISIG is enabled and Ctrl+C is typed, deliver SIGINT immediately!
-                if isig && byte == 0x03 {
-                    if let Some(current_pid) = crate::process::scheduler::current_pid() {
-                        crate::syscall::signal::deliver_signal(current_pid, 2); // SIGINT = 2
+            {
+                let _lock = STDIN_LOCK.lock();
+
+                let termios = TTY_TERMIOS.lock();
+                let icanon = (termios.c_lflag & 0x00000002) != 0;
+                let echo = (termios.c_lflag & 0x00000008) != 0;
+                let isig = (termios.c_lflag & 0x00000001) != 0;
+                drop(termios);
+
+                // Check if any character is available on serial
+                if let Some(mut byte) = crate::arch::x86_64::serial::try_read_byte() {
+                    if byte == b'\r' {
+                        byte = b'\n';
                     }
-                    return Err(-4); // EINTR
-                }
 
-                if icanon {
-                    // Backspace/delete cooked character erasing
-                    if byte == 0x7F || byte == b'\x08' {
-                        if let Some(popped) = crate::drivers::keyboard::try_pop_back() {
-                            if popped != b'\n' {
-                                if echo {
-                                    crate::arch::x86_64::serial::write_byte(b'\x08');
-                                    crate::arch::x86_64::serial::write_byte(b' ');
-                                    crate::arch::x86_64::serial::write_byte(b'\x08');
+                    // If ISIG is enabled and Ctrl+C is typed, deliver SIGINT immediately!
+                    if isig && byte == 0x03 {
+                        if let Some(current_pid) = crate::process::scheduler::current_pid() {
+                            crate::syscall::signal::deliver_signal(current_pid, 2); // SIGINT = 2
+                        }
+                        interrupted = Some(-4); // EINTR
+                    }
+
+                    if interrupted.is_none() {
+                        if icanon {
+                            // Backspace/delete cooked character erasing
+                            if byte == 0x7F || byte == b'\x08' {
+                                if let Some(popped) = crate::drivers::keyboard::try_pop_back() {
+                                    if popped != b'\n' {
+                                        if echo {
+                                            crate::arch::x86_64::serial::write_byte(b'\x08');
+                                            crate::arch::x86_64::serial::write_byte(b' ');
+                                            crate::arch::x86_64::serial::write_byte(b'\x08');
+                                        }
+                                    } else {
+                                        crate::drivers::keyboard::push_char(popped);
+                                    }
                                 }
                             } else {
-                                crate::drivers::keyboard::push_char(popped);
+                                if echo {
+                                    crate::arch::x86_64::serial::write_byte(byte);
+                                }
+                                crate::drivers::keyboard::push_char(byte);
                             }
+                        } else {
+                            // Raw mode bypasses cooked edits
+                            if echo {
+                                crate::arch::x86_64::serial::write_byte(byte);
+                            }
+                            crate::drivers::keyboard::push_char(byte);
                         }
-                    } else {
-                        if echo {
-                            crate::arch::x86_64::serial::write_byte(byte);
-                        }
-                        crate::drivers::keyboard::push_char(byte);
+                    }
+                }
+
+                if let Some(err) = interrupted {
+                    return Err(err);
+                }
+
+                // Verify if we can return
+                if icanon {
+                    if crate::drivers::keyboard::has_newline() {
+                        got_input = true;
                     }
                 } else {
-                    // Raw mode bypasses cooked edits
-                    if echo {
-                        crate::arch::x86_64::serial::write_byte(byte);
+                    // Raw mode: check if buffer has characters and return immediately
+                    if let Some(ch) = crate::drivers::keyboard::try_read_char() {
+                        raw_char = Some(ch);
                     }
-                    crate::drivers::keyboard::push_char(byte);
                 }
             }
 
-            // Verify if we can return
-            if icanon {
-                if crate::drivers::keyboard::has_newline() {
-                    break;
-                }
-            } else {
-                // Raw mode: check if buffer has characters and return immediately
-                if let Some(ch) = crate::drivers::keyboard::try_read_char() {
-                    buf[0] = ch;
-                    return Ok(1);
-                }
+            if let Some(ch) = raw_char {
+                buf[0] = ch;
+                return Ok(1);
+            }
+
+            if got_input {
+                break;
             }
 
             // Yield to avoid hard locking
@@ -138,16 +173,19 @@ impl InodeOps for DevStdin {
 
         // Drain canonical buffer to user
         let mut count = 0;
-        while count < buf.len() {
-            match crate::drivers::keyboard::try_read_char() {
-                Some(ch) => {
-                    buf[count] = ch;
-                    count += 1;
-                    if ch == b'\n' {
-                        break;
+        {
+            let _lock = STDIN_LOCK.lock();
+            while count < buf.len() {
+                match crate::drivers::keyboard::try_read_char() {
+                    Some(ch) => {
+                        buf[count] = ch;
+                        count += 1;
+                        if ch == b'\n' {
+                            break;
+                        }
                     }
+                    None => break,
                 }
-                None => break,
             }
         }
 
@@ -163,11 +201,32 @@ impl InodeOps for DevStdin {
                 }
                 Ok(0)
             }
-            0x5402 => { // TCSETS
+            0x5402 | 0x5403 | 0x5404 => { // TCSETS, TCSETSW, TCSETSF
                 let mut termios = TTY_TERMIOS.lock();
                 unsafe {
                     *termios = core::ptr::read(arg as *const Termios);
                 }
+                Ok(0)
+            }
+            0x5413 => { // TIOCGWINSZ
+                let ws = Winsize {
+                    ws_row: 24,
+                    ws_col: 80,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                unsafe {
+                    core::ptr::write(arg as *mut Winsize, ws);
+                }
+                Ok(0)
+            }
+            0x540F => { // TIOCGPGRP
+                unsafe {
+                    core::ptr::write(arg as *mut i32, 1);
+                }
+                Ok(0)
+            }
+            0x5410 => { // TIOCSPGRP
                 Ok(0)
             }
             _ => Err(-22), // EINVAL

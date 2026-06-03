@@ -276,6 +276,7 @@ pub unsafe extern "C" fn enter_user_mode(
         "xor r14, r14",
         "xor r15, r15",
 
+        "swapgs",
         // Switch to user-space!
         "iretq"
     );

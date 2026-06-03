@@ -101,25 +101,24 @@ pub fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
         return Errno::EFAULT.into();
     }
 
-    let inode = match proc_fd::current_task_read_fd(fd) {
-        Some(i) => i,
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
         None => return Errno::EBADF.into(),
     };
 
-    let is_pipe = inode.inode().file_type == crate::fs::inode::FileType::Pipe;
+    let is_pipe = file_desc.inode.inode().file_type == crate::fs::inode::FileType::Pipe;
     if is_pipe {
-        crate::kprintln!("[syscall] sys_read on pipe fd {}", fd);
+        let pid_str = crate::process::scheduler::current_pid().map(|p| p.as_u64()).unwrap_or(0);
+        crate::kprintln!("[syscall pid={}] sys_read on pipe fd {}", pid_str, fd);
     }
 
-    let offset = proc_fd::get_fd_offset(fd).unwrap_or(0);
     let slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
 
-    match inode.read(offset, slice) {
+    match file_desc.read(slice) {
         Ok(n) => {
             if is_pipe {
                 crate::kprintln!("[syscall] sys_read on pipe fd {} returned {} bytes", fd, n);
             }
-            proc_fd::set_fd_offset(fd, offset + n as u64);
             n as SyscallResult
         }
         Err(e) => {
@@ -146,25 +145,24 @@ pub fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
         return Errno::EFAULT.into();
     }
 
-    let inode = match proc_fd::current_task_read_fd(fd) {
-        Some(i) => i,
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
         None => return Errno::EBADF.into(),
     };
 
-    let is_pipe = inode.inode().file_type == crate::fs::inode::FileType::Pipe;
+    let is_pipe = file_desc.inode.inode().file_type == crate::fs::inode::FileType::Pipe;
     if is_pipe {
-        crate::kprintln!("[syscall] sys_write on pipe fd {} count {}", fd, count);
+        let pid_str = crate::process::scheduler::current_pid().map(|p| p.as_u64()).unwrap_or(0);
+        crate::kprintln!("[syscall pid={}] sys_write on pipe fd {} count {}", pid_str, fd, count);
     }
 
-    let offset = proc_fd::get_fd_offset(fd).unwrap_or(0);
     let slice = unsafe { core::slice::from_raw_parts(buf, count) };
 
-    match inode.write(offset, slice) {
+    match file_desc.write(slice) {
         Ok(n) => {
             if is_pipe {
                 crate::kprintln!("[syscall] sys_write on pipe fd {} returned {} bytes written", fd, n);
             }
-            proc_fd::set_fd_offset(fd, offset + n as u64);
             n as SyscallResult
         }
         Err(e) => {
@@ -241,7 +239,7 @@ pub fn sys_open(pathname: *const u8, flags: i32, _mode: u32) -> SyscallResult {
         }
     };
 
-    match proc_fd::current_task_alloc_fd(inode) {
+    match proc_fd::current_task_alloc_fd_with_flags(inode, crate::fs::file::OpenFlags(flags_u32)) {
         Some(fd) => fd as SyscallResult,
         None => Errno::EMFILE.into(),
     }
@@ -256,7 +254,8 @@ pub fn sys_close(fd: i32) -> SyscallResult {
         .map(|i| i.inode().file_type == crate::fs::inode::FileType::Pipe)
         .unwrap_or(false);
     if is_pipe {
-        crate::kprintln!("[syscall] sys_close on pipe fd {}", fd);
+        let pid_str = crate::process::scheduler::current_pid().map(|p| p.as_u64()).unwrap_or(0);
+        crate::kprintln!("[syscall pid={}] sys_close on pipe fd {}", pid_str, fd);
     }
     if proc_fd::current_task_close_fd(fd) {
         0
@@ -276,27 +275,15 @@ pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> SyscallResult {
     if fd < 0 {
         return Errno::EBADF.into();
     }
-    let inode = match proc_fd::current_task_read_fd(fd) {
-        Some(i) => i,
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
         None => return Errno::EBADF.into(),
     };
 
-    let current_offset = proc_fd::get_fd_offset(fd).unwrap_or(0) as i64;
-    let size = inode.inode().size as i64;
-
-    let new_offset = match whence {
-        0 => offset, // SEEK_SET
-        1 => current_offset + offset, // SEEK_CUR
-        2 => size + offset, // SEEK_END
-        _ => return Errno::EINVAL.into(),
-    };
-
-    if new_offset < 0 {
-        return Errno::EINVAL.into();
+    match file_desc.seek(offset, whence) {
+        Ok(new_offset) => new_offset as SyscallResult,
+        Err(e) => e as SyscallResult,
     }
-
-    proc_fd::set_fd_offset(fd, new_offset as u64);
-    new_offset as SyscallResult
 }
 
 /// `dup(fd)` — Duplicate a file descriptor.
@@ -319,7 +306,8 @@ pub fn sys_dup2(oldfd: i32, newfd: i32) -> SyscallResult {
         .map(|i| i.inode().file_type == crate::fs::inode::FileType::Pipe)
         .unwrap_or(false);
     if is_pipe {
-        crate::kprintln!("[syscall] sys_dup2(oldfd={}, newfd={}) on pipe", oldfd, newfd);
+        let pid_str = crate::process::scheduler::current_pid().map(|p| p.as_u64()).unwrap_or(0);
+        crate::kprintln!("[syscall pid={}] sys_dup2(oldfd={}, newfd={}) on pipe", pid_str, oldfd, newfd);
     }
     match proc_fd::current_task_dup2_fd(oldfd, newfd) {
         Some(fd) => fd as SyscallResult,
@@ -691,10 +679,6 @@ pub fn sys_faccessat(
 pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
     match cmd {
         0 => { // F_DUPFD
-            let inode_ops = match proc_fd::current_task_read_fd(fd) {
-                Some(i) => i,
-                None => return Errno::EBADF.into(),
-            };
             let start_fd = arg as i32;
             if start_fd < 0 {
                 return Errno::EINVAL.into();
@@ -714,6 +698,13 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                 None => return Errno::ESRCH.into(),
             };
             
+            let file_desc = match task.fd_table.get(fd as usize) {
+                Some(Some(desc)) => desc.clone(),
+                _ => return Errno::EBADF.into(),
+            };
+            
+            *file_desc.ref_count.lock() += 1;
+            
             let mut new_fd = start_fd;
             while (new_fd as usize) < task.fd_table.len() && task.fd_table[new_fd as usize].is_some() {
                 new_fd += 1;
@@ -722,13 +713,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             if (new_fd as usize) >= task.fd_table.len() {
                 task.fd_table.resize(new_fd as usize + 1, None);
             }
-            task.fd_table[new_fd as usize] = Some(inode_ops);
-            
-            if (new_fd as usize) >= task.fd_offsets.len() {
-                task.fd_offsets.resize(new_fd as usize + 1, 0);
-            }
-            let old_offset = task.fd_offsets[fd as usize];
-            task.fd_offsets[new_fd as usize] = old_offset;
+            task.fd_table[new_fd as usize] = Some(file_desc);
             
             kprintln!("[syscall] fcntl(fd={}, F_DUPFD, arg={}) -> {}", fd, arg, new_fd);
             new_fd as i64
@@ -740,10 +725,38 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             0
         }
         3 => { // F_GETFL
-            2 // O_RDWR
+            let current_pid = match crate::process::scheduler::current_pid() {
+                Some(p) => p,
+                None => return Errno::ESRCH.into(),
+            };
+            let sched_lock = crate::process::scheduler::SCHEDULER.lock();
+            if let Some(ref scheduler) = *sched_lock {
+                if let Some(task) = scheduler.get_task(current_pid) {
+                    if let Some(Some(desc)) = task.fd_table.get(fd as usize) {
+                        return desc.flags.lock().0 as i64;
+                    }
+                }
+            }
+            Errno::EBADF.into()
         }
         4 => { // F_SETFL
-            0
+            let current_pid = match crate::process::scheduler::current_pid() {
+                Some(p) => p,
+                None => return Errno::ESRCH.into(),
+            };
+            let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
+            if let Some(ref mut scheduler) = *sched_lock {
+                if let Some(task) = scheduler.get_task_mut(current_pid) {
+                    if let Some(Some(desc)) = task.fd_table.get_mut(fd as usize) {
+                        let allowed_flags = crate::fs::file::OpenFlags::O_APPEND | crate::fs::file::OpenFlags::O_NONBLOCK;
+                        let mut flags = desc.flags.lock();
+                        let old_val = flags.0;
+                        flags.0 = (old_val & !allowed_flags) | (arg as u32 & allowed_flags);
+                        return 0;
+                    }
+                }
+            }
+            Errno::EBADF.into()
         }
         _ => {
             kprintln!("[syscall] fcntl(fd={}, cmd={}, arg={}) -> ENOSYS", fd, cmd, arg);

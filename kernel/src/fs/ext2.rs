@@ -244,12 +244,12 @@ impl Ext2FileSystem {
             calc_inode_bitmap[byte] |= 1 << bit;
         }
         
-        // 3. Scan all inodes from 11 to sb.s_inodes_count
+        // 3. Scan all inodes from 2 to sb.s_inodes_count
         let table_block = gd.bg_inode_table as u64;
         let mut block_cache_idx = 0u64;
         let mut block_cache_buf = alloc::vec![0u8; block_size as usize];
         
-        for ino in 11..=sb.s_inodes_count {
+        for ino in 2..=sb.s_inodes_count {
             let index = (ino - 1) % s_inodes_per_group;
             let inode_offset_in_table = (index * s_inode_size as u32) as u64;
             let logical_block = table_block + (inode_offset_in_table / block_size as u64);

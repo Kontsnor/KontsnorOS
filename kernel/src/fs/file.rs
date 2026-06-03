@@ -60,7 +60,7 @@ pub struct FileDescription {
     /// Current read/write offset.
     pub offset: Mutex<u64>,
     /// Open flags.
-    pub flags: OpenFlags,
+    pub flags: Mutex<OpenFlags>,
     /// Reference count (how many fds point here).
     pub ref_count: Mutex<u32>,
 }
@@ -71,14 +71,15 @@ impl FileDescription {
         Self {
             inode,
             offset: Mutex::new(0),
-            flags,
+            flags: Mutex::new(flags),
             ref_count: Mutex::new(1),
         }
     }
 
     /// Read from this file.
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, i32> {
-        if !self.flags.is_readable() {
+        let flags = self.flags.lock();
+        if !flags.is_readable() {
             return Err(-9); // EBADF
         }
 
@@ -90,14 +91,15 @@ impl FileDescription {
 
     /// Write to this file.
     pub fn write(&self, data: &[u8]) -> Result<usize, i32> {
-        if !self.flags.is_writable() {
+        let flags = self.flags.lock();
+        if !flags.is_writable() {
             return Err(-9); // EBADF
         }
 
         let mut offset = self.offset.lock();
 
         // Handle O_APPEND
-        if self.flags.0 & OpenFlags::O_APPEND != 0 {
+        if flags.0 & OpenFlags::O_APPEND != 0 {
             *offset = self.inode.inode().size;
         }
 

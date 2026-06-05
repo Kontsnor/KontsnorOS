@@ -89,14 +89,15 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
     }
 
     use crate::process::context::CpuContext;
-    let child_context = CpuContext::new(
+    let mut child_context = CpuContext::new(
         crate::process::context::fork_child_return as *const () as u64,
         child_regs_ptr as u64,
         child_page_table,
     );
+    child_context.fs_base = x86_64::registers::model_specific::FsBase::read().as_u64();
 
-    crate::kprintln!("[syscall] fork debug: rip = {:#x}, rsp = {:#x}, cr3 = {:#x}", 
-        child_context.rip, child_context.rsp, child_context.cr3);
+    crate::kprintln!("[syscall] fork debug: rip = {:#x}, rsp = {:#x}, cr3 = {:#x}, fs_base = {:#x}", 
+        child_context.rip, child_context.rsp, child_context.cr3, child_context.fs_base);
 
     child_task.context = child_context;
 
@@ -338,7 +339,15 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
     }
 
     // Construct System V ABI compliant stack
-    let user_sp = match crate::process::elf::construct_user_stack(&argv, &envp, highest_stack_phys) {
+    let user_sp = match crate::process::elf::construct_user_stack(
+        &argv,
+        &envp,
+        highest_stack_phys,
+        elf_info.entry_point,
+        elf_info.phdr,
+        elf_info.phnum,
+        elf_info.phent,
+    ) {
         Ok(sp) => sp,
         Err(e) => return e.into(),
     };
@@ -363,6 +372,7 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
                 let old = task.page_table_root;
                 task.page_table_root = new_page_table;
                 task.brk = initial_brk; // Dynamically calculated start of heap
+                task.context.fs_base = 0; // Clear TLS base for new process
                 old
             } else {
                 0
@@ -386,6 +396,9 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
 
     kprintln!("[syscall] execve: loading OK, entry={:#x}, jumping to Ring 3...", entry);
 
+    // Clear the active CPU FS_BASE register to prevent inheriting parent's TLS
+    x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(0));
+
     // Switch to the new address space and enter Ring 3 (never returns)
     unsafe {
         crate::process::context::enter_user_mode(entry, user_sp, new_page_table);
@@ -396,6 +409,11 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
 pub fn sys_exit(status: i32) -> SyscallResult {
     kprintln!("[syscall] exit(status={})", status);
     crate::process::scheduler::exit_current_thread(status);
+}
+
+/// `exit_group(status)` — Terminate all threads in the thread group.
+pub fn sys_exit_group(status: i32) -> SyscallResult {
+    sys_exit(status)
 }
 
 /// `wait4(pid, wstatus, options, rusage)` — Wait for a child process.
@@ -558,6 +576,7 @@ pub fn sys_getegid() -> SyscallResult { 0 }
 
 /// `arch_prctl()` — Set thread base register (FS_BASE).
 pub fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
+    kprintln!("[syscall] arch_prctl(code={:#x}, addr={:#x})", code, addr);
     if code == 0x1002 { // ARCH_SET_FS
         x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(addr));
         
@@ -582,5 +601,457 @@ pub fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
 pub fn sys_set_tid_address(_tidptr: *mut i32) -> SyscallResult {
     let pid = crate::process::scheduler::current_pid().map(|p| p.as_u64()).unwrap_or(0);
     pid as i64
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POSIX process identity / session syscalls (required by bash + musl-libc)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `getppid()` — Return the parent PID of the calling process.
+pub fn sys_getppid() -> SyscallResult {
+    let sched = scheduler::SCHEDULER.lock();
+    if let Some(ref sched) = *sched {
+        if let Some(pid) = sched.current_pid() {
+            if let Some(task) = sched.get_task(pid) {
+                return task.parent_pid.as_u64() as SyscallResult;
+            }
+        }
+    }
+    0
+}
+
+/// `setpgid(pid, pgid)` — Set the process group ID of a process.
+///
+/// If pid == 0, set the calling process's pgid.
+/// If pgid == 0, set pgid = pid.
+pub fn sys_setpgid(pid: i32, pgid: i32) -> SyscallResult {
+    let target_pid = if pid == 0 {
+        match scheduler::current_pid() {
+            Some(p) => p,
+            None => return Errno::ESRCH.into(),
+        }
+    } else {
+        crate::process::pid::Pid::from_raw(pid as u64)
+    };
+
+    let new_pgid = if pgid == 0 { target_pid.as_u64() } else { pgid as u64 };
+
+    let mut sched = scheduler::SCHEDULER.lock();
+    if let Some(ref mut sched) = *sched {
+        if let Some(task) = sched.get_task_mut(target_pid) {
+            task.pgid = new_pgid;
+            return 0;
+        }
+    }
+    Errno::ESRCH.into()
+}
+
+/// `getpgid(pid)` — Get the process group ID of a process.
+///
+/// If pid == 0, returns the calling process's pgid.
+pub fn sys_getpgid(pid: i32) -> SyscallResult {
+    let target_pid = if pid == 0 {
+        match scheduler::current_pid() {
+            Some(p) => p,
+            None => return Errno::ESRCH.into(),
+        }
+    } else {
+        crate::process::pid::Pid::from_raw(pid as u64)
+    };
+
+    let sched = scheduler::SCHEDULER.lock();
+    if let Some(ref sched) = *sched {
+        if let Some(task) = sched.get_task(target_pid) {
+            return task.pgid as SyscallResult;
+        }
+    }
+    Errno::ESRCH.into()
+}
+
+/// `setsid()` — Create a new session and set the process group ID.
+///
+/// The calling process becomes the session leader of a new session
+/// with pgid == pid.
+pub fn sys_setsid() -> SyscallResult {
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    let mut sched = scheduler::SCHEDULER.lock();
+    if let Some(ref mut sched) = *sched {
+        if let Some(task) = sched.get_task_mut(current_pid) {
+            task.pgid = current_pid.as_u64();
+            return current_pid.as_u64() as SyscallResult;
+        }
+    }
+    Errno::ESRCH.into()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POSIX time / resource limit syscalls
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Linux `uname` struct (sys/utsname.h), each field is 65 bytes.
+#[repr(C)]
+struct UtsName {
+    sysname:    [u8; 65],
+    nodename:   [u8; 65],
+    release:    [u8; 65],
+    version:    [u8; 65],
+    machine:    [u8; 65],
+    domainname: [u8; 65],
+}
+
+/// `uname(buf)` — Write kernel identity information into a `utsname` struct.
+pub fn sys_uname(buf: *mut u8) -> SyscallResult {
+    use super::fs::validate_user_ptr_write;
+
+    if buf.is_null() {
+        return Errno::EFAULT.into();
+    }
+    // UtsName is 6 × 65 = 390 bytes
+    if validate_user_ptr_write(buf, core::mem::size_of::<UtsName>()).is_err() {
+        return Errno::EFAULT.into();
+    }
+
+    let mut u = UtsName {
+        sysname:    [0u8; 65],
+        nodename:   [0u8; 65],
+        release:    [0u8; 65],
+        version:    [0u8; 65],
+        machine:    [0u8; 65],
+        domainname: [0u8; 65],
+    };
+
+    // Helper: copy a &str into a fixed [u8;65], null-terminated.
+    fn fill(dst: &mut [u8; 65], s: &[u8]) {
+        let len = s.len().min(64);
+        dst[..len].copy_from_slice(&s[..len]);
+        dst[len] = 0;
+    }
+
+    fill(&mut u.sysname,    b"Linux");
+    fill(&mut u.nodename,   b"kontsnoros");
+    fill(&mut u.release,    b"6.1.0-KontsnorOS");
+    fill(&mut u.version,    b"#1 SMP");
+    fill(&mut u.machine,    b"x86_64");
+    fill(&mut u.domainname, b"(none)");
+
+    unsafe {
+        core::ptr::write(buf as *mut UtsName, u);
+    }
+    0
+}
+
+/// `timeval` struct used by `gettimeofday`.
+#[repr(C)]
+struct TimeVal {
+    tv_sec:  i64,
+    tv_usec: i64,
+}
+
+/// `timezone` struct used by `gettimeofday`.
+#[repr(C)]
+struct TimeZone {
+    tz_minuteswest: i32,
+    tz_dsttime:     i32,
+}
+
+/// `gettimeofday(tv, tz)` — Return current time-of-day.
+///
+/// We stub this to return a fixed point in time (epoch + 0).
+/// Real wall-clock time requires an RTC driver.
+pub fn sys_gettimeofday(tv: *mut u8, tz: *mut u8) -> SyscallResult {
+    if !tv.is_null() {
+        let t = TimeVal { tv_sec: 0, tv_usec: 0 };
+        unsafe { core::ptr::write(tv as *mut TimeVal, t); }
+    }
+    if !tz.is_null() {
+        let z = TimeZone { tz_minuteswest: 0, tz_dsttime: 0 };
+        unsafe { core::ptr::write(tz as *mut TimeZone, z); }
+    }
+    0
+}
+
+/// `timespec` struct used by `clock_gettime` and `nanosleep`.
+#[repr(C)]
+struct TimeSpec {
+    tv_sec:  i64,
+    tv_nsec: i64,
+}
+
+/// `clock_gettime(clockid, tp)` — Return current clock value.
+pub fn sys_clock_gettime(_clockid: i32, tp: *mut u8) -> SyscallResult {
+    if tp.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let ts = TimeSpec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { core::ptr::write(tp as *mut TimeSpec, ts); }
+    0
+}
+
+/// `nanosleep(req, rem)` — High-resolution sleep.
+///
+/// We approximate with a scheduler yield. `rem` is zeroed on return.
+pub fn sys_nanosleep(_req: *const u8, rem: *mut u8) -> SyscallResult {
+    // Yield to the scheduler (no real timer infrastructure yet).
+    crate::process::scheduler::yield_now();
+    if !rem.is_null() {
+        let ts = TimeSpec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { core::ptr::write(rem as *mut TimeSpec, ts); }
+    }
+    0
+}
+
+/// `tms` struct used by `times`.
+#[repr(C)]
+struct Tms {
+    tms_utime:  i64,
+    tms_stime:  i64,
+    tms_cutime: i64,
+    tms_cstime: i64,
+}
+
+/// `times(buf)` — Return process and children CPU usage times.
+pub fn sys_times(buf: *mut u8) -> SyscallResult {
+    if !buf.is_null() {
+        let t = Tms { tms_utime: 0, tms_stime: 0, tms_cutime: 0, tms_cstime: 0 };
+        unsafe { core::ptr::write(buf as *mut Tms, t); }
+    }
+    0
+}
+
+/// `rlimit` struct used by `getrlimit`.
+#[repr(C)]
+struct RLimit {
+    rlim_cur: u64, // soft limit
+    rlim_max: u64, // hard limit
+}
+
+const RLIM_INFINITY: u64 = !0u64;
+
+/// `getrlimit(resource, rlim)` — Get resource limits.
+///
+/// Returns sane defaults; KontsnorOS does not currently enforce limits.
+pub fn sys_getrlimit(resource: i32, rlim: *mut u8) -> SyscallResult {
+    if rlim.is_null() {
+        return Errno::EFAULT.into();
+    }
+
+    // Provide generous defaults so bash/musl don't self-restrict.
+    let limit = match resource {
+        0  => RLimit { rlim_cur: RLIM_INFINITY, rlim_max: RLIM_INFINITY }, // RLIMIT_CPU
+        1  => RLimit { rlim_cur: RLIM_INFINITY, rlim_max: RLIM_INFINITY }, // RLIMIT_FSIZE
+        2  => RLimit { rlim_cur: RLIM_INFINITY, rlim_max: RLIM_INFINITY }, // RLIMIT_DATA
+        3  => RLimit { rlim_cur: 8 * 1024 * 1024, rlim_max: RLIM_INFINITY }, // RLIMIT_STACK (8 MiB)
+        4  => RLimit { rlim_cur: 0, rlim_max: 0 },                           // RLIMIT_CORE (no core dumps)
+        5  => RLimit { rlim_cur: RLIM_INFINITY, rlim_max: RLIM_INFINITY }, // RLIMIT_RSS
+        6  => RLimit { rlim_cur: RLIM_INFINITY, rlim_max: RLIM_INFINITY }, // RLIMIT_NPROC
+        7  => RLimit { rlim_cur: 1024, rlim_max: 4096 },                    // RLIMIT_NOFILE
+        8  => RLimit { rlim_cur: RLIM_INFINITY, rlim_max: RLIM_INFINITY }, // RLIMIT_MEMLOCK
+        9  => RLimit { rlim_cur: RLIM_INFINITY, rlim_max: RLIM_INFINITY }, // RLIMIT_AS
+        10 => RLimit { rlim_cur: RLIM_INFINITY, rlim_max: RLIM_INFINITY }, // RLIMIT_LOCKS
+        _  => RLimit { rlim_cur: RLIM_INFINITY, rlim_max: RLIM_INFINITY },
+    };
+    unsafe { core::ptr::write(rlim as *mut RLimit, limit); }
+    0
+}
+
+/// `setrlimit(resource, rlim)` — Set resource limits (stub; KontsnorOS ignores limits).
+pub fn sys_setrlimit(_resource: i32, _rlim: *const u8) -> SyscallResult {
+    0 // Accept all limit changes silently.
+}
+
+/// `sysinfo` struct (linux/sysinfo.h).
+#[repr(C)]
+struct SysInfo {
+    uptime:    i64,
+    loads:     [u64; 3],
+    totalram:  u64,
+    freeram:   u64,
+    sharedram: u64,
+    bufferram: u64,
+    totalswap: u64,
+    freeswap:  u64,
+    procs:     u16,
+    pad:       [u8; 22],
+    totalhigh: u64,
+    freehigh:  u64,
+    mem_unit:  u32,
+    _pad2:     [u8; 8],
+}
+
+/// `sysinfo(info)` — Return overall system information.
+pub fn sys_sysinfo(info: *mut u8) -> SyscallResult {
+    if info.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let si = SysInfo {
+        uptime:    0,
+        loads:     [0, 0, 0],
+        totalram:  128 * 1024 * 1024, // 128 MiB
+        freeram:   64 * 1024 * 1024,  //  64 MiB
+        sharedram: 0,
+        bufferram: 0,
+        totalswap: 0,
+        freeswap:  0,
+        procs:     1,
+        pad:       [0u8; 22],
+        totalhigh: 0,
+        freehigh:  0,
+        mem_unit:  1,
+        _pad2:     [0u8; 8],
+    };
+    unsafe { core::ptr::write(info as *mut SysInfo, si); }
+    0
+}
+
+/// `sigaltstack(ss, old_ss)` — Set/get alternate signal stack (stub).
+pub fn sys_sigaltstack(_ss: *const u8, _old_ss: *mut u8) -> SyscallResult {
+    0
+}
+
+/// `prctl(option, ...)` — Process control (stub).
+///
+/// Returns 0 for all recognized options bash uses (PR_SET_NAME, PR_GET_DUMPABLE, etc.).
+pub fn sys_prctl(_option: i32, _arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> SyscallResult {
+    0
+}
+
+/// `getrandom(buf, buflen, flags)` — Get random bytes.
+pub fn sys_getrandom(buf: *mut u8, buflen: usize, _flags: u32) -> SyscallResult {
+    use super::fs::validate_user_ptr;
+    if buf.is_null() { return Errno::EFAULT.into(); }
+    if !validate_user_ptr(buf, buflen) { return Errno::EFAULT.into(); }
+    let slice = unsafe { core::slice::from_raw_parts_mut(buf, buflen) };
+    let mut seed = 0x12345678u32;
+    for (i, b) in slice.iter_mut().enumerate() {
+        seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        *b = ((seed >> 16) & 0xFF) as u8 ^ (i as u8);
+    }
+    buflen as SyscallResult
+}
+
+/// `prlimit64(pid, resource, new_limit, old_limit)` — Get/set resource limits.
+pub fn sys_prlimit64(_pid: i32, resource: i32, _new_limit: *const u8, old_limit: *mut u8) -> SyscallResult {
+    if !old_limit.is_null() {
+        let ret = sys_getrlimit(resource, old_limit);
+        if ret < 0 { return ret; }
+    }
+    0
+}
+
+/// `gettid()` — Get thread ID (alias to getpid).
+pub fn sys_gettid() -> SyscallResult {
+    sys_getpid()
+}
+
+/// `tgkill(tgid, tid, sig)` — Send signal to thread.
+pub fn sys_tgkill(_tgid: i32, tid: i32, sig: i32) -> SyscallResult {
+    super::signal::sys_kill(tid, sig)
+}
+
+/// `clone(flags, child_stack, parent_tidptr, child_tidptr, newtls)`
+pub fn sys_clone(
+    flags: u64,
+    child_stack: u64,
+    parent_tidptr: *mut i32,
+    child_tidptr: *mut i32,
+    newtls: u64,
+    regs: *mut crate::syscall::SavedRegisters,
+) -> SyscallResult {
+    use crate::process::{pid, scheduler, task::Task, context::CpuContext};
+
+    kprintln!("[syscall] clone(flags={:#x}, child_stack={:#x}, parent_tid={:?}, child_tid={:?}, newtls={:#x})",
+        flags, child_stack, parent_tidptr, child_tidptr, newtls);
+
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+
+    let parent_cr3 = {
+        let sched = scheduler::SCHEDULER.lock();
+        if let Some(ref sched) = *sched {
+            if let Some(task) = sched.get_task(current_pid) {
+                task.page_table_root
+            } else {
+                return Errno::ESRCH.into();
+            }
+        } else {
+            return Errno::ESRCH.into();
+        }
+    };
+
+    let child_page_table = match crate::memory::r#virtual::clone_parent_page_table(parent_cr3) {
+        Ok(pt) => pt,
+        Err(_) => return Errno::ENOMEM.into(),
+    };
+
+    let child_pid = pid::allocate();
+    let mut child_task = Task::new(child_pid, alloc::format!("clone:{}", child_pid), child_page_table);
+
+    {
+        let mut sched = scheduler::SCHEDULER.lock();
+        if let Some(ref mut sched) = *sched {
+            if let Some(parent_task) = sched.get_task(current_pid) {
+                child_task.fd_table = parent_task.fd_table.clone();
+                for slot in &child_task.fd_table {
+                    if let Some(ref file_desc) = slot {
+                        *file_desc.ref_count.lock() += 1;
+                    }
+                }
+                child_task.sigactions = parent_task.sigactions.clone();
+                child_task.blocked_signals = parent_task.blocked_signals;
+                child_task.brk = parent_task.brk;
+                child_task.cwd = parent_task.cwd.clone();
+                child_task.mmap_bump = parent_task.mmap_bump;
+            }
+        }
+    }
+    child_task.pending_signals = 0;
+    child_task.parent_pid = current_pid;
+
+    let layout = alloc::alloc::Layout::from_size_align(32768, 16).unwrap();
+    let kstack_base = unsafe { alloc::alloc::alloc(layout) } as u64;
+    child_task.kernel_stack_base = kstack_base;
+    child_task.kernel_stack_size = 32768;
+
+    let child_regs_ptr = (kstack_base + 32768 - 128) as *mut crate::syscall::SavedRegisters;
+    unsafe {
+        core::ptr::write(child_regs_ptr, *regs);
+        if child_stack != 0 {
+            (*child_regs_ptr).rsp = child_stack;
+        }
+    }
+
+    let mut child_context = CpuContext::new(
+        crate::process::context::fork_child_return as *const () as u64,
+        child_regs_ptr as u64,
+        child_page_table,
+    );
+
+    if flags & 0x00080000 != 0 {
+        child_context.fs_base = newtls;
+    } else {
+        child_context.fs_base = x86_64::registers::model_specific::FsBase::read().as_u64();
+    }
+
+    child_task.context = child_context;
+
+    if flags & 0x00100000 != 0 && !parent_tidptr.is_null() {
+        unsafe {
+            parent_tidptr.write_volatile(child_pid.as_u64() as i32);
+        }
+    }
+    if flags & 0x01000000 != 0 && !child_tidptr.is_null() {
+        unsafe {
+            child_tidptr.write_volatile(child_pid.as_u64() as i32);
+        }
+    }
+
+    scheduler::add_task(child_task);
+
+    child_pid.as_u64() as SyscallResult
 }
 

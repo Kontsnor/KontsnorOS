@@ -115,6 +115,9 @@ pub struct Task {
     /// Parent PID (0 for the init process).
     pub parent_pid: Pid,
 
+    /// Process group ID (POSIX job control).
+    pub pgid: u64,
+
     /// CPU time consumed (in timer ticks).
     pub cpu_ticks: u64,
 
@@ -185,6 +188,7 @@ impl Task {
             blocked_signals: 0,
             sigactions: [SigAction { sa_handler: 0, sa_flags: 0, sa_restorer: 0, sa_mask: 0 }; 64],
             child_wait_queue: Arc::new(crate::sync::wait_queue::WaitQueue::new()),
+            pgid: pid.as_u64(),
         }
     }
 

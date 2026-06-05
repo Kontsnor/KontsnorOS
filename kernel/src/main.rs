@@ -88,6 +88,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     arch::x86_64::interrupts::init_pics();
     kprintln!("[boot] PIC initialized.");
 
+    kprintln!("[boot] Enabling SSE...");
+    unsafe {
+        arch::x86_64::boot::enable_sse();
+    }
+    kprintln!("[boot] SSE enabled.");
+
     // ── Phase 3: Memory initialization ─────────────────────────────────
     kprintln!("[boot] Initializing memory subsystem...");
     let phys_mem_offset = boot_info
@@ -173,21 +179,26 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     kprintln!("[boot] Syscall interface initialized.");
 
     // Spawn Ring 3 user shell from ext2 RAM disk
-    kprintln!("[boot] Spawning Ring 3 → Ring 3 shell: /bin/sh...");
-    if let Some(inode) = fs::vfs::lookup("/bin/sh") {
+    let shell_path = if fs::vfs::lookup("/bin/bash").is_some() {
+        "/bin/bash"
+    } else {
+        "/bin/sh"
+    };
+    kprintln!("[boot] Spawning Ring 3 → Ring 3 shell: {}...", shell_path);
+    if let Some(inode) = fs::vfs::lookup(shell_path) {
         let size = inode.inode().size as usize;
         let mut buf = alloc::vec![0u8; size];
         match inode.read(0, &mut buf) {
             Ok(bytes_read) => {
-                kprintln!("[boot] Loaded /bin/sh ({} bytes) from VFS, spawning...", bytes_read);
-                process::spawn_user_process(alloc::string::String::from("kontsnorsh"), &buf);
+                kprintln!("[boot] Loaded {} ({} bytes) from VFS, spawning...", shell_path, bytes_read);
+                process::spawn_user_process(alloc::string::String::from("bash"), &buf);
             }
             Err(e) => {
-                kprintln!("[boot] Failed to read /bin/sh: error {}", e);
+                kprintln!("[boot] Failed to read {}: error {}", shell_path, e);
             }
         }
     } else {
-        kprintln!("[boot] /bin/sh not found on mounted ext2 disk!");
+        kprintln!("[boot] {} not found on mounted ext2 disk!", shell_path);
     }
 
     kprintln!("[boot] Initializing network stack...");

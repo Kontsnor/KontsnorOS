@@ -264,12 +264,6 @@ pub fn sys_close(fd: i32) -> SyscallResult {
     }
 }
 
-/// `stat(pathname, statbuf)` — Get file status.
-pub fn sys_stat(_pathname: *const u8, _statbuf: *mut u8) -> SyscallResult {
-    // TODO: fill in stat buffer with inode metadata
-    Errno::ENOSYS.into()
-}
-
 /// `lseek(fd, offset, whence)` — Reposition file offset.
 pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> SyscallResult {
     if fd < 0 {
@@ -860,6 +854,260 @@ pub fn sys_unlink(pathname: *const u8) -> SyscallResult {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Additional POSIX FS syscalls required by bash + glibc/musl
+// ─────────────────────────────────────────────────────────────────────────────
 
+/// Validate that a user-space write target at `[ptr, ptr+size)` is safe.
+///
+/// This is the write-variant of `validate_user_ptr`: it must also be mapped
+/// and writable (we allow any user-space address below the canonical hole).
+pub fn validate_user_ptr_write(ptr: *mut u8, size: usize) -> Result<(), ()> {
+    if ptr.is_null() {
+        return Err(());
+    }
+    let start = ptr as u64;
+    let end = match start.checked_add(size as u64) {
+        Some(e) => e,
+        None => return Err(()),
+    };
+    if end > 0x0000_7FFF_FFFF_FFFF {
+        return Err(());
+    }
+    if size == 0 {
+        return Ok(());
+    }
+    let page_size: u64 = 4096;
+    let start_page = start & !(page_size - 1);
+    let end_page = (end + page_size - 1) & !(page_size - 1);
+    let mut curr = start_page;
+    while curr < end_page {
+        if crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(curr)).is_none() {
+            return Err(());
+        }
+        curr += page_size;
+    }
+    Ok(())
+}
 
+/// `stat(pathname, statbuf)` — Get file status by path.
+pub fn sys_stat(pathname: *const u8, statbuf: *mut LinuxStat) -> SyscallResult {
+    if statbuf.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if !validate_user_ptr(statbuf as *const u8, core::mem::size_of::<LinuxStat>()) {
+        return Errno::EFAULT.into();
+    }
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved = crate::fs::vfs::resolve_relative_path(&raw_path);
+    kprintln!("[syscall] stat(\"{}\")", resolved);
+
+    let inode_ops = match crate::fs::vfs::lookup(&resolved) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    let stat = populate_stat(inode_ops.as_ref());
+    unsafe {
+        statbuf.write(stat);
+    }
+    0
+}
+
+/// `lstat(pathname, statbuf)` — Get file status by path, not following symlinks.
+///
+/// Since KontsnorOS has no symbolic links, this is identical to `stat`.
+pub fn sys_lstat(pathname: *const u8, statbuf: *mut LinuxStat) -> SyscallResult {
+    sys_stat(pathname, statbuf)
+}
+
+/// `access(pathname, mode)` — Check file accessibility.
+///
+/// We defer to `faccessat` with `AT_FDCWD` and no flags.
+pub fn sys_access(pathname: *const u8, mode: i32) -> SyscallResult {
+    sys_faccessat(-100, pathname, mode, 0)
+}
+
+/// `rename(oldpath, newpath)` — Rename a file or directory.
+pub fn sys_rename(oldpath: *const u8, newpath: *const u8) -> SyscallResult {
+    let raw_old = match unsafe { copy_string_from_user(oldpath) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let raw_new = match unsafe { copy_string_from_user(newpath) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved_old = crate::fs::vfs::resolve_relative_path(&raw_old);
+    let resolved_new = crate::fs::vfs::resolve_relative_path(&raw_new);
+    kprintln!("[syscall] rename(\"{}\" -> \"{}\")", resolved_old, resolved_new);
+
+    // Split paths into parent + name
+    let (old_parent_path, old_name) = crate::fs::path::split_path(&resolved_old);
+    let (new_parent_path, new_name) = crate::fs::path::split_path(&resolved_new);
+
+    let old_parent = match crate::fs::vfs::lookup(old_parent_path) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    // For now: read the file data, create at new location, remove at old location.
+    // This works for regular files in tmpfs; directory rename is not supported.
+    let src_inode_ops = match crate::fs::vfs::lookup(&resolved_old) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    let file_size = src_inode_ops.inode().size as usize;
+    let mut buf = alloc::vec![0u8; file_size];
+    if file_size > 0 {
+        let _ = src_inode_ops.read(0, &mut buf);
+    }
+
+    // Create file at new location
+    let new_parent = match crate::fs::vfs::lookup(new_parent_path) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+    let new_inode = match new_parent.create(new_name, crate::fs::inode::FileType::Regular) {
+        Some(i) => i,
+        None => return Errno::ENOSPC.into(),
+    };
+    if file_size > 0 {
+        let _ = new_inode.write(0, &buf);
+    }
+
+    // Remove old file
+    let _ = old_parent.unlink(old_name);
+    0
+}
+
+/// `link(oldpath, newpath)` — Create a hard link.
+///
+/// KontsnorOS does not support hard links; return EPERM.
+pub fn sys_link(_oldpath: *const u8, _newpath: *const u8) -> SyscallResult {
+    Errno::EPERM.into()
+}
+
+/// `readlink(pathname, buf, bufsize)` — Read the value of a symbolic link.
+///
+/// KontsnorOS does not support symlinks; always returns EINVAL.
+pub fn sys_readlink(_pathname: *const u8, _buf: *mut u8, _bufsize: usize) -> SyscallResult {
+    Errno::EINVAL.into()
+}
+
+/// `readlinkat(dirfd, pathname, buf, bufsize)` — `readlink` relative to a directory fd.
+pub fn sys_readlinkat(
+    _dirfd: i32,
+    _pathname: *const u8,
+    _buf: *mut u8,
+    _bufsize: usize,
+) -> SyscallResult {
+    Errno::EINVAL.into()
+}
+
+/// `poll` fd event struct.
+#[repr(C)]
+struct PollFd {
+    fd:      i32,
+    events:  i16,
+    revents: i16,
+}
+
+/// `poll(fds, nfds, timeout)` — Wait for events on file descriptors.
+///
+/// Stub: marks all fds as having POLLIN|POLLOUT ready and returns immediately.
+/// A real implementation would block in the scheduler until events fire.
+pub fn sys_poll(fds: *mut u8, nfds: u64, _timeout: i32) -> SyscallResult {
+    if fds.is_null() || nfds == 0 {
+        return 0;
+    }
+    // Set revents = events for each pollfd so callers proceed without blocking.
+    let fds_slice = unsafe {
+        core::slice::from_raw_parts_mut(fds as *mut PollFd, nfds as usize)
+    };
+    let mut ready = 0i64;
+    for pfd in fds_slice.iter_mut() {
+        if pfd.fd >= 0 {
+            pfd.revents = pfd.events;
+            ready += 1;
+        } else {
+            pfd.revents = 0;
+        }
+    }
+    ready as SyscallResult
+}
+
+/// `pread64(fd, buf, count, offset)` — Read from a file descriptor at an offset.
+///
+/// Unlike `read`, this does not change the file's seek position.
+pub fn sys_pread64(fd: i32, buf: *mut u8, count: usize, offset: i64) -> SyscallResult {
+    if !validate_user_ptr(buf, count) {
+        return Errno::EFAULT.into();
+    }
+
+    let file = match proc_fd::current_task_get_file_desc(fd) {
+        Some(f) => f,
+        None => return Errno::EBADF.into(),
+    };
+
+    let slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
+    match file.inode.read(offset as u64, slice) {
+        Ok(n)  => n as SyscallResult,
+        Err(e) => e as SyscallResult,
+    }
+}
+
+/// `IoVec` structure for `writev`.
+#[repr(C)]
+pub struct IoVec {
+    pub iov_base: *const u8,
+    pub iov_len: usize,
+}
+
+/// `writev(fd, iov, iovcnt)` — Write vector.
+pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: i32) -> SyscallResult {
+    if iov.is_null() || iovcnt <= 0 || iovcnt > 1024 {
+        return Errno::EINVAL.into();
+    }
+    if !validate_user_ptr(iov as *const u8, iovcnt as usize * core::mem::size_of::<IoVec>()) {
+        return Errno::EFAULT.into();
+    }
+    let iov_slice = unsafe { core::slice::from_raw_parts(iov, iovcnt as usize) };
+    let mut total_written = 0;
+    for io in iov_slice {
+        if io.iov_len == 0 { continue; }
+        let ret = sys_write(fd, io.iov_base, io.iov_len);
+        if ret < 0 {
+            if total_written > 0 { break; }
+            return ret;
+        }
+        total_written += ret;
+    }
+    total_written
+}
+
+/// `openat(dfd, pathname, flags, mode)` — Open file relative to directory file descriptor.
+pub fn sys_openat(dfd: i32, pathname: *const u8, flags: i32, mode: u32) -> SyscallResult {
+    if dfd == -100 { // AT_FDCWD
+        sys_open(pathname, flags, mode)
+    } else {
+        if pathname.is_null() {
+            return Errno::EFAULT.into();
+        }
+        // If the path starts with '/', it is absolute, so dfd is ignored.
+        let first_byte = unsafe { pathname.read() };
+        if first_byte == b'/' {
+            sys_open(pathname, flags, mode)
+        } else {
+            // Relative to directory fd is not supported yet
+            Errno::ENOSYS.into()
+        }
+    }
+}
 

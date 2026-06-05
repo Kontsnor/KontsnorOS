@@ -19,9 +19,7 @@ pub struct Termios {
     pub c_cflag: u32,
     pub c_lflag: u32,
     pub c_line: u8,
-    pub c_cc: [u8; 32],
-    pub c_ispeed: u32,
-    pub c_ospeed: u32,
+    pub c_cc: [u8; 19],
 }
 
 /// POSIX winsize structure for TIOCGWINSZ.
@@ -42,9 +40,7 @@ pub static TTY_TERMIOS: Mutex<Termios> = Mutex::new(Termios {
     c_cflag: 0,
     c_lflag: 0x00000002 | 0x00000008 | 0x00000001,
     c_line: 0,
-    c_cc: [0; 32],
-    c_ispeed: 38400,
-    c_ospeed: 38400,
+    c_cc: [0; 19],
 });
 
 // ── /dev/stdin ────────────────────────────────────────────────────────────────

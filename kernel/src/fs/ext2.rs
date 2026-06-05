@@ -697,6 +697,35 @@ impl Ext2FileSystem {
                 }
                 self.deallocate_block(sib)?;
             }
+
+            // Free double indirect block if present
+            let dib = i_block[13];
+            if dib != 0 {
+                let mut dib_buf = alloc::vec![0u8; self.block_size as usize];
+                read_blocks(&*self.device, dib as u64, &mut dib_buf, self.block_size)?;
+                let refs_per_block = self.block_size / 4;
+                for i in 0..refs_per_block {
+                    let sib_offset = (i * 4) as usize;
+                    let sib = u32::from_le_bytes([
+                        dib_buf[sib_offset], dib_buf[sib_offset + 1], dib_buf[sib_offset + 2], dib_buf[sib_offset + 3]
+                    ]);
+                    if sib != 0 {
+                        let mut sib_buf = alloc::vec![0u8; self.block_size as usize];
+                        read_blocks(&*self.device, sib as u64, &mut sib_buf, self.block_size)?;
+                        for j in 0..refs_per_block {
+                            let ptr_offset = (j * 4) as usize;
+                            let phys_block = u32::from_le_bytes([
+                                sib_buf[ptr_offset], sib_buf[ptr_offset + 1], sib_buf[ptr_offset + 2], sib_buf[ptr_offset + 3]
+                            ]);
+                            if phys_block != 0 {
+                                self.deallocate_block(phys_block)?;
+                            }
+                        }
+                        self.deallocate_block(sib)?;
+                    }
+                }
+                self.deallocate_block(dib)?;
+            }
             
             // Release the inode
             self.deallocate_inode(ino, is_dir)?;
@@ -748,7 +777,38 @@ impl Ext2Inode {
             return Ok(phys_block);
         }
 
-        Err("Double/triple indirect blocks are unsupported in this phase.")
+        let double_index = indirect_index - refs_per_block;
+        let max_double_blocks = refs_per_block * refs_per_block;
+        if double_index < max_double_blocks {
+            let dib = i_block[13];
+            if dib == 0 {
+                return Ok(0);
+            }
+            
+            let mut dib_buf = alloc::vec![0u8; self.fs.block_size as usize];
+            read_blocks(&*self.fs.device, dib as u64, &mut dib_buf, self.fs.block_size)?;
+            
+            let sib_index = double_index / refs_per_block;
+            let sib_ptr_offset = (sib_index * 4) as usize;
+            let sib = u32::from_le_bytes([
+                dib_buf[sib_ptr_offset], dib_buf[sib_ptr_offset + 1], dib_buf[sib_ptr_offset + 2], dib_buf[sib_ptr_offset + 3]
+            ]);
+            if sib == 0 {
+                return Ok(0);
+            }
+            
+            let mut sib_buf = alloc::vec![0u8; self.fs.block_size as usize];
+            read_blocks(&*self.fs.device, sib as u64, &mut sib_buf, self.fs.block_size)?;
+            
+            let data_index = double_index % refs_per_block;
+            let data_ptr_offset = (data_index * 4) as usize;
+            let phys_block = u32::from_le_bytes([
+                sib_buf[data_ptr_offset], sib_buf[data_ptr_offset + 1], sib_buf[data_ptr_offset + 2], sib_buf[data_ptr_offset + 3]
+            ]);
+            return Ok(phys_block);
+        }
+
+        Err("Triple indirect blocks are unsupported in this phase.")
     }
 
     /// Resolve logical block number to physical disk block.
@@ -803,7 +863,59 @@ impl Ext2Inode {
             return Ok(phys_block);
         }
         
-        Err("Double/triple indirect blocks are unsupported in this phase.")
+        let double_index = indirect_index - refs_per_block;
+        let max_double_blocks = refs_per_block * refs_per_block;
+        if double_index < max_double_blocks {
+            let mut dib = raw.i_block[13];
+            if dib == 0 {
+                dib = self.fs.allocate_block()?;
+                raw.i_block[13] = dib;
+                raw.i_blocks += self.fs.block_size / 512;
+                self.fs.write_inode(self.ino, raw)?;
+            }
+            
+            let mut dib_buf = alloc::vec![0u8; self.fs.block_size as usize];
+            read_blocks(&*self.fs.device, dib as u64, &mut dib_buf, self.fs.block_size)?;
+            
+            let sib_index = double_index / refs_per_block;
+            let sib_ptr_offset = (sib_index * 4) as usize;
+            let mut sib = u32::from_le_bytes([
+                dib_buf[sib_ptr_offset], dib_buf[sib_ptr_offset + 1], dib_buf[sib_ptr_offset + 2], dib_buf[sib_ptr_offset + 3]
+            ]);
+            
+            if sib == 0 {
+                sib = self.fs.allocate_block()?;
+                let bytes = sib.to_le_bytes();
+                dib_buf[sib_ptr_offset..sib_ptr_offset + 4].copy_from_slice(&bytes);
+                write_blocks(&*self.fs.device, dib as u64, &dib_buf, self.fs.block_size)?;
+                
+                raw.i_blocks += self.fs.block_size / 512;
+                self.fs.write_inode(self.ino, raw)?;
+            }
+            
+            let mut sib_buf = alloc::vec![0u8; self.fs.block_size as usize];
+            read_blocks(&*self.fs.device, sib as u64, &mut sib_buf, self.fs.block_size)?;
+            
+            let data_index = double_index % refs_per_block;
+            let data_ptr_offset = (data_index * 4) as usize;
+            let mut phys_block = u32::from_le_bytes([
+                sib_buf[data_ptr_offset], sib_buf[data_ptr_offset + 1], sib_buf[data_ptr_offset + 2], sib_buf[data_ptr_offset + 3]
+            ]);
+            
+            if phys_block == 0 {
+                phys_block = self.fs.allocate_block()?;
+                let bytes = phys_block.to_le_bytes();
+                sib_buf[data_ptr_offset..data_ptr_offset + 4].copy_from_slice(&bytes);
+                write_blocks(&*self.fs.device, sib as u64, &sib_buf, self.fs.block_size)?;
+                
+                raw.i_blocks += self.fs.block_size / 512;
+                self.fs.write_inode(self.ino, raw)?;
+            }
+            
+            return Ok(phys_block);
+        }
+
+        Err("Triple indirect blocks are unsupported in this phase.")
     }
 
     /// Add a directory entry to the parent.
@@ -1286,6 +1398,35 @@ impl InodeOps for Ext2Inode {
             }
             self.fs.deallocate_block(sib).map_err(|_| -5)?;
             raw.i_block[12] = 0;
+        }
+
+        let dib = raw.i_block[13];
+        if dib != 0 {
+            let mut dib_buf = alloc::vec![0u8; self.fs.block_size as usize];
+            read_blocks(&*self.fs.device, dib as u64, &mut dib_buf, self.fs.block_size).map_err(|_| -5)?;
+            let refs_per_block = self.fs.block_size / 4;
+            for i in 0..refs_per_block {
+                let sib_offset = (i * 4) as usize;
+                let sib = u32::from_le_bytes([
+                    dib_buf[sib_offset], dib_buf[sib_offset + 1], dib_buf[sib_offset + 2], dib_buf[sib_offset + 3]
+                ]);
+                if sib != 0 {
+                    let mut sib_buf = alloc::vec![0u8; self.fs.block_size as usize];
+                    read_blocks(&*self.fs.device, sib as u64, &mut sib_buf, self.fs.block_size).map_err(|_| -5)?;
+                    for j in 0..refs_per_block {
+                        let ptr_offset = (j * 4) as usize;
+                        let phys_block = u32::from_le_bytes([
+                            sib_buf[ptr_offset], sib_buf[ptr_offset + 1], sib_buf[ptr_offset + 2], sib_buf[ptr_offset + 3]
+                        ]);
+                        if phys_block != 0 {
+                            self.fs.deallocate_block(phys_block).map_err(|_| -5)?;
+                        }
+                    }
+                    self.fs.deallocate_block(sib).map_err(|_| -5)?;
+                }
+            }
+            self.fs.deallocate_block(dib).map_err(|_| -5)?;
+            raw.i_block[13] = 0;
         }
         
         raw.i_size = 0;

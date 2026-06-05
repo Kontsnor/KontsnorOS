@@ -177,8 +177,16 @@ pub fn spawn_user_process(name: alloc::string::String, elf_data: &[u8]) -> pid::
     // Construct System V ABI stack
     let default_argv = [name.clone()];
     let default_envp: [alloc::string::String; 0] = [];
-    let user_sp = elf::construct_user_stack(&default_argv, &default_envp, highest_stack_phys)
-        .expect("Failed to construct user stack");
+    let user_sp = elf::construct_user_stack(
+        &default_argv,
+        &default_envp,
+        highest_stack_phys,
+        elf_info.entry_point,
+        elf_info.phdr,
+        elf_info.phnum,
+        elf_info.phent,
+    )
+    .expect("Failed to construct user stack");
     
     // Calculate initial program break (brk) dynamically from loaded ELF segment boundaries
     let mut max_vaddr = 0;

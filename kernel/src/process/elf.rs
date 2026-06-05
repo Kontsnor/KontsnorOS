@@ -177,6 +177,12 @@ pub struct ElfInfo {
     pub is_pie: bool,
     /// Stack size from PT_GNU_STACK (0 = use default).
     pub stack_size: u64,
+    /// Program header table virtual address.
+    pub phdr: u64,
+    /// Number of program headers.
+    pub phnum: u64,
+    /// Size of program header entry.
+    pub phent: u64,
 }
 
 /// A segment that needs to be loaded into memory.
@@ -311,11 +317,26 @@ pub fn parse_elf(data: &[u8]) -> Result<ElfInfo, ElfError> {
         }
     }
 
+    let e_phoff = header.e_phoff;
+    let mut phdr_vaddr = 0;
+    for segment in &segments {
+        if e_phoff >= segment.file_offset && e_phoff < segment.file_offset + segment.file_size {
+            phdr_vaddr = segment.vaddr + (e_phoff - segment.file_offset);
+            break;
+        }
+    }
+    if phdr_vaddr == 0 {
+        phdr_vaddr = e_phoff;
+    }
+
     Ok(ElfInfo {
         entry_point,
         segments,
         is_pie,
         stack_size,
+        phdr: phdr_vaddr,
+        phnum: ph_count as u64,
+        phent: ph_entry_size as u64,
     })
 }
 
@@ -362,9 +383,23 @@ pub fn construct_user_stack(
     argv: &[alloc::string::String],
     envp: &[alloc::string::String],
     phys_frame_addr: u64,
+    entry_point: u64,
+    phdr: u64,
+    phnum: u64,
+    phent: u64,
 ) -> Result<u64, crate::syscall::Errno> {
     let mut page_buf = alloc::vec![0u8; 4096];
     let mut str_pos = 4096;
+
+    // Allocate 16 bytes for AT_RANDOM value at the top of the stack
+    if str_pos < 16 {
+        return Err(crate::syscall::Errno::E2BIG);
+    }
+    str_pos -= 16;
+    for (i, b) in page_buf[str_pos..str_pos + 16].iter_mut().enumerate() {
+        *b = (i as u8 + 42) ^ 0xAA;
+    }
+    let random_vaddr = (USER_STACK_TOP - 4096) + str_pos as u64;
 
     // 1. Copy environment strings
     let mut envp_vaddrs = alloc::vec::Vec::new();
@@ -396,9 +431,25 @@ pub fn construct_user_stack(
     }
     argv_vaddrs.reverse();
 
+    // Auxiliary vector entries required by musl-libc
+    let auxv = [
+        (3u64, phdr),          // AT_PHDR
+        (4u64, phent),         // AT_PHENT
+        (5u64, phnum),         // AT_PHNUM
+        (6u64, 4096),          // AT_PAGESZ
+        (9u64, entry_point),   // AT_ENTRY
+        (11u64, 0),            // AT_UID
+        (12u64, 0),            // AT_EUID
+        (13u64, 0),            // AT_GID
+        (14u64, 0),            // AT_EGID
+        (23u64, 0),            // AT_SECURE
+        (25u64, random_vaddr), // AT_RANDOM
+        (0u64, 0),             // AT_NULL
+    ];
+
     // 3. Calculate space for pointers:
-    // pointers size = 8 (argc) + (argv.len() * 8) + 8 (null) + (envp.len() * 8) + 8 (null) + 16 (terminating auxv)
-    let ptrs_size = 8 + (argv.len() * 8) + 8 + (envp.len() * 8) + 8 + 16;
+    // pointers size = 8 (argc) + (argv.len() * 8) + 8 (null) + (envp.len() * 8) + 8 (null) + (auxv.len() * 16)
+    let ptrs_size = 8 + (argv.len() * 8) + 8 + (envp.len() * 8) + 8 + (auxv.len() * 16);
     if ptrs_size > str_pos {
         return Err(crate::syscall::Errno::E2BIG);
     }
@@ -430,9 +481,11 @@ pub fn construct_user_stack(
     }
     write_u64(0, &mut page_buf, &mut write_pos); // envp NULL
 
-    // Write auxiliary vector (terminating entry: AT_NULL = 0, value = 0)
-    write_u64(0, &mut page_buf, &mut write_pos);
-    write_u64(0, &mut page_buf, &mut write_pos);
+    // Write auxiliary vector entries
+    for (type_, val) in &auxv {
+        write_u64(*type_, &mut page_buf, &mut write_pos);
+        write_u64(*val, &mut page_buf, &mut write_pos);
+    }
 
     // Copy constructed stack page to physical memory
     let dest = (phys_frame_addr + crate::memory::r#virtual::phys_mem_offset()) as *mut u8;

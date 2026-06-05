@@ -206,7 +206,60 @@ pub extern "C" fn syscall_dispatch_rust(
     let arg4 = unsafe { (*regs).r8 };
     let arg5 = unsafe { (*regs).r9 };
 
+    // Debug print FS_BASE and canary
+    let fs_base = x86_64::registers::model_specific::FsBase::read().as_u64();
+    let user_rsp = unsafe { (*regs).rsp };
+    let mut canary_msg = alloc::string::String::new();
+    if fs_base != 0 {
+        let canary_addr = fs_base + 0x28;
+        if let Some(phys) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(canary_addr)) {
+            let virt = phys.as_u64() + crate::memory::r#virtual::phys_mem_offset();
+            let canary_val = unsafe { *(virt as *const u64) };
+            canary_msg = alloc::format!("canary={:#x}", canary_val);
+        } else {
+            canary_msg = alloc::format!("canary_addr={:#x} (unmapped)", canary_addr);
+        }
+    }
+    
+    // Print stack values
+    let mut stack_msg = alloc::string::String::new();
+    if user_rsp != 0 && user_rsp < 0x0000_7FFF_FFFF_FFFF {
+        if let Some(phys) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(user_rsp)) {
+            let virt = phys.as_u64() + crate::memory::r#virtual::phys_mem_offset();
+            // print 4 words from RSP
+            let mut words = [0u64; 4];
+            for i in 0..4 {
+                let addr = user_rsp + (i * 8);
+                if let Some(p) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(addr)) {
+                    let v = p.as_u64() + crate::memory::r#virtual::phys_mem_offset();
+                    words[i as usize] = unsafe { *(v as *const u64) };
+                }
+            }
+            stack_msg = alloc::format!("rsp={:#x} stack=[{:#x}, {:#x}, {:#x}, {:#x}]", 
+                user_rsp, words[0], words[1], words[2], words[3]);
+        }
+    }
+
+    crate::kprintln!("[debug syscall {}] args=[{:#x}, {:#x}, {:#x}] fs_base={:#x} {} {}", 
+        syscall_num, arg0, arg1, arg2, fs_base, canary_msg, stack_msg);
+
     let res = dispatch(regs, syscall_num, arg0, arg1, arg2, arg3, arg4, arg5);
+    crate::kprintln!("[debug syscall {} ret] res={}", syscall_num, res);
+    
+    if syscall_num == 16 {
+        let mut words_after = [0u64; 8];
+        for i in 0..8 {
+            let addr = user_rsp + (i * 8);
+            if let Some(p) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(addr)) {
+                let v = p.as_u64() + crate::memory::r#virtual::phys_mem_offset();
+                words_after[i as usize] = unsafe { *(v as *const u64) };
+            }
+        }
+        crate::kprintln!("[debug syscall 16 ret] stack_after=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
+            words_after[0], words_after[1], words_after[2], words_after[3],
+            words_after[4], words_after[5], words_after[6], words_after[7]);
+    }
+
     unsafe {
         (*regs).rax = res as u64;
     }
@@ -274,7 +327,7 @@ pub fn dispatch(
     arg1: u64,
     arg2: u64,
     arg3: u64,
-    _arg4: u64,
+    arg4: u64,
     _arg5: u64,
 ) -> SyscallResult {
     match syscall_num {
@@ -283,37 +336,67 @@ pub fn dispatch(
         1  => fs::sys_write(arg0 as i32, arg1 as *const u8, arg2 as usize),
         2  => fs::sys_open(arg0 as *const u8, arg1 as i32, arg2 as u32),
         3  => fs::sys_close(arg0 as i32),
+        4  => fs::sys_stat(arg0 as *const u8, arg1 as *mut fs::LinuxStat),
         5  => fs::sys_fstat(arg0 as i32, arg1 as *mut fs::LinuxStat),
+        6  => fs::sys_lstat(arg0 as *const u8, arg1 as *mut fs::LinuxStat),
+        7  => fs::sys_poll(arg0 as *mut u8, arg1, arg2 as i32),
         8  => fs::sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32),
         16 => io::sys_ioctl(arg0 as i32, arg1, arg2),
+        17 => fs::sys_pread64(arg0 as i32, arg1 as *mut u8, arg2 as usize, arg3 as i64),
+        20 => fs::sys_writev(arg0 as i32, arg1 as *const fs::IoVec, arg2 as i32),
+        21 => fs::sys_access(arg0 as *const u8, arg1 as i32),
         22 => fs::sys_pipe(arg0 as *mut i32),
         32 => fs::sys_dup(arg0 as i32),
         33 => fs::sys_dup2(arg0 as i32, arg1 as i32),
         72 => fs::sys_fcntl(arg0 as i32, arg1 as i32, arg2),
         79 => fs::sys_getcwd(arg0 as *mut u8, arg1 as usize),
         80 => fs::sys_chdir(arg0 as *const u8),
+        82 => fs::sys_rename(arg0 as *const u8, arg1 as *const u8),
         83 => fs::sys_mkdir(arg0 as *const u8, arg1 as u32),
         84 => fs::sys_rmdir(arg0 as *const u8),
+        86 => fs::sys_link(arg0 as *const u8, arg1 as *const u8),
         87 => fs::sys_unlink(arg0 as *const u8),
+        89 => fs::sys_readlink(arg0 as *const u8, arg1 as *mut u8, arg2 as usize),
         217 => fs::sys_getdents64(arg0 as i32, arg1 as *mut u8, arg2 as usize),
+        257 => fs::sys_openat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as u32),
         262 => fs::sys_newfstatat(arg0 as i32, arg1 as *const u8, arg2 as *mut fs::LinuxStat, arg3 as i32),
+        267 => fs::sys_readlinkat(arg0 as i32, arg1 as *const u8, arg2 as *mut u8, arg3 as usize),
         269 => fs::sys_faccessat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as i32),
         // Memory
-        9  => memory::sys_mmap(arg0, arg1 as usize, arg2 as i32, arg3 as i32, _arg4 as i32, _arg5 as i64),
+        9  => memory::sys_mmap(arg0, arg1 as usize, arg2 as i32, arg3 as i32, arg4 as i32, _arg5 as i64),
         10 => memory::sys_mprotect(arg0, arg1 as usize, arg2 as i32),
         11 => memory::sys_munmap(arg0, arg1 as usize),
         12 => memory::sys_brk(arg0),
         // Process
         13 => signal::sys_rt_sigaction(arg0 as i32, arg1 as *const crate::process::task::SigAction, arg2 as *mut crate::process::task::SigAction, arg3 as usize),
         14 => signal::sys_rt_sigprocmask(arg0 as i32, arg1 as *const u64, arg2 as *mut u64, arg3 as usize),
+        35 => process::sys_nanosleep(arg0 as *const u8, arg1 as *mut u8),
         39 => process::sys_getpid(),
+        56 => process::sys_clone(arg0, arg1, arg2 as *mut i32, arg3 as *mut i32, arg4, regs),
         57 => process::sys_fork(regs),
         59 => process::sys_execve(arg0 as *const u8, arg1 as *const *const u8, arg2 as *const *const u8),
         60 => process::sys_exit(arg0 as i32),
         61 => process::sys_wait4(arg0 as i32, arg1 as *mut i32, arg2 as i32, arg3 as *mut u8),
         62 => signal::sys_kill(arg0 as i32, arg1 as i32),
+        63 => process::sys_uname(arg0 as *mut u8),
+        96 => process::sys_gettimeofday(arg0 as *mut u8, arg1 as *mut u8),
+        97 => process::sys_getrlimit(arg0 as i32, arg1 as *mut u8),
+        99 => process::sys_sysinfo(arg0 as *mut u8),
+        100 => process::sys_times(arg0 as *mut u8),
+        109 => process::sys_setpgid(arg0 as i32, arg1 as i32),
+        110 => process::sys_getppid(),
+        112 => process::sys_setsid(),
+        121 => process::sys_getpgid(arg0 as i32),
+        131 => process::sys_sigaltstack(arg0 as *const u8, arg1 as *mut u8),
+        157 => process::sys_prctl(arg0 as i32, arg1, arg2, arg3, arg4),
         158 => process::sys_arch_prctl(arg0 as i32, arg1),
+        186 => process::sys_gettid(),
         218 => process::sys_set_tid_address(arg0 as *mut i32),
+        228 => process::sys_clock_gettime(arg0 as i32, arg1 as *mut u8),
+        231 => process::sys_exit_group(arg0 as i32),
+        234 => process::sys_tgkill(arg0 as i32, arg1 as i32, arg2 as i32),
+        302 => process::sys_prlimit64(arg0 as i32, arg1 as i32, arg2 as *const u8, arg3 as *mut u8),
+        318 => process::sys_getrandom(arg0 as *mut u8, arg1 as usize, arg2 as u32),
         // Identity
         102 => process::sys_getuid(),
         104 => process::sys_getgid(),

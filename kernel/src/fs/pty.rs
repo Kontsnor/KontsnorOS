@@ -5,11 +5,10 @@
 //! formatting (canonical editing, echo, and signal routing).
 
 use alloc::collections::VecDeque;
-use alloc::string::String;
 use alloc::sync::Arc;
 use spin::Mutex;
 
-use crate::fs::inode::{DirEntry, FileType, Inode, InodeOps};
+use crate::fs::inode::{FileType, Inode, InodeOps};
 use crate::fs::tty::{Termios, Winsize};
 
 /// Shared state of a PTY master/slave pair.
@@ -271,7 +270,7 @@ impl InodeOps for PtySlave {
                 Ok(0)
             }
             0x540F => { // TIOCGPGRP
-                if !crate::syscall::fs::validate_user_ptr(arg as *mut i32, core::mem::size_of::<i32>()) {
+                if !crate::syscall::fs::validate_user_ptr(arg as *mut i32 as *const u8, core::mem::size_of::<i32>()) {
                     return Err(-14); // EFAULT
                 }
                 let pgid = *self.shared.foreground_pgid.lock() as i32;
@@ -281,7 +280,7 @@ impl InodeOps for PtySlave {
                 Ok(0)
             }
             0x5410 => { // TIOCSPGRP
-                if !crate::syscall::fs::validate_user_ptr(arg as *const i32, core::mem::size_of::<i32>()) {
+                if !crate::syscall::fs::validate_user_ptr(arg as *const i32 as *const u8, core::mem::size_of::<i32>()) {
                     return Err(-14); // EFAULT
                 }
                 let pgid = unsafe { core::ptr::read(arg as *const i32) } as u64;
@@ -301,13 +300,17 @@ pub fn deliver_signal_to_pgrp(pgid: u64, sig: i32) {
     }
     let mut sched_lock = scheduler::SCHEDULER.lock();
     if let Some(ref mut sched) = *sched_lock {
+        let mut pids_to_wake = alloc::vec::Vec::new();
         for task_opt in sched.tasks.iter_mut() {
             if let Some(ref mut task) = task_opt {
                 if task.pgid == pgid {
                     task.pending_signals |= 1 << (sig - 1);
-                    sched.wake_task(task.pid);
+                    pids_to_wake.push(task.pid);
                 }
             }
+        }
+        for pid in pids_to_wake {
+            sched.wake_task(pid);
         }
     }
 }

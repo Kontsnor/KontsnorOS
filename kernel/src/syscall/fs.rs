@@ -194,53 +194,60 @@ pub fn sys_open(pathname: *const u8, flags: i32, _mode: u32) -> SyscallResult {
     kprintln!("[syscall] open(\"{}\", flags={:#x})", resolved_path, flags);
 
     let flags_u32 = flags as u32;
-    let exists = crate::fs::vfs::lookup(&resolved_path);
 
-    let inode = match exists {
-        Some(i) => {
-            // If O_CREAT and O_EXCL are both set, return EEXIST
-            if (flags_u32 & crate::fs::file::OpenFlags::O_CREAT != 0)
-                && (flags_u32 & crate::fs::file::OpenFlags::O_EXCL != 0)
-            {
-                return Errno::EEXIST.into();
-            }
-            // If O_DIRECTORY is set and it is not a directory, return ENOTDIR
-            if (flags_u32 & crate::fs::file::OpenFlags::O_DIRECTORY != 0)
-                && !i.inode().is_dir()
-            {
-                return Errno::ENOTDIR.into();
-            }
-            // If opened for writing and the inode is a directory, return EISDIR
-            if i.inode().is_dir() && crate::fs::file::OpenFlags(flags_u32).is_writable() {
-                return Errno::EISDIR.into();
-            }
-            // If O_TRUNC is set and it is a regular file, truncate it to 0 size
-            if (flags_u32 & crate::fs::file::OpenFlags::O_TRUNC != 0)
-                && i.inode().is_file()
-            {
-                if let Err(e) = i.truncate(0) {
-                    return e as SyscallResult;
-                }
-            }
-            i
+    let inode = if resolved_path == "/dev/ptmx" {
+        match crate::fs::pty::allocate_new_pty() {
+            Ok(master_inode) => master_inode,
+            Err(e) => return e as SyscallResult,
         }
-        None => {
-            if flags_u32 & crate::fs::file::OpenFlags::O_CREAT != 0 {
-                // Split path to find parent directory
-                let (parent_path, name) = crate::fs::path::split_path(&resolved_path);
-                let parent_inode = match crate::fs::vfs::lookup(parent_path) {
-                    Some(i) => i,
-                    None => return Errno::ENOENT.into(),
-                };
-                if !parent_inode.inode().is_dir() {
+    } else {
+        let exists = crate::fs::vfs::lookup(&resolved_path);
+        match exists {
+            Some(i) => {
+                // If O_CREAT and O_EXCL are both set, return EEXIST
+                if (flags_u32 & crate::fs::file::OpenFlags::O_CREAT != 0)
+                    && (flags_u32 & crate::fs::file::OpenFlags::O_EXCL != 0)
+                {
+                    return Errno::EEXIST.into();
+                }
+                // If O_DIRECTORY is set and it is not a directory, return ENOTDIR
+                if (flags_u32 & crate::fs::file::OpenFlags::O_DIRECTORY != 0)
+                    && !i.inode().is_dir()
+                {
                     return Errno::ENOTDIR.into();
                 }
-                match parent_inode.create(name, crate::fs::inode::FileType::Regular) {
-                    Some(new_i) => new_i,
-                    None => return Errno::EACCES.into(),
+                // If opened for writing and the inode is a directory, return EISDIR
+                if i.inode().is_dir() && crate::fs::file::OpenFlags(flags_u32).is_writable() {
+                    return Errno::EISDIR.into();
                 }
-            } else {
-                return Errno::ENOENT.into();
+                // If O_TRUNC is set and it is a regular file, truncate it to 0 size
+                if (flags_u32 & crate::fs::file::OpenFlags::O_TRUNC != 0)
+                    && i.inode().is_file()
+                {
+                    if let Err(e) = i.truncate(0) {
+                        return e as SyscallResult;
+                    }
+                }
+                i
+            }
+            None => {
+                if flags_u32 & crate::fs::file::OpenFlags::O_CREAT != 0 {
+                    // Split path to find parent directory
+                    let (parent_path, name) = crate::fs::path::split_path(&resolved_path);
+                    let parent_inode = match crate::fs::vfs::lookup(parent_path) {
+                        Some(i) => i,
+                        None => return Errno::ENOENT.into(),
+                    };
+                    if !parent_inode.inode().is_dir() {
+                        return Errno::ENOTDIR.into();
+                    }
+                    match parent_inode.create(name, crate::fs::inode::FileType::Regular) {
+                        Some(new_i) => new_i,
+                        None => return Errno::EACCES.into(),
+                    }
+                } else {
+                    return Errno::ENOENT.into();
+                }
             }
         }
     };

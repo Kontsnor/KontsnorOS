@@ -117,7 +117,8 @@ impl InodeOps for DevZero {
         Ok(buf.len())
     }
 
-        Ok(data.len()) // Discard all data
+    fn write(&self, _offset: u64, data: &[u8]) -> Result<usize, i32> {
+        Ok(data.len())
     }
 }
 
@@ -204,7 +205,7 @@ pub fn register_device(name: &str, device: Arc<dyn InodeOps>) {
 /// Register a new device node in /dev/pts.
 pub fn register_pts_device(name: String, device: Arc<dyn InodeOps>) {
     if let Some(ref pts) = *PTS_DIR.read() {
-        pts.entries.write().insert(name, device);
+        pts.entries.write().insert(name.clone(), device);
         kprintln!("[devfs] Registered pts device: /dev/pts/{}", name);
     }
 }

@@ -75,7 +75,7 @@ impl Default for CpuContext {
             r15: 0,
             rsp: 0,
             rip: 0,
-            rflags: 0x202, // IF (Interrupt Flag) set
+            rflags: 0x2, // Clear IF (Interrupt Flag) so tasks start with interrupts disabled
             cr3: 0,
             fs_base: 0,
             gs_base: core::ptr::addr_of!(crate::syscall::CPU_SCRATCH) as u64,
@@ -92,7 +92,7 @@ impl CpuContext {
             rip: entry_point,
             rsp: stack_pointer,
             cr3: page_table,
-            rflags: 0x202, // Interrupts enabled
+            rflags: 0x2, // Interrupts disabled initially in Ring 0
             fs_base: 0,
             ..Default::default()
         }

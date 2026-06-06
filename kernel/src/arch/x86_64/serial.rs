@@ -69,6 +69,10 @@ pub fn write_byte(byte: u8) {
     use core::fmt::Write;
     interrupts::without_interrupts(|| {
         let _ = SERIAL1.lock().write_fmt(format_args!("{}", byte as char));
+        if let Some(ref mut console) = *crate::drivers::gpu::bochs::GRAPHICS_CONSOLE.lock() {
+            console.write_char(byte);
+            console.gpu.blit();
+        }
     });
 }
 
@@ -85,6 +89,10 @@ pub fn _print(args: ::core::fmt::Arguments) {
             .lock()
             .write_fmt(args)
             .expect("Printing to serial failed");
+
+        if let Some(ref mut console) = *crate::drivers::gpu::bochs::GRAPHICS_CONSOLE.lock() {
+            let _ = console.write_fmt(args);
+        }
     });
 }
 

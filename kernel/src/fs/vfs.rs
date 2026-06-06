@@ -30,7 +30,7 @@ pub struct FileSystemType {
 /// to provide file operations through a common interface.
 pub trait FileSystem: Send + Sync {
     /// Get the root inode of this filesystem.
-    fn root(&self) -> Arc<dyn InodeOps>;
+    fn root(&self) -> Option<Arc<dyn InodeOps>>;
 
     /// Get the filesystem name.
     fn name(&self) -> &str;
@@ -141,7 +141,7 @@ impl Vfs {
     /// Lookup an inode by path.
     pub fn lookup(&self, path: &str) -> Option<Arc<dyn InodeOps>> {
         let (fs, remaining_path) = self.resolve_mount(path)?;
-        let root = fs.root();
+        let root = fs.root()?;
 
         // Walk the path components
         let mut current = root;

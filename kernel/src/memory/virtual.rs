@@ -33,6 +33,10 @@ static KERNEL_PML4_PHYS: Mutex<Option<u64>> = Mutex::new(None);
 /// `phys_mem_offset` is the virtual address where physical memory is
 /// mapped by the bootloader.
 pub fn init(phys_mem_offset: u64) {
+    let pml4_index = (phys_mem_offset >> 39) & 0x1FF;
+    if pml4_index < 256 {
+        panic!("Physical memory mapping offset {:#x} resides in lower half of PML4 (index {}), overlapping user space!", phys_mem_offset, pml4_index);
+    }
     *PHYS_MEM_OFFSET.lock() = Some(phys_mem_offset);
     let (level_4_table_frame, _) = Cr3::read();
     *KERNEL_PML4_PHYS.lock() = Some(level_4_table_frame.start_address().as_u64());
@@ -118,6 +122,9 @@ pub fn create_user_page_table() -> Result<u64, &'static str> {
 
     // Copy the physical memory mapping PML4 entry (which resides in the lower half)
     let pml4_index = (phys_mem_offset() >> 39) & 0x1FF;
+    if pml4_index < 256 {
+        return Err("Physical memory mapping overlaps user space");
+    }
     crate::kprintln!("[virtual] User PML4: cloning index {}, entry: {:?}", pml4_index, active_pml4[pml4_index as usize]);
     new_pml4[pml4_index as usize] = active_pml4[pml4_index as usize].clone();
 

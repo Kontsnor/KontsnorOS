@@ -56,7 +56,7 @@ pub fn sys_bind(fd: i32, addr_ptr: *const SockAddrIn, addrlen: u32) -> SyscallRe
         return Errno::EINVAL.into();
     }
 
-    let addr = unsafe { &*addr_ptr };
+    let addr = unsafe { core::ptr::read_volatile(addr_ptr) };
     if addr.sin_family != 2 {
         return Errno::EINVAL.into();
     }
@@ -93,7 +93,7 @@ pub fn sys_connect(fd: i32, addr_ptr: *const SockAddrIn, addrlen: u32) -> Syscal
         return Errno::EINVAL.into();
     }
 
-    let addr = unsafe { &*addr_ptr };
+    let addr = unsafe { core::ptr::read_volatile(addr_ptr) };
     if addr.sin_family != 2 {
         return Errno::EINVAL.into();
     }
@@ -140,8 +140,14 @@ pub fn sys_connect(fd: i32, addr_ptr: *const SockAddrIn, addrlen: u32) -> Syscal
         sock.tcp_snd_nxt = 1000;
         sock.tcp_snd_una = 1000;
         
-        local_port = sock.local_port.unwrap();
-        local_ip = sock.local_addr.unwrap();
+        local_port = match sock.local_port {
+            Some(p) => p,
+            None => return Errno::EINVAL.into(),
+        };
+        local_ip = match sock.local_addr {
+            Some(ip) => ip,
+            None => return Errno::EINVAL.into(),
+        };
         tcp_snd_nxt = sock.tcp_snd_nxt;
         sock.tcp_snd_nxt = sock.tcp_snd_nxt.wrapping_add(1);
     }
@@ -199,7 +205,7 @@ pub fn sys_listen(fd: i32, backlog: i32) -> SyscallResult {
     }
 
     sock.tcp_state = crate::net::tcp::TcpState::Listen;
-    sock.tcp_max_backlog = backlog.max(1) as usize;
+    sock.tcp_max_backlog = (backlog.max(1) as usize).min(128);
     0
 }
 
@@ -278,7 +284,10 @@ pub fn sys_sendto(
         None => return Errno::EBADF.into(),
     };
 
-    let slice = unsafe { core::slice::from_raw_parts(buf, len) };
+    let mut kernel_buf = alloc::vec![0u8; len];
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf, kernel_buf.as_mut_ptr(), len);
+    }
 
     if !dest_addr.is_null() {
         if !validate_user_ptr(dest_addr as *const u8, core::mem::size_of::<SockAddrIn>()) {
@@ -287,7 +296,7 @@ pub fn sys_sendto(
         if addrlen < 16 {
             return Errno::EINVAL.into();
         }
-        let addr = unsafe { &*dest_addr };
+        let addr = unsafe { core::ptr::read_volatile(dest_addr) };
         if addr.sin_family != 2 {
             return Errno::EINVAL.into();
         }
@@ -310,7 +319,7 @@ pub fn sys_sendto(
         };
         if sock_type == 2 { // UDP
             let mut udp_buf = [0u8; 2048];
-            let udp_len = match crate::net::udp::build_datagram(&mut udp_buf, local_port, remote_port, slice) {
+            let udp_len = match crate::net::udp::build_datagram(&mut udp_buf, local_port, remote_port, &kernel_buf) {
                 Some(l) => l,
                 None => return Errno::EINVAL.into(),
             };
@@ -328,7 +337,7 @@ pub fn sys_sendto(
         Some(i) => i,
         None => return Errno::EBADF.into(),
     };
-    match inode.write(0, slice) {
+    match inode.write(0, &kernel_buf) {
         Ok(n) => n as SyscallResult,
         Err(e) => e as SyscallResult,
     }
@@ -367,7 +376,7 @@ pub fn sys_recvfrom(
         if let Some(dg) = sock.udp_recv_queue.pop_front() {
             let n = len.min(dg.data.len());
             unsafe {
-                core::slice::from_raw_parts_mut(buf, n).copy_from_slice(&dg.data[..n]);
+                core::ptr::copy_nonoverlapping(dg.data.as_ptr(), buf, n);
             }
 
             if !src_addr.is_null() && !addrlen_ptr.is_null() {
@@ -398,9 +407,12 @@ pub fn sys_recvfrom(
         Some(i) => i,
         None => return Errno::EBADF.into(),
     };
-    let slice = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-    match inode.read(0, slice) {
+    let mut kernel_buf = alloc::vec![0u8; len];
+    match inode.read(0, &mut kernel_buf) {
         Ok(n) => {
+            unsafe {
+                core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf, n);
+            }
             if !src_addr.is_null() && !addrlen_ptr.is_null() {
                 if crate::syscall::fs::validate_user_ptr_write(src_addr as *mut u8, core::mem::size_of::<SockAddrIn>()).is_err() ||
                    crate::syscall::fs::validate_user_ptr_write(addrlen_ptr as *mut u8, 4).is_err() {

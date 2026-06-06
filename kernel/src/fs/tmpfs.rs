@@ -32,8 +32,8 @@ pub struct TmpFs {
 }
 
 impl FileSystem for TmpFs {
-    fn root(&self) -> Arc<dyn InodeOps> {
-        self.root.clone()
+    fn root(&self) -> Option<Arc<dyn InodeOps>> {
+        Some(self.root.clone())
     }
 
     fn name(&self) -> &str {

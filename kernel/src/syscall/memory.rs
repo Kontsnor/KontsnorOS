@@ -56,7 +56,10 @@ pub fn sys_mmap(
     };
 
     // Align length up to page size
-    let aligned_len = (length + 4095) & !4095;
+    let aligned_len = match length.checked_add(4095) {
+        Some(len) => len & !4095,
+        None => return Errno::EINVAL.into(),
+    };
 
     // Get current mmap_bump and page table root
     let (resolved_addr, page_table_root) = {
@@ -72,10 +75,28 @@ pub fn sys_mmap(
 
         let resolved = if addr == 0 {
             let current_bump = task.mmap_bump;
-            task.mmap_bump += aligned_len as u64;
+            let next_bump = match current_bump.checked_add(aligned_len as u64) {
+                Some(b) => b,
+                None => return Errno::EINVAL.into(),
+            };
+            if next_bump > 0x0000_7FFF_FFFF_FFFF {
+                return Errno::EINVAL.into();
+            }
+            task.mmap_bump = next_bump;
             current_bump
         } else {
-            (addr + 4095) & !4095 // align user-requested address
+            let aligned_addr = match addr.checked_add(4095) {
+                Some(a) => a & !4095,
+                None => return Errno::EINVAL.into(),
+            };
+            let end_addr = match aligned_addr.checked_add(aligned_len as u64) {
+                Some(end) => end,
+                None => return Errno::EINVAL.into(),
+            };
+            if end_addr > 0x0000_7FFF_FFFF_FFFF {
+                return Errno::EINVAL.into();
+            }
+            aligned_addr
         };
 
         (resolved, task.page_table_root)
@@ -150,9 +171,19 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
         task.page_table_root
     };
 
-    let aligned_len = (length + 4095) & !4095;
+    let aligned_len = match length.checked_add(4095) {
+        Some(len) => len & !4095,
+        None => return Errno::EINVAL.into(),
+    };
+    let end_addr = match addr.checked_add(aligned_len as u64) {
+        Some(end) => end,
+        None => return Errno::EINVAL.into(),
+    };
+    if end_addr > 0x0000_7FFF_FFFF_FFFF {
+        return Errno::EINVAL.into();
+    }
     let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
-    let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr + aligned_len as u64 - 1));
+    let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(end_addr - 1));
 
     let mut unmapped_count = 0;
     for page in Page::range_inclusive(start_page, end_page) {
@@ -200,9 +231,19 @@ pub fn sys_mprotect(addr: u64, length: usize, prot: i32) -> SyscallResult {
         task.page_table_root
     };
 
-    let aligned_len = (length + 4095) & !4095;
+    let aligned_len = match length.checked_add(4095) {
+        Some(len) => len & !4095,
+        None => return Errno::EINVAL.into(),
+    };
+    let end_addr = match addr.checked_add(aligned_len as u64) {
+        Some(end) => end,
+        None => return Errno::EINVAL.into(),
+    };
+    if end_addr > 0x0000_7FFF_FFFF_FFFF {
+        return Errno::EINVAL.into();
+    }
     let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
-    let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr + aligned_len as u64 - 1));
+    let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(end_addr - 1));
 
     let flags = prot_to_page_flags(prot);
 

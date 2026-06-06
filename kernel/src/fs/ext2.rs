@@ -153,6 +153,19 @@ impl Ext2FileSystem {
         if s_magic != 0xEF53 {
             return Err("Invalid ext2 superblock magic");
         }
+
+        // Validate metadata parameters
+        if s_log_block_size > 10 || s_inode_size == 0 || s_inodes_per_group == 0 {
+            return Err("Malformed ext2 superblock fields");
+        }
+
+        if sb.s_inodes_count == 0 || sb.s_blocks_count == 0 {
+            return Err("Malformed ext2 superblock: inodes or blocks count is zero");
+        }
+
+        if sb.s_inodes_count > sb.s_inodes_per_group {
+            return Err("Multi-group ext2 filesystems are not supported");
+        }
         
         let block_size = 1024 << s_log_block_size;
         let inode_size = s_inode_size;
@@ -168,6 +181,13 @@ impl Ext2FileSystem {
         read_blocks(&*device, gdt_block, &mut gdt_buf, block_size)?;
 
         let mut gd = unsafe { core::ptr::read_unaligned(gdt_buf.as_ptr() as *const GroupDescriptor) };
+
+        // Validate GDT offsets are within filesystem bounds
+        if gd.bg_block_bitmap >= sb.s_blocks_count ||
+           gd.bg_inode_bitmap >= sb.s_blocks_count ||
+           gd.bg_inode_table >= sb.s_blocks_count {
+            return Err("Metadata blocks exceed filesystem blocks count");
+        }
 
         // Self-healing bitmaps check on mount
         let mut block_bitmap = alloc::vec![0u8; block_size as usize];
@@ -227,8 +247,17 @@ impl Ext2FileSystem {
         let mut calc_inode_bitmap = alloc::vec![0u8; block_size as usize];
         
         // 1. Mark reserved metadata blocks as allocated
-        let it_blocks = (s_inodes_per_group * s_inode_size as u32 + block_size - 1) / block_size;
-        let reserved_blocks_count = gd.bg_inode_table as u32 + it_blocks;
+        let it_blocks = match (s_inodes_per_group as u64).checked_mul(s_inode_size as u64) {
+            Some(prod) => ((prod + block_size as u64 - 1) / block_size as u64) as u32,
+            None => return Err("Overflow in metadata size calculation"),
+        };
+        let reserved_blocks_count = match (gd.bg_inode_table as u32).checked_add(it_blocks) {
+            Some(count) => count,
+            None => return Err("Overflow in reserved blocks count calculation"),
+        };
+        if reserved_blocks_count > sb.s_blocks_count {
+            return Err("Reserved metadata block count exceeds total block count");
+        }
         for b in 0..reserved_blocks_count {
             let byte = (b / 8) as usize;
             let bit = b % 8;
@@ -1440,8 +1469,8 @@ impl InodeOps for Ext2Inode {
 }
 
 impl FileSystem for Ext2FileSystem {
-    fn root(&self) -> Arc<dyn InodeOps> {
-        self.root_node.lock().clone().expect("Root node missing")
+    fn root(&self) -> Option<Arc<dyn InodeOps>> {
+        self.root_node.lock().clone()
     }
 
     fn name(&self) -> &str {

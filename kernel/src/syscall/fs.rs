@@ -112,10 +112,13 @@ pub fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
         crate::kprintln!("[syscall pid={}] sys_read on pipe fd {}", pid_str, fd);
     }
 
-    let slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
+    let mut kernel_buf = alloc::vec![0u8; count];
 
-    match file_desc.read(slice) {
+    match file_desc.read(&mut kernel_buf) {
         Ok(n) => {
+            unsafe {
+                core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf, n);
+            }
             if is_pipe {
                 crate::kprintln!("[syscall] sys_read on pipe fd {} returned {} bytes", fd, n);
             }
@@ -156,9 +159,12 @@ pub fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
         crate::kprintln!("[syscall pid={}] sys_write on pipe fd {} count {}", pid_str, fd, count);
     }
 
-    let slice = unsafe { core::slice::from_raw_parts(buf, count) };
+    let mut kernel_buf = alloc::vec![0u8; count];
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf, kernel_buf.as_mut_ptr(), count);
+    }
 
-    match file_desc.write(slice) {
+    match file_desc.write(&kernel_buf) {
         Ok(n) => {
             if is_pipe {
                 crate::kprintln!("[syscall] sys_write on pipe fd {} returned {} bytes written", fd, n);
@@ -1013,6 +1019,7 @@ pub fn sys_readlinkat(
 
 /// `poll` fd event struct.
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 struct PollFd {
     fd:      i32,
     events:  i16,
@@ -1027,12 +1034,21 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, _timeout: i32) -> SyscallResult {
     if fds.is_null() || nfds == 0 {
         return 0;
     }
-    // Set revents = events for each pollfd so callers proceed without blocking.
-    let fds_slice = unsafe {
-        core::slice::from_raw_parts_mut(fds as *mut PollFd, nfds as usize)
+    let total_size = match (nfds as usize).checked_mul(core::mem::size_of::<PollFd>()) {
+        Some(s) => s,
+        None => return Errno::EINVAL.into(),
     };
+    if validate_user_ptr_write(fds, total_size).is_err() {
+        return Errno::EFAULT.into();
+    }
+
+    let mut local_fds = alloc::vec![PollFd { fd: 0, events: 0, revents: 0 }; nfds as usize];
+    unsafe {
+        core::ptr::copy_nonoverlapping(fds as *const PollFd, local_fds.as_mut_ptr(), nfds as usize);
+    }
+
     let mut ready = 0i64;
-    for pfd in fds_slice.iter_mut() {
+    for pfd in local_fds.iter_mut() {
         if pfd.fd >= 0 {
             pfd.revents = pfd.events;
             ready += 1;
@@ -1040,6 +1056,11 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, _timeout: i32) -> SyscallResult {
             pfd.revents = 0;
         }
     }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(local_fds.as_ptr(), fds as *mut PollFd, nfds as usize);
+    }
+
     ready as SyscallResult
 }
 
@@ -1056,15 +1077,21 @@ pub fn sys_pread64(fd: i32, buf: *mut u8, count: usize, offset: i64) -> SyscallR
         None => return Errno::EBADF.into(),
     };
 
-    let slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
-    match file.inode.read(offset as u64, slice) {
-        Ok(n)  => n as SyscallResult,
+    let mut kernel_buf = alloc::vec![0u8; count];
+    match file.inode.read(offset as u64, &mut kernel_buf) {
+        Ok(n)  => {
+            unsafe {
+                core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf, n);
+            }
+            n as SyscallResult
+        }
         Err(e) => e as SyscallResult,
     }
 }
 
 /// `IoVec` structure for `writev`.
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct IoVec {
     pub iov_base: *const u8,
     pub iov_len: usize,
@@ -1078,9 +1105,12 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: i32) -> SyscallResult {
     if !validate_user_ptr(iov as *const u8, iovcnt as usize * core::mem::size_of::<IoVec>()) {
         return Errno::EFAULT.into();
     }
-    let iov_slice = unsafe { core::slice::from_raw_parts(iov, iovcnt as usize) };
+    let mut local_iov = alloc::vec![IoVec { iov_base: core::ptr::null(), iov_len: 0 }; iovcnt as usize];
+    unsafe {
+        core::ptr::copy_nonoverlapping(iov, local_iov.as_mut_ptr(), iovcnt as usize);
+    }
     let mut total_written = 0;
-    for io in iov_slice {
+    for io in local_iov {
         if io.iov_len == 0 { continue; }
         let ret = sys_write(fd, io.iov_base, io.iov_len);
         if ret < 0 {

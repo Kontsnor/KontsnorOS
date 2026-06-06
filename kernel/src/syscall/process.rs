@@ -484,8 +484,14 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
                 // Sleep on our child_wait_queue until a child exits
                 let wait_queue = {
                     let sched = scheduler::SCHEDULER.lock();
-                    let sched = sched.as_ref().unwrap();
-                    let task = sched.get_task(current_pid).unwrap();
+                    let sched = match sched.as_ref() {
+                        Some(s) => s,
+                        None => return Errno::ECHILD.into(),
+                    };
+                    let task = match sched.get_task(current_pid) {
+                        Some(t) => t,
+                        None => return Errno::ESRCH.into(),
+                    };
                     task.child_wait_queue.clone()
                 };
                 wait_queue.wait();
@@ -964,6 +970,10 @@ pub fn sys_clone(
 
     kprintln!("[syscall] clone(flags={:#x}, child_stack={:#x}, parent_tid={:?}, child_tid={:?}, newtls={:#x})",
         flags, child_stack, parent_tidptr, child_tidptr, newtls);
+
+    if child_stack != 0 && child_stack > 0x0000_7FFF_FFFF_FFFF {
+        return Errno::EINVAL.into();
+    }
 
     let current_pid = match scheduler::current_pid() {
         Some(p) => p,

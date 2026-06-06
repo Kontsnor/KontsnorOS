@@ -406,11 +406,16 @@ fn process_segment(
 
             if !payload.is_empty() {
                 if seq == sock.tcp_rcv_nxt {
-                    sock.tcp_recv_buf.extend_from_slice(payload);
-                    sock.tcp_rcv_nxt = seq.wrapping_add(payload.len() as u32);
-                    
-                    reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK));
-                    sock.wait_queue.wake_all();
+                    let max_buf_limit = 65536;
+                    if sock.tcp_recv_buf.len() + payload.len() <= max_buf_limit {
+                        sock.tcp_recv_buf.extend_from_slice(payload);
+                        sock.tcp_rcv_nxt = seq.wrapping_add(payload.len() as u32);
+                        
+                        reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK));
+                        sock.wait_queue.wake_all();
+                    } else {
+                        reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK));
+                    }
                 }
             }
 

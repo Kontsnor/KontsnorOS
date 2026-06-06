@@ -130,7 +130,12 @@ impl Ipv4Header {
             return None;
         }
 
-        let payload = &data[ihl..];
+        let total_len = u16::from_be(header.total_length) as usize;
+        if total_len < ihl || data.len() < total_len {
+            return None;
+        }
+
+        let payload = &data[ihl..total_len];
         Some((header, payload))
     }
 

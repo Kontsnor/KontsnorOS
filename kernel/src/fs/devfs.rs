@@ -29,8 +29,8 @@ pub struct DevFs {
 }
 
 impl FileSystem for DevFs {
-    fn root(&self) -> Arc<dyn InodeOps> {
-        self.root.clone()
+    fn root(&self) -> Option<Arc<dyn InodeOps>> {
+        Some(self.root.clone())
     }
 
     fn name(&self) -> &str {

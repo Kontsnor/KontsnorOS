@@ -55,6 +55,8 @@ pub enum InterruptIndex {
     IpiHalt = 35,
     /// IPI TLB Shootdown interrupt (vector 36).
     IpiTlbShootdown = 36,
+    /// Network interrupt (IRQ 11, vector 43).
+    Network = 43,
 }
 
 impl InterruptIndex {
@@ -102,6 +104,7 @@ lazy_static! {
         idt[InterruptIndex::IpiReschedule.as_u8()].set_handler_fn(ipi_reschedule_handler);
         idt[InterruptIndex::IpiHalt.as_u8()].set_handler_fn(ipi_halt_handler);
         idt[InterruptIndex::IpiTlbShootdown.as_u8()].set_handler_fn(ipi_tlb_shootdown_handler);
+        idt[InterruptIndex::Network.as_u8()].set_handler_fn(network_interrupt_handler);
         idt[255].set_handler_fn(spurious_interrupt_handler);
 
         idt
@@ -350,7 +353,16 @@ extern "x86-interrupt" fn ipi_tlb_shootdown_handler(_stack_frame: InterruptStack
     x86_64::instructions::tlb::flush_all();
 }
 
+extern "x86-interrupt" fn network_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // Call e1000 poll handler if initialized
+    crate::drivers::net::e1000::handle_interrupt();
+
+    // Acknowledge interrupt to Local APIC
+    super::apic::lapic_eoi();
+}
+
 /// Returns the number of timer ticks since boot.
 pub fn timer_ticks() -> u64 {
     TIMER_TICKS.load(core::sync::atomic::Ordering::Relaxed)
 }
+

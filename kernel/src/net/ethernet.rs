@@ -92,3 +92,20 @@ pub fn build_frame(
 
     Some(total_len)
 }
+
+/// Handle an incoming Ethernet frame.
+pub fn handle_packet(data: &[u8]) {
+    if let Some((header, payload)) = EthernetHeader::parse(data) {
+        let ethertype = header.ethertype_host();
+        match ethertype {
+            ETHERTYPE_ARP => {
+                super::arp::handle_packet(header.src_mac, payload);
+            }
+            ETHERTYPE_IPV4 => {
+                super::ipv4::handle_packet(header.src_mac, payload);
+            }
+            _ => {}
+        }
+    }
+}
+

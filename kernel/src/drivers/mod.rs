@@ -20,6 +20,7 @@ pub mod keyboard;
 pub mod traits;
 pub mod ramdisk;
 pub mod block;
+pub mod net;
 
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -39,6 +40,7 @@ pub fn init() {
     keyboard::init();
     console::init();
     gpu::init();
+    net::init();
 
     kprintln!("[drivers] Driver framework initialized.");
 }

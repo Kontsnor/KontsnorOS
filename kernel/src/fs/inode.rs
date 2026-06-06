@@ -7,6 +7,7 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use spin::Mutex;
 
 /// Types of file system objects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +155,11 @@ pub struct DirEntry {
 pub trait InodeOps: Send + Sync {
     /// Get the inode metadata.
     fn inode(&self) -> &Inode;
+
+    /// Return the inner socket if this inode is a socket.
+    fn as_socket(&self) -> Option<Arc<Mutex<crate::net::socket::Socket>>> {
+        None
+    }
 
     /// Look up a child by name (for directories).
     fn lookup(&self, _name: &str) -> Option<Arc<dyn InodeOps>> {

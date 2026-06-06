@@ -10,6 +10,7 @@ pub mod io;
 pub mod memory;
 pub mod process;
 pub mod signal;
+pub mod net;
 
 /// Syscall numbers for KontsnorOS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +80,12 @@ pub enum Errno {
     ENOTEMPTY = -39,
     ENOEXEC = -8,
     ELOOP = -40,
+    ENOTSOCK = -88,
+    EDESTADDRREQ = -89,
+    ENETUNREACH = -101,
+    EISCONN = -106,
+    ENOTCONN = -107,
+    ECONNREFUSED = -111,
 }
 
 impl From<Errno> for SyscallResult {
@@ -224,8 +231,7 @@ pub extern "C" fn syscall_dispatch_rust(
     // Print stack values
     let mut stack_msg = alloc::string::String::new();
     if user_rsp != 0 && user_rsp < 0x0000_7FFF_FFFF_FFFF {
-        if let Some(phys) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(user_rsp)) {
-            let virt = phys.as_u64() + crate::memory::r#virtual::phys_mem_offset();
+        if let Some(_phys) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(user_rsp)) {
             // print 4 words from RSP
             let mut words = [0u64; 4];
             for i in 0..4 {
@@ -402,6 +408,14 @@ pub fn dispatch(
         104 => process::sys_getgid(),
         107 => process::sys_geteuid(),
         108 => process::sys_getegid(),
+        // Network
+        41 => net::sys_socket(arg0 as i32, arg1 as i32, arg2 as i32),
+        42 => net::sys_connect(arg0 as i32, arg1 as *const net::SockAddrIn, arg2 as u32),
+        43 => net::sys_accept(arg0 as i32, arg1 as *mut net::SockAddrIn, arg2 as *mut u32),
+        44 => net::sys_sendto(arg0 as i32, arg1 as *const u8, arg2 as usize, arg3 as i32, arg4 as *const net::SockAddrIn, _arg5 as u32),
+        45 => net::sys_recvfrom(arg0 as i32, arg1 as *mut u8, arg2 as usize, arg3 as i32, arg4 as *mut net::SockAddrIn, _arg5 as *mut u32),
+        49 => net::sys_bind(arg0 as i32, arg1 as *const net::SockAddrIn, arg2 as u32),
+        50 => net::sys_listen(arg0 as i32, arg1 as i32),
         _ => {
             kprintln!("[syscall] Unknown syscall: {}", syscall_num);
             Errno::ENOSYS.into()

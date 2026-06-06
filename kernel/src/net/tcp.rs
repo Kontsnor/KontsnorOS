@@ -27,7 +27,9 @@
 //! ```
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use spin::Mutex;
+use super::ipv4::Ipv4Addr;
 
 /// TCP header (20 bytes minimum).
 #[derive(Debug, Clone, Copy)]
@@ -235,5 +237,258 @@ static TCP_CONNECTIONS: Mutex<Option<BTreeMap<TcpEndpoint, TcpConnection>>> =
 
 /// Initialize the TCP subsystem.
 pub fn init() {
-    *TCP_CONNECTIONS.lock() = Some(BTreeMap::new());
+    // Keep it minimal as we use the unified SOCKET_REGISTRY
 }
+
+/// Build a TCP packet into a buffer.
+pub fn build_tcp_packet(
+    buf: &mut [u8],
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u16,
+    payload: &[u8],
+) -> Option<usize> {
+    let header_len = 20;
+    let total_len = header_len + payload.len();
+    if buf.len() < total_len {
+        return None;
+    }
+
+    let data_offset_flags = (5u16 << 12) | (flags & 0x1FF);
+
+    let header = TcpHeader {
+        src_port: src_port.to_be(),
+        dst_port: dst_port.to_be(),
+        seq_num: seq.to_be(),
+        ack_num: ack.to_be(),
+        data_offset_flags: data_offset_flags.to_be(),
+        window: (65535u16).to_be(),
+        checksum: 0,
+        urgent_ptr: 0,
+    };
+
+    let header_bytes = unsafe {
+        core::slice::from_raw_parts(&header as *const TcpHeader as *const u8, 20)
+    };
+    buf[0..20].copy_from_slice(header_bytes);
+    buf[20..total_len].copy_from_slice(payload);
+
+    let checksum = super::ipv4::internet_checksum(&buf[..total_len]);
+    buf[16..18].copy_from_slice(&checksum.to_be_bytes());
+
+    Some(total_len)
+}
+
+/// Process an incoming TCP segment.
+pub fn handle_packet(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, payload: &[u8]) {
+    if let Some((header, tcp_payload)) = TcpHeader::parse(payload) {
+        let src_port = header.src_port_host();
+        let dst_port = header.dst_port_host();
+        let seq = header.seq_num_host();
+        let ack = header.ack_num_host();
+        let flags = header.flags();
+
+        if let Some(sock_arc) = super::socket::find_tcp_connection(dst_ip, dst_port, src_ip, src_port) {
+            let mut sock = sock_arc.lock();
+            process_segment(&mut sock, src_ip, dst_ip, src_port, dst_port, seq, ack, flags, tcp_payload);
+        } else if let Some(listener_arc) = super::socket::find_tcp_listener(dst_ip, dst_port) {
+            if flags & TCP_SYN != 0 {
+                let mut listener = listener_arc.lock();
+                if listener.tcp_backlog.len() < listener.tcp_max_backlog {
+                    let child = Arc::new(Mutex::new(super::socket::Socket::new(listener.domain, listener.sock_type, listener.protocol)));
+                    {
+                        let mut child_sock = child.lock();
+                        child_sock.local_addr = Some(dst_ip);
+                        child_sock.local_port = Some(dst_port);
+                        child_sock.remote_addr = Some(src_ip);
+                        child_sock.remote_port = Some(src_port);
+                        child_sock.tcp_state = TcpState::SynReceived;
+                        child_sock.tcp_rcv_nxt = seq.wrapping_add(1);
+                        child_sock.tcp_snd_nxt = 1000;
+                        child_sock.tcp_snd_una = 1000;
+                        
+                        let mut tcp_buf = [0u8; 128];
+                        if let Some(tcp_len) = build_tcp_packet(
+                            &mut tcp_buf,
+                            dst_port,
+                            src_port,
+                            child_sock.tcp_snd_nxt,
+                            child_sock.tcp_rcv_nxt,
+                            TCP_SYN | TCP_ACK,
+                            &[],
+                        ) {
+                            let _ = super::ipv4::send_packet(
+                                dst_ip,
+                                src_ip,
+                                super::ipv4::PROTO_TCP,
+                                &tcp_buf[..tcp_len],
+                            );
+                            child_sock.tcp_snd_nxt = child_sock.tcp_snd_nxt.wrapping_add(1);
+                        }
+                    }
+                    listener.tcp_backlog.push(child.clone());
+                    super::socket::register_socket(child);
+                    listener.wait_queue.wake_all();
+                }
+            }
+        }
+    }
+}
+
+fn process_segment(
+    sock: &mut super::socket::Socket,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u16,
+    payload: &[u8],
+) {
+    match sock.tcp_state {
+        TcpState::SynSent => {
+            if (flags & TCP_SYN != 0) && (flags & TCP_ACK != 0) {
+                sock.tcp_rcv_nxt = seq.wrapping_add(1);
+                sock.tcp_snd_una = ack;
+                sock.tcp_state = TcpState::Established;
+
+                let mut tcp_buf = [0u8; 128];
+                if let Some(tcp_len) = build_tcp_packet(
+                    &mut tcp_buf,
+                    dst_port,
+                    src_port,
+                    sock.tcp_snd_nxt,
+                    sock.tcp_rcv_nxt,
+                    TCP_ACK,
+                    &[],
+                ) {
+                    let _ = super::ipv4::send_packet(
+                        dst_ip,
+                        src_ip,
+                        super::ipv4::PROTO_TCP,
+                        &tcp_buf[..tcp_len],
+                    );
+                }
+                sock.wait_queue.wake_all();
+            }
+        }
+        TcpState::SynReceived => {
+            if flags & TCP_ACK != 0 {
+                sock.tcp_snd_una = ack;
+                sock.tcp_state = TcpState::Established;
+                sock.wait_queue.wake_all();
+            }
+        }
+        TcpState::Established => {
+            if flags & TCP_ACK != 0 {
+                sock.tcp_snd_una = ack;
+            }
+
+            if !payload.is_empty() {
+                if seq == sock.tcp_rcv_nxt {
+                    sock.tcp_recv_buf.extend_from_slice(payload);
+                    sock.tcp_rcv_nxt = seq.wrapping_add(payload.len() as u32);
+                    
+                    let mut tcp_buf = [0u8; 128];
+                    if let Some(tcp_len) = build_tcp_packet(
+                        &mut tcp_buf,
+                        dst_port,
+                        src_port,
+                        sock.tcp_snd_nxt,
+                        sock.tcp_rcv_nxt,
+                        TCP_ACK,
+                        &[],
+                    ) {
+                        let _ = super::ipv4::send_packet(
+                            dst_ip,
+                            src_ip,
+                            super::ipv4::PROTO_TCP,
+                            &tcp_buf[..tcp_len],
+                        );
+                    }
+                    sock.wait_queue.wake_all();
+                }
+            }
+
+            if flags & TCP_FIN != 0 {
+                sock.tcp_rcv_nxt = seq.wrapping_add(1);
+                sock.tcp_state = TcpState::CloseWait;
+                
+                let mut tcp_buf = [0u8; 128];
+                if let Some(tcp_len) = build_tcp_packet(
+                    &mut tcp_buf,
+                    dst_port,
+                    src_port,
+                    sock.tcp_snd_nxt,
+                    sock.tcp_rcv_nxt,
+                    TCP_ACK,
+                    &[],
+                ) {
+                    let _ = super::ipv4::send_packet(
+                        dst_ip,
+                        src_ip,
+                        super::ipv4::PROTO_TCP,
+                        &tcp_buf[..tcp_len],
+                    );
+                }
+                sock.wait_queue.wake_all();
+            }
+        }
+        TcpState::FinWait1 => {
+            if flags & TCP_ACK != 0 {
+                sock.tcp_snd_una = ack;
+                sock.tcp_state = TcpState::FinWait2;
+            }
+            if flags & TCP_FIN != 0 {
+                sock.tcp_rcv_nxt = seq.wrapping_add(1);
+                let mut tcp_buf = [0u8; 128];
+                if let Some(tcp_len) = build_tcp_packet(
+                    &mut tcp_buf,
+                    dst_port,
+                    src_port,
+                    sock.tcp_snd_nxt,
+                    sock.tcp_rcv_nxt,
+                    TCP_ACK,
+                    &[],
+                ) {
+                    let _ = super::ipv4::send_packet(
+                        dst_ip,
+                        src_ip,
+                        super::ipv4::PROTO_TCP,
+                        &tcp_buf[..tcp_len],
+                    );
+                }
+                sock.tcp_state = TcpState::Closing;
+            }
+        }
+        TcpState::FinWait2 => {
+            if flags & TCP_FIN != 0 {
+                sock.tcp_rcv_nxt = seq.wrapping_add(1);
+                let mut tcp_buf = [0u8; 128];
+                if let Some(tcp_len) = build_tcp_packet(
+                    &mut tcp_buf,
+                    dst_port,
+                    src_port,
+                    sock.tcp_snd_nxt,
+                    sock.tcp_rcv_nxt,
+                    TCP_ACK,
+                    &[],
+                ) {
+                    let _ = super::ipv4::send_packet(
+                        dst_ip,
+                        src_ip,
+                        super::ipv4::PROTO_TCP,
+                        &tcp_buf[..tcp_len],
+                    );
+                }
+                sock.tcp_state = TcpState::Closed;
+                sock.wait_queue.wake_all();
+            }
+        }
+        _ => {}
+    }
+}
+

@@ -120,6 +120,7 @@ pub fn init() {
     *INTERFACES.lock() = Some(interfaces);
 
     super::arp::init();
+    super::ipv4::init_routing();
     super::tcp::init();
     super::udp::init();
 
@@ -146,3 +147,28 @@ pub fn interface_count() -> usize {
         .map(|v| v.len())
         .unwrap_or(0)
 }
+
+/// Find a registered interface by IP.
+pub fn find_interface_by_ip(ip: Ipv4Addr) -> Option<(Ipv4Addr, [u8; 6])> {
+    if let Some(ref interfaces) = *INTERFACES.lock() {
+        for iface in interfaces {
+            if iface.is_up && (iface.ipv4_addr == ip || (ip.is_loopback() && iface.name == "lo")) {
+                return Some((iface.ipv4_addr, iface.mac_addr));
+            }
+        }
+    }
+    None
+}
+
+/// Get the first configured physical Ethernet interface.
+pub fn get_first_ethernet_interface() -> Option<(Ipv4Addr, [u8; 6])> {
+    if let Some(ref interfaces) = *INTERFACES.lock() {
+        for iface in interfaces {
+            if iface.is_up && iface.name == "eth0" {
+                return Some((iface.ipv4_addr, iface.mac_addr));
+            }
+        }
+    }
+    None
+}
+

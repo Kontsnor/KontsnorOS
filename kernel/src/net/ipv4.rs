@@ -2,6 +2,9 @@
 //!
 //! Handles parsing, building, and routing IPv4 packets.
 
+use spin::Mutex;
+
+
 /// IPv4 header (20 bytes minimum, up to 60 with options).
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
@@ -236,3 +239,171 @@ impl RoutingTable {
         None
     }
 }
+
+pub static ROUTING_TABLE: Mutex<Option<RoutingTable>> = Mutex::new(None);
+
+/// Initialize the IPv4 routing table.
+pub fn init_routing() {
+    let mut table = RoutingTable::new();
+    // Default loopback route
+    table.add_route(RouteEntry {
+        destination: Ipv4Addr::new(127, 0, 0, 0),
+        netmask: Ipv4Addr::new(255, 0, 0, 0),
+        gateway: Ipv4Addr::UNSPECIFIED,
+        interface_idx: 0,
+        metric: 0,
+    });
+    // Default eth0 subnet route
+    table.add_route(RouteEntry {
+        destination: Ipv4Addr::new(10, 0, 2, 0),
+        netmask: Ipv4Addr::new(255, 255, 255, 0),
+        gateway: Ipv4Addr::UNSPECIFIED,
+        interface_idx: 1,
+        metric: 0,
+    });
+    // Default gateway route
+    table.add_route(RouteEntry {
+        destination: Ipv4Addr::UNSPECIFIED,
+        netmask: Ipv4Addr::UNSPECIFIED,
+        gateway: Ipv4Addr::new(10, 0, 2, 2),
+        interface_idx: 1,
+        metric: 10,
+    });
+    *ROUTING_TABLE.lock() = Some(table);
+}
+
+/// Handle an incoming IPv4 packet.
+pub fn handle_packet(src_mac: [u8; 6], payload: &[u8]) {
+    if let Some((header, ip_payload)) = Ipv4Header::parse(payload) {
+        if !header.verify_checksum() {
+            return;
+        }
+
+        let src_ip = header.src_addr;
+        let dst_ip = header.dst_addr;
+
+        // Auto-update ARP cache
+        super::arp::update(src_ip, src_mac);
+
+        let is_us = super::interface::find_interface_by_ip(dst_ip).is_some()
+            || dst_ip.is_broadcast()
+            || dst_ip.is_loopback();
+
+        if is_us {
+            match header.protocol {
+                PROTO_ICMP => {
+                    super::icmp::handle_packet(src_ip, ip_payload);
+                }
+                PROTO_UDP => {
+                    super::udp::handle_packet(src_ip, dst_ip, ip_payload);
+                }
+                PROTO_TCP => {
+                    super::tcp::handle_packet(src_ip, dst_ip, ip_payload);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+static IP_IDENT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(1);
+
+/// Build an IPv4 packet into a buffer.
+pub fn build_ipv4_packet(
+    buf: &mut [u8],
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    protocol: u8,
+    payload: &[u8],
+) -> Option<usize> {
+    let header_len = 20;
+    let total_len = header_len + payload.len();
+    if buf.len() < total_len || total_len > 65535 {
+        return None;
+    }
+
+    let ident = IP_IDENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+    let mut header = Ipv4Header {
+        version_ihl: 0x45,
+        tos: 0,
+        total_length: (total_len as u16).to_be(),
+        identification: ident.to_be(),
+        flags_fragment: 0,
+        ttl: 64,
+        protocol,
+        checksum: 0,
+        src_addr: src_ip,
+        dst_addr: dst_ip,
+    };
+
+    let header_bytes = unsafe {
+        core::slice::from_raw_parts(&header as *const Ipv4Header as *const u8, 20)
+    };
+    header.checksum = internet_checksum(header_bytes).to_be();
+
+    let header_bytes_updated = unsafe {
+        core::slice::from_raw_parts(&header as *const Ipv4Header as *const u8, 20)
+    };
+    buf[0..20].copy_from_slice(header_bytes_updated);
+    buf[20..total_len].copy_from_slice(payload);
+
+    Some(total_len)
+}
+
+/// Send an IPv4 packet, performing routing and ARP resolution as needed.
+pub fn send_packet(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    protocol: u8,
+    payload: &[u8],
+) -> Result<(), &'static str> {
+    if dst_ip.is_loopback() {
+        let mut ip_buf = [0u8; 2048];
+        if let Some(ip_len) = build_ipv4_packet(&mut ip_buf, src_ip, dst_ip, protocol, payload) {
+            handle_packet([0; 6], &ip_buf[..ip_len]);
+            return Ok(());
+        }
+        return Err("Failed to build loopback IP packet");
+    }
+
+    let next_hop = {
+        let table_lock = ROUTING_TABLE.lock();
+        let table = table_lock.as_ref().ok_or("Routing table not initialized")?;
+        let route = table.lookup(dst_ip).ok_or("No route to host")?;
+        if route.gateway == Ipv4Addr::UNSPECIFIED {
+            dst_ip
+        } else {
+            route.gateway
+        }
+    };
+
+    let mut dst_mac = super::arp::lookup(next_hop);
+    if dst_mac.is_none() {
+        super::arp::send_request(next_hop);
+        let start_ticks = crate::arch::x86_64::interrupts::timer_ticks();
+        while dst_mac.is_none() && crate::arch::x86_64::interrupts::timer_ticks() - start_ticks < 5 {
+            core::hint::spin_loop();
+            dst_mac = super::arp::lookup(next_hop);
+        }
+    }
+
+    let dst_mac = dst_mac.ok_or("ARP resolution failed")?;
+    let (_, local_mac) = super::interface::get_first_ethernet_interface().ok_or("No ethernet interface up")?;
+
+    let mut ip_buf = [0u8; 1600];
+    let ip_len = build_ipv4_packet(&mut ip_buf, src_ip, dst_ip, protocol, payload).ok_or("IP packet too large")?;
+
+    let mut eth_buf = [0u8; 1620];
+    let eth_len = super::ethernet::build_frame(
+        &mut eth_buf,
+        dst_mac,
+        local_mac,
+        super::ethernet::ETHERTYPE_IPV4,
+        &ip_buf[..ip_len],
+    ).ok_or("Ethernet frame too large")?;
+
+    let _ = crate::drivers::net::e1000::send_packet(&eth_buf[..eth_len]);
+    Ok(())
+}
+

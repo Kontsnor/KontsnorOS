@@ -107,3 +107,50 @@ pub fn build_echo_reply(
 
     Some(total_len)
 }
+
+/// Handle an incoming ICMP packet.
+pub fn handle_packet(src_ip: ipv4::Ipv4Addr, payload: &[u8]) {
+    if let Some((header, _)) = IcmpHeader::parse(payload) {
+        if !IcmpHeader::verify_checksum(payload) {
+            return;
+        }
+
+        if header.icmp_type == ICMP_ECHO_REQUEST {
+            if let Some((echo, echo_data)) = IcmpEcho::parse(payload) {
+                // Find our local IP address to respond from
+                if let Some((local_ip, _)) = super::interface::get_first_ethernet_interface() {
+                    let mut reply_buf = [0u8; 1500];
+                    if let Some(reply_len) = build_echo_reply(
+                        &mut reply_buf,
+                        echo.identifier_host(),
+                        echo.sequence_host(),
+                        echo_data,
+                    ) {
+                        let _ = super::ipv4::send_packet(
+                            local_ip,
+                            src_ip,
+                            super::ipv4::PROTO_ICMP,
+                            &reply_buf[..reply_len],
+                        );
+                    }
+                } else if src_ip.is_loopback() {
+                    let mut reply_buf = [0u8; 1500];
+                    if let Some(reply_len) = build_echo_reply(
+                        &mut reply_buf,
+                        echo.identifier_host(),
+                        echo.sequence_host(),
+                        echo_data,
+                    ) {
+                        let _ = super::ipv4::send_packet(
+                            ipv4::Ipv4Addr::LOCALHOST,
+                            src_ip,
+                            super::ipv4::PROTO_ICMP,
+                            &reply_buf[..reply_len],
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+

@@ -131,6 +131,69 @@ impl GpuDevice for NvidiaGpu {
 }
 ```
 
+## Terminal TTY Driver Subsystem
+
+The TTY (Teletypewriter) driver subsystem bridges physical hardware streams with the Virtual File System (VFS). This allows standard Unix file I/O operations (like read and write system calls) to interact seamlessly with serial ports and input buffers.
+
+### Character Bridge Devices
+
+KontsnorOS defines four standard stream character devices that implement the `InodeOps` trait:
+
+1. **`DevStdin`** (representing `/dev/stdin`): 
+   * Provides terminal input capabilities.
+   * Leverages the `read` method to block cooperatively until input characters are available in the serial port or keyboard buffers.
+   * Respects settings from `TTY_TERMIOS` (such as `ICANON`, `ECHO`, and `ISIG`).
+   * Supports raw mode reads and backspace/cooked editing buffers.
+2. **`DevStdout`** (representing `/dev/stdout`):
+   * Provides terminal output capabilities.
+   * Writes data bytes directly to the serial hardware via `serial::write_byte`.
+3. **`DevStderr`** (representing `/dev/stderr`):
+   * Provides standard error output capabilities (identical output mapping to `DevStdout`).
+4. **`DevTty`** (representing `/dev/tty`):
+   * An alias for the controlling terminal of the process.
+   * Delegates `read` and `ioctl` requests to `DevStdin`, and `write` requests to `DevStdout`.
+
+### Termios & ABI Structure Requirements
+
+Terminal state behavior is configured through a termios structure defined as:
+
+```rust
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Termios {
+    pub c_iflag: u32,
+    pub c_oflag: u32,
+    pub c_cflag: u32,
+    pub c_lflag: u32,
+    pub c_line: u8,
+    pub c_cc: [u8; 19],
+}
+```
+
+> [!IMPORTANT]
+> To comply with the standard Linux x86_64 ABI layout, the kernel's `Termios` struct **MUST strictly be exactly 36 bytes** (requiring `NCCS = 19`). 
+> 
+> A mismatch in this size will cause user-space stack corruption when programs call standard C-library hooks (such as `tcgetattr` and `tcsetattr`), which allocate a 36-byte stack structure and expect the kernel to write exactly that amount.
+
+By default, the global `TTY_TERMIOS` settings initialize with:
+* `c_lflag` containing `ICANON` (0x02) | `ECHO` (0x08) | `ISIG` (0x01).
+  * **`ICANON` (Canonical/Cooked mode)**: Input is processed in lines terminated by a newline (`\n`). Erasing/backspacing is handled inside the kernel input buffer.
+  * **`ECHO` (Echo mode)**: Characters are echoed back to the screen as they are typed.
+  * **`ISIG` (Signals enabled)**: Keyboard input is scanned for signal characters. E.g., when Ctrl+C (0x03) is typed, `SIGINT` (signal 2) is delivered to the calling process.
+
+### Synchronization Design (`STDIN_LOCK`)
+
+Serial console read and write operations must be safe across multiple threads and processes. To prevent interleaving of input streams or concurrent readers competing for incoming keystrokes, the kernel serializes access using a static spinlock mutex:
+
+```rust
+// Defined in kernel/src/fs/tty.rs
+static STDIN_LOCK: Mutex<()> = Mutex::new(());
+```
+
+Any operation reading from standard input must acquire `STDIN_LOCK` before pulling characters from the shared keyboard driver queues or hardware serial registers. This ensures:
+1. **Thread safety**: Only one thread is actively querying the UART chip or keyboard ring buffer.
+2. **Deterministic reads**: Complete lines (under canonical mode) or single characters (under raw mode) are delivered to a single reader without another concurrent process slicing off parts of the input.
+
 ## Hardware Access
 
 ### MMIO (Memory-Mapped I/O)

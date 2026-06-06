@@ -56,29 +56,74 @@ KontsnorOS is a **hybrid kernel** that combines the performance of a monolithic 
 
 ### Prerequisites
 
-- **Rust** (nightly toolchain — automatically selected via `rust-toolchain.toml`)
-- **QEMU** for testing: `sudo apt install qemu-system-x86`
+*   **Rust** (nightly toolchain — automatically selected via `rust-toolchain.toml`)
+*   **QEMU** for emulation: `sudo apt install qemu-system-x86`
+*   **e2fsprogs** (provides `debugfs` and `mkfs.ext2` tools): `sudo apt install e2fsprogs`
 
 ### Building
+
+To compile the kernel:
 
 ```bash
 # Clone the repository
 git clone https://github.com/kontsnor/KontsnorOS.git
 cd KontsnorOS
 
-# Build the kernel
+# Build the kernel in debug mode
 cargo build
 
-# Build in release mode
+# Build the kernel in release mode (recommended)
 cargo build --release
 ```
 
-### Running in QEMU
+### Formatting the Persistent Disk & Importing Binaries
+
+KontsnorOS mounts a persistent Ext2 disk image (`disk.img`) at boot. You can create this image, format it, and copy binaries (such as static GNU Bash or custom shells) directly from your host system using `debugfs` — without requiring host-level loopback mounts or `root`/`sudo` privileges:
 
 ```bash
-# Run with serial output to terminal
-./tools/run-qemu.sh
+# 1. Create a blank 16MB file for the disk image
+dd if=/dev/zero of=disk.img bs=1M count=16
+
+# 2. Format the disk image with an Ext2 filesystem (1024-byte block size)
+mkfs.ext2 -b 1024 -F disk.img
+
+# 3. Create folders and write host binaries to the image using debugfs
+# Import GNU Bash and standard shell executable to /bin/
+debugfs -w disk.img -R "mkdir /bin"
+debugfs -w disk.img -R "write /path/to/host/static/bash /bin/bash"
+debugfs -w disk.img -R "write ./tools/sh /bin/sh"
+
+# 4. Import configuration files or text assets
+debugfs -w disk.img -R "write /path/to/host/hello.txt /hello.txt"
 ```
+
+A reference helper script is available at `./tools/format-disk.sh` which automates this layout preparation.
+
+### Running in QEMU
+
+Launch the compiled kernel natively within the QEMU emulator:
+
+```bash
+# Run using the release build (default)
+./tools/run-qemu.sh
+
+# Run and force specific options
+./tools/run-qemu.sh --release
+```
+
+### Kernel-Level Debugging with GDB
+
+You can connect GDB to inspect kernel state and step through execution:
+
+1.  Start the emulator in GDB listening mode. This freezes execution at the first instruction and listens on local TCP port `1234`:
+    ```bash
+    ./tools/run-qemu.sh --debug
+    ```
+2.  From another terminal, connect with GDB:
+    ```bash
+    gdb -ex "target remote :1234"
+    ```
+    *(Or `rust-gdb -ex "target remote :1234"` to leverage Rust type formatting).*
 
 ## Writing Drivers
 

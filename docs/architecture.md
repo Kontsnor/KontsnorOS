@@ -2,9 +2,9 @@
 
 ## Overview
 
-KontsnorOS is a **hybrid kernel** operating system written entirely in Rust.
-It combines the performance characteristics of a monolithic kernel with the
-modularity and fault isolation benefits of a microkernel.
+KontsnorOS is a **hybrid kernel** operating system written entirely in Rust. It combines the performance characteristics of a monolithic kernel with the modularity and fault isolation benefits of a microkernel. The system is designed to provide secure, POSIX-compatible multi-tasking for user space applications.
+
+---
 
 ## Kernel Architecture
 
@@ -12,18 +12,20 @@ modularity and fault isolation benefits of a microkernel.
 
 These run with full kernel privileges for maximum performance:
 
-- **Process Scheduler** — Multi-Level Feedback Queue (MLFQ) with 5 priority levels
-- **Virtual Memory Manager** — 4-level page table management, demand paging
-- **Interrupt Handler** — IDT-based interrupt dispatching with IST stacks
-- **Core IPC** — Pipes, signals, Unix domain sockets
+- **Process Scheduler** — Multi-Level Feedback Queue (MLFQ) with 5 priority levels, executing tasks across Symmetric Multiprocessing (SMP) cores.
+- **Virtual Memory Manager** — 4-level page table management (PML4), demand paging, copy-on-write (COW) page translation, and remote TLB shootdowns.
+- **Interrupt Handler** — IDT-based interrupt dispatching with dedicated Interrupt Stack Tables (ISTs) for fail-safe exception recovery.
+- **Core IPC & Signal Engine** — Wait queues, POSIX signal delivery/masking, and pipes (SIGPIPE notifications).
 
 ### Modular Components
 
 These are loadable and can be replaced or extended:
 
-- **File Systems** — VFS layer with pluggable filesystem drivers
-- **Device Drivers** — Trait-based driver model with stable SDK
-- **Network Stack** — (planned) TCP/IP stack with modular protocols
+- **File Systems** — VFS layer with pluggable filesystem drivers (including a writable `ext2` implementation).
+- **Device Drivers** — Trait-based driver model with stable SDK (bridging console, ATA drives, and peripherals).
+- **Network Stack** — (In progress) TCP/IP protocol stack with modular PCI NIC drivers.
+
+---
 
 ## Memory Model
 
@@ -46,33 +48,41 @@ Virtual Address Space (48-bit, 256 TiB):
 0x0000_0000_0000_0000  └─────────────────────┘
 ```
 
+### Thread Local Storage (TLS)
+User-space thread-local storage is supported by saving and restoring the CPU's `FS_BASE` model-specific register (`0xC0000100`) during context switches. Child threads created via `sys_fork` and `sys_clone` inherit their parent's TLS register settings if not explicitly overridden by TLS configuration flags.
+
+---
+
 ## Syscall Interface
 
-KontsnorOS implements the POSIX syscall interface using the `syscall` instruction:
+KontsnorOS implements the POSIX system call interface using the `syscall` / `sysretq` instructions.
 
-- **Registers**: rdi, rsi, rdx, r10, r8, r9 for arguments
-- **Return**: rax for result
-- **Numbering**: Linux-compatible syscall numbers
+- **Registers**: `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9` for arguments.
+- **Return**: `rax` for results (negative values indicate standard error codes).
+- **Numbering**: Linux/x86_64 compatible syscall numbers (e.g. `clone` = 56, `fork` = 57, `execve` = 59, `exit_group` = 231).
 
-## Driver Model
+---
 
-The driver framework uses Rust traits for type-safe hardware abstraction:
+## Process & Thread Model
 
-```
-             ┌─────────────────────────────┐
-             │       Driver SDK (public)    │
-             │  CharDevice │ BlockDevice    │
-             │  NetDevice  │ GpuDevice      │
-             └──────────────┬──────────────┘
-                            │
-             ┌──────────────┼──────────────┐
-             │       Driver Framework       │
-             │  Registration │ Lifecycle    │
-             │  Bus Matching │ IRQ Routing  │
-             └──────────────┬──────────────┘
-                            │
-             ┌──────────────┼──────────────┐
-             │       Bus Abstraction        │
-             │    PCI │ USB │ Platform      │
-             └─────────────────────────────┘
-```
+A `Task` struct represents a single execution context. The kernel groups tasks according to:
+- **PID**: Unique process identifier.
+- **PGID (Process Group ID)**: Shared by processes in the same pipeline or job session, allowing group-wide signal dispatching.
+- **Forking/Cloning**: Created via `sys_fork` (duplicating address spaces with COW) or `sys_clone` (specifying custom stack boundaries and TLS contexts).
+
+---
+
+## Security & Multi-User Architecture (Roadmap)
+
+To support a full distribution model, the security and credential architecture is planned to transition from a single-user model to:
+- **Enforced File Credentials**: Inode properties (`uid`, `gid`, `mode`) will be checked at the VFS layer for permissions validation.
+- **Process Credentials**: Proper implementation of real and effective IDs (UID/GID), restricting privileged system calls to processes running with effective user ID `0` (root).
+- **Safe privilege transitions**: `setuid` binary execution flags on `execve` will permit standard user tasks to assume root privileges for specific operations.
+
+---
+
+## Shared Memory & Dynamic Linker (Roadmap)
+
+To reduce disk and RAM footprints, the OS will evolve to support:
+- **Dynamic ELF Loader**: Dynamic loading of shared object (`.so`) libraries via `/lib/ld-kontsnoros.so`.
+- **Shared Memory Mappings**: Memory mappings initialized with `MAP_SHARED` will be tracked by the virtual memory manager, linking multiple processes to identical physical frames for efficient IPC and library sharing.

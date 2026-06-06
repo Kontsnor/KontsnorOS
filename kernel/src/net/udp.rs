@@ -123,7 +123,26 @@ static UDP_SOCKETS: Mutex<Option<BTreeMap<UdpBinding, UdpSocket>>> = Mutex::new(
 
 /// Initialize the UDP subsystem.
 pub fn init() {
-    *UDP_SOCKETS.lock() = Some(BTreeMap::new());
+    // Keep it minimal as we use the unified SOCKET_REGISTRY
+}
+
+/// Handle an incoming UDP packet.
+pub fn handle_packet(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, payload: &[u8]) {
+    if let Some((header, udp_payload)) = UdpHeader::parse(payload) {
+        let src_port = header.src_port_host();
+        let dst_port = header.dst_port_host();
+
+        if let Some(sock_arc) = super::socket::find_udp_socket(dst_ip, dst_port) {
+            let mut sock = sock_arc.lock();
+            let datagram = UdpDatagram {
+                src_addr: src_ip,
+                src_port,
+                data: udp_payload.to_vec(),
+            };
+            sock.udp_recv_queue.push_back(datagram);
+            sock.wait_queue.wake_all();
+        }
+    }
 }
 
 /// Well-known port numbers.
@@ -155,3 +174,4 @@ pub fn build_datagram(
 
     Some(total_len)
 }
+

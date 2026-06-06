@@ -124,3 +124,80 @@ pub fn update(ip: Ipv4Addr, mac: [u8; 6]) {
         );
     }
 }
+
+/// Handle an incoming ARP packet.
+pub fn handle_packet(src_mac: [u8; 6], payload: &[u8]) {
+    if let Some(packet) = ArpPacket::parse(payload) {
+        let sender_ip = packet.sender_ip_addr();
+        let target_ip = packet.target_ip_addr();
+        
+        // Update cache
+        update(sender_ip, src_mac);
+
+        let op = packet.operation_host();
+        if op == ARP_OP_REQUEST {
+            // Check if request is for us
+            if let Some((local_ip, local_mac)) = super::interface::find_interface_by_ip(target_ip) {
+                let reply = ArpPacket {
+                    hw_type: (ARP_HW_ETHERNET).to_be(),
+                    proto_type: (0x0800u16).to_be(),
+                    hw_len: 6,
+                    proto_len: 4,
+                    operation: (ARP_OP_REPLY).to_be(),
+                    sender_mac: local_mac,
+                    sender_ip: local_ip.octets,
+                    target_mac: src_mac,
+                    target_ip: sender_ip.octets,
+                };
+
+                let reply_bytes = unsafe {
+                    core::slice::from_raw_parts(&reply as *const ArpPacket as *const u8, core::mem::size_of::<ArpPacket>())
+                };
+
+                let mut eth_buf = [0u8; 64];
+                if let Some(eth_len) = super::ethernet::build_frame(
+                    &mut eth_buf,
+                    src_mac,
+                    local_mac,
+                    super::ethernet::ETHERTYPE_ARP,
+                    reply_bytes,
+                ) {
+                    let _ = crate::drivers::net::e1000::send_packet(&eth_buf[..eth_len]);
+                }
+            }
+        }
+    }
+}
+
+/// Send an ARP request for the given IP address.
+pub fn send_request(target_ip: Ipv4Addr) {
+    if let Some((local_ip, local_mac)) = super::interface::get_first_ethernet_interface() {
+        let req = ArpPacket {
+            hw_type: (ARP_HW_ETHERNET).to_be(),
+            proto_type: (0x0800u16).to_be(),
+            hw_len: 6,
+            proto_len: 4,
+            operation: (ARP_OP_REQUEST).to_be(),
+            sender_mac: local_mac,
+            sender_ip: local_ip.octets,
+            target_mac: [0; 6],
+            target_ip: target_ip.octets,
+        };
+
+        let req_bytes = unsafe {
+            core::slice::from_raw_parts(&req as *const ArpPacket as *const u8, core::mem::size_of::<ArpPacket>())
+        };
+
+        let mut eth_buf = [0u8; 64];
+        if let Some(eth_len) = super::ethernet::build_frame(
+            &mut eth_buf,
+            super::ethernet::BROADCAST_MAC,
+            local_mac,
+            super::ethernet::ETHERTYPE_ARP,
+            req_bytes,
+        ) {
+            let _ = crate::drivers::net::e1000::send_packet(&eth_buf[..eth_len]);
+        }
+    }
+}
+

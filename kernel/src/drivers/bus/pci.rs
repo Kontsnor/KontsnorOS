@@ -222,3 +222,26 @@ pub fn find_by_class(class_code: u8, subclass: u8) -> Vec<PciDevice> {
         .cloned()
         .collect()
 }
+
+/// Read a 32-bit value from PCI configuration space.
+pub fn read_config(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+    pci_config_read(bus, device, function, offset)
+}
+
+/// Write a 32-bit value to PCI configuration space.
+pub fn write_config(bus: u8, device: u8, function: u8, offset: u8, val: u32) {
+    let address: u32 = (1u32 << 31)  // Enable bit
+        | ((bus as u32) << 16)
+        | ((device as u32) << 11)
+        | ((function as u32) << 8)
+        | ((offset as u32) & 0xFC);
+
+    // SAFETY: PCI configuration space I/O ports are standard on x86.
+    unsafe {
+        let mut addr_port = Port::<u32>::new(PCI_CONFIG_ADDRESS);
+        let mut data_port = Port::<u32>::new(PCI_CONFIG_DATA);
+        addr_port.write(address);
+        data_port.write(val);
+    }
+}
+

@@ -76,10 +76,10 @@ pub fn create_ext2_ramdisk() -> Arc<dyn BlockDevice> {
     data[sb_offset..sb_offset + 4].copy_from_slice(&32u32.to_le_bytes());
     // s_blocks_count = 128
     data[sb_offset + 4..sb_offset + 8].copy_from_slice(&128u32.to_le_bytes());
-    // s_free_blocks_count = 94 (we use Blocks 0-11 for structures, Blocks 12-23 for sh, and Blocks 24-33 for hello)
-    data[sb_offset + 12..sb_offset + 16].copy_from_slice(&94u32.to_le_bytes());
-    // s_free_inodes_count = 27 (we used 2, 12, 13, 14, 15)
-    data[sb_offset + 16..sb_offset + 20].copy_from_slice(&27u32.to_le_bytes());
+    // s_free_blocks_count = 78 (we use Blocks 0-11 for structures, Blocks 12-23 for sh, Blocks 24-33 for hello, and 34-49 for net_test)
+    data[sb_offset + 12..sb_offset + 16].copy_from_slice(&78u32.to_le_bytes());
+    // s_free_inodes_count = 26 (we used 2, 12, 13, 14, 15, 16)
+    data[sb_offset + 16..sb_offset + 20].copy_from_slice(&26u32.to_le_bytes());
     // s_first_data_block = 1
     data[sb_offset + 20..sb_offset + 24].copy_from_slice(&1u32.to_le_bytes());
     // s_log_block_size = 0 (1024 bytes logical blocks)
@@ -107,10 +107,10 @@ pub fn create_ext2_ramdisk() -> Arc<dyn BlockDevice> {
     data[gd_offset + 4..gd_offset + 8].copy_from_slice(&4u32.to_le_bytes());
     // bg_inode_table = Block 5
     data[gd_offset + 8..gd_offset + 12].copy_from_slice(&5u32.to_le_bytes());
-    // bg_free_blocks_count = 94
-    data[gd_offset + 12..gd_offset + 14].copy_from_slice(&94u16.to_le_bytes());
-    // bg_free_inodes_count = 27
-    data[gd_offset + 14..gd_offset + 16].copy_from_slice(&27u16.to_le_bytes());
+    // bg_free_blocks_count = 78
+    data[gd_offset + 12..gd_offset + 14].copy_from_slice(&78u16.to_le_bytes());
+    // bg_free_inodes_count = 26
+    data[gd_offset + 14..gd_offset + 16].copy_from_slice(&26u16.to_le_bytes());
     // bg_used_dirs_count = 2 (Root directory + /bin directory)
     data[gd_offset + 16..gd_offset + 18].copy_from_slice(&2u16.to_le_bytes());
 
@@ -196,6 +196,29 @@ pub fn create_ext2_ramdisk() -> Arc<dyn BlockDevice> {
         data[p_offset..p_offset + 4].copy_from_slice(&block_num.to_le_bytes());
     }
 
+    // /bin/net_test is Inode 16 (offset inside table = 15 * 128 = 1920 bytes)
+    let ino16_offset = it_offset + 1920;
+    let net_test_bytes = crate::process::net_test_elf::NET_TEST_ELF;
+    let net_test_len = net_test_bytes.len() as u32;
+    // i_mode = 0x81A4 (regular file, rw-r--r--)
+    data[ino16_offset..ino16_offset + 2].copy_from_slice(&0x81A4u16.to_le_bytes());
+    // i_size = net_test_len
+    data[ino16_offset + 4..ino16_offset + 8].copy_from_slice(&net_test_len.to_le_bytes());
+    // i_links_count = 1
+    data[ino16_offset + 26..ino16_offset + 28].copy_from_slice(&1u16.to_le_bytes());
+    // i_blocks = number of 512-byte sectors (including data blocks + 1 indirect block = 15*2 + 2 = 32 sectors)
+    let net_test_sectors = ((net_test_len + 511) / 512) + 2;
+    data[ino16_offset + 28..ino16_offset + 32].copy_from_slice(&net_test_sectors.to_le_bytes());
+    // Map first 12 logical blocks directly to blocks 34..45
+    for i in 0..12 {
+        let block_num = (34 + i) as u32;
+        let p_offset = ino16_offset + 40 + i * 4;
+        data[p_offset..p_offset + 4].copy_from_slice(&block_num.to_le_bytes());
+    }
+    // Map i_block[12] (singly-indirect pointer) to block 50
+    let sib_block = 50u32;
+    data[ino16_offset + 40 + 12 * 4..ino16_offset + 40 + 12 * 4 + 4].copy_from_slice(&sib_block.to_le_bytes());
+
     // 4. Populate Root Directory Entries (Block 9, offset 9 * 1024 = 9216)
     let dir_offset = 9216;
     
@@ -267,7 +290,7 @@ pub fn create_ext2_ramdisk() -> Arc<dyn BlockDevice> {
     // Entry 4: "hello" -> Inode 15
     let bin_ent4_offset = bin_dir_offset + 36;
     data[bin_ent4_offset..bin_ent4_offset + 4].copy_from_slice(&15u32.to_le_bytes()); // Inode 15
-    data[bin_ent4_offset + 4..bin_ent4_offset + 6].copy_from_slice(&988u16.to_le_bytes()); // rec_len (rest of 1024 block)
+    data[bin_ent4_offset + 4..bin_ent4_offset + 6].copy_from_slice(&16u16.to_le_bytes()); // rec_len = 16
     data[bin_ent4_offset + 6] = 5; // name_len
     data[bin_ent4_offset + 7] = 1; // file_type (regular file)
     data[bin_ent4_offset + 8] = b'h';
@@ -276,6 +299,21 @@ pub fn create_ext2_ramdisk() -> Arc<dyn BlockDevice> {
     data[bin_ent4_offset + 11] = b'l';
     data[bin_ent4_offset + 12] = b'o';
 
+    // Entry 5: "net_test" -> Inode 16
+    let bin_ent5_offset = bin_dir_offset + 52;
+    data[bin_ent5_offset..bin_ent5_offset + 4].copy_from_slice(&16u32.to_le_bytes()); // Inode 16
+    data[bin_ent5_offset + 4..bin_ent5_offset + 6].copy_from_slice(&972u16.to_le_bytes()); // rec_len = rest of block
+    data[bin_ent5_offset + 6] = 8; // name_len
+    data[bin_ent5_offset + 7] = 1; // file_type (regular file)
+    data[bin_ent5_offset + 8] = b'n';
+    data[bin_ent5_offset + 9] = b'e';
+    data[bin_ent5_offset + 10] = b't';
+    data[bin_ent5_offset + 11] = b'_';
+    data[bin_ent5_offset + 12] = b't';
+    data[bin_ent5_offset + 13] = b'e';
+    data[bin_ent5_offset + 14] = b's';
+    data[bin_ent5_offset + 15] = b't';
+
     // 7. Populate /bin/sh ELF data (Blocks 12 to 23, offset 12 * 1024 = 12288)
     let shell_elf_bytes = crate::process::shell_elf::SHELL_ELF;
     data[12288..12288 + shell_elf_bytes.len()].copy_from_slice(shell_elf_bytes);
@@ -283,6 +321,17 @@ pub fn create_ext2_ramdisk() -> Arc<dyn BlockDevice> {
     // 8. Populate /bin/hello ELF data (Blocks 24 to 33, offset 24 * 1024 = 24576)
     let hello_elf_bytes = crate::process::hello_elf::HELLO_ELF;
     data[24576..24576 + hello_elf_bytes.len()].copy_from_slice(hello_elf_bytes);
+
+    // 9. Populate /bin/net_test ELF data (Blocks 34 to 48, offset 34 * 1024 = 34816)
+    let net_test_elf_bytes = crate::process::net_test_elf::NET_TEST_ELF;
+    data[34816..34816 + net_test_elf_bytes.len()].copy_from_slice(net_test_elf_bytes);
+
+    // 10. Populate singly-indirect block for net_test (Block 50, offset 50 * 1024 = 51200)
+    let sib_offset = 51200;
+    // Map logical block 12 -> block 46, logical block 13 -> block 47, logical block 14 -> block 48
+    data[sib_offset..sib_offset + 4].copy_from_slice(&46u32.to_le_bytes());
+    data[sib_offset + 4..sib_offset + 8].copy_from_slice(&47u32.to_le_bytes());
+    data[sib_offset + 8..sib_offset + 12].copy_from_slice(&48u32.to_le_bytes());
 
     let info = DriverInfo {
         name: alloc::string::String::from("ramdisk"),

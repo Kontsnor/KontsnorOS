@@ -17,6 +17,7 @@ pub mod scheduler;
 pub mod task;
 pub mod shell_elf;
 pub mod hello_elf;
+pub mod net_test_elf;
 
 /// Spawn a new kernel thread.
 pub fn spawn_kernel_thread(name: alloc::string::String, entry_point: fn()) -> pid::Pid {
@@ -302,5 +303,10 @@ pub fn create_shell_elf() -> &'static [u8] {
 /// Create the statically embedded freestanding C test binary.
 pub fn create_hello_elf() -> &'static [u8] {
     hello_elf::HELLO_ELF
+}
+
+/// Create the statically embedded freestanding network test binary.
+pub fn create_net_test_elf() -> &'static [u8] {
+    net_test_elf::NET_TEST_ELF
 }
 

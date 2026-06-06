@@ -1,6 +1,7 @@
 # Rust build artifacts
 target/
 Cargo.lock
+rust_out
 
 # Disk images and bootloader builds
 bios.img
@@ -15,3 +16,8 @@ qemu_output.log
 .antigravity/
 .vscode/
 .idea/
+
+# BusyBox build and source files
+busybox-build/
+busybox/
+busybox

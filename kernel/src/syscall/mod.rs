@@ -12,6 +12,8 @@ pub mod process;
 pub mod signal;
 pub mod net;
 
+pub const DEBUG_SYSCALLS: bool = false;
+
 /// Syscall numbers for KontsnorOS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
@@ -213,57 +215,63 @@ pub extern "C" fn syscall_dispatch_rust(
     let arg4 = unsafe { (*regs).r8 };
     let arg5 = unsafe { (*regs).r9 };
 
-    // Debug print FS_BASE and canary
-    let fs_base = x86_64::registers::model_specific::FsBase::read().as_u64();
-    let user_rsp = unsafe { (*regs).rsp };
-    let mut canary_msg = alloc::string::String::new();
-    if fs_base != 0 {
-        let canary_addr = fs_base + 0x28;
-        if let Some(phys) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(canary_addr)) {
-            let virt = phys.as_u64() + crate::memory::r#virtual::phys_mem_offset();
-            let canary_val = unsafe { *(virt as *const u64) };
-            canary_msg = alloc::format!("canary={:#x}", canary_val);
-        } else {
-            canary_msg = alloc::format!("canary_addr={:#x} (unmapped)", canary_addr);
+    if DEBUG_SYSCALLS {
+        // Debug print FS_BASE and canary
+        let fs_base = x86_64::registers::model_specific::FsBase::read().as_u64();
+        let user_rsp = unsafe { (*regs).rsp };
+        let mut canary_msg = alloc::string::String::new();
+        if fs_base != 0 {
+            let canary_addr = fs_base + 0x28;
+            if let Some(phys) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(canary_addr)) {
+                let virt = phys.as_u64() + crate::memory::r#virtual::phys_mem_offset();
+                let canary_val = unsafe { *(virt as *const u64) };
+                canary_msg = alloc::format!("canary={:#x}", canary_val);
+            } else {
+                canary_msg = alloc::format!("canary_addr={:#x} (unmapped)", canary_addr);
+            }
         }
+        
+        // Print stack values
+        let mut stack_msg = alloc::string::String::new();
+        if user_rsp != 0 && user_rsp < 0x0000_7FFF_FFFF_FFFF {
+            if let Some(_phys) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(user_rsp)) {
+                // print 4 words from RSP
+                let mut words = [0u64; 4];
+                for i in 0..4 {
+                    let addr = user_rsp + (i * 8);
+                    if let Some(p) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(addr)) {
+                        let v = p.as_u64() + crate::memory::r#virtual::phys_mem_offset();
+                        words[i as usize] = unsafe { *(v as *const u64) };
+                    }
+                }
+                stack_msg = alloc::format!("rsp={:#x} stack=[{:#x}, {:#x}, {:#x}, {:#x}]", 
+                    user_rsp, words[0], words[1], words[2], words[3]);
+            }
+        }
+
+        crate::kprintln!("[debug syscall {}] args=[{:#x}, {:#x}, {:#x}] fs_base={:#x} {} {}", 
+            syscall_num, arg0, arg1, arg2, fs_base, canary_msg, stack_msg);
     }
+
+    let res = dispatch(regs, syscall_num, arg0, arg1, arg2, arg3, arg4, arg5);
     
-    // Print stack values
-    let mut stack_msg = alloc::string::String::new();
-    if user_rsp != 0 && user_rsp < 0x0000_7FFF_FFFF_FFFF {
-        if let Some(_phys) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(user_rsp)) {
-            // print 4 words from RSP
-            let mut words = [0u64; 4];
-            for i in 0..4 {
+    if DEBUG_SYSCALLS {
+        crate::kprintln!("[debug syscall {} ret] res={}", syscall_num, res);
+        
+        if syscall_num == 16 {
+            let user_rsp = unsafe { (*regs).rsp };
+            let mut words_after = [0u64; 8];
+            for i in 0..8 {
                 let addr = user_rsp + (i * 8);
                 if let Some(p) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(addr)) {
                     let v = p.as_u64() + crate::memory::r#virtual::phys_mem_offset();
-                    words[i as usize] = unsafe { *(v as *const u64) };
+                    words_after[i as usize] = unsafe { *(v as *const u64) };
                 }
             }
-            stack_msg = alloc::format!("rsp={:#x} stack=[{:#x}, {:#x}, {:#x}, {:#x}]", 
-                user_rsp, words[0], words[1], words[2], words[3]);
+            crate::kprintln!("[debug syscall 16 ret] stack_after=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
+                words_after[0], words_after[1], words_after[2], words_after[3],
+                words_after[4], words_after[5], words_after[6], words_after[7]);
         }
-    }
-
-    crate::kprintln!("[debug syscall {}] args=[{:#x}, {:#x}, {:#x}] fs_base={:#x} {} {}", 
-        syscall_num, arg0, arg1, arg2, fs_base, canary_msg, stack_msg);
-
-    let res = dispatch(regs, syscall_num, arg0, arg1, arg2, arg3, arg4, arg5);
-    crate::kprintln!("[debug syscall {} ret] res={}", syscall_num, res);
-    
-    if syscall_num == 16 {
-        let mut words_after = [0u64; 8];
-        for i in 0..8 {
-            let addr = user_rsp + (i * 8);
-            if let Some(p) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(addr)) {
-                let v = p.as_u64() + crate::memory::r#virtual::phys_mem_offset();
-                words_after[i as usize] = unsafe { *(v as *const u64) };
-            }
-        }
-        crate::kprintln!("[debug syscall 16 ret] stack_after=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
-            words_after[0], words_after[1], words_after[2], words_after[3],
-            words_after[4], words_after[5], words_after[6], words_after[7]);
     }
 
     unsafe {
@@ -362,10 +370,12 @@ pub fn dispatch(
         84 => fs::sys_rmdir(arg0 as *const u8),
         86 => fs::sys_link(arg0 as *const u8, arg1 as *const u8),
         87 => fs::sys_unlink(arg0 as *const u8),
+        88 => fs::sys_symlink(arg0 as *const u8, arg1 as *const u8),
         89 => fs::sys_readlink(arg0 as *const u8, arg1 as *mut u8, arg2 as usize),
         217 => fs::sys_getdents64(arg0 as i32, arg1 as *mut u8, arg2 as usize),
         257 => fs::sys_openat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as u32),
         262 => fs::sys_newfstatat(arg0 as i32, arg1 as *const u8, arg2 as *mut fs::LinuxStat, arg3 as i32),
+        266 => fs::sys_symlinkat(arg0 as *const u8, arg1 as i32, arg2 as *const u8),
         267 => fs::sys_readlinkat(arg0 as i32, arg1 as *const u8, arg2 as *mut u8, arg3 as usize),
         269 => fs::sys_faccessat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as i32),
         // Memory

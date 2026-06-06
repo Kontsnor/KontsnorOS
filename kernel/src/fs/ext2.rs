@@ -455,6 +455,7 @@ impl Ext2FileSystem {
         let file_type = match i_mode & 0xF000 {
             0x8000 => FileType::Regular,
             0x4000 => FileType::Directory,
+            0xA000 => FileType::Symlink,
             _ => FileType::Regular,
         };
 
@@ -958,6 +959,7 @@ impl Ext2Inode {
         let file_type_byte: u8 = match child_type {
             FileType::Regular => 1,
             FileType::Directory => 2,
+            FileType::Symlink => 7,
             _ => 1,
         };
         
@@ -1115,9 +1117,28 @@ impl InodeOps for Ext2Inode {
     }
 
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
-        let file_size = self.vfs_inode.lock().size;
+        let (file_size, is_symlink) = {
+            let vfs = self.vfs_inode.lock();
+            (vfs.size, vfs.file_type == FileType::Symlink)
+        };
         if offset >= file_size {
             return Ok(0);
+        }
+
+        if is_symlink && file_size < 60 {
+            let raw = self.raw.lock();
+            let total_len = file_size as usize;
+            if offset as usize >= total_len {
+                return Ok(0);
+            }
+            let bytes_to_copy = core::cmp::min(buf.len(), total_len - offset as usize);
+            let i_block = raw.i_block;
+            let raw_block_ptr = i_block.as_ptr() as *const u8;
+            unsafe {
+                let src = raw_block_ptr.add(offset as usize);
+                core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), bytes_to_copy);
+            }
+            return Ok(bytes_to_copy);
         }
 
         let mut read_bytes = 0;
@@ -1164,6 +1185,23 @@ impl InodeOps for Ext2Inode {
     fn write(&self, offset: u64, buf: &[u8]) -> Result<usize, i32> {
         let mut raw = self.raw.lock();
         let mut vfs = self.vfs_inode.lock();
+
+        if vfs.file_type == FileType::Symlink && (offset + buf.len() as u64) < 60 {
+            let mut i_block = raw.i_block;
+            let i_block_ptr = i_block.as_mut_ptr() as *mut u8;
+            unsafe {
+                let dest = i_block_ptr.add(offset as usize);
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), dest, buf.len());
+            }
+            raw.i_block = i_block;
+            let new_size = offset + buf.len() as u64;
+            if new_size > vfs.size {
+                vfs.size = new_size;
+                raw.i_size = new_size as u32;
+            }
+            self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?;
+            return Ok(buf.len());
+        }
         
         let mut written_bytes = 0;
         let mut current_offset = offset;
@@ -1209,7 +1247,7 @@ impl InodeOps for Ext2Inode {
     }
 
     fn create(&self, name: &str, file_type: FileType) -> Option<Arc<dyn InodeOps>> {
-        if file_type != FileType::Regular && file_type != FileType::Directory {
+        if file_type != FileType::Regular && file_type != FileType::Directory && file_type != FileType::Symlink {
             return None;
         }
         
@@ -1217,7 +1255,11 @@ impl InodeOps for Ext2Inode {
         let child_ino = self.fs.allocate_inode(is_dir).ok()?;
         
         let mut raw_child = Ext2RawInode {
-            i_mode: if is_dir { 0x4000 | 0o755 } else { 0x8000 | 0o644 },
+            i_mode: match file_type {
+                FileType::Directory => 0x4000 | 0o755,
+                FileType::Symlink => 0xA000 | 0o777,
+                _ => 0x8000 | 0o644,
+            },
             i_uid: 0,
             i_size: 0,
             i_atime: 0,
@@ -1366,6 +1408,7 @@ impl InodeOps for Ext2Inode {
                         let file_type = match file_type_byte {
                             1 => FileType::Regular,
                             2 => FileType::Directory,
+                            7 => FileType::Symlink,
                             _ => FileType::Regular,
                         };
                         entries.push(DirEntry {

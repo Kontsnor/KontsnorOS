@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use spin::RwLock;
 use crate::kprintln;
 
-use super::inode::InodeOps;
+use super::inode::{InodeOps, FileType};
 
 /// The global VFS instance.
 static VFS: RwLock<Option<Vfs>> = RwLock::new(None);
@@ -140,16 +140,70 @@ impl Vfs {
 
     /// Lookup an inode by path.
     pub fn lookup(&self, path: &str) -> Option<Arc<dyn InodeOps>> {
-        let (fs, remaining_path) = self.resolve_mount(path)?;
-        let root = fs.root()?;
+        self.lookup_follow(path, true)
+    }
 
-        // Walk the path components
-        let mut current = root;
-        for component in remaining_path.split('/').filter(|c| !c.is_empty()) {
-            current = current.lookup(component)?;
+    /// Lookup an inode by path, optionally following symlinks.
+    pub fn lookup_follow(&self, path: &str, follow_last: bool) -> Option<Arc<dyn InodeOps>> {
+        let mut resolved_path = resolve_relative_path(path);
+        let mut symlink_count = 0;
+
+        loop {
+            let (fs, remaining_path) = self.resolve_mount(&resolved_path)?;
+            let root = fs.root()?;
+
+            let mut current = root;
+            let components: Vec<&str> = remaining_path.split('/').filter(|c| !c.is_empty()).collect();
+            let mut resolved_till_now = String::from("/");
+
+            let n_comp = components.len();
+            let mut i = 0;
+            let mut symlink_target = None;
+
+            for component in components {
+                i += 1;
+                let next = current.lookup(component)?;
+
+                // Check if this component is a symlink
+                if next.inode().file_type == FileType::Symlink {
+                    let is_last = i == n_comp;
+                    if !is_last || follow_last {
+                        // Read symlink target
+                        let mut target_buf = alloc::vec![0u8; 4096];
+                        if let Ok(n) = next.read(0, &mut target_buf) {
+                            if let Ok(target_str) = core::str::from_utf8(&target_buf[..n]) {
+                                symlink_target = Some((resolved_till_now.clone(), String::from(target_str)));
+                                break;
+                            }
+                        }
+                        return None; // failed to read/parse symlink
+                    }
+                }
+
+                current = next;
+                if resolved_till_now != "/" {
+                    resolved_till_now.push('/');
+                }
+                resolved_till_now.push_str(component);
+            }
+
+            if let Some((dir_path, target)) = symlink_target {
+                symlink_count += 1;
+                if symlink_count > 20 {
+                    kprintln!("[vfs] symlink loop limit exceeded");
+                    return None;
+                }
+
+                if target.starts_with('/') {
+                    resolved_path = crate::fs::path::normalize(&target);
+                } else {
+                    resolved_path = crate::fs::path::normalize(&crate::fs::path::join(&dir_path, &target));
+                }
+                continue;
+            }
+
+            return Some(current);
         }
-
-        Some(current)
     }
 }
 
@@ -169,6 +223,11 @@ pub fn mount(path: String, filesystem: Arc<dyn FileSystem>) {
 /// Lookup an inode by path.
 pub fn lookup(path: &str) -> Option<Arc<dyn InodeOps>> {
     VFS.read().as_ref()?.lookup(path)
+}
+
+/// Lookup an inode by path, optionally following symlinks.
+pub fn lookup_follow(path: &str, follow_last: bool) -> Option<Arc<dyn InodeOps>> {
+    VFS.read().as_ref()?.lookup_follow(path, follow_last)
 }
 
 /// Register a filesystem type.

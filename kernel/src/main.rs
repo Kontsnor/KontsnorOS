@@ -54,6 +54,8 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 };
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
+const ENABLE_DEMO_THREADS: bool = false;
+const ENABLE_NET_TESTS: bool = false;
 
 /// Kernel entry point — called by the bootloader after basic setup.
 ///
@@ -161,9 +163,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     kprintln!("[boot] Process subsystem initialized.");
 
     // Spawn demo multitasking threads
-    kprintln!("[boot] Spawning kernel multitasking demo threads...");
-    process::spawn_kernel_thread(alloc::string::String::from("demo_1"), demo_thread_1);
-    process::spawn_kernel_thread(alloc::string::String::from("demo_2"), demo_thread_2);
+    if ENABLE_DEMO_THREADS {
+        kprintln!("[boot] Spawning kernel multitasking demo threads...");
+        process::spawn_kernel_thread(alloc::string::String::from("demo_1"), demo_thread_1);
+        process::spawn_kernel_thread(alloc::string::String::from("demo_2"), demo_thread_2);
+    }
 
     kprintln!("[boot] Initializing network stack...");
     net::init();
@@ -205,9 +209,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     // Spawn freestanding network test binary
-    kprintln!("[boot] Spawning freestanding network test binary...");
-    let net_test_elf = process::create_net_test_elf();
-    process::spawn_user_process(alloc::string::String::from("net_test"), net_test_elf);
+    if ENABLE_NET_TESTS {
+        kprintln!("[boot] Spawning freestanding network test binary...");
+        let net_test_elf = process::create_net_test_elf();
+        process::spawn_user_process(alloc::string::String::from("net_test"), net_test_elf);
+    }
 
     // Clear the graphics console to enter terminal mode
     if let Some(ref mut console) = *crate::drivers::gpu::bochs::GRAPHICS_CONSOLE.lock() {
@@ -246,6 +252,7 @@ fn idle_loop() -> ! {
 }
 
 /// Demo thread 1: prints and cooperatively yields control.
+#[allow(dead_code)]
 fn demo_thread_1() {
     for i in 0..5 {
         kprintln!("[demo_thread_1] Executing step {} — yielding", i);
@@ -255,6 +262,7 @@ fn demo_thread_1() {
 }
 
 /// Demo thread 2: prints and cooperatively yields control.
+#[allow(dead_code)]
 fn demo_thread_2() {
     for i in 0..5 {
         kprintln!("[demo_thread_2] Executing step {} — yielding", i);

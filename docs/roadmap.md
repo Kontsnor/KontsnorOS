@@ -160,10 +160,10 @@ gantt
 - **Dynamic ELF Loader**: Implement dynamic ELF parsing in the kernel and a user-space dynamic linker (`/lib/ld-kontsnoros.so`) to load shared object (.so) libraries.
 - **VMM Shared Mappings**: Extend `sys_mmap` to support shared write memory mappings (`MAP_SHARED`), allowing clean IPC memory mapping and shared libraries sharing.
 
-#### Phase 48: Package Manager & Native Toolchain
+#### Phase 48: Package Manager & Native Toolchain [Partially Completed]
 - **Native Ports/Compiler**: Bootstrap `gcc` or `clang` and `make` on KontsnorOS to allow compiling software natively inside the running OS.
 - **Package Manager (`pkg`)**: Write a simple package manager to download, unpack, and install software packages from remote repositories via HTTP.
-- **Standard Core Utilities (Coreutils)**: Replace the current basic C utilities with a full suite of GNU/POSIX-compatible tools (`ls`, `cat`, `grep`, `mkdir`, `cp`, `mv`, `rm`, `kill`, `ps`, `df`, `free`, `top`) built natively.
+- **Standard Core Utilities (Coreutils) via BusyBox**: Cross-compile BusyBox statically using the musl-libc toolchain, integrate it into the ext2 filesystem, stub necessary syscalls (e.g., `symlink`, `symlinkat`, `readlink`), and expose standard Unix applets (`ls`, `cat`, `grep`, `ps`, `wc`, `uname`, etc.) via symlinks. [Completed]
 
 ---
 

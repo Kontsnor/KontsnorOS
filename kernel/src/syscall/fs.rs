@@ -201,9 +201,13 @@ pub fn sys_open(pathname: *const u8, flags: i32, _mode: u32) -> SyscallResult {
             Err(e) => return e as SyscallResult,
         }
     } else {
-        let exists = crate::fs::vfs::lookup(&resolved_path);
+        let follow_last = (flags_u32 & 0x20000) == 0; // AT_SYMLINK_NOFOLLOW/O_NOFOLLOW
+        let exists = crate::fs::vfs::lookup_follow(&resolved_path, follow_last);
         match exists {
             Some(i) => {
+                if !follow_last && i.inode().file_type == crate::fs::inode::FileType::Symlink {
+                    return Errno::ELOOP.into();
+                }
                 // If O_CREAT and O_EXCL are both set, return EEXIST
                 if (flags_u32 & crate::fs::file::OpenFlags::O_CREAT != 0)
                     && (flags_u32 & crate::fs::file::OpenFlags::O_EXCL != 0)
@@ -626,7 +630,9 @@ pub fn sys_newfstatat(
         crate::fs::vfs::resolve_relative_path(&raw_path)
     };
 
-    let inode_ops = match crate::fs::vfs::lookup(&resolved_path) {
+    let follow_last = (_flags & 0x100) == 0; // AT_SYMLINK_NOFOLLOW = 0x100
+
+    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved_path, follow_last) {
         Some(i) => i,
         None => return Errno::ENOENT.into(),
     };
@@ -661,7 +667,7 @@ pub fn sys_faccessat(
         crate::fs::vfs::resolve_relative_path(&raw_path)
     };
 
-    let inode_ops = match crate::fs::vfs::lookup(&resolved_path) {
+    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved_path, true) {
         Some(i) => i,
         None => return Errno::ENOENT.into(),
     };
@@ -917,9 +923,11 @@ pub fn sys_stat(pathname: *const u8, statbuf: *mut LinuxStat) -> SyscallResult {
     };
 
     let resolved = crate::fs::vfs::resolve_relative_path(&raw_path);
-    kprintln!("[syscall] stat(\"{}\")", resolved);
+    if super::DEBUG_SYSCALLS {
+        kprintln!("[syscall] stat(\"{}\")", resolved);
+    }
 
-    let inode_ops = match crate::fs::vfs::lookup(&resolved) {
+    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved, true) {
         Some(i) => i,
         None => return Errno::ENOENT.into(),
     };
@@ -932,10 +940,33 @@ pub fn sys_stat(pathname: *const u8, statbuf: *mut LinuxStat) -> SyscallResult {
 }
 
 /// `lstat(pathname, statbuf)` — Get file status by path, not following symlinks.
-///
-/// Since KontsnorOS has no symbolic links, this is identical to `stat`.
 pub fn sys_lstat(pathname: *const u8, statbuf: *mut LinuxStat) -> SyscallResult {
-    sys_stat(pathname, statbuf)
+    if statbuf.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if !validate_user_ptr(statbuf as *const u8, core::mem::size_of::<LinuxStat>()) {
+        return Errno::EFAULT.into();
+    }
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved = crate::fs::vfs::resolve_relative_path(&raw_path);
+    if super::DEBUG_SYSCALLS {
+        kprintln!("[syscall] lstat(\"{}\")", resolved);
+    }
+
+    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved, false) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    let stat = populate_stat(inode_ops.as_ref());
+    unsafe {
+        statbuf.write(stat);
+    }
+    0
 }
 
 /// `access(pathname, mode)` — Check file accessibility.
@@ -1008,20 +1039,121 @@ pub fn sys_link(_oldpath: *const u8, _newpath: *const u8) -> SyscallResult {
 }
 
 /// `readlink(pathname, buf, bufsize)` — Read the value of a symbolic link.
-///
-/// KontsnorOS does not support symlinks; always returns EINVAL.
-pub fn sys_readlink(_pathname: *const u8, _buf: *mut u8, _bufsize: usize) -> SyscallResult {
-    Errno::EINVAL.into()
+pub fn sys_readlink(pathname: *const u8, buf: *mut u8, bufsize: usize) -> SyscallResult {
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+    if super::DEBUG_SYSCALLS {
+        kprintln!("[syscall] readlink(\"{}\")", resolved_path);
+    }
+
+    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved_path, false) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    if inode_ops.inode().file_type != crate::fs::inode::FileType::Symlink {
+        return Errno::EINVAL.into();
+    }
+
+    if buf.is_null() || bufsize == 0 {
+        return 0;
+    }
+    if !validate_user_ptr(buf as *const u8, bufsize) {
+        return Errno::EFAULT.into();
+    }
+
+    let mut kernel_buf = alloc::vec![0u8; bufsize];
+    match inode_ops.read(0, &mut kernel_buf) {
+        Ok(n) => {
+            unsafe {
+                core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf, n);
+            }
+            n as SyscallResult
+        }
+        Err(e) => e as SyscallResult,
+    }
 }
 
 /// `readlinkat(dirfd, pathname, buf, bufsize)` — `readlink` relative to a directory fd.
 pub fn sys_readlinkat(
-    _dirfd: i32,
-    _pathname: *const u8,
-    _buf: *mut u8,
-    _bufsize: usize,
+    dirfd: i32,
+    pathname: *const u8,
+    buf: *mut u8,
+    bufsize: usize,
 ) -> SyscallResult {
-    Errno::EINVAL.into()
+    if dirfd == -100 { // AT_FDCWD
+        sys_readlink(pathname, buf, bufsize)
+    } else {
+        if super::DEBUG_SYSCALLS {
+            kprintln!("[syscall] sys_readlinkat: only AT_FDCWD is supported currently");
+        }
+        Errno::ENOSYS.into()
+    }
+}
+
+/// `symlink(target, linkpath)` — Create a symbolic link.
+pub fn sys_symlink(target: *const u8, linkpath: *const u8) -> SyscallResult {
+    let raw_target = match unsafe { copy_string_from_user(target) } {
+        Some(t) => t,
+        None => return Errno::EFAULT.into(),
+    };
+    let raw_linkpath = match unsafe { copy_string_from_user(linkpath) } {
+        Some(l) => l,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved_linkpath = crate::fs::vfs::resolve_relative_path(&raw_linkpath);
+    if super::DEBUG_SYSCALLS {
+        kprintln!("[syscall] symlink(\"{}\" -> \"{}\")", resolved_linkpath, raw_target);
+    }
+
+    // Check if the destination linkpath already exists
+    if crate::fs::vfs::lookup(&resolved_linkpath).is_some() {
+        return Errno::EEXIST.into();
+    }
+
+    // Split resolved_linkpath into parent directory and base name
+    let (parent_path, name) = crate::fs::path::split_path(&resolved_linkpath);
+
+    // Lookup parent directory
+    let parent_inode = match crate::fs::vfs::lookup(parent_path) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    // Make sure parent is a directory
+    if parent_inode.inode().file_type != crate::fs::inode::FileType::Directory {
+        return Errno::ENOTDIR.into();
+    }
+
+    // Create the symlink inode
+    let symlink_inode = match parent_inode.create(name, crate::fs::inode::FileType::Symlink) {
+        Some(i) => i,
+        None => return Errno::ENOSPC.into(),
+    };
+
+    // Write the target path into the symlink file
+    let target_bytes = raw_target.as_bytes();
+    match symlink_inode.write(0, target_bytes) {
+        Ok(n) if n == target_bytes.len() => 0,
+        Ok(_) => Errno::ENOSPC.into(),
+        Err(e) => e as SyscallResult,
+    }
+}
+
+/// `symlinkat(target, newdirfd, linkpath)` — Create a symbolic link relative to a directory fd.
+pub fn sys_symlinkat(target: *const u8, newdirfd: i32, linkpath: *const u8) -> SyscallResult {
+    if newdirfd == -100 { // AT_FDCWD
+        sys_symlink(target, linkpath)
+    } else {
+        if super::DEBUG_SYSCALLS {
+            kprintln!("[syscall] sys_symlinkat: only AT_FDCWD is supported currently");
+        }
+        Errno::ENOSYS.into()
+    }
 }
 
 /// `poll` fd event struct.

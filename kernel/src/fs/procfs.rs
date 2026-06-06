@@ -137,6 +137,32 @@ fn gen_uptime() -> String {
     format!("{}.{:02}\n", seconds, (ticks % 18) * 100 / 18)
 }
 
+/// Generate `/proc/tasks` content.
+fn gen_tasks() -> String {
+    let mut out = String::new();
+    out.push_str("PID  PPID  STATE    NAME\n");
+    if let Some(sched) = crate::process::scheduler::SCHEDULER.lock().as_ref() {
+        for slot in &sched.tasks {
+            if let Some(task) = slot {
+                let state_str = match task.state {
+                    crate::process::task::TaskState::Ready => "Ready",
+                    crate::process::task::TaskState::Running => "Running",
+                    crate::process::task::TaskState::Blocked => "Blocked",
+                    crate::process::task::TaskState::Zombie => "Zombie",
+                };
+                out.push_str(&format!(
+                    "{:<5} {:<5} {:<8} {}\n",
+                    task.pid.as_u64(),
+                    task.parent_pid.as_u64(),
+                    state_str,
+                    task.name
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// Initialize procfs and mount at `/proc`.
 pub fn init() {
     let entries = vec![
@@ -159,6 +185,13 @@ pub fn init() {
             Arc::new(ProcFile {
                 inode: Inode::new(52, FileType::Regular),
                 generator: gen_uptime,
+            }) as Arc<dyn InodeOps>,
+        ),
+        (
+            String::from("tasks"),
+            Arc::new(ProcFile {
+                inode: Inode::new(53, FileType::Regular),
+                generator: gen_tasks,
             }) as Arc<dyn InodeOps>,
         ),
     ];

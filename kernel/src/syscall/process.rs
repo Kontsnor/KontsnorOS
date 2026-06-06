@@ -148,7 +148,7 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
     kprintln!("[syscall] execve(\"{}\") with {} args, {} env vars", path, argv.len(), envp.len());
 
     // Look up the file in the VFS
-    let inode = match crate::fs::vfs::lookup(&path) {
+    let inode = match crate::fs::vfs::lookup_follow(&path, true) {
         Some(i) => i,
         None => {
             kprintln!("[syscall] execve: file not found: {}", path);
@@ -230,7 +230,7 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
         argv = new_argv;
 
         // Load the interpreter file
-        let interp_inode = match crate::fs::vfs::lookup(&path) {
+        let interp_inode = match crate::fs::vfs::lookup_follow(&path, true) {
             Some(i) => i,
             None => {
                 kprintln!("[syscall] execve: interpreter not found: {}", path);

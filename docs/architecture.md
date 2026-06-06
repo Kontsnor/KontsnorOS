@@ -23,7 +23,7 @@ These are loadable and can be replaced or extended:
 
 - **File Systems** — VFS layer with pluggable filesystem drivers (including a writable `ext2` implementation).
 - **Device Drivers** — Trait-based driver model with stable SDK (bridging console, ATA drives, and peripherals).
-- **Network Stack** — (In progress) TCP/IP protocol stack with modular PCI NIC drivers.
+- **Network Stack** — e1000 PCI driver, TCP/IP protocol stack, and BSD socket layer interface.
 
 ---
 
@@ -36,7 +36,7 @@ Virtual Address Space (48-bit, 256 TiB):
                        │   Kernel Code/Data   │
 0xFFFF_FFFF_8000_0000  ├─────────────────────┤
                        │    Kernel Heap       │
-0xFFFF_8000_0000_0000  ├─────────────────────┤
+0xFFFF_A000_0000_0000  ├─────────────────────┤
                        │  Physical Memory Map │
                        │  (direct mapping)    │
 0xFFFF_0000_0000_0000  ├─────────────────────┤
@@ -47,6 +47,10 @@ Virtual Address Space (48-bit, 256 TiB):
                        │  (per-process)       │
 0x0000_0000_0000_0000  └─────────────────────┘
 ```
+
+### Physical Memory Mapping
+
+The kernel's physical memory mapping layout is consolidated at a fixed mapping base: `Mapping::FixedAddress(0xffff_a000_0000_0000)`. This transition from `Mapping::Dynamic` guarantees a stable higher-half direct mapping layout for physical frame translation in the Virtual Memory Manager.
 
 ### Thread Local Storage (TLS)
 User-space thread-local storage is supported by saving and restoring the CPU's `FS_BASE` model-specific register (`0xC0000100`) during context switches. Child threads created via `sys_fork` and `sys_clone` inherit their parent's TLS register settings if not explicitly overridden by TLS configuration flags.
@@ -60,6 +64,48 @@ KontsnorOS implements the POSIX system call interface using the `syscall` / `sys
 - **Registers**: `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9` for arguments.
 - **Return**: `rax` for results (negative values indicate standard error codes).
 - **Numbering**: Linux/x86_64 compatible syscall numbers (e.g. `clone` = 56, `fork` = 57, `execve` = 59, `exit_group` = 231).
+
+### Syscall Memory Hardening
+
+System calls are hardened at the kernel boundary to protect against unsafe user pointer dereferencing and TOCTOU vulnerabilities:
+- **Buffer Hardening**: Core system calls (`sys_read`, `sys_write`, `sys_poll`, `sys_pread64`, and `sys_writev`) copy buffers into local kernel-allocated vectors (`alloc::vec![0u8; count]`) using `copy_nonoverlapping` before performing operations.
+- **Pointer Validation**: Arguments containing user pointers (e.g., child stack and TID pointers in `sys_clone`, `wstatus` in `sys_wait4`) are validated via `validate_user_ptr` and `validate_user_ptr_write` before execution.
+
+### Socket Layer System Calls
+
+BSD socket layer routing is wired through the syscall interface under the `net` module:
+- **`socket` (41)**: Creates a communications endpoint.
+- **`connect` (42)**: Establishes a connection (initiates TCP handshake or binds UDP remote endpoints).
+- **`accept` (43)**: Accepts a connection from a passive listening queue.
+- **`sendto` (44)**: Transmits data to a destination address.
+- **`recvfrom` (45)**: Receives data and records its source address.
+- **`bind` (49)**: Binds a local IPv4 address and port.
+- **`listen` (50)**: Places the socket in a passive listening state.
+
+---
+
+## Virtual File System (VFS)
+
+The VFS layer manages filesystem dispatch and paths resolution.
+
+### Filesystem Interface Consistency
+
+Filesystem drivers (such as `ext2` and `devfs`) implement the pluggable `FileSystem` trait. The `FileSystem::root` signature returns `Option<Arc<dyn InodeOps>>`, ensuring that unmounted or uninitialized roots are gracefully handled:
+```rust
+pub trait FileSystem: Send + Sync {
+    fn root(&self) -> Option<Arc<dyn InodeOps>>;
+    fn name(&self) -> &str;
+    // ...
+}
+```
+
+### ext2 Metadata & Mount Safety
+
+The `ext2` driver implements strict verification checks during volume mount to prevent integer overflows and directory index compromises:
+- **Superblock Validation**: Asserts magic number (`0xEF53`), log block size, and verifies that the total inodes and blocks counts are non-zero.
+- **GDT Boundary Checks**: Validates that Group Descriptor Table metadata blocks (block bitmap, inode bitmap, and inode table blocks) lie within physical filesystem boundaries.
+- **Reserved Blocks Calculation**: Protects against integer overflows during calculations of reserved blocks count.
+- **Self-Healing Checks (FSCK)**: Traces allocated blocks and inodes to compare actual bitmaps against metadata and dynamically resolves inconsistencies.
 
 ---
 

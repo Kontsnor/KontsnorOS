@@ -49,7 +49,7 @@ use bootloader_api::config::Mapping;
 /// Bootloader configuration — request kernel mapping at higher half.
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
-    config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config.mappings.physical_memory = Some(Mapping::FixedAddress(0xffff_a000_0000_0000));
     config.kernel_stack_size = 256 * 1024; // 256 KiB kernel stack
     config
 };
@@ -166,6 +166,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     process::spawn_kernel_thread(alloc::string::String::from("demo_1"), demo_thread_1);
     process::spawn_kernel_thread(alloc::string::String::from("demo_2"), demo_thread_2);
 
+    kprintln!("[boot] Initializing network stack...");
+    net::init();
+    kprintln!("[boot] Network stack initialized.");
+
     kprintln!("[boot] Initializing driver framework...");
     drivers::init();
     kprintln!("[boot] Driver framework initialized.");
@@ -201,9 +205,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         kprintln!("[boot] {} not found on mounted ext2 disk!", shell_path);
     }
 
-    kprintln!("[boot] Initializing network stack...");
-    net::init();
-    kprintln!("[boot] Network stack initialized.");
+    // Spawn freestanding network test binary
+    kprintln!("[boot] Spawning freestanding network test binary...");
+    let net_test_elf = process::create_net_test_elf();
+    process::spawn_user_process(alloc::string::String::from("net_test"), net_test_elf);
 
     // ── Boot complete ──────────────────────────────────────────────────
     kprintln!();

@@ -24,9 +24,9 @@ gantt
     TTY, Job Control & Terminal IOCTLs  :done, bash4, after bash3, 15d
     Musl-libc Toolchain Integration     :done, bash5, after bash4, 10d
     GNU Bash Static Compilation         :done, bash6, after bash5, 10d
-    section Phase D: Network Stack
-    e1000 PCI NIC Network Driver       :active, net1, after bash6, 30d
-    Socket API & TCP/IP Stack          :         net2, after net1, 25d
+    section Phase D: Network Stack (Completed)
+    e1000 PCI NIC Network Driver       :done, net1, after bash6, 30d
+    Socket API & TCP/IP Stack          :done, net2, after net1, 25d
     section Phase E: Advanced Graphics TUI
     Framebuffer GPU Acceleration        :         ui1, after net2, 20d
     Custom Shell,Pts pseudoterminals TUI:         ui2, after ui1, 30d
@@ -111,21 +111,24 @@ gantt
 
 ---
 
-### 🌐 Phase D: Network Stack & Socket API
+### 🌐 Phase D: Network Stack & Socket API [Completed]
 *This phase connects KontsnorOS to the outside world, implementing standard socket APIs and networking hardware drivers.*
 
-#### Phase 40: PCI Network Interface Card (NIC) Driver
-- **Intel e1000 Gigabit Ethernet Driver**: Write a high-performance DMA-based network driver for the standard `82540EM` PCI Ethernet controller simulated in QEMU.
-- **DMA Ring-Buffers**: Set up separate Tx (transmit) and Rx (receive) descriptor ring-buffers mapped directly to physical memory.
+#### Phase 40: PCI Network Interface Card (NIC) Driver [Completed]
+- **Intel e1000 Gigabit Ethernet Driver**: Write a DMA-based network driver for the standard `82540EM` PCI Ethernet controller simulated in QEMU. [Completed]
+- **DMA Ring-Buffers**: Set up Tx (transmit) and Rx (receive) descriptor ring-buffers mapped directly to physical memory. [Completed]
+- **Initialization Order**: Wire the network stack initialization (`net::init`) prior to the driver framework setup (`drivers::init`) inside `kernel_main`. [Completed]
 
-#### Phase 41: Core IP Stack & Packet Processing
-- **Packet Dispatching**: Build a fast packet parsing engine for Ethernet frames.
-- **ARP, IP, UDP & ICMP Layers**: Implement address resolution (ARP), internet routing (IPv4), ICMP echo responses (ping), and user datagram processing (UDP).
-- **Loopback Interface (lo)**: Wire a high-speed internal loopback stack for local IPC socket communication.
+#### Phase 41: Core IP Stack & Packet Processing [Completed]
+- **Packet Dispatching**: Build a fast packet parsing engine for Ethernet frames. [Completed]
+- **ARP, IP, UDP & ICMP Layers**: Implement address resolution (ARP), internet routing (IPv4), ICMP echo responses (ping), and user datagram processing (UDP). [Completed]
+- **Loopback Interface (lo)**: Wire a high-speed internal loopback stack for local IPC socket communication. [Completed]
 
-#### Phase 42: Socket System Calls & TCP Stack
-- **BSD Socket APIs**: Map standard system calls: `socket`, `bind`, `connect`, `listen`, `accept`, `send`, `recv`.
-- **Lightweight TCP Stack**: Implement a stable, stateful Transmission Control Protocol (TCP) flow machine with windowed packet acknowledgment and sliding congestion control.
+#### Phase 42: Socket System Calls & TCP Stack [Completed]
+- **BSD Socket APIs**: Wire system calls 41-45 (`socket`, `connect`, `accept`, `sendto`, `recvfrom`) and 49-50 (`bind`, `listen`) to the core BSD socket manager layer. [Completed]
+- **POSIX Errno Integration**: Map network error states to standard POSIX error numbers: `ENOTSOCK` (-88), `EDESTADDRREQ` (-89), `ENETUNREACH` (-101), `EISCONN` (-106), `ENOTCONN` (-107), `ECONNREFUSED` (-111). [Completed]
+- **Lightweight TCP Stack**: Implement a stateful TCP flow machine with windowed packet acknowledgment and sliding congestion control. [Completed]
+- **Freestanding Network Test**: Spawn and verify the user-space network test ELF (`net_test`) during the Ring 3 startup sequence in `kernel_main`. [Completed]
 
 ---
 

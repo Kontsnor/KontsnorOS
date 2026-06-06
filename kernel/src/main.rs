@@ -210,6 +210,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let net_test_elf = process::create_net_test_elf();
     process::spawn_user_process(alloc::string::String::from("net_test"), net_test_elf);
 
+    // Clear the graphics console to enter terminal mode
+    if let Some(ref mut console) = *crate::drivers::gpu::bochs::GRAPHICS_CONSOLE.lock() {
+        console.clear(crate::drivers::gpu::framebuffer::Color::BLACK);
+        console.gpu.blit();
+    }
+
     // ── Boot complete ──────────────────────────────────────────────────
     kprintln!();
     kprintln!("=========================================");

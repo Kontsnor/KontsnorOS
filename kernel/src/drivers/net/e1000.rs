@@ -86,12 +86,13 @@ impl E1000 {
     }
 
     fn recv_packet(&mut self, buf: &mut [u8]) -> Result<usize, DriverError> {
-        let desc = unsafe { &mut *self.rx_ring.add(self.rx_idx) };
-        if desc.status & 0x01 == 0 {
+        let desc_ptr = unsafe { self.rx_ring.add(self.rx_idx) };
+        let status = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*desc_ptr).status)) };
+        if status & 0x01 == 0 {
             return Err(DriverError::NotReady);
         }
 
-        let len = desc.length as usize;
+        let len = unsafe { (*desc_ptr).length as usize };
         if len > buf.len() {
             return Err(DriverError::IoError);
         }
@@ -101,8 +102,10 @@ impl E1000 {
             buf[..len].copy_from_slice(core::slice::from_raw_parts(src, len));
         }
 
-        desc.status = 0;
-        desc.errors = 0;
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc_ptr).status), 0);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc_ptr).errors), 0);
+        }
 
         self.write_reg(REG_RDT, self.rx_idx as u32);
 
@@ -111,10 +114,10 @@ impl E1000 {
     }
 
     fn send_packet(&mut self, data: &[u8]) -> Result<(), DriverError> {
-        let desc = unsafe { &mut *self.tx_ring.add(self.tx_idx) };
+        let desc_ptr = unsafe { self.tx_ring.add(self.tx_idx) };
         
         let mut timeout = 0;
-        while desc.status & 0x01 == 0 {
+        while unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*desc_ptr).status)) } & 0x01 == 0 {
             timeout += 1;
             if timeout > 1000000 {
                 return Err(DriverError::Timeout);
@@ -128,9 +131,11 @@ impl E1000 {
             core::slice::from_raw_parts_mut(dest, len).copy_from_slice(&data[..len]);
         }
 
-        desc.length = len as u16;
-        desc.status = 0;
-        desc.cmd = 0x0B; // EOP | IFCS | RS
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc_ptr).length), len as u16);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc_ptr).status), 0);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc_ptr).cmd), 0x0B); // EOP | IFCS | RS
+        }
 
         self.write_reg(REG_TDT, ((self.tx_idx + 1) % NUM_TX_DESC) as u32);
 

@@ -49,9 +49,9 @@ impl WaitQueue {
 
     /// Wake up all tasks currently sleeping on this wait queue.
     pub fn wake_all(&self) {
-        let mut pids = self.pids.lock();
         let mut sched_lock = scheduler::SCHEDULER.lock();
         if let Some(ref mut sched) = *sched_lock {
+            let mut pids = self.pids.lock();
             while let Some(pid) = pids.pop_front() {
                 sched.wake_task(pid);
             }

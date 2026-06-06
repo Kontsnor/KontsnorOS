@@ -191,6 +191,9 @@ impl InodeOps for DevStdin {
     fn ioctl(&self, request: u64, arg: u64) -> Result<u64, i32> {
         match request {
             0x5401 => { // TCGETS
+                if !crate::syscall::fs::validate_user_ptr(arg as *const u8, core::mem::size_of::<Termios>()) {
+                    return Err(-14); // EFAULT
+                }
                 let termios = TTY_TERMIOS.lock();
                 unsafe {
                     core::ptr::write(arg as *mut Termios, *termios);
@@ -198,6 +201,9 @@ impl InodeOps for DevStdin {
                 Ok(0)
             }
             0x5402 | 0x5403 | 0x5404 => { // TCSETS, TCSETSW, TCSETSF
+                if !crate::syscall::fs::validate_user_ptr(arg as *const u8, core::mem::size_of::<Termios>()) {
+                    return Err(-14); // EFAULT
+                }
                 let mut termios = TTY_TERMIOS.lock();
                 unsafe {
                     *termios = core::ptr::read(arg as *const Termios);
@@ -205,6 +211,9 @@ impl InodeOps for DevStdin {
                 Ok(0)
             }
             0x5413 => { // TIOCGWINSZ
+                if !crate::syscall::fs::validate_user_ptr(arg as *const u8, core::mem::size_of::<Winsize>()) {
+                    return Err(-14); // EFAULT
+                }
                 let ws = Winsize {
                     ws_row: 24,
                     ws_col: 80,
@@ -217,12 +226,18 @@ impl InodeOps for DevStdin {
                 Ok(0)
             }
             0x540F => { // TIOCGPGRP
+                if !crate::syscall::fs::validate_user_ptr(arg as *mut i32 as *const u8, core::mem::size_of::<i32>()) {
+                    return Err(-14); // EFAULT
+                }
                 unsafe {
                     core::ptr::write(arg as *mut i32, 1);
                 }
                 Ok(0)
             }
             0x5410 => { // TIOCSPGRP
+                if !crate::syscall::fs::validate_user_ptr(arg as *const i32 as *const u8, core::mem::size_of::<i32>()) {
+                    return Err(-14); // EFAULT
+                }
                 Ok(0)
             }
             _ => Err(-22), // EINVAL

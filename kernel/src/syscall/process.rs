@@ -98,6 +98,11 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
     child_context.kernel_gs_base = unsafe {
         x86_64::registers::model_specific::Msr::new(0xC0000102).read()
     };
+    assert_eq!(
+        child_context.gs_base,
+        core::ptr::addr_of!(crate::syscall::CPU_SCRATCH) as u64,
+        "child_context.gs_base must be initialized to CPU_SCRATCH"
+    );
 
     crate::kprintln!("[syscall] fork debug: rip = {:#x}, rsp = {:#x}, cr3 = {:#x}, fs_base = {:#x}, gs_base = {:#x}", 
         child_context.rip, child_context.rsp, child_context.cr3, child_context.fs_base, child_context.kernel_gs_base);
@@ -1052,6 +1057,11 @@ pub fn sys_clone(
     child_context.kernel_gs_base = unsafe {
         x86_64::registers::model_specific::Msr::new(0xC0000102).read()
     };
+    assert_eq!(
+        child_context.gs_base,
+        core::ptr::addr_of!(crate::syscall::CPU_SCRATCH) as u64,
+        "child_context.gs_base must be initialized to CPU_SCRATCH"
+    );
 
     child_task.context = child_context;
 

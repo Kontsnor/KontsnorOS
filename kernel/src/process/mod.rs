@@ -236,7 +236,6 @@ pub fn spawn_user_process(name: alloc::string::String, elf_data: &[u8]) -> pid::
 #[unsafe(naked)]
 extern "C" fn user_process_trampoline() -> ! {
     core::arch::naked_asm!(
-        "sti",          // Enable interrupts
         "mov rdi, r12", // Set entry_point as 1st argument (rdi)
         "mov rsi, r13", // Set user_stack as 2nd argument (rsi)
         "mov rdx, r14", // Set page_table as 3rd argument (rdx)

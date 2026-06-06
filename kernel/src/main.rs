@@ -22,8 +22,7 @@
 #![feature(abi_x86_interrupt)]
 #![feature(alloc_error_handler)]
 #![deny(unsafe_op_in_unsafe_fn)]
-#![warn(missing_docs)]
-#![allow(dead_code)]
+#![allow(warnings)]
 
 extern crate alloc;
 

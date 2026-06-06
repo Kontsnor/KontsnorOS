@@ -29,6 +29,9 @@
 /// 0x38    rip
 /// 0x40    rflags
 /// 0x48    cr3
+/// 0x50    fs_base
+/// 0x58    gs_base
+/// 0x60    kernel_gs_base
 /// ```
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -55,6 +58,10 @@ pub struct CpuContext {
     pub cr3: u64,
     /// FS_BASE MSR (for Thread Local Storage) — offset 0x50.
     pub fs_base: u64,
+    /// IA32_GS_BASE MSR — offset 0x58.
+    pub gs_base: u64,
+    /// IA32_KERNEL_GS_BASE MSR — offset 0x60.
+    pub kernel_gs_base: u64,
 }
 
 impl Default for CpuContext {
@@ -71,6 +78,8 @@ impl Default for CpuContext {
             rflags: 0x202, // IF (Interrupt Flag) set
             cr3: 0,
             fs_base: 0,
+            gs_base: core::ptr::addr_of!(crate::syscall::CPU_SCRATCH) as u64,
+            kernel_gs_base: 0,
         }
     }
 }
@@ -155,6 +164,20 @@ pub unsafe extern "C" fn switch_context(
         "or rax, rdx",                  // Full 64-bit value in rax
         "mov [rdi + 0x50], rax",        // Save to old context
 
+        // Save GS_BASE MSR
+        "mov ecx, 0xC0000101",          // GS_BASE MSR
+        "rdmsr",                        // Reads MSR into edx:eax
+        "shl rdx, 32",
+        "or rax, rdx",                  // Full 64-bit value in rax
+        "mov [rdi + 0x58], rax",        // Save to old context
+
+        // Save KERNEL_GS_BASE MSR
+        "mov ecx, 0xC0000102",          // KERNEL_GS_BASE MSR
+        "rdmsr",                        // Reads MSR into edx:eax
+        "shl rdx, 32",
+        "or rax, rdx",                  // Full 64-bit value in rax
+        "mov [rdi + 0x60], rax",        // Save to old context
+
         // ── Restore new context ────────────────────────────────────
         // rsi = new_ctx pointer
 
@@ -181,6 +204,20 @@ pub unsafe extern "C" fn switch_context(
         "mov rdx, rax",
         "shr rdx, 32",                  // High 32 bits in edx
         "mov ecx, 0xC0000100",          // FS_BASE MSR
+        "wrmsr",                        // Writes edx:eax to MSR
+
+        // Restore GS_BASE MSR
+        "mov rax, [rsi + 0x58]",
+        "mov rdx, rax",
+        "shr rdx, 32",                  // High 32 bits in edx
+        "mov ecx, 0xC0000101",          // GS_BASE MSR
+        "wrmsr",                        // Writes edx:eax to MSR
+
+        // Restore KERNEL_GS_BASE MSR
+        "mov rax, [rsi + 0x60]",
+        "mov rdx, rax",
+        "shr rdx, 32",                  // High 32 bits in edx
+        "mov ecx, 0xC0000102",          // KERNEL_GS_BASE MSR
         "wrmsr",                        // Writes edx:eax to MSR
 
         // Restore callee-saved registers

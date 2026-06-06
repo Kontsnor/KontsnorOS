@@ -113,6 +113,9 @@ pub fn sys_connect(fd: i32, addr_ptr: *const SockAddrIn, addrlen: u32) -> Syscal
 
     let sock_type;
     let mut tcp_state;
+    let local_port;
+    let local_ip;
+    let tcp_snd_nxt;
 
     {
         let mut sock = socket.lock();
@@ -137,27 +140,28 @@ pub fn sys_connect(fd: i32, addr_ptr: *const SockAddrIn, addrlen: u32) -> Syscal
         sock.tcp_snd_nxt = 1000;
         sock.tcp_snd_una = 1000;
         
-        let local_port = sock.local_port.unwrap();
-        let local_ip = sock.local_addr.unwrap();
+        local_port = sock.local_port.unwrap();
+        local_ip = sock.local_addr.unwrap();
+        tcp_snd_nxt = sock.tcp_snd_nxt;
+        sock.tcp_snd_nxt = sock.tcp_snd_nxt.wrapping_add(1);
+    }
 
-        let mut tcp_buf = [0u8; 128];
-        if let Some(tcp_len) = crate::net::tcp::build_tcp_packet(
-            &mut tcp_buf,
-            local_port,
-            remote_port,
-            sock.tcp_snd_nxt,
-            0,
-            crate::net::tcp::TCP_SYN,
-            &[],
-        ) {
-            let _ = crate::net::ipv4::send_packet(
-                local_ip,
-                remote_ip,
-                crate::net::ipv4::PROTO_TCP,
-                &tcp_buf[..tcp_len],
-            );
-            sock.tcp_snd_nxt = sock.tcp_snd_nxt.wrapping_add(1);
-        }
+    let mut tcp_buf = [0u8; 128];
+    if let Some(tcp_len) = crate::net::tcp::build_tcp_packet(
+        &mut tcp_buf,
+        local_port,
+        remote_port,
+        tcp_snd_nxt,
+        0,
+        crate::net::tcp::TCP_SYN,
+        &[],
+    ) {
+        let _ = crate::net::ipv4::send_packet(
+            local_ip,
+            remote_ip,
+            crate::net::ipv4::PROTO_TCP,
+            &tcp_buf[..tcp_len],
+        );
     }
 
     // Wait until state changes to Established or Closed (error)
@@ -172,7 +176,11 @@ pub fn sys_connect(fd: i32, addr_ptr: *const SockAddrIn, addrlen: u32) -> Syscal
         if tcp_state == crate::net::tcp::TcpState::Closed {
             return -111; // ECONNREFUSED
         }
-        socket.lock().wait_queue.wait();
+        let wq = {
+            let sock = socket.lock();
+            sock.wait_queue.clone()
+        };
+        wq.wait();
     }
 
     0
@@ -203,24 +211,26 @@ pub fn sys_accept(fd: i32, addr_ptr: *mut SockAddrIn, addrlen_ptr: *mut u32) -> 
     };
 
     let child = loop {
-        let mut sock = socket.lock();
-        if sock.sock_type != 1 || sock.tcp_state != crate::net::tcp::TcpState::Listen {
-            return Errno::EINVAL.into();
-        }
+        let wq;
+        {
+            let mut sock = socket.lock();
+            if sock.sock_type != 1 || sock.tcp_state != crate::net::tcp::TcpState::Listen {
+                return Errno::EINVAL.into();
+            }
 
-        if !sock.tcp_backlog.is_empty() {
-            break sock.tcp_backlog.remove(0);
+            if !sock.tcp_backlog.is_empty() {
+                break sock.tcp_backlog.remove(0);
+            }
+            wq = sock.wait_queue.clone();
         }
-
-        drop(sock);
-        socket.lock().wait_queue.wait();
+        wq.wait();
     };
 
     let child_sock = child.lock();
     
     if !addr_ptr.is_null() && !addrlen_ptr.is_null() {
-        if !validate_user_ptr(addr_ptr as *const u8, core::mem::size_of::<SockAddrIn>()) ||
-           !validate_user_ptr(addrlen_ptr as *const u8, 4) {
+        if crate::syscall::fs::validate_user_ptr_write(addr_ptr as *mut u8, core::mem::size_of::<SockAddrIn>()).is_err() ||
+           crate::syscall::fs::validate_user_ptr_write(addrlen_ptr as *mut u8, 4).is_err() {
             return Errno::EFAULT.into();
         }
 
@@ -290,11 +300,15 @@ pub fn sys_sendto(
         );
         let remote_port = u16::from_be(addr.sin_port);
 
-        let sock = socket.lock();
-        if sock.sock_type == 2 { // UDP
-            let local_ip = sock.local_addr.unwrap_or(Ipv4Addr::LOCALHOST);
-            let local_port = sock.local_port.unwrap_or(50000);
-            
+        let (sock_type, local_ip, local_port) = {
+            let sock = socket.lock();
+            (
+                sock.sock_type,
+                sock.local_addr.unwrap_or(Ipv4Addr::LOCALHOST),
+                sock.local_port.unwrap_or(50000),
+            )
+        };
+        if sock_type == 2 { // UDP
             let mut udp_buf = [0u8; 2048];
             let udp_len = match crate::net::udp::build_datagram(&mut udp_buf, local_port, remote_port, slice) {
                 Some(l) => l,
@@ -332,7 +346,7 @@ pub fn sys_recvfrom(
     if buf.is_null() || len == 0 {
         return 0;
     }
-    if !validate_user_ptr(buf as *const u8, len) {
+    if crate::syscall::fs::validate_user_ptr_write(buf, len).is_err() {
         return Errno::EFAULT.into();
     }
 
@@ -344,8 +358,9 @@ pub fn sys_recvfrom(
     let mut sock = socket.lock();
     if sock.sock_type == 2 { // UDP
         if sock.udp_recv_queue.is_empty() {
+            let wq = sock.wait_queue.clone();
             drop(sock);
-            socket.lock().wait_queue.wait();
+            wq.wait();
             sock = socket.lock();
         }
 
@@ -356,8 +371,8 @@ pub fn sys_recvfrom(
             }
 
             if !src_addr.is_null() && !addrlen_ptr.is_null() {
-                if !validate_user_ptr(src_addr as *const u8, core::mem::size_of::<SockAddrIn>()) ||
-                   !validate_user_ptr(addrlen_ptr as *const u8, 4) {
+                if crate::syscall::fs::validate_user_ptr_write(src_addr as *mut u8, core::mem::size_of::<SockAddrIn>()).is_err() ||
+                   crate::syscall::fs::validate_user_ptr_write(addrlen_ptr as *mut u8, 4).is_err() {
                     return Errno::EFAULT.into();
                 }
 
@@ -387,8 +402,8 @@ pub fn sys_recvfrom(
     match inode.read(0, slice) {
         Ok(n) => {
             if !src_addr.is_null() && !addrlen_ptr.is_null() {
-                if !validate_user_ptr(src_addr as *const u8, core::mem::size_of::<SockAddrIn>()) ||
-                   !validate_user_ptr(addrlen_ptr as *const u8, 4) {
+                if crate::syscall::fs::validate_user_ptr_write(src_addr as *mut u8, core::mem::size_of::<SockAddrIn>()).is_err() ||
+                   crate::syscall::fs::validate_user_ptr_write(addrlen_ptr as *mut u8, 4).is_err() {
                     return Errno::EFAULT.into();
                 }
 

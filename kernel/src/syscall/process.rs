@@ -1040,11 +1040,17 @@ pub fn sys_clone(
     child_task.context = child_context;
 
     if flags & 0x00100000 != 0 && !parent_tidptr.is_null() {
+        if super::fs::validate_user_ptr_write(parent_tidptr as *mut u8, core::mem::size_of::<i32>()).is_err() {
+            return Errno::EFAULT.into();
+        }
         unsafe {
             parent_tidptr.write_volatile(child_pid.as_u64() as i32);
         }
     }
     if flags & 0x01000000 != 0 && !child_tidptr.is_null() {
+        if super::fs::validate_user_ptr_write(child_tidptr as *mut u8, core::mem::size_of::<i32>()).is_err() {
+            return Errno::EFAULT.into();
+        }
         unsafe {
             child_tidptr.write_volatile(child_pid.as_u64() as i32);
         }

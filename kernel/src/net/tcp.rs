@@ -31,6 +31,7 @@ use alloc::sync::Arc;
 use spin::Mutex;
 use super::ipv4::Ipv4Addr;
 
+
 /// TCP header (20 bytes minimum).
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
@@ -290,14 +291,39 @@ pub fn handle_packet(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, payload: &[u8]) {
         let ack = header.ack_num_host();
         let flags = header.flags();
 
+
+
         if let Some(sock_arc) = super::socket::find_tcp_connection(dst_ip, dst_port, src_ip, src_port) {
-            let mut sock = sock_arc.lock();
-            process_segment(&mut sock, src_ip, dst_ip, src_port, dst_port, seq, ack, flags, tcp_payload);
+            let reply = {
+                let mut sock = sock_arc.lock();
+                process_segment(&mut sock, src_ip, dst_ip, src_port, dst_port, seq, ack, flags, tcp_payload)
+            };
+            if let Some((reply_seq, reply_ack, reply_flags)) = reply {
+                let mut tcp_buf = [0u8; 128];
+                if let Some(tcp_len) = build_tcp_packet(
+                    &mut tcp_buf,
+                    dst_port,
+                    src_port,
+                    reply_seq,
+                    reply_ack,
+                    reply_flags,
+                    &[],
+                ) {
+                    let _ = super::ipv4::send_packet(
+                        dst_ip,
+                        src_ip,
+                        super::ipv4::PROTO_TCP,
+                        &tcp_buf[..tcp_len],
+                    );
+                }
+            }
         } else if let Some(listener_arc) = super::socket::find_tcp_listener(dst_ip, dst_port) {
             if flags & TCP_SYN != 0 {
                 let mut listener = listener_arc.lock();
                 if listener.tcp_backlog.len() < listener.tcp_max_backlog {
                     let child = Arc::new(Mutex::new(super::socket::Socket::new(listener.domain, listener.sock_type, listener.protocol)));
+                    let child_snd_nxt;
+                    let child_rcv_nxt;
                     {
                         let mut child_sock = child.lock();
                         child_sock.local_addr = Some(dst_ip);
@@ -308,29 +334,34 @@ pub fn handle_packet(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, payload: &[u8]) {
                         child_sock.tcp_rcv_nxt = seq.wrapping_add(1);
                         child_sock.tcp_snd_nxt = 1000;
                         child_sock.tcp_snd_una = 1000;
-                        
-                        let mut tcp_buf = [0u8; 128];
-                        if let Some(tcp_len) = build_tcp_packet(
-                            &mut tcp_buf,
-                            dst_port,
-                            src_port,
-                            child_sock.tcp_snd_nxt,
-                            child_sock.tcp_rcv_nxt,
-                            TCP_SYN | TCP_ACK,
-                            &[],
-                        ) {
-                            let _ = super::ipv4::send_packet(
-                                dst_ip,
-                                src_ip,
-                                super::ipv4::PROTO_TCP,
-                                &tcp_buf[..tcp_len],
-                            );
-                            child_sock.tcp_snd_nxt = child_sock.tcp_snd_nxt.wrapping_add(1);
-                        }
+                        child_snd_nxt = child_sock.tcp_snd_nxt;
+                        child_rcv_nxt = child_sock.tcp_rcv_nxt;
+                        child_sock.tcp_snd_nxt = child_sock.tcp_snd_nxt.wrapping_add(1);
                     }
                     listener.tcp_backlog.push(child.clone());
                     super::socket::register_socket(child);
                     listener.wait_queue.wake_all();
+
+                    // Release the listener lock before sending the SYN|ACK packet to prevent recursive lock deadlock
+                    drop(listener);
+
+                    let mut tcp_buf = [0u8; 128];
+                    if let Some(tcp_len) = build_tcp_packet(
+                        &mut tcp_buf,
+                        dst_port,
+                        src_port,
+                        child_snd_nxt,
+                        child_rcv_nxt,
+                        TCP_SYN | TCP_ACK,
+                        &[],
+                    ) {
+                        let _ = super::ipv4::send_packet(
+                            dst_ip,
+                            src_ip,
+                            super::ipv4::PROTO_TCP,
+                            &tcp_buf[..tcp_len],
+                        );
+                    }
                 }
             }
         }
@@ -339,15 +370,17 @@ pub fn handle_packet(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, payload: &[u8]) {
 
 fn process_segment(
     sock: &mut super::socket::Socket,
-    src_ip: Ipv4Addr,
-    dst_ip: Ipv4Addr,
-    src_port: u16,
-    dst_port: u16,
+    _src_ip: Ipv4Addr,
+    _dst_ip: Ipv4Addr,
+    _src_port: u16,
+    _dst_port: u16,
     seq: u32,
     ack: u32,
     flags: u16,
     payload: &[u8],
-) {
+) -> Option<(u32, u32, u16)> {
+
+    let mut reply = None;
     match sock.tcp_state {
         TcpState::SynSent => {
             if (flags & TCP_SYN != 0) && (flags & TCP_ACK != 0) {
@@ -355,23 +388,7 @@ fn process_segment(
                 sock.tcp_snd_una = ack;
                 sock.tcp_state = TcpState::Established;
 
-                let mut tcp_buf = [0u8; 128];
-                if let Some(tcp_len) = build_tcp_packet(
-                    &mut tcp_buf,
-                    dst_port,
-                    src_port,
-                    sock.tcp_snd_nxt,
-                    sock.tcp_rcv_nxt,
-                    TCP_ACK,
-                    &[],
-                ) {
-                    let _ = super::ipv4::send_packet(
-                        dst_ip,
-                        src_ip,
-                        super::ipv4::PROTO_TCP,
-                        &tcp_buf[..tcp_len],
-                    );
-                }
+                reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK));
                 sock.wait_queue.wake_all();
             }
         }
@@ -392,23 +409,7 @@ fn process_segment(
                     sock.tcp_recv_buf.extend_from_slice(payload);
                     sock.tcp_rcv_nxt = seq.wrapping_add(payload.len() as u32);
                     
-                    let mut tcp_buf = [0u8; 128];
-                    if let Some(tcp_len) = build_tcp_packet(
-                        &mut tcp_buf,
-                        dst_port,
-                        src_port,
-                        sock.tcp_snd_nxt,
-                        sock.tcp_rcv_nxt,
-                        TCP_ACK,
-                        &[],
-                    ) {
-                        let _ = super::ipv4::send_packet(
-                            dst_ip,
-                            src_ip,
-                            super::ipv4::PROTO_TCP,
-                            &tcp_buf[..tcp_len],
-                        );
-                    }
+                    reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK));
                     sock.wait_queue.wake_all();
                 }
             }
@@ -417,23 +418,7 @@ fn process_segment(
                 sock.tcp_rcv_nxt = seq.wrapping_add(1);
                 sock.tcp_state = TcpState::CloseWait;
                 
-                let mut tcp_buf = [0u8; 128];
-                if let Some(tcp_len) = build_tcp_packet(
-                    &mut tcp_buf,
-                    dst_port,
-                    src_port,
-                    sock.tcp_snd_nxt,
-                    sock.tcp_rcv_nxt,
-                    TCP_ACK,
-                    &[],
-                ) {
-                    let _ = super::ipv4::send_packet(
-                        dst_ip,
-                        src_ip,
-                        super::ipv4::PROTO_TCP,
-                        &tcp_buf[..tcp_len],
-                    );
-                }
+                reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK));
                 sock.wait_queue.wake_all();
             }
         }
@@ -444,51 +429,20 @@ fn process_segment(
             }
             if flags & TCP_FIN != 0 {
                 sock.tcp_rcv_nxt = seq.wrapping_add(1);
-                let mut tcp_buf = [0u8; 128];
-                if let Some(tcp_len) = build_tcp_packet(
-                    &mut tcp_buf,
-                    dst_port,
-                    src_port,
-                    sock.tcp_snd_nxt,
-                    sock.tcp_rcv_nxt,
-                    TCP_ACK,
-                    &[],
-                ) {
-                    let _ = super::ipv4::send_packet(
-                        dst_ip,
-                        src_ip,
-                        super::ipv4::PROTO_TCP,
-                        &tcp_buf[..tcp_len],
-                    );
-                }
+                reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK));
                 sock.tcp_state = TcpState::Closing;
             }
         }
         TcpState::FinWait2 => {
             if flags & TCP_FIN != 0 {
                 sock.tcp_rcv_nxt = seq.wrapping_add(1);
-                let mut tcp_buf = [0u8; 128];
-                if let Some(tcp_len) = build_tcp_packet(
-                    &mut tcp_buf,
-                    dst_port,
-                    src_port,
-                    sock.tcp_snd_nxt,
-                    sock.tcp_rcv_nxt,
-                    TCP_ACK,
-                    &[],
-                ) {
-                    let _ = super::ipv4::send_packet(
-                        dst_ip,
-                        src_ip,
-                        super::ipv4::PROTO_TCP,
-                        &tcp_buf[..tcp_len],
-                    );
-                }
+                reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK));
                 sock.tcp_state = TcpState::Closed;
                 sock.wait_queue.wake_all();
             }
         }
         _ => {}
     }
+    reply
 }
 

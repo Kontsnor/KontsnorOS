@@ -34,7 +34,7 @@ pub struct Socket {
     pub tcp_max_backlog: usize,
 
     // Wait queue for blocking calls
-    pub wait_queue: WaitQueue,
+    pub wait_queue: Arc<WaitQueue>,
 }
 
 impl Socket {
@@ -56,7 +56,7 @@ impl Socket {
             tcp_send_buf: Vec::new(),
             tcp_backlog: Vec::new(),
             tcp_max_backlog: 0,
-            wait_queue: WaitQueue::new(),
+            wait_queue: Arc::new(WaitQueue::new()),
         }
     }
 }
@@ -96,8 +96,9 @@ impl InodeOps for SocketInode {
                     return Ok(0); // EOF
                 }
                 // Block/Wait
+                let wq = sock.wait_queue.clone();
                 drop(sock);
-                self.socket.lock().wait_queue.wait();
+                wq.wait();
                 sock = self.socket.lock();
             }
             let n = buf.len().min(sock.tcp_recv_buf.len());
@@ -109,8 +110,9 @@ impl InodeOps for SocketInode {
             Ok(n)
         } else if sock.sock_type == 2 { // SOCK_DGRAM (UDP)
             if sock.udp_recv_queue.is_empty() {
+                let wq = sock.wait_queue.clone();
                 drop(sock);
-                self.socket.lock().wait_queue.wait();
+                wq.wait();
                 sock = self.socket.lock();
             }
             if let Some(dg) = sock.udp_recv_queue.pop_front() {
@@ -126,27 +128,33 @@ impl InodeOps for SocketInode {
     }
 
     fn write(&self, _offset: u64, data: &[u8]) -> Result<usize, i32> {
-        let mut sock = self.socket.lock();
-        if sock.sock_type == 1 { // SOCK_STREAM (TCP)
-            if sock.tcp_state != TcpState::Established {
-                return Err(-32); // EPIPE / ENOTCONN
-            }
-            let local_ip = sock.local_addr.unwrap_or(Ipv4Addr::LOCALHOST);
-            let remote_ip = sock.remote_addr.ok_or(-107)?; // ENOTCONN
+        let sock_type = self.socket.lock().sock_type;
+        if sock_type == 1 { // SOCK_STREAM (TCP)
+            let (local_ip, remote_ip, local_port, remote_port, tcp_snd_nxt, tcp_rcv_nxt) = {
+                let sock = self.socket.lock();
+                if sock.tcp_state != TcpState::Established {
+                    return Err(-32); // EPIPE / ENOTCONN
+                }
+                (
+                    sock.local_addr.unwrap_or(Ipv4Addr::LOCALHOST),
+                    sock.remote_addr.ok_or(-107)?, // ENOTCONN
+                    sock.local_port.unwrap_or(0),
+                    sock.remote_port.unwrap_or(0),
+                    sock.tcp_snd_nxt,
+                    sock.tcp_rcv_nxt,
+                )
+            };
+            
             let payload = data.to_vec();
-            
             let mut tcp_buf = [0u8; 1500];
-            let local_port = sock.local_port.unwrap_or(0);
-            let remote_port = sock.remote_port.unwrap_or(0);
-            
             let flags = 0x10 | 0x08; // ACK | PSH
             
             let tcp_len = super::tcp::build_tcp_packet(
                 &mut tcp_buf,
                 local_port,
                 remote_port,
-                sock.tcp_snd_nxt,
-                sock.tcp_rcv_nxt,
+                tcp_snd_nxt,
+                tcp_rcv_nxt,
                 flags,
                 &payload,
             ).ok_or(-5)?; // EIO
@@ -154,13 +162,21 @@ impl InodeOps for SocketInode {
             super::ipv4::send_packet(local_ip, remote_ip, super::ipv4::PROTO_TCP, &tcp_buf[..tcp_len])
                 .map_err(|_| -101)?; // ENETUNREACH
                 
-            sock.tcp_snd_nxt = sock.tcp_snd_nxt.wrapping_add(payload.len() as u32);
+            {
+                let mut sock = self.socket.lock();
+                sock.tcp_snd_nxt = sock.tcp_snd_nxt.wrapping_add(payload.len() as u32);
+            }
             Ok(payload.len())
-        } else if sock.sock_type == 2 { // SOCK_DGRAM (UDP)
-            let remote_ip = sock.remote_addr.ok_or(-89)?; // EDESTADDRREQ
-            let remote_port = sock.remote_port.ok_or(-89)?;
-            let local_ip = sock.local_addr.unwrap_or(Ipv4Addr::LOCALHOST);
-            let local_port = sock.local_port.unwrap_or(50000);
+        } else if sock_type == 2 { // SOCK_DGRAM (UDP)
+            let (remote_ip, remote_port, local_ip, local_port) = {
+                let sock = self.socket.lock();
+                (
+                    sock.remote_addr.ok_or(-89)?, // EDESTADDRREQ
+                    sock.remote_port.ok_or(-89)?,
+                    sock.local_addr.unwrap_or(Ipv4Addr::LOCALHOST),
+                    sock.local_port.unwrap_or(50000),
+                )
+            };
             
             let mut udp_buf = [0u8; 2048];
             let udp_len = super::udp::build_datagram(&mut udp_buf, local_port, remote_port, data).ok_or(-22)?;

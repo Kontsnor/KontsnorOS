@@ -29,6 +29,7 @@ pub mod procfs;
 pub mod tmpfs;
 pub mod tty;
 pub mod vfs;
+pub mod pty;
 
 /// Initialize the Virtual File System.
 pub fn init() {

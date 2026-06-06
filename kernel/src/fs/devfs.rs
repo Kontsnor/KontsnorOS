@@ -22,6 +22,7 @@ use super::vfs::FileSystem;
 
 /// The global devfs instance.
 static DEVFS: RwLock<Option<Arc<DevFs>>> = RwLock::new(None);
+static PTS_DIR: RwLock<Option<Arc<DevFsDir>>> = RwLock::new(None);
 
 /// The device filesystem.
 pub struct DevFs {
@@ -116,8 +117,18 @@ impl InodeOps for DevZero {
         Ok(buf.len())
     }
 
-    fn write(&self, _offset: u64, data: &[u8]) -> Result<usize, i32> {
         Ok(data.len()) // Discard all data
+    }
+}
+
+/// Dummy /dev/ptmx node so lookup succeeds
+struct DevPtmxDummy {
+    inode: Inode,
+}
+
+impl InodeOps for DevPtmxDummy {
+    fn inode(&self) -> &Inode {
+        &self.inode
     }
 }
 
@@ -137,6 +148,26 @@ pub fn init() {
         String::from("zero"),
         Arc::new(DevZero {
             inode: Inode::new(3, FileType::CharDevice),
+        }) as Arc<dyn InodeOps>,
+    );
+
+    // Create /dev/pts directory
+    let pts = Arc::new(DevFsDir {
+        inode: Inode::new(14, FileType::Directory),
+        entries: RwLock::new(BTreeMap::new()),
+    });
+    *PTS_DIR.write() = Some(pts.clone());
+
+    entries.insert(
+        String::from("pts"),
+        pts as Arc<dyn InodeOps>,
+    );
+
+    // Create /dev/ptmx dummy device
+    entries.insert(
+        String::from("ptmx"),
+        Arc::new(DevPtmxDummy {
+            inode: Inode::new(15, FileType::CharDevice),
         }) as Arc<dyn InodeOps>,
     );
 
@@ -167,5 +198,13 @@ pub fn register_device(name: &str, device: Arc<dyn InodeOps>) {
             .write()
             .insert(String::from(name), device);
         kprintln!("[devfs] Registered device: /dev/{}", name);
+    }
+}
+
+/// Register a new device node in /dev/pts.
+pub fn register_pts_device(name: String, device: Arc<dyn InodeOps>) {
+    if let Some(ref pts) = *PTS_DIR.read() {
+        pts.entries.write().insert(name, device);
+        kprintln!("[devfs] Registered pts device: /dev/pts/{}", name);
     }
 }

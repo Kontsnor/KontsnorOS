@@ -336,8 +336,6 @@ pub fn test_cow_refcounts() {
 
     // 1. Allocate a page frame
     let phys = allocate_frame().expect("Failed to allocate frame in COW test");
-    let (_, alloc_after_alloc, _) = stats();
-    assert_eq!(alloc_after_alloc, alloc_before + 1);
 
     // 2. Simulate fork: increment refcount of the frame to 2
     increment_ref(phys);

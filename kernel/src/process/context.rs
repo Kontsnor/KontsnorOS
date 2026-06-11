@@ -163,6 +163,13 @@ pub unsafe extern "C" fn switch_context(
         // ── Restore new context ────────────────────────────────────
         // rsi = new_ctx pointer
 
+        // Cache the old fs_base and kernel_gs_base in GPRs before stack/CR3 switch
+        // so that we don't dereference old context [rdi] afterwards.
+        // We use rbx and rbp temporarily; they will be overwritten when restoring
+        // the new context anyway.
+        "mov rbx, [rdi + 0x50]",        // rbx = old fs_base
+        "mov rbp, [rdi + 0x60]",        // rbp = old kernel_gs_base
+
         // Check if we need to switch page tables
         "mov rax, [rsi + 0x48]",        // Load new CR3
         "test rax, rax",                // Skip if CR3 is 0 (kernel task)
@@ -183,7 +190,7 @@ pub unsafe extern "C" fn switch_context(
 
         // Restore FS_BASE MSR only if it changed
         "mov rax, [rsi + 0x50]",        // Load new fs_base
-        "cmp rax, [rdi + 0x50]",        // Compare with old fs_base
+        "cmp rax, rbx",                 // Compare with cached old fs_base
         "je 3f",                        // Skip if same
         "mov rdx, rax",
         "shr rdx, 32",                  // High 32 bits of new fs_base in edx
@@ -195,7 +202,7 @@ pub unsafe extern "C" fn switch_context(
 
         // Restore KERNEL_GS_BASE MSR only if it changed
         "mov rax, [rsi + 0x60]",        // Load new kernel_gs_base
-        "cmp rax, [rdi + 0x60]",        // Compare with old kernel_gs_base
+        "cmp rax, rbp",                 // Compare with cached old kernel_gs_base
         "je 4f",                        // Skip if same
         "mov rdx, rax",
         "shr rdx, 32",                  // High 32 bits of new kernel_gs_base in edx

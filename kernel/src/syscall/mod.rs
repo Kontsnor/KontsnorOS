@@ -246,6 +246,7 @@ core::arch::global_asm!(
 
 /// CPU-local scratch space for syscall privilege transitions.
 #[repr(C, align(16))]
+#[derive(Debug, Clone, Copy)]
 pub struct CpuScratch {
     pub user_rsp: u64,
     pub kernel_rsp: u64,
@@ -253,19 +254,24 @@ pub struct CpuScratch {
     pub signals_pending: u64,
 }
 
-/// Static mutable CPU scratch space for the Bootstrap Processor (BSP).
+/// Static mutable CPU scratch spaces.
 #[no_mangle]
-pub static mut CPU_SCRATCH: CpuScratch = CpuScratch {
+pub static mut CPU_SCRATCHES: [CpuScratch; 32] = [CpuScratch {
     user_rsp: 0,
     kernel_rsp: 0,
     current_pid: 0xFFFF_FFFF_FFFF_FFFF,
     signals_pending: 0,
-};
+}; 32];
 
 /// Set the temporary kernel stack pointer for syscall entry.
 pub fn set_kernel_stack(stack: u64) {
     unsafe {
-        CPU_SCRATCH.kernel_rsp = stack;
+        let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
+        if apic_id < 32 {
+            CPU_SCRATCHES[apic_id].kernel_rsp = stack;
+        } else {
+            CPU_SCRATCHES[0].kernel_rsp = stack;
+        }
     }
 }
 
@@ -416,9 +422,14 @@ pub fn init() {
         // 4. Set FMASK flags to clear (clear Interrupt Flag IF, Direction Flag DF)
         fmask_msr.write(0x200 | 0x400); 
 
-        // 5. Configure IA32_GS_BASE (active GS base in kernel) to point to CPU_SCRATCH
+        // 5. Configure IA32_GS_BASE (active GS base in kernel) to point to CPU_SCRATCHES slot for this core
+        let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
+        let scratch_addr = if apic_id < 32 {
+            core::ptr::addr_of!(CPU_SCRATCHES[apic_id]) as u64
+        } else {
+            core::ptr::addr_of!(CPU_SCRATCHES[0]) as u64
+        };
         let mut gs_base_msr = Msr::new(0xC0000101);
-        let scratch_addr = core::ptr::addr_of!(CPU_SCRATCH) as u64;
         gs_base_msr.write(scratch_addr);
 
         // 6. Configure IA32_KERNEL_GS_BASE MSR to 0 (swapped GS base, initially 0 for user space)

@@ -220,8 +220,11 @@ impl Scheduler {
                     parent_task.pending_signals |= 1 << (17 - 1);
                     if Some(parent) == curr_pid {
                         let pending_unblocked = parent_task.pending_signals & !parent_task.blocked_signals;
+                        let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
                         unsafe {
-                            crate::syscall::CPU_SCRATCH.signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
+                            if apic_id < 32 {
+                                crate::syscall::CPU_SCRATCHES[apic_id].signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
+                            }
                         }
                     }
                     // Wake parent task from blocked state if it was waiting
@@ -445,8 +448,10 @@ pub fn schedule() {
 
         // Update CPU-local scratch space with the new PID and pending signals
         unsafe {
-            crate::syscall::CPU_SCRATCH.current_pid = next_pid.as_u64();
-            crate::syscall::CPU_SCRATCH.signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
+            if apic_id < 32 {
+                crate::syscall::CPU_SCRATCHES[apic_id].current_pid = next_pid.as_u64();
+                crate::syscall::CPU_SCRATCHES[apic_id].signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
+            }
         }
 
         // Drop lock before switching to prevent deadlock
@@ -478,8 +483,10 @@ pub fn set_bootstrap_thread(task: Task) {
 
         // Update CPU-local scratch space for the current bootstrap thread
         unsafe {
-            crate::syscall::CPU_SCRATCH.current_pid = pid.as_u64();
-            crate::syscall::CPU_SCRATCH.signals_pending = 0;
+            if apic_id < 32 {
+                crate::syscall::CPU_SCRATCHES[apic_id].current_pid = pid.as_u64();
+                crate::syscall::CPU_SCRATCHES[apic_id].signals_pending = 0;
+            }
         }
     }
 }

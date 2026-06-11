@@ -308,8 +308,11 @@ pub fn deliver_signal_to_pgrp(pgid: u64, sig: i32) {
                     task.pending_signals |= 1 << (sig - 1);
                     if Some(task.pid) == curr_pid {
                         let pending_unblocked = task.pending_signals & !task.blocked_signals;
+                        let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
                         unsafe {
-                            crate::syscall::CPU_SCRATCH.signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
+                            if apic_id < 32 {
+                                crate::syscall::CPU_SCRATCHES[apic_id].signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
+                            }
                         }
                     }
                     pids_to_wake.push(task.pid);

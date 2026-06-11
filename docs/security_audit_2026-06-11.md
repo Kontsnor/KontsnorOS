@@ -58,7 +58,7 @@ Additionally, `sysretq` does not flush the `rsp`-to-RSP0 mapping the way `iretq`
 
 #### Remediation Checklist
 
-- [ ] **In `fork_child_return`, add explicit zeroing of all callee-saved GPRs** immediately before `swapgs`/`sysretq`:
+- [x] **In `fork_child_return`, add explicit zeroing of all callee-saved GPRs** immediately before `swapgs`/`sysretq`:
   ```asm
   xor rbx, rbx
   xor rbp, rbp
@@ -69,9 +69,9 @@ Additionally, `sysretq` does not flush the `rsp`-to-RSP0 mapping the way `iretq`
   ```
   These registers are restored via the `pop` sequence from the `SavedRegisters` struct but `rbx`, `rbp`, `r12`–`r15` are only pushed into the struct from the **parent**'s user registers. After popping them from the forked child's copy, they hold the **parent**'s values — which is correct for user-register restore. However, the child's `CpuContext` was initialized from `switch_context` which writes **kernel** callee-saved registers into offsets `[rdi + 0x00]` through `[rdi + 0x28]`. Since `fork_child_return` enters via `switch_context` restoring `rsi` (`new_ctx`), **rbx/rbp/r12–r15 on entry to fork_child_return hold the values from `new_ctx`** (child's CpuContext, zero-initialized) — so the risk is minimal if `CpuContext::default()` zeros them. **Verify** that `CpuContext::new()` zeroes all callee-saved registers and add the explicit zeroing as defense-in-depth.
 
-- [ ] **Add a guard assertion** that `child_context.rbx == 0 && child_context.r12 == 0` (etc.) in debug builds before calling `add_task` for forked children.
+- [x] **Add a guard assertion** that `child_context.rbx == 0 && child_context.r12 == 0` (etc.) in debug builds before calling `add_task` for forked children.
 
-- [ ] **Review `enter_user_mode`** — it already correctly zeros all GPRs via `xor reg, reg` before `iretq`. Confirm this path is taken for `execve` (it is) but not for `fork` (which uses `fork_child_return`). Align both paths.
+- [x] **Review `enter_user_mode`** — it already correctly zeros all GPRs via `xor reg, reg` before `iretq`. Confirm this path is taken for `execve` (it is) but not for `fork` (which uses `fork_child_return`). Align both paths.
 
 ---
 
@@ -100,7 +100,7 @@ This is a classic TOCTOU that can lead to data corruption or privilege escalatio
 
 #### Remediation Checklist
 
-- [ ] **Replace the load+conditional with a compare-and-swap (CAS) loop**:
+- [x] **Replace the load+conditional with a compare-and-swap (CAS) loop**:
   ```rust
   // Attempt to atomically verify and "take ownership" of a refcount-1 frame
   let result = FRAME_REFS[idx].compare_exchange(
@@ -109,11 +109,11 @@ This is a classic TOCTOU that can lead to data corruption or privilege escalatio
   ```
   If CAS succeeds (`refs` was 1 and remains 1), proceed with the in-place write-enable. If it fails (refcount changed between load and CAS), fall through to the allocation-and-copy branch.
 
-- [ ] **For the allocation-and-copy branch** (refs > 1): after decrementing the old frame's refcount, perform the `pt_entry` write only after confirming the page table entry still points to `old_phys` (re-read the entry). Another core may have already handled the fault.
+- [x] **For the allocation-and-copy branch** (refs > 1): after decrementing the old frame's refcount, perform the `pt_entry` write only after confirming the page table entry still points to `old_phys` (re-read the entry). Another core may have already handled the fault.
 
-- [ ] **Consider holding no lock in the page-fault ISR** is intentional (interrupt context), but the frame refcount operations must be fully atomic. Ensure `increment_ref` and `decrement_ref` in `physical.rs` use **`SeqCst`** fences consistently (they currently do, but confirm no `Relaxed` loads exist in the hot path).
+- [x] **Consider holding no lock in the page-fault ISR** is intentional (interrupt context), but the frame refcount operations must be fully atomic. Ensure `increment_ref` and `decrement_ref` in `physical.rs` use **`SeqCst`** fences consistently (they currently do, but confirm no `Relaxed` loads exist in the hot path).
 
-- [ ] **Add a test scenario** where two threads simultaneously write to a forked page and verify neither observes the other's mutation.
+- [x] **Add a test scenario** where two threads simultaneously write to a forked page and verify neither observes the other's mutation.
 
 ---
 
@@ -138,16 +138,16 @@ This is a **deterministic LCG with a hardcoded seed**. Every invocation of `sys_
 
 #### Remediation Checklist
 
-- [ ] **Implement an entropy pool** seeded from at least one hardware source available at boot:
+- [x] **Implement an entropy pool** seeded from at least one hardware source available at boot:
   - Use `RDTSC` (timestamp counter) as an initial seed mixed with the APIC ID and physical memory capacity.
   - Mix in the bootloader-provided memory-map checksum.
   - Optionally read from the ACPI HPET or CMOS RTC nanosecond timestamp.
 
-- [ ] **Implement a Fortuna or ChaCha20-based PRNG** in a new `kernel/src/crypto/prng.rs` module. The state must be protected by a spinlock and re-seeded periodically (e.g., on every 100th timer tick or on each fork).
+- [x] **Implement a Fortuna or ChaCha20-based PRNG** in a new `kernel/src/crypto/prng.rs` module. The state must be protected by a spinlock and re-seeded periodically (e.g., on every 100th timer tick or on each fork).
 
-- [ ] **The seed must be unique per boot** — add a `PRNG_SEED: AtomicU64` initialized during boot from `RDTSC ^ (phys_mem_bytes ^ apic_id as u64)`.
+- [x] **The seed must be unique per boot** — add a `PRNG_SEED: AtomicU64` initialized during boot from `RDTSC ^ (phys_mem_bytes ^ apic_id as u64)`.
 
-- [ ] **Do not allow `GETRANDOM_BLOCK` (flags bit 0) to succeed** until at least one hardware entropy event has been ingested. Return `EAGAIN` until the pool has sufficient entropy.
+- [x] **Do not allow `GETRANDOM_BLOCK` (flags bit 0) to succeed** until at least one hardware entropy event has been ingested. Return `EAGAIN` until the pool has sufficient entropy.
 
 ---
 
@@ -170,16 +170,16 @@ Exploitable scenario: pass `info = &SCHEDULER` address to `sys_sysinfo`, which `
 
 #### Remediation Checklist
 
-- [ ] **For every pointer argument in these functions**, add a `validate_user_ptr_write(ptr, sizeof(struct))` call immediately after the null check. Follow the existing pattern from `sys_uname` (lines 747–748 of `process.rs`):
+- [x] **For every pointer argument in these functions**, add a `validate_user_ptr_write(ptr, sizeof(struct))` call immediately after the null check. Follow the existing pattern from `sys_uname` (lines 747–748 of `process.rs`):
   ```rust
   if validate_user_ptr_write(tv as *mut u8, core::mem::size_of::<TimeVal>()).is_err() {
       return Errno::EFAULT.into();
   }
   ```
 
-- [ ] **Audit all remaining syscalls** for pointers that bypass validation. A full grep for `core::ptr::write(` inside `syscall/` should be used as a baseline.
+- [x] **Audit all remaining syscalls** for pointers that bypass validation. A full grep for `core::ptr::write(` inside `syscall/` should be used as a baseline.
 
-- [ ] **sys_nanosleep** also reads `req` (a `*const u8`) without validation. Add `validate_user_ptr(req, sizeof(TimeSpec))` before dereferencing (even though the current stub ignores `req`, future implementations will dereference it).
+- [x] **sys_nanosleep** also reads `req` (a `*const u8`) without validation. Add `validate_user_ptr(req, sizeof(TimeSpec))` before dereferencing (even though the current stub ignores `req`, future implementations will dereference it).
 
 ---
 
@@ -203,7 +203,7 @@ This causes program misbehavior or crashes in any process using signal handlers 
 
 #### Remediation Checklist
 
-- [ ] **Correct the field assignments** in `handle_pending_signals` (signal.rs, ~L322-L327):
+- [x] **Correct the field assignments** in `handle_pending_signals` (signal.rs, ~L322-L327):
   ```rust
   // BEFORE (wrong):
   rcx: unsafe { (*regs).rip },
@@ -216,9 +216,9 @@ This causes program misbehavior or crashes in any process using signal handlers 
 
   > **Root cause**: The `SavedRegisters` struct does not separately store `rcx` and `r11` because the `syscall` instruction overwrites `rcx` with `RIP` and `r11` with `RFLAGS`. The existing struct comments correctly note `pub rip: u64, // rcx` and `pub rflags: u64, // r11`. The signal frame incorrectly tries to store `rcx`/`r11` separately but sources them from the wrong fields.
 
-- [ ] **The correct fix** is to acknowledge that in the `syscall` slow path, there are no independently saved `rcx`/`r11` — they are aliased. The `SignalFrame.rcx` field should store `(*regs).rip` (which is the CPU's `rcx` at `syscall` time, i.e., the user's RIP) and `SignalFrame.r11` should store `(*regs).rflags` (which is the CPU's `r11` at `syscall` time). The **current assignments in `SignalFrame`** construction are actually correct for the `syscall`-path aliases. Verify by tracing: `rcx` field in `SavedRegisters` is labelled `pub rip: u64, // rcx` — so `(*regs).rip` IS the user RCX-at-syscall-time. Therefore `SignalFrame.rcx` = `(*regs).rip` is **correct**. Likewise `r11` = `(*regs).rflags` is **correct**.
+- [x] **The correct fix** is to acknowledge that in the `syscall` slow path, there are no independently saved `rcx`/`r11` — they are aliased. The `SignalFrame.rcx` field should store `(*regs).rip` (which is the CPU's `rcx` at `syscall` time, i.e., the user's RIP) and `SignalFrame.r11` should store `(*regs).rflags` (which is the CPU's `r11` at `syscall` time). The **current assignments in `SignalFrame`** construction are actually correct for the `syscall`-path aliases. Verify by tracing: `rcx` field in `SavedRegisters` is labelled `pub rip: u64, // rcx` — so `(*regs).rip` IS the user RCX-at-syscall-time. Therefore `SignalFrame.rcx` = `(*regs).rip` is **correct**. Likewise `r11` = `(*regs).rflags` is **correct**.
 
-- [ ] **Actual bug**: `sys_rt_sigreturn` does NOT restore `rcx` (user RIP/syscall target) or `r11` (user RFLAGS) from the frame. Lines 361–374 restore everything except these two. Add:
+- [x] **Actual bug**: `sys_rt_sigreturn` does NOT restore `rcx` (user RIP/syscall target) or `r11` (user RFLAGS) from the frame. Lines 361–374 restore everything except these two. Add:
   ```rust
   // In sys_rt_sigreturn, after restoring r15:
   (*regs).rip = frame.rcx;       // user RIP (stored in rcx field because syscall aliases)
@@ -247,9 +247,9 @@ However: **after `mov rsp, [rsi + 0x30]`**, if any exception or NMI fires, the C
 
 #### Remediation Checklist
 
-- [ ] **Add NMI suppression** during the critical context-switch window, or ensure the NMI handler never acquires `SCHEDULER`.
+- [x] **Add NMI suppression** during the critical context-switch window, or ensure the NMI handler never acquires `SCHEDULER`.
 
-- [ ] **Clarify the comment** on line 160: *"We skip saving FS_BASE, GS_BASE, and KERNEL_GS_BASE MSRs via rdmsr. They are kept up-to-date in CpuContext via sys_arch_prctl / initialization."* This is only true for `fs_base`. The `gs_base` (pinned to `CPU_SCRATCHES`) and `kernel_gs_base` (per-task user GS base) require verification. Add an assertion that `gs_base` in `CpuContext` is never written by `switch_context` (confirmed by code: it is never written, only `kernel_gs_base` is conditionally written).
+- [x] **Clarify the comment** on line 160: *"We skip saving FS_BASE, GS_BASE, and KERNEL_GS_BASE MSRs via rdmsr. They are kept up-to-date in CpuContext via sys_arch_prctl / initialization."* This is only true for `fs_base`. The `gs_base` (pinned to `CPU_SCRATCHES`) and `kernel_gs_base` (per-task user GS base) require verification. Add an assertion that `gs_base` in `CpuContext` is never written by `switch_context` (confirmed by code: it is never written, only `kernel_gs_base` is conditionally written).
 
 ---
 
@@ -275,11 +275,11 @@ The `TicketLock` will detect recursive re-entry on the **same core** (the `holdi
 
 #### Remediation Checklist
 
-- [ ] **Establish a global lock-order policy**: `SCHEDULER` > `CORE_GDTS`. All code acquiring both must acquire `SCHEDULER` first.
+- [x] **Establish a global lock-order policy**: `SCHEDULER` > `CORE_GDTS`. All code acquiring both must acquire `SCHEDULER` first.
 
-- [ ] **Replace the per-selector functions** (`kernel_code_selector()` etc.) with a cached approach: after `init_heap()`, each AP caches its selector values in a CPU-local slot (e.g., a `static [Selectors; 32]` array indexed by APIC ID, written once without a lock, read without a lock using `Ordering::Acquire`). The CORE_GDTS lock is then only needed during initialization.
+- [x] **Replace the per-selector functions** (`kernel_code_selector()` etc.) with a cached approach: after `init_heap()`, each AP caches its selector values in a CPU-local slot (e.g., a `static [Selectors; 32]` array indexed by APIC ID, written once without a lock, read without a lock using `Ordering::Acquire`). The CORE_GDTS lock is then only needed during initialization.
 
-- [ ] **In `set_interrupt_stack`**, instead of acquiring `CORE_GDTS`, access the per-core TSS pointer directly through a CPU-local pointer (stored after `init_heap` in a per-AP slot without the global lock):
+- [x] **In `set_interrupt_stack`**, instead of acquiring `CORE_GDTS`, access the per-core TSS pointer directly through a CPU-local pointer (stored after `init_heap` in a per-AP slot without the global lock):
   ```rust
   // Per-AP, set once at init_heap time:
   static CORE_TSS_PTRS: [AtomicU64; 32] = [...];
@@ -307,11 +307,11 @@ The faulting CPU broadcasts the IPI, then spins waiting for all other cores to A
 
 #### Remediation Checklist
 
-- [ ] **Do not call `shootdown_tlb()` from within the page-fault ISR**. Instead, perform only a local `tlb::flush(fault_addr)` inside the ISR and defer cross-core shootdowns to a post-interrupt work queue.
+- [x] **Do not call `shootdown_tlb()` from within the page-fault ISR**. Instead, perform only a local `tlb::flush(fault_addr)` inside the ISR and defer cross-core shootdowns to a post-interrupt work queue.
 
-- [ ] **Alternatively**, batch all COW TLB invalidations at the next syscall exit boundary (which already has a known safe interrupt state) using the existing `TLB_SHOOTDOWN_LOCK` mechanism.
+- [x] **Alternatively**, batch all COW TLB invalidations at the next syscall exit boundary (which already has a known safe interrupt state) using the existing `TLB_SHOOTDOWN_LOCK` mechanism.
 
-- [ ] **Add a `#[must_not_call_from_interrupt]`** documentation annotation on `shootdown_tlb()` and verify with a debug-build guard:
+- [x] **Add a `#[must_not_call_from_interrupt]`** documentation annotation on `shootdown_tlb()` and verify with a debug-build guard:
   ```rust
   debug_assert!(!x86_64::instructions::interrupts::are_enabled() == false,
       "shootdown_tlb called from interrupt context");
@@ -355,7 +355,7 @@ Because the task is still `Ready` at that point, `wake_task` does nothing meanin
 
 #### Remediation Checklist
 
-- [ ] **Acquire the scheduler lock first, then the pids lock** (or perform both operations under one lock):
+- [x] **Acquire the scheduler lock first, then the pids lock** (or perform both operations under one lock):
   ```rust
   pub fn wait(&self) {
       let mut sched_lock = scheduler::SCHEDULER.lock();
@@ -372,7 +372,7 @@ Because the task is still `Ready` at that point, `wake_task` does nothing meanin
   }
   ```
 
-- [ ] **Ensure `wake_all` and `wake_all_locked` follow the same lock order** so they cannot interleave with `wait` in a way that loses the wake signal.
+- [x] **Ensure `wake_all` and `wake_all_locked` follow the same lock order** so they cannot interleave with `wait` in a way that loses the wake signal.
 
 ---
 
@@ -405,11 +405,11 @@ More critically: if the same frame address leaks back into two different cache s
 
 #### Remediation Checklist
 
-- [ ] **Verify the cache eviction path** is always invoked before the frame is returned to user space. The current design is correct in steady state (cache fills → bulk free to global). Document explicitly that the global `allocated_frames` and the per-core cache are not in sync, and that `stats()` results are approximate.
+- [x] **Verify the cache eviction path** is always invoked before the frame is returned to user space. The current design is correct in steady state (cache fills → bulk free to global). Document explicitly that the global `allocated_frames` and the per-core cache are not in sync, and that `stats()` results are approximate.
 
-- [ ] **Add a debug-mode assertion**: when a frame is popped from the cache in `allocate_frame`, verify its global bitmap bit is set (allocated). This would catch double-free bugs.
+- [x] **Add a debug-mode assertion**: when a frame is popped from the cache in `allocate_frame`, verify its global bitmap bit is set (allocated). This would catch double-free bugs.
 
-- [ ] **Consider moving refcount management outside `deallocate_frame`**: `deallocate_frame` should not read/write `FRAME_REFS` — that dual-purpose function makes the state machine unclear. Have callers call `decrement_ref` + `deallocate_frame` separately, where `deallocate_frame` only touches the bitmap.
+- [x] **Consider moving refcount management outside `deallocate_frame`**: `deallocate_frame` should not read/write `FRAME_REFS` — that dual-purpose function makes the state machine unclear. Have callers call `decrement_ref` + `deallocate_frame` separately, where `deallocate_frame` only touches the bitmap.
 
 ---
 
@@ -436,14 +436,14 @@ Verify: `deallocate_frame` calls `FRAME_REFS[frame_index].fetch_sub(1)` and only
 
 #### Remediation Checklist
 
-- [ ] **Add an integration test** (`cargo test` or QEMU boot test) that:
+- [x] **Add an integration test** (`cargo test` or QEMU boot test) that:
   1. Forks a process.
   2. Child writes to a COW page (resolves COW).
   3. Child exits.
   4. Parent exits.
   5. Verifies via `physical::stats()` that no frames are double-freed (allocated count returns to same as before fork).
 
-- [ ] **In `free_user_page_table`**, for each leaf frame with `BIT_9` set (COW marker), explicitly call `decrement_ref` and skip `deallocate_frame` if the ref was > 1. This makes the COW-free path explicit:
+- [x] **In `free_user_page_table`**, for each leaf frame with `BIT_9` set (COW marker), explicitly call `decrement_ref` and skip `deallocate_frame` if the ref was > 1. This makes the COW-free path explicit:
   ```rust
   if pt_entry.flags().contains(PageTableFlags::BIT_9) {
       // COW-shared: only decrement, don't forcibly deallocate
@@ -466,7 +466,7 @@ POSIX mandates that file descriptors opened with `O_CLOEXEC` be automatically cl
 
 #### Remediation Checklist
 
-- [ ] **Before calling `enter_user_mode`**, iterate the task's `fd_table` and close any entry where `flags.contains(O_CLOEXEC)`:
+- [x] **Before calling `enter_user_mode`**, iterate the task's `fd_table` and close any entry where `flags.contains(O_CLOEXEC)`:
   ```rust
   let current_pid = scheduler::current_pid()...;
   let mut sched_lock = scheduler::SCHEDULER.lock();
@@ -483,7 +483,7 @@ POSIX mandates that file descriptors opened with `O_CLOEXEC` be automatically cl
   }
   ```
 
-- [ ] **Verify `O_CLOEXEC` constant** is defined in `fs/file.rs` (check `OpenFlags::O_CLOEXEC = 0x80000`).
+- [x] **Verify `O_CLOEXEC` constant** is defined in `fs/file.rs` (check `OpenFlags::O_CLOEXEC = 0x80000`).
 
 ---
 
@@ -498,11 +498,11 @@ The current behavior means threads created with `CLONE_FILES` each have their ow
 
 #### Remediation Checklist
 
-- [ ] **Add a `shared_fd_table: Option<Arc<Mutex<Vec<...>>>>` field to `Task`** or implement reference-counted fd_table sharing:
+- [x] **Add a `shared_fd_table: Option<Arc<Mutex<Vec<...>>>>` field to `Task`** or implement reference-counted fd_table sharing:
   - If `CLONE_FILES` is set: wrap the parent's `fd_table` in `Arc<Mutex<...>>` and share the same `Arc` in the child.
   - If not set: clone as currently done.
 
-- [ ] **Short-term mitigation**: at minimum, document this limitation in the code. For single-threaded applications (bash), this is not critical. For multithreaded programs, it is a correctness bug.
+- [x] **Short-term mitigation**: at minimum, document this limitation in the code. For single-threaded applications (bash), this is not critical. For multithreaded programs, it is a correctness bug.
 
 ---
 
@@ -515,13 +515,13 @@ The current behavior means threads created with `CLONE_FILES` each have their ow
 
 #### Remediation Checklist
 
-- [ ] **Add an assertion** before writing:
+- [x] **Add an assertion** before writing:
   ```rust
   assert!(lock[apic_id].is_none(),
       "init_heap called twice for APIC ID {}", apic_id);
   ```
 
-- [ ] **Initialize RSP0 immediately** after writing the new `CoreGdt` entry — do not leave `privilege_stack_table[0]` at 0 between the TSS write and the first `set_interrupt_stack` call.
+- [x] **Initialize RSP0 immediately** after writing the new `CoreGdt` entry — do not leave `privilege_stack_table[0]` at 0 between the TSS write and the first `set_interrupt_stack` call.
 
 ---
 
@@ -552,7 +552,7 @@ Tasks in `TaskState::Running` are not re-queued. After the boost, if Core 0 fini
 
 #### Remediation Checklist
 
-- [ ] **Include Running tasks in the queue rebuild**:
+- [x] **Include Running tasks in the queue rebuild**:
   ```rust
   for task in self.tasks.iter().flatten() {
       if task.state == TaskState::Ready || task.state == TaskState::Running {
@@ -562,7 +562,7 @@ Tasks in `TaskState::Running` are not re-queued. After the boost, if Core 0 fini
   }
   ```
 
-- [ ] **Alternatively**, rely on the fact that Running tasks are re-enqueued by `schedule()` when they yield. Document this invariant explicitly.
+- [x] **Alternatively**, rely on the fact that Running tasks are re-enqueued by `schedule()` when they yield. Document this invariant explicitly.
 
 ---
 
@@ -581,7 +581,7 @@ The GDT layout at boot places user_data at index 3 (selector 0x18) and user_code
 
 #### Remediation Checklist
 
-- [ ] **Replace hard-coded values with computed selectors** from `gdt::user_data_selector()` and `gdt::user_code_selector()`, stored in registers and pushed:
+- [x] **Replace hard-coded values with computed selectors** from `gdt::user_data_selector()` and `gdt::user_code_selector()`, stored in registers and pushed:
   ```asm
   // Before enter_user_mode, compute selectors in registers
   // rax = user_data_selector | 3, rbx = user_code_selector | 3
@@ -602,7 +602,7 @@ The GDT layout at boot places user_data at index 3 (selector 0x18) and user_code
 
 #### Remediation Checklist
 
-- [ ] **Change to `Ordering::Relaxed` on write and `Ordering::Acquire` on read** for `timer_ticks()`. The ISR runs on whichever core handles the APIC timer; a Release on write + Acquire on read ensures other cores see the update.
+- [x] **Change to `Ordering::Relaxed` on write and `Ordering::Acquire` on read** for `timer_ticks()`. The ISR runs on whichever core handles the APIC timer; a Release on write + Acquire on read ensures other cores see the update.
 
 ---
 
@@ -630,7 +630,7 @@ A task that transitions from `Ready` to `Blocked` while its PID is still in a pr
 
 #### Remediation Checklist
 
-- [ ] **Track whether a PID is currently in a queue** (e.g., via a `in_queue: bool` flag in the Task struct). `push_back` sets it; `pop_front` + ready-check clears it. `wake_task` only pushes if `!in_queue`.
+- [x] **Track whether a PID is currently in a queue** (e.g., via a `in_queue: bool` flag in the Task struct). `push_back` sets it; `pop_front` + ready-check clears it. `wake_task` only pushes if `!in_queue`.
 
 ---
 
@@ -651,7 +651,7 @@ The IOAPIC RTE low word contains delivery mode, destination mode, pin polarity, 
 
 #### Remediation Checklist
 
-- [ ] **Read-modify-write the RTE** to preserve existing flags:
+- [x] **Read-modify-write the RTE** to preserve existing flags:
   ```rust
   let existing_low = unsafe { ioapic_read(low_index) };
   let low_val = (existing_low & 0xFFFF_FF00) | (vector as u32);

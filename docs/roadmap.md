@@ -27,10 +27,18 @@ gantt
     section Phase D: Network Stack (Completed)
     e1000 PCI NIC Network Driver       :done, net1, after bash6, 30d
     Socket API & TCP/IP Stack          :done, net2, after net1, 25d
-    section Phase E: Advanced Graphics TUI
-    Framebuffer GPU Acceleration        :         ui1, after net2, 20d
+    section Phase E: Disk & VFS Performance Hardening
+    Block Buffer Cache & ATA Multi-sector :         perf1, after net2, 15d
+    VFS Dentry Path Cache                 :         perf2, after perf1, 10d
+    ATA Bus Master DMA Driver            :         perf3, after perf2, 25d
+    section Phase H: Core Kernel & VM Performance Optimization
+    Per-Core Run Queues & Local Storage  :         core1, after perf3, 20d
+    Batched VM & TLB Shootdowns          :         core2, after core1, 15d
+    Syscall & Stack-Buffered I/O         :         core3, after core2, 15d
+    section Phase F: Advanced Graphics TUI
+    Framebuffer GPU Acceleration        :         ui1, after core3, 20d
     Custom Shell,Pts pseudoterminals TUI:         ui2, after ui1, 30d
-    section Phase F: Distribution Readiness & Security
+    section Phase G: Distribution Readiness & Security
     Init Daemon (PID 1) & Service Mgt   :         dist1, after ui2, 20d
     VFS Permissions & UID/GID Enforce   :         dist2, after dist1, 20d
     Dynamic Loader (ld.so) & Shared Libs:         dist3, after dist2, 30d
@@ -132,35 +140,71 @@ gantt
 
 ---
 
-### 🖥️ Phase E: Advanced User-Space & GPU Graphics
+### 💾 Phase E: Disk & VFS Performance Hardening
+*Address user-space performance bottlenecks by implementing standard caching layers and optimizing disk command paths.*
+
+#### Phase 43: Block Buffer Cache & ATA Multi-Sector Support
+- **LRU Block Buffer Cache**: Implement a global Least Recently Used (LRU) block buffer cache layer inside the kernel heap. Keep recently used 4096-byte blocks mapped to memory to avoid redundant disk block lookups.
+- **ATA Multi-Sector Command Transfers**: Refactor the ATA driver to support commands for reading/writing multiple sectors in a single IO request rather than polling/looping sector-by-sector.
+- **Yielding wait_ready**: Replace busy-wait spin loops in ATA status polling with cooperative scheduler yields when waiting on long-duration disk ready states.
+
+#### Phase 44: Directory Entry (Dentry) Cache
+- **Path Resolution Cache**: Cache resolved directory path nodes to avoid walking the VFS directory hierarchy (and performing disk lookup requests) repeatedly for identical paths.
+
+#### Phase 45: ATA Bus Master DMA Driver
+- **PCI Bus Master DMA**: Transition the ATA controller driver from Programmed I/O (PIO) to Bus Master DMA using Physical Region Descriptor Tables (PRDT) to transfer disk data directly to/from page frames without CPU busy polling.
+
+---
+
+### ⚡ Phase H: Core Kernel & VM Performance Optimization
+*Minimize context switch latencies, lock contention, VM overhead, and memory allocation bottlenecks in the kernel hot paths.*
+
+#### Phase 46: Low-Contention Scheduler & CPU-Local Storage
+- **Per-Core Run Queues & Work-Stealing**: Partition scheduler priority queues per logical core, protecting each with a local lock. Implement cooperative work-stealing for load balancing across cores.
+- **Lock-Free current_pid Resolution**: Store active task pointers/PIDs in per-core scratch spaces (`CpuScratch` or local segment offsets) to resolve the active thread PID lock-free via the `GS` register, avoiding global scheduler lock acquisition.
+- **Per-Core GDT & TSS Layouts**: Allocate GDT/TSS structures per-core, ensuring TSS updates (e.g. TSS privilege stack RSP0 modifications on context switches) do not cause cross-core lock serialization.
+- **Decoupled Task Table**: Refactor the master tasks collection (`tasks`) using read-mostly or fine-grained task locks to prevent task state queries from locking the execution queue scheduler.
+
+#### Phase 47: Batched VM Operations & TLB Shootdowns
+- **TLB Shootdown Batching**: Modify range-based virtual memory system calls (`mmap`, `munmap`, `mprotect`, `brk`) to execute page table updates sequentially without triggering immediate flushes, performing a single batched TLB shootdown (IPI broadcast) at the syscall boundary.
+- **Lazy TLB Shootdowns**: Research deferred invalidation strategies for process teardown and context switches to minimize synchronous APIC ICR wait times.
+
+#### Phase 48: High-Performance Syscall & I/O Pathways
+- **Omission of Redundant MSR Accesses**: Avoid reading FS_BASE via `rdmsr` during context switches, relying on user-space base addresses already stored in the task context. Skip GS MSR changes during kernel-to-kernel context switches.
+- **Zero-Allocation Stack-Buffered I/O**: Refactor the boundary hardening of `sys_read` and `sys_write` to copy data chunk-by-chunk using a stack-allocated buffer (e.g., 4 KiB) instead of making heap-allocated dynamic vector allocations (`alloc::vec!`) on the hot path.
+- **Fast-Path Syscall Register Saving**: Avoid pushing/popping callee-saved registers (`rbx`, `rbp`, `r12`-`r15`) on standard fast-path syscalls that do not yield or context switch.
+
+---
+
+### 🖥️ Phase F: Advanced User-Space & GPU Graphics
 *Transition the kernel output console into a modern graphical Terminal User Interface (TUI) and compile rich user applications.*
 
-#### Phase 43: GPU Framebuffer Acceleration
+#### Phase 49: GPU Framebuffer Acceleration
 - **BOCHS / VBE Graphics Driver**: Write a PCI display device driver supporting higher resolutions (e.g. 1920x1080) and 32-bit RGB double-buffering.
 - **Hardware Cursor & Blitting**: Accelerate display rendering using DMA transfer windows to copy backbuffers without stressing the CPU.
 
-#### Phase 44: Graphical Terminal & Console TUI
+#### Phase 50: Graphical Terminal & Console TUI
 - **Terminal Emulator (Pts/PTY)**: Develop a hardware-accelerated user-space terminal emulator reading from TTY pseudoterminals (`/dev/pts/*`).
 - **Font Rendering & Window Manager**: Map standard rasterized Unicode fonts and support basic window layout overlay blending.
 
 ---
 
-### 📦 Phase F: Distribution Readiness & Multi-User Security
+### 📦 Phase G: Distribution Readiness & Multi-User Security
 *Transform the current kernel-interactive setup into a self-contained, fully featured, multi-user Linux/Unix-like operating system distribution.*
 
-#### Phase 45: Proper Init System (PID 1) & Re-parenting
+#### Phase 51: Proper Init System (PID 1) & Re-parenting
 - **Init Daemon (`/sbin/init`)**: Create a robust PID 1 process that mounts directories, runs initialization scripts, listens for system restarts/shutdowns, and spawns terminal getty terminals.
 - **Orphan Re-parenting**: Ensure exiting tasks automatically re-parent their children to PID 1 to clean up zombie descriptors and prevent memory leaks.
 
-#### Phase 46: VFS Permission Checks & Multi-User Model
+#### Phase 52: VFS Permission Checks & Multi-User Model
 - **Enforced File Permissions**: Update VFS lookup checks to validate read/write/execute flags against inode owner `uid`, group `gid`, and permission modes (`chmod` flags).
 - **Process Credentials**: Fully implement `getuid`, `getgid`, `setuid`, and `setgid` system calls, enforcing privilege constraints (non-root cannot assume arbitrary IDs) and set-UID executable logic on `execve`.
 
-#### Phase 47: Dynamic Linker (`ld.so`) & Shared Libraries
+#### Phase 53: Dynamic Linker (`ld.so`) & Shared Libraries
 - **Dynamic ELF Loader**: Implement dynamic ELF parsing in the kernel and a user-space dynamic linker (`/lib/ld-kontsnoros.so`) to load shared object (.so) libraries.
 - **VMM Shared Mappings**: Extend `sys_mmap` to support shared write memory mappings (`MAP_SHARED`), allowing clean IPC memory mapping and shared libraries sharing.
 
-#### Phase 48: Package Manager & Native Toolchain [Partially Completed]
+#### Phase 54: Package Manager & Native Toolchain [Partially Completed]
 - **Native Ports/Compiler**: Bootstrap `gcc` or `clang` and `make` on KontsnorOS to allow compiling software natively inside the running OS.
 - **Package Manager (`pkg`)**: Write a simple package manager to download, unpack, and install software packages from remote repositories via HTTP.
 - **Standard Core Utilities (Coreutils) via BusyBox**: Cross-compile BusyBox statically using the musl-libc toolchain, integrate it into the ext2 filesystem, stub necessary syscalls (e.g., `symlink`, `symlinkat`, `readlink`), and expose standard Unix applets (`ls`, `cat`, `grep`, `ps`, `wc`, `uname`, etc.) via symlinks. [Completed]

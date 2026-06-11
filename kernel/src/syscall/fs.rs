@@ -97,7 +97,7 @@ pub fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
     if buf.is_null() || count == 0 {
         return 0;
     }
-    if !validate_user_ptr(buf as *const u8, count) {
+    if validate_user_ptr_write(buf, count).is_err() {
         return Errno::EFAULT.into();
     }
 
@@ -112,25 +112,38 @@ pub fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
         crate::kprintln!("[syscall pid={}] sys_read on pipe fd {}", pid_str, fd);
     }
 
-    let mut kernel_buf = alloc::vec![0u8; count];
+    let mut total_read = 0;
+    let mut temp_buf = [0u8; 4096];
 
-    match file_desc.read(&mut kernel_buf) {
-        Ok(n) => {
-            unsafe {
-                core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf, n);
+    while total_read < count {
+        let chunk_size = core::cmp::min(count - total_read, 4096);
+        match file_desc.read(&mut temp_buf[..chunk_size]) {
+            Ok(0) => break,
+            Ok(n) => {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(temp_buf.as_ptr(), buf.add(total_read), n);
+                }
+                total_read += n;
+                if is_pipe {
+                    crate::kprintln!("[syscall] sys_read on pipe fd {} chunk returned {} bytes", fd, n);
+                }
+                if n < chunk_size {
+                    break;
+                }
             }
-            if is_pipe {
-                crate::kprintln!("[syscall] sys_read on pipe fd {} returned {} bytes", fd, n);
+            Err(e) => {
+                if is_pipe {
+                    crate::kprintln!("[syscall] sys_read on pipe fd {} failed with error {}", fd, e);
+                }
+                if total_read > 0 {
+                    break;
+                }
+                return e as SyscallResult;
             }
-            n as SyscallResult
-        }
-        Err(e) => {
-            if is_pipe {
-                crate::kprintln!("[syscall] sys_read on pipe fd {} failed with error {}", fd, e);
-            }
-            e as SyscallResult
         }
     }
+
+    total_read as SyscallResult
 }
 
 /// `write(fd, buf, count)` — Write to a file descriptor.
@@ -159,25 +172,38 @@ pub fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
         crate::kprintln!("[syscall pid={}] sys_write on pipe fd {} count {}", pid_str, fd, count);
     }
 
-    let mut kernel_buf = alloc::vec![0u8; count];
-    unsafe {
-        core::ptr::copy_nonoverlapping(buf, kernel_buf.as_mut_ptr(), count);
+    let mut total_written = 0;
+    let mut temp_buf = [0u8; 4096];
+
+    while total_written < count {
+        let chunk_size = core::cmp::min(count - total_written, 4096);
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf.add(total_written), temp_buf.as_mut_ptr(), chunk_size);
+        }
+        match file_desc.write(&temp_buf[..chunk_size]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total_written += n;
+                if is_pipe {
+                    crate::kprintln!("[syscall] sys_write on pipe fd {} returned {} bytes written", fd, n);
+                }
+                if n < chunk_size {
+                    break;
+                }
+            }
+            Err(e) => {
+                if is_pipe {
+                    crate::kprintln!("[syscall] sys_write on pipe fd {} failed with error {}", fd, e);
+                }
+                if total_written > 0 {
+                    break;
+                }
+                return e as SyscallResult;
+            }
+        }
     }
 
-    match file_desc.write(&kernel_buf) {
-        Ok(n) => {
-            if is_pipe {
-                crate::kprintln!("[syscall] sys_write on pipe fd {} returned {} bytes written", fd, n);
-            }
-            n as SyscallResult
-        }
-        Err(e) => {
-            if is_pipe {
-                crate::kprintln!("[syscall] sys_write on pipe fd {} failed with error {}", fd, e);
-            }
-            e as SyscallResult
-        }
-    }
+    total_written as SyscallResult
 }
 
 /// `open(pathname, flags, mode)` — Open a file.
@@ -1215,7 +1241,13 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, _timeout: i32) -> SyscallResult {
 ///
 /// Unlike `read`, this does not change the file's seek position.
 pub fn sys_pread64(fd: i32, buf: *mut u8, count: usize, offset: i64) -> SyscallResult {
-    if !validate_user_ptr(buf, count) {
+    if fd < 0 {
+        return Errno::EBADF.into();
+    }
+    if buf.is_null() || count == 0 {
+        return 0;
+    }
+    if validate_user_ptr_write(buf, count).is_err() {
         return Errno::EFAULT.into();
     }
 
@@ -1224,16 +1256,33 @@ pub fn sys_pread64(fd: i32, buf: *mut u8, count: usize, offset: i64) -> SyscallR
         None => return Errno::EBADF.into(),
     };
 
-    let mut kernel_buf = alloc::vec![0u8; count];
-    match file.inode.read(offset as u64, &mut kernel_buf) {
-        Ok(n)  => {
-            unsafe {
-                core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf, n);
+    let mut total_read = 0;
+    let mut temp_buf = [0u8; 4096];
+
+    while total_read < count {
+        let chunk_size = core::cmp::min(count - total_read, 4096);
+        let chunk_offset = offset + total_read as i64;
+        match file.inode.read(chunk_offset as u64, &mut temp_buf[..chunk_size]) {
+            Ok(0) => break,
+            Ok(n) => {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(temp_buf.as_ptr(), buf.add(total_read), n);
+                }
+                total_read += n;
+                if n < chunk_size {
+                    break;
+                }
             }
-            n as SyscallResult
+            Err(e) => {
+                if total_read > 0 {
+                    break;
+                }
+                return e as SyscallResult;
+            }
         }
-        Err(e) => e as SyscallResult,
     }
+
+    total_read as SyscallResult
 }
 
 /// `IoVec` structure for `writev`.

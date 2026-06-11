@@ -99,6 +99,13 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
         x86_64::registers::model_specific::Msr::new(0xC0000102).read()
     };
 
+    debug_assert_eq!(child_context.rbx, 0);
+    debug_assert_eq!(child_context.rbp, 0);
+    debug_assert_eq!(child_context.r12, 0);
+    debug_assert_eq!(child_context.r13, 0);
+    debug_assert_eq!(child_context.r14, 0);
+    debug_assert_eq!(child_context.r15, 0);
+
     crate::kprintln!("[syscall] fork debug: rip = {:#x}, rsp = {:#x}, cr3 = {:#x}, fs_base = {:#x}, gs_base = {:#x}", 
         child_context.rip, child_context.rsp, child_context.cr3, child_context.fs_base, child_context.kernel_gs_base);
 
@@ -1077,6 +1084,13 @@ pub fn sys_clone(
     child_context.kernel_gs_base = unsafe {
         x86_64::registers::model_specific::Msr::new(0xC0000102).read()
     };
+
+    debug_assert_eq!(child_context.rbx, 0);
+    debug_assert_eq!(child_context.rbp, 0);
+    debug_assert_eq!(child_context.r12, 0);
+    debug_assert_eq!(child_context.r13, 0);
+    debug_assert_eq!(child_context.r14, 0);
+    debug_assert_eq!(child_context.r15, 0);
 
     child_task.context = child_context;
 

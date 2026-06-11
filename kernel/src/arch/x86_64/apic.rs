@@ -95,11 +95,12 @@ pub fn ioapic_set_routing(pin: u8, vector: u8, apic_id: u8) {
     let low_index = 0x10 + 2 * pin;
     let high_index = low_index + 1;
 
-    // Delivery Mode: 000 (Fixed), Dest Mode: 0 (Physical), Mask: 0 (Unmasked)
-    let low_val = vector as u32; 
-    let high_val = (apic_id as u32) << 24;
-
     unsafe {
+        let existing_low = ioapic_read(low_index);
+        // Preserve existing flags (trigger mode, polarity, etc.), update the vector, and unmask (clear bit 16)
+        let low_val = ((existing_low & 0xFFFF_FF00) | (vector as u32)) & !(1 << 16);
+        let high_val = (apic_id as u32) << 24;
+
         ioapic_write(low_index, low_val);
         ioapic_write(high_index, high_val);
     }

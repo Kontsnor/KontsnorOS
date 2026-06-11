@@ -145,9 +145,13 @@ impl Scheduler {
     ///
     /// This prevents starvation by periodically moving all tasks
     /// back to a high priority queue.
+    ///
+    /// Invariant: Running tasks are boosted in priority, but their PIDs are
+    /// not re-added to the queues here. Instead, they will be re-enqueued
+    /// with their boosted priority by `schedule()` when they yield or are preempted.
     fn boost_priorities(&mut self) {
         for task in self.tasks.iter_mut().flatten() {
-            if task.priority > Priority::High && task.state == TaskState::Ready {
+            if task.priority > Priority::High && (task.state == TaskState::Ready || task.state == TaskState::Running) {
                 task.priority = Priority::High;
             }
         }

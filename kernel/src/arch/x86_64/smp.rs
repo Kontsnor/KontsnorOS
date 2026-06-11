@@ -91,9 +91,20 @@ pub fn current_lapic_id() -> u8 {
 ///
 /// Under SMP, we broadcast the IPI and block until all other active cores
 /// have processed the flush, preventing use-after-free conditions.
+///
+/// # Panics
+///
+/// This function must not be called from interrupt/exception context as it
+/// can produce a deadlock if another core is also waiting for a TLB shootdown ACK.
 pub fn shootdown_tlb() {
     let cpu_count = get_cpu_count();
     if cpu_count > 1 {
+        // F-08: Ensure we are not in an interrupt context under SMP
+        debug_assert!(
+            x86_64::instructions::interrupts::are_enabled(),
+            "shootdown_tlb called with interrupts disabled (potential deadlock)"
+        );
+
         let _lock = TLB_SHOOTDOWN_LOCK.lock();
         
         let target_count = cpu_count - 1;

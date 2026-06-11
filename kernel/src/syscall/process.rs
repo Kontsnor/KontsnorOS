@@ -803,11 +803,18 @@ struct TimeZone {
 /// We stub this to return a fixed point in time (epoch + 0).
 /// Real wall-clock time requires an RTC driver.
 pub fn sys_gettimeofday(tv: *mut u8, tz: *mut u8) -> SyscallResult {
+    use super::fs::validate_user_ptr_write;
     if !tv.is_null() {
+        if validate_user_ptr_write(tv, core::mem::size_of::<TimeVal>()).is_err() {
+            return Errno::EFAULT.into();
+        }
         let t = TimeVal { tv_sec: 0, tv_usec: 0 };
         unsafe { core::ptr::write(tv as *mut TimeVal, t); }
     }
     if !tz.is_null() {
+        if validate_user_ptr_write(tz, core::mem::size_of::<TimeZone>()).is_err() {
+            return Errno::EFAULT.into();
+        }
         let z = TimeZone { tz_minuteswest: 0, tz_dsttime: 0 };
         unsafe { core::ptr::write(tz as *mut TimeZone, z); }
     }
@@ -823,7 +830,11 @@ struct TimeSpec {
 
 /// `clock_gettime(clockid, tp)` — Return current clock value.
 pub fn sys_clock_gettime(_clockid: i32, tp: *mut u8) -> SyscallResult {
+    use super::fs::validate_user_ptr_write;
     if tp.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if validate_user_ptr_write(tp, core::mem::size_of::<TimeSpec>()).is_err() {
         return Errno::EFAULT.into();
     }
     let ts = TimeSpec { tv_sec: 0, tv_nsec: 0 };
@@ -834,10 +845,19 @@ pub fn sys_clock_gettime(_clockid: i32, tp: *mut u8) -> SyscallResult {
 /// `nanosleep(req, rem)` — High-resolution sleep.
 ///
 /// We approximate with a scheduler yield. `rem` is zeroed on return.
-pub fn sys_nanosleep(_req: *const u8, rem: *mut u8) -> SyscallResult {
+pub fn sys_nanosleep(req: *const u8, rem: *mut u8) -> SyscallResult {
+    use super::fs::{validate_user_ptr, validate_user_ptr_write};
+    if !req.is_null() {
+        if !validate_user_ptr(req, core::mem::size_of::<TimeSpec>()) {
+            return Errno::EFAULT.into();
+        }
+    }
     // Yield to the scheduler (no real timer infrastructure yet).
     crate::process::scheduler::yield_now();
     if !rem.is_null() {
+        if validate_user_ptr_write(rem, core::mem::size_of::<TimeSpec>()).is_err() {
+            return Errno::EFAULT.into();
+        }
         let ts = TimeSpec { tv_sec: 0, tv_nsec: 0 };
         unsafe { core::ptr::write(rem as *mut TimeSpec, ts); }
     }
@@ -855,7 +875,11 @@ struct Tms {
 
 /// `times(buf)` — Return process and children CPU usage times.
 pub fn sys_times(buf: *mut u8) -> SyscallResult {
+    use super::fs::validate_user_ptr_write;
     if !buf.is_null() {
+        if validate_user_ptr_write(buf, core::mem::size_of::<Tms>()).is_err() {
+            return Errno::EFAULT.into();
+        }
         let t = Tms { tms_utime: 0, tms_stime: 0, tms_cutime: 0, tms_cstime: 0 };
         unsafe { core::ptr::write(buf as *mut Tms, t); }
     }
@@ -875,7 +899,11 @@ const RLIM_INFINITY: u64 = !0u64;
 ///
 /// Returns sane defaults; KontsnorOS does not currently enforce limits.
 pub fn sys_getrlimit(resource: i32, rlim: *mut u8) -> SyscallResult {
+    use super::fs::validate_user_ptr_write;
     if rlim.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if validate_user_ptr_write(rlim, core::mem::size_of::<RLimit>()).is_err() {
         return Errno::EFAULT.into();
     }
 
@@ -924,7 +952,11 @@ struct SysInfo {
 
 /// `sysinfo(info)` — Return overall system information.
 pub fn sys_sysinfo(info: *mut u8) -> SyscallResult {
+    use super::fs::validate_user_ptr_write;
     if info.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if validate_user_ptr_write(info, core::mem::size_of::<SysInfo>()).is_err() {
         return Errno::EFAULT.into();
     }
     let si = SysInfo {

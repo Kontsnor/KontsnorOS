@@ -240,12 +240,14 @@ extern "x86-interrupt" fn page_fault_handler(
                                         // This is a Copy-on-Write page!
                                         if let Ok(old_frame) = pt_entry.frame() {
                                             let old_phys = old_frame.start_address().as_u64();
+                                            let idx = (old_phys / 4096) as usize;
 
-                                            // Safely read reference count from AtomicU8 array
                                             use core::sync::atomic::Ordering;
-                                            let refs = crate::memory::physical::FRAME_REFS[(old_phys / 4096) as usize].load(Ordering::SeqCst);
+                                            let is_sole_owner = crate::memory::physical::FRAME_REFS[idx].compare_exchange(
+                                                1, 1, Ordering::SeqCst, Ordering::SeqCst
+                                            ).is_ok();
 
-                                            if refs == 1 {
+                                            if is_sole_owner {
                                                 // Not shared anymore! Mark as writable directly
                                                 flags.remove(PageTableFlags::BIT_9);
                                                 flags.insert(PageTableFlags::WRITABLE);
@@ -253,10 +255,8 @@ extern "x86-interrupt" fn page_fault_handler(
 
                                                 // Flush local TLB for this virtual address
                                                 x86_64::instructions::tlb::flush(fault_addr);
-                                                // Broadcast TLB shootdown to notify other CPU cores
-                                                crate::arch::x86_64::smp::shootdown_tlb();
                                                 return; // Fault resolved!
-                                            } else if refs > 1 {
+                                            } else {
                                                 // Shared page! Allocate a new page frame, copy contents, and map writable
                                                 if let Some(new_phys) = crate::memory::physical::allocate_frame() {
                                                     let src_ptr = (old_phys + phys_mem_offset) as *const u8;
@@ -269,13 +269,22 @@ extern "x86-interrupt" fn page_fault_handler(
                                                     // Decrement old frame's reference count
                                                     crate::memory::physical::decrement_ref(old_phys);
 
-                                                    flags.remove(PageTableFlags::BIT_9);
-                                                    flags.insert(PageTableFlags::WRITABLE);
-                                                    pt_entry.set_addr(PhysAddr::new(new_phys), flags);
+                                                    // Re-verify that pt_entry still points to old_phys before writing
+                                                    if let Ok(current_frame) = pt_entry.frame() {
+                                                        if current_frame.start_address().as_u64() == old_phys {
+                                                            flags.remove(PageTableFlags::BIT_9);
+                                                            flags.insert(PageTableFlags::WRITABLE);
+                                                            pt_entry.set_addr(PhysAddr::new(new_phys), flags);
 
-                                                    // Flush local TLB and broadcast shootdown
-                                                    x86_64::instructions::tlb::flush(fault_addr);
-                                                    crate::arch::x86_64::smp::shootdown_tlb();
+                                                            // Flush local TLB for this virtual address
+                                                            x86_64::instructions::tlb::flush(fault_addr);
+                                                        } else {
+                                                            // Another core already handled the page fault, deallocate the new frame
+                                                            crate::memory::physical::deallocate_frame(new_phys);
+                                                        }
+                                                    } else {
+                                                        crate::memory::physical::deallocate_frame(new_phys);
+                                                    }
                                                     return; // Fault resolved!
                                                 }
                                             }

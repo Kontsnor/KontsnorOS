@@ -126,6 +126,20 @@ pub static CORE_GDTS: crate::sync::spinlock::TicketLock<[Option<CoreGdt>; 32]> =
         None, None, None, None, None, None, None, None,
     ]);
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Per-core TSS pointers for lockless access in set_interrupt_stack.
+pub static CORE_TSS_PTRS: [AtomicU64; 32] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+
 /// Initialize the GDT and load segment registers.
 ///
 /// This must be called early in the boot process, before interrupts
@@ -152,7 +166,21 @@ pub fn init_heap() {
         panic!("APIC ID {} out of bounds (>= 32) in init_heap", apic_id);
     }
 
+    // F-14: Protect against double-initialization of the same slot
+    {
+        let lock = CORE_GDTS.lock();
+        assert!(lock[apic_id].is_none(), "init_heap called twice for APIC ID {}", apic_id);
+    }
+
     let tss_mut = Box::leak(Box::new(TaskStateSegment::new()));
+
+    // F-14: Initialize privilege_stack_table[0] (RSP0) immediately to the current RSP
+    // to prevent page faults/triple faults on interrupt delivery before the first context switch.
+    let current_rsp: u64;
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) current_rsp);
+    }
+    tss_mut.privilege_stack_table[0] = VirtAddr::new(current_rsp);
 
     // Allocate double-fault and page-fault stacks on the heap per-core to avoid sharing them
     let double_fault_stack = Box::leak(Box::new([0u8; INTERRUPT_STACK_SIZE]));
@@ -193,6 +221,9 @@ pub fn init_heap() {
         load_tss(selectors.tss);
     }
 
+    // Store TSS pointer for lockless access in set_interrupt_stack
+    CORE_TSS_PTRS[apic_id].store(tss_mut as *mut TaskStateSegment as u64, Ordering::Release);
+
     let mut lock = CORE_GDTS.lock();
     lock[apic_id] = Some(CoreGdt {
         gdt: gdt_ref,
@@ -203,49 +234,21 @@ pub fn init_heap() {
 
 /// Get the kernel code segment selector.
 pub fn kernel_code_selector() -> SegmentSelector {
-    let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
-    let lock = CORE_GDTS.lock();
-    if apic_id < 32 {
-        if let Some(ref core_gdt) = lock[apic_id] {
-            return core_gdt.selectors.kernel_code;
-        }
-    }
     GDT.1.kernel_code
 }
 
 /// Get the kernel data segment selector.
 pub fn kernel_data_selector() -> SegmentSelector {
-    let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
-    let lock = CORE_GDTS.lock();
-    if apic_id < 32 {
-        if let Some(ref core_gdt) = lock[apic_id] {
-            return core_gdt.selectors.kernel_data;
-        }
-    }
     GDT.1.kernel_data
 }
 
 /// Get the user code segment selector.
 pub fn user_code_selector() -> SegmentSelector {
-    let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
-    let lock = CORE_GDTS.lock();
-    if apic_id < 32 {
-        if let Some(ref core_gdt) = lock[apic_id] {
-            return core_gdt.selectors.user_code;
-        }
-    }
     GDT.1.user_code
 }
 
 /// Get the user data segment selector.
 pub fn user_data_selector() -> SegmentSelector {
-    let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
-    let lock = CORE_GDTS.lock();
-    if apic_id < 32 {
-        if let Some(ref core_gdt) = lock[apic_id] {
-            return core_gdt.selectors.user_data;
-        }
-    }
     GDT.1.user_data
 }
 
@@ -259,9 +262,13 @@ pub fn set_interrupt_stack(stack_top: u64) {
     if apic_id >= 32 {
         panic!("APIC ID {} out of bounds (>= 32) in set_interrupt_stack", apic_id);
     }
-    let mut lock = CORE_GDTS.lock();
-    if let Some(ref mut core_gdt) = lock[apic_id] {
-        core_gdt.tss.privilege_stack_table[0] = VirtAddr::new(stack_top);
+    // F-07: Access per-core TSS locklessly to prevent deadlocks with SCHEDULER lock
+    let tss_addr = CORE_TSS_PTRS[apic_id].load(Ordering::Acquire);
+    if tss_addr != 0 {
+        let tss_ptr = tss_addr as *mut TaskStateSegment;
+        unsafe {
+            (*tss_ptr).privilege_stack_table[0] = VirtAddr::new(stack_top);
+        }
     } else {
         // Fallback to static TSS if heap is not yet initialized
         unsafe {

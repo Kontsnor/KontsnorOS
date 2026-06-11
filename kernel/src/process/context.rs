@@ -78,7 +78,7 @@ impl Default for CpuContext {
             rflags: 0x2, // Clear IF (Interrupt Flag) so tasks start with interrupts disabled
             cr3: 0,
             fs_base: 0,
-            gs_base: core::ptr::addr_of!(crate::syscall::CPU_SCRATCH) as u64,
+            gs_base: 0,
             kernel_gs_base: 0,
         }
     }
@@ -157,26 +157,8 @@ pub unsafe extern "C" fn switch_context(
         "mov rax, cr3",
         "mov [rdi + 0x48], rax",
 
-        // Save FS_BASE MSR
-        "mov ecx, 0xC0000100",          // FS_BASE MSR
-        "rdmsr",                        // Reads MSR into edx:eax
-        "shl rdx, 32",
-        "or rax, rdx",                  // Full 64-bit value in rax
-        "mov [rdi + 0x50], rax",        // Save to old context
-
-        // Save GS_BASE MSR
-        "mov ecx, 0xC0000101",          // GS_BASE MSR
-        "rdmsr",                        // Reads MSR into edx:eax
-        "shl rdx, 32",
-        "or rax, rdx",                  // Full 64-bit value in rax
-        "mov [rdi + 0x58], rax",        // Save to old context
-
-        // Save KERNEL_GS_BASE MSR
-        "mov ecx, 0xC0000102",          // KERNEL_GS_BASE MSR
-        "rdmsr",                        // Reads MSR into edx:eax
-        "shl rdx, 32",
-        "or rax, rdx",                  // Full 64-bit value in rax
-        "mov [rdi + 0x60], rax",        // Save to old context
+        // Note: We skip saving FS_BASE, GS_BASE, and KERNEL_GS_BASE MSRs via rdmsr.
+        // They are kept up-to-date in CpuContext via sys_arch_prctl / initialization.
 
         // ── Restore new context ────────────────────────────────────
         // rsi = new_ctx pointer
@@ -199,26 +181,27 @@ pub unsafe extern "C" fn switch_context(
         "push rax",
         "popfq",
 
-        // Restore FS_BASE MSR
-        "mov rax, [rsi + 0x50]",
+        // Restore FS_BASE MSR only if it changed
+        "mov rax, [rsi + 0x50]",        // Load new fs_base
+        "cmp rax, [rdi + 0x50]",        // Compare with old fs_base
+        "je 3f",                        // Skip if same
         "mov rdx, rax",
-        "shr rdx, 32",                  // High 32 bits in edx
+        "shr rdx, 32",                  // High 32 bits of new fs_base in edx
         "mov ecx, 0xC0000100",          // FS_BASE MSR
         "wrmsr",                        // Writes edx:eax to MSR
+        "3:",
 
-        // Restore GS_BASE MSR
-        "mov rax, [rsi + 0x58]",
-        "mov rdx, rax",
-        "shr rdx, 32",                  // High 32 bits in edx
-        "mov ecx, 0xC0000101",          // GS_BASE MSR
-        "wrmsr",                        // Writes edx:eax to MSR
+        // Note: GS_BASE is permanently pinned to the core's scratch block, so we never restore it here.
 
-        // Restore KERNEL_GS_BASE MSR
-        "mov rax, [rsi + 0x60]",
+        // Restore KERNEL_GS_BASE MSR only if it changed
+        "mov rax, [rsi + 0x60]",        // Load new kernel_gs_base
+        "cmp rax, [rdi + 0x60]",        // Compare with old kernel_gs_base
+        "je 4f",                        // Skip if same
         "mov rdx, rax",
-        "shr rdx, 32",                  // High 32 bits in edx
+        "shr rdx, 32",                  // High 32 bits of new kernel_gs_base in edx
         "mov ecx, 0xC0000102",          // KERNEL_GS_BASE MSR
         "wrmsr",                        // Writes edx:eax to MSR
+        "4:",
 
         // Restore callee-saved registers
         "mov rbx, [rsi + 0x00]",

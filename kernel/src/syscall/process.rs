@@ -392,6 +392,24 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
                         crate::syscall::CPU_SCRATCHES[apic_id].signals_pending = 0;
                     }
                 }
+                // Close O_CLOEXEC file descriptors (F-12)
+                for slot in task.fd_table.iter_mut() {
+                    let mut close = false;
+                    if let Some(ref fd) = slot {
+                        if fd.flags.lock().0 & crate::fs::file::OpenFlags::O_CLOEXEC != 0 {
+                            close = true;
+                        }
+                    }
+                    if close {
+                        if let Some(desc) = slot.take() {
+                            let mut rc = desc.ref_count.lock();
+                            if *rc > 0 {
+                                *rc -= 1;
+                            }
+                        }
+                    }
+                }
+
                 let old = task.page_table_root;
                 task.page_table_root = new_page_table;
                 task.brk = initial_brk; // Dynamically calculated start of heap

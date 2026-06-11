@@ -36,6 +36,8 @@ impl OpenFlags {
     pub const O_NONBLOCK: u32 = 0o4000;
     /// Directory.
     pub const O_DIRECTORY: u32 = 0o200000;
+    /// Close on execve.
+    pub const O_CLOEXEC: u32 = 0x80000;
 
     /// Check if the file is opened for reading.
     pub fn is_readable(self) -> bool {

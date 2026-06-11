@@ -314,7 +314,7 @@ extern "x86-interrupt" fn page_fault_handler(
 static TIMER_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    TIMER_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    TIMER_TICKS.fetch_add(1, core::sync::atomic::Ordering::Release);
 
     // Update scheduler tick counter
     crate::process::scheduler::tick();
@@ -373,6 +373,6 @@ extern "x86-interrupt" fn network_interrupt_handler(_stack_frame: InterruptStack
 
 /// Returns the number of timer ticks since boot.
 pub fn timer_ticks() -> u64 {
-    TIMER_TICKS.load(core::sync::atomic::Ordering::Relaxed)
+    TIMER_TICKS.load(core::sync::atomic::Ordering::Acquire)
 }
 

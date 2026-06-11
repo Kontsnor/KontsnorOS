@@ -182,6 +182,7 @@ core::arch::global_asm!(
 pub struct CpuScratch {
     pub user_rsp: u64,
     pub kernel_rsp: u64,
+    pub current_pid: u64,
 }
 
 /// Static mutable CPU scratch space for the Bootstrap Processor (BSP).
@@ -189,6 +190,7 @@ pub struct CpuScratch {
 pub static mut CPU_SCRATCH: CpuScratch = CpuScratch {
     user_rsp: 0,
     kernel_rsp: 0,
+    current_pid: 0xFFFF_FFFF_FFFF_FFFF,
 };
 
 /// Set the temporary kernel stack pointer for syscall entry.

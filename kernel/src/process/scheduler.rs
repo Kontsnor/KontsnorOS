@@ -312,9 +312,21 @@ pub fn tick() {
     }
 }
 
-/// Get the current task's PID.
+/// Get the current task's PID (lock-free).
 pub fn current_pid() -> Option<Pid> {
-    SCHEDULER.lock().as_ref()?.current_pid()
+    let pid_val: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, gs:[16]",
+            out(reg) pid_val,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    if pid_val == 0xFFFF_FFFF_FFFF_FFFF {
+        None
+    } else {
+        Some(Pid::from_raw(pid_val))
+    }
 }
 
 /// Cooperative yield: give up the remaining time slice of the current task.
@@ -420,6 +432,11 @@ pub fn schedule() {
         scheduler.current_cpus[apic_id] = Some(next_pid);
         scheduler.context_switches += 1;
 
+        // Update CPU-local scratch space with the new PID
+        unsafe {
+            crate::syscall::CPU_SCRATCH.current_pid = next_pid.as_u64();
+        }
+
         // Drop lock before switching to prevent deadlock
         drop(sched_lock);
 
@@ -445,6 +462,11 @@ pub fn set_bootstrap_thread(task: Task) {
         let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
         if apic_id < 32 {
             scheduler.current_cpus[apic_id] = Some(pid);
+        }
+
+        // Update CPU-local scratch space for the current bootstrap thread
+        unsafe {
+            crate::syscall::CPU_SCRATCH.current_pid = pid.as_u64();
         }
     }
 }

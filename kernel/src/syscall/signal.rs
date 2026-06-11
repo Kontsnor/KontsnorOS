@@ -50,6 +50,12 @@ pub fn deliver_signal(pid: crate::process::pid::Pid, sig: i32) {
     if let Some(ref mut sched) = *sched_lock {
         if let Some(task) = sched.get_task_mut(pid) {
             task.pending_signals |= 1 << (sig - 1);
+            if Some(pid) == scheduler::current_pid() {
+                let pending_unblocked = task.pending_signals & !task.blocked_signals;
+                unsafe {
+                    crate::syscall::CPU_SCRATCH.signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
+                }
+            }
             sched.wake_task(pid);
         }
     }
@@ -175,6 +181,11 @@ pub fn sys_rt_sigprocmask(
         // SIGKILL (9) and SIGSTOP (19) cannot be blocked
         task.blocked_signals &= !((1 << 8) | (1 << 18));
     }
+    
+    let pending_unblocked = task.pending_signals & !task.blocked_signals;
+    unsafe {
+        crate::syscall::CPU_SCRATCH.signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
+    }
     0
 }
 
@@ -226,6 +237,9 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
         
         let unblocked = task.pending_signals & !task.blocked_signals;
         if unblocked == 0 {
+            unsafe {
+                crate::syscall::CPU_SCRATCH.signals_pending = 0;
+            }
             return;
         }
         
@@ -251,6 +265,11 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
         }
         task.blocked_signals |= action.sa_mask;
         task.blocked_signals &= !((1 << 8) | (1 << 18));
+        
+        let pending_unblocked = task.pending_signals & !task.blocked_signals;
+        unsafe {
+            crate::syscall::CPU_SCRATCH.signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
+        }
         
         (active_sig, action, old_mask)
     };
@@ -347,6 +366,11 @@ pub fn sys_rt_sigreturn(regs: *mut super::SavedRegisters) -> SyscallResult {
                     task.blocked_signals = frame.mask;
                     // SIGKILL (9) and SIGSTOP (19) cannot be blocked
                     task.blocked_signals &= !((1 << 8) | (1 << 18));
+                    
+                    let pending_unblocked = task.pending_signals & !task.blocked_signals;
+                    unsafe {
+                        crate::syscall::CPU_SCRATCH.signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
+                    }
                 }
             }
         }

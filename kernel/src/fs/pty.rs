@@ -301,10 +301,17 @@ pub fn deliver_signal_to_pgrp(pgid: u64, sig: i32) {
     let mut sched_lock = scheduler::SCHEDULER.lock();
     if let Some(ref mut sched) = *sched_lock {
         let mut pids_to_wake = alloc::vec::Vec::new();
+        let curr_pid = scheduler::current_pid();
         for task_opt in sched.tasks.iter_mut() {
             if let Some(ref mut task) = task_opt {
                 if task.pgid == pgid {
                     task.pending_signals |= 1 << (sig - 1);
+                    if Some(task.pid) == curr_pid {
+                        let pending_unblocked = task.pending_signals & !task.blocked_signals;
+                        unsafe {
+                            crate::syscall::CPU_SCRATCH.signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
+                        }
+                    }
                     pids_to_wake.push(task.pid);
                 }
             }

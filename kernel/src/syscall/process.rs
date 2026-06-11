@@ -384,6 +384,9 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
                     }
                 }
                 task.pending_signals = 0;
+                unsafe {
+                    crate::syscall::CPU_SCRATCH.signals_pending = 0;
+                }
                 let old = task.page_table_root;
                 task.page_table_root = new_page_table;
                 task.brk = initial_brk; // Dynamically calculated start of heap

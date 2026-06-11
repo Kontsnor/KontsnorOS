@@ -214,8 +214,16 @@ impl Scheduler {
                     wq.wake_all_locked(self);
                 }
 
+                let curr_pid = self.current_pid();
+
                 if let Some(Some(ref mut parent_task)) = self.tasks.get_mut(parent_idx) {
                     parent_task.pending_signals |= 1 << (17 - 1);
+                    if Some(parent) == curr_pid {
+                        let pending_unblocked = parent_task.pending_signals & !parent_task.blocked_signals;
+                        unsafe {
+                            crate::syscall::CPU_SCRATCH.signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
+                        }
+                    }
                     // Wake parent task from blocked state if it was waiting
                     if parent_task.state == TaskState::Blocked {
                         parent_task.state = TaskState::Ready;
@@ -415,6 +423,7 @@ pub fn schedule() {
             &mut current_task.context as *mut super::context::CpuContext
         };
 
+        let mut pending_unblocked = 0;
         let new_ctx_ptr = {
             let next_task = scheduler.tasks[next_idx].as_mut().expect("Next task missing");
             next_task.state = TaskState::Running;
@@ -426,15 +435,18 @@ pub fn schedule() {
                 crate::arch::x86_64::gdt::set_interrupt_stack(stack_top);
             }
 
+            pending_unblocked = next_task.pending_signals & !next_task.blocked_signals;
+
             &next_task.context as *const super::context::CpuContext
         };
 
         scheduler.current_cpus[apic_id] = Some(next_pid);
         scheduler.context_switches += 1;
 
-        // Update CPU-local scratch space with the new PID
+        // Update CPU-local scratch space with the new PID and pending signals
         unsafe {
             crate::syscall::CPU_SCRATCH.current_pid = next_pid.as_u64();
+            crate::syscall::CPU_SCRATCH.signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
         }
 
         // Drop lock before switching to prevent deadlock
@@ -467,6 +479,7 @@ pub fn set_bootstrap_thread(task: Task) {
         // Update CPU-local scratch space for the current bootstrap thread
         unsafe {
             crate::syscall::CPU_SCRATCH.current_pid = pid.as_u64();
+            crate::syscall::CPU_SCRATCH.signals_pending = 0;
         }
     }
 }

@@ -126,6 +126,30 @@ core::arch::global_asm!(
     "mov gs:[0], rsp",                    // Save user RSP in CpuScratch.user_rsp
     "mov rsp, gs:[8]",                    // Load kernel stack pointer from CpuScratch.kernel_rsp
     
+    // 1. Check if there are pending signals for the current task
+    "cmp qword ptr gs:[24], 0",           // gs:[24] is CpuScratch.signals_pending
+    "jne .Lsyscall_slow",                 // If signals are pending, go slow path
+    
+    // 2. Check if syscall is a fast-path candidate
+    "cmp rax, 39",                        // sys_getpid
+    "je .Lsyscall_fast",
+    "cmp rax, 102",                       // sys_getuid
+    "je .Lsyscall_fast",
+    "cmp rax, 104",                       // sys_getgid
+    "je .Lsyscall_fast",
+    "cmp rax, 107",                       // sys_geteuid
+    "je .Lsyscall_fast",
+    "cmp rax, 108",                       // sys_getegid
+    "je .Lsyscall_fast",
+    "cmp rax, 110",                       // sys_getppid
+    "je .Lsyscall_fast",
+    "cmp rax, 186",                       // sys_gettid
+    "je .Lsyscall_fast",
+    "cmp rax, 218",                       // sys_set_tid_address
+    "je .Lsyscall_fast",
+    
+    // 3. Fall through to slow path
+    ".Lsyscall_slow:",
     // Push registers in reverse order of SavedRegisters struct
     "push qword ptr gs:[0]", // User RSP (rsp)
     "push r11", // User RFLAGS (rflags)
@@ -175,6 +199,49 @@ core::arch::global_asm!(
     "mov rsp, gs:[0]",
     "swapgs",
     "sysretq",
+
+    // 4. Fast path implementation
+    ".Lsyscall_fast:",
+    // Push caller-saved registers to preserve them
+    "push r11",             // User RFLAGS
+    "push rcx",             // User RIP
+    "push r9",
+    "push r8",
+    "push r10",
+    "push rdx",
+    "push rsi",
+    "push rdi",
+
+    // Map System V ABI registers for Rust:
+    // rdi = syscall_num (rax)
+    // rsi = arg0        (rdi)
+    // rdx = arg1        (rsi)
+    // rcx = arg2        (rdx)
+    // r8  = arg3        (r10)
+    // r9  = arg4        (r8)
+    "mov r9, r8",
+    "mov r8, r10",
+    "mov rcx, rdx",
+    "mov rdx, rsi",
+    "mov rsi, rdi",
+    "mov rdi, rax",
+
+    "call syscall_fast_dispatch",
+
+    // Restore preserved caller-saved registers
+    "pop rdi",
+    "pop rsi",
+    "pop rdx",
+    "pop r10",
+    "pop r8",
+    "pop r9",
+    "pop rcx",
+    "pop r11",
+
+    // Restore user stack pointer and swapgs back
+    "mov rsp, gs:[0]",
+    "swapgs",
+    "sysretq",
 );
 
 /// CPU-local scratch space for syscall privilege transitions.
@@ -183,6 +250,7 @@ pub struct CpuScratch {
     pub user_rsp: u64,
     pub kernel_rsp: u64,
     pub current_pid: u64,
+    pub signals_pending: u64,
 }
 
 /// Static mutable CPU scratch space for the Bootstrap Processor (BSP).
@@ -191,6 +259,7 @@ pub static mut CPU_SCRATCH: CpuScratch = CpuScratch {
     user_rsp: 0,
     kernel_rsp: 0,
     current_pid: 0xFFFF_FFFF_FFFF_FFFF,
+    signals_pending: 0,
 };
 
 /// Set the temporary kernel stack pointer for syscall entry.
@@ -284,6 +353,31 @@ pub extern "C" fn syscall_dispatch_rust(
     crate::syscall::signal::handle_pending_signals(regs);
 
     unsafe { (*regs).rax as i64 }
+}
+
+/// Fast-path syscall dispatcher.
+///
+/// Dispatches simple, non-yielding system calls directly from the fast assembly stub.
+#[no_mangle]
+pub extern "C" fn syscall_fast_dispatch(
+    syscall_num: u64,
+    arg0: u64,
+    _arg1: u64,
+    _arg2: u64,
+    _arg3: u64,
+    _arg4: u64,
+) -> i64 {
+    match syscall_num {
+        39  => process::sys_getpid(),
+        102 => process::sys_getuid(),
+        104 => process::sys_getgid(),
+        107 => process::sys_geteuid(),
+        108 => process::sys_getegid(),
+        110 => process::sys_getppid(),
+        186 => process::sys_gettid(),
+        218 => process::sys_set_tid_address(arg0 as *mut i32),
+        _ => -38, // ENOSYS
+    }
 }
 
 /// Initialize the syscall interface.

@@ -224,6 +224,8 @@ pub fn spawn_user_process(name: alloc::string::String, elf_data: &[u8]) -> pid::
     context.r12 = elf_info.entry_point;
     context.r13 = user_sp; // User stack pointer (16-byte aligned)
     context.r14 = page_table_root;
+    context.r15 = (crate::arch::x86_64::gdt::user_code_selector().0 | 3) as u64;
+    context.rbx = (crate::arch::x86_64::gdt::user_data_selector().0 | 3) as u64;
     
     task.context = context;
     
@@ -239,6 +241,8 @@ extern "C" fn user_process_trampoline() -> ! {
         "mov rdi, r12", // Set entry_point as 1st argument (rdi)
         "mov rsi, r13", // Set user_stack as 2nd argument (rsi)
         "mov rdx, r14", // Set page_table as 3rd argument (rdx)
+        "mov rcx, r15", // Set user_code_selector as 4th argument (rcx)
+        "mov r8, rbx",  // Set user_data_selector as 5th argument (r8)
         "jmp {}",       // Jump to enter_user_mode (never returns)
         sym context::enter_user_mode,
     );

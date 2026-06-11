@@ -442,7 +442,13 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
 
     // Switch to the new address space and enter Ring 3 (never returns)
     unsafe {
-        crate::process::context::enter_user_mode(entry, user_sp, new_page_table);
+        crate::process::context::enter_user_mode(
+            entry,
+            user_sp,
+            new_page_table,
+            (crate::arch::x86_64::gdt::user_code_selector().0 | 3) as u64,
+            (crate::arch::x86_64::gdt::user_data_selector().0 | 3) as u64,
+        );
     }
 }
 

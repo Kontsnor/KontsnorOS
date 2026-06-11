@@ -269,20 +269,22 @@ pub unsafe extern "C" fn enter_user_mode(
     _entry_point: u64,
     _user_stack: u64,
     _page_table: u64,
+    _user_code_selector: u64,
+    _user_data_selector: u64,
 ) -> ! {
     core::arch::naked_asm!(
         // Switch CR3 to user page table (passed in rdx)
         "mov cr3, rdx",
 
         // Build the iretq stack frame:
-        // SS (User Data segment selector with RPL 3: 0x18 | 3 = 0x1B)
-        "push 0x1B",
+        // SS (User Data segment selector passed in r8)
+        "push r8",
         // RSP (User stack pointer, passed in rsi)
         "push rsi",
         // RFLAGS (0x202: Interrupts enabled)
         "push 0x202",
-        // CS (User Code segment selector with RPL 3: 0x20 | 3 = 0x23)
-        "push 0x23",
+        // CS (User Code segment selector passed in rcx)
+        "push rcx",
         // RIP (Entry point, passed in rdi)
         "push rdi",
 

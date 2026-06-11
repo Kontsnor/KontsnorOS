@@ -289,7 +289,7 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
             if !segment.flags.execute { flags |= PageTableFlags::NO_EXECUTE; }
 
             unsafe {
-                if crate::memory::r#virtual::map_user_page(new_page_table, page, frame, flags).is_err() {
+                if crate::memory::r#virtual::map_user_page_no_shootdown(new_page_table, page, frame, flags).is_err() {
                     return Errno::ENOMEM.into();
                 }
             }
@@ -340,7 +340,7 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE
             | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE;
         unsafe {
-            if crate::memory::r#virtual::map_user_page(new_page_table, page, frame, flags).is_err() {
+            if crate::memory::r#virtual::map_user_page_no_shootdown(new_page_table, page, frame, flags).is_err() {
                 return Errno::ENOMEM.into();
             }
         }
@@ -555,20 +555,29 @@ pub fn sys_brk(addr: u64) -> SyscallResult {
     let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(old_brk));
     let end_page   = Page::<Size4KiB>::containing_address(VirtAddr::new(new_brk - 1));
 
+    let mut mapped_count = 0;
     for page in Page::range_inclusive(start_page, end_page) {
         if let Some(phys) = crate::memory::physical::allocate_frame() {
             let frame = PhysFrame::containing_address(PhysAddr::new(phys));
             let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE
                 | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE;
             let _ = unsafe {
-                crate::memory::r#virtual::map_user_page(page_table_root, page, frame, flags)
+                crate::memory::r#virtual::map_user_page_no_shootdown(page_table_root, page, frame, flags)
             };
             // Zero the new page
             let dest = (phys + crate::memory::r#virtual::phys_mem_offset()) as *mut u8;
             unsafe { core::ptr::write_bytes(dest, 0, 4096); }
+            mapped_count += 1;
         } else {
+            if mapped_count > 0 {
+                crate::arch::x86_64::smp::shootdown_tlb();
+            }
             return Errno::ENOMEM.into();
         }
+    }
+
+    if mapped_count > 0 {
+        crate::arch::x86_64::smp::shootdown_tlb();
     }
 
     // Update the task's brk

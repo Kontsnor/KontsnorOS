@@ -268,6 +268,27 @@ pub unsafe fn map_user_page(
     frame: PhysFrame<Size4KiB>,
     flags: PageTableFlags,
 ) -> Result<(), &'static str> {
+    unsafe {
+        map_user_page_no_shootdown(pml4_phys, page, frame, flags)?;
+        crate::arch::x86_64::smp::shootdown_tlb();
+    }
+    Ok(())
+}
+
+/// Map a virtual page to a physical frame in a non-active PML4 page table without triggering TLB shootdown.
+///
+/// # Safety
+///
+/// The caller must ensure that:
+/// - The targeted PML4 physical address is valid.
+/// - The physical frame is valid and not already mapped elsewhere.
+/// - The virtual page is not already mapped.
+pub unsafe fn map_user_page_no_shootdown(
+    pml4_phys: u64,
+    page: Page<Size4KiB>,
+    frame: PhysFrame<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<(), &'static str> {
     let pml4_virt = VirtAddr::new(pml4_phys + phys_mem_offset());
     let pml4: &mut PageTable = unsafe { &mut *pml4_virt.as_mut_ptr() };
     let mut mapper = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(phys_mem_offset())) };
@@ -279,7 +300,6 @@ pub unsafe fn map_user_page(
             .map_to(page, frame, flags, &mut frame_alloc)
             .map_err(|_| "Failed to map user page")?
             .flush();
-        crate::arch::x86_64::smp::shootdown_tlb();
     }
 
     Ok(())
@@ -312,6 +332,22 @@ pub unsafe fn unmap_user_page(
     pml4_phys: u64,
     page: Page<Size4KiB>,
 ) -> Result<u64, &'static str> {
+    unsafe {
+        let phys = unmap_user_page_no_shootdown(pml4_phys, page)?;
+        crate::arch::x86_64::smp::shootdown_tlb();
+        Ok(phys)
+    }
+}
+
+/// Unmap a virtual page from a targeted, non-active PML4 page table without triggering TLB shootdown.
+///
+/// # Safety
+///
+/// The caller must ensure that the targeted PML4 physical address is valid.
+pub unsafe fn unmap_user_page_no_shootdown(
+    pml4_phys: u64,
+    page: Page<Size4KiB>,
+) -> Result<u64, &'static str> {
     let pml4_virt = VirtAddr::new(pml4_phys + phys_mem_offset());
     let pml4: &mut PageTable = unsafe { &mut *pml4_virt.as_mut_ptr() };
     let mut mapper = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(phys_mem_offset())) };
@@ -320,7 +356,6 @@ pub unsafe fn unmap_user_page(
     match mapper.unmap(page) {
         Ok((frame, flush)) => {
             flush.flush();
-            crate::arch::x86_64::smp::shootdown_tlb();
             Ok(frame.start_address().as_u64())
         }
         Err(_) => Err("Page not mapped"),
@@ -337,6 +372,23 @@ pub unsafe fn update_user_page_flags(
     page: Page<Size4KiB>,
     flags: PageTableFlags,
 ) -> Result<(), &'static str> {
+    unsafe {
+        update_user_page_flags_no_shootdown(pml4_phys, page, flags)?;
+        crate::arch::x86_64::smp::shootdown_tlb();
+    }
+    Ok(())
+}
+
+/// Update flags of a virtual page in a targeted, non-active PML4 page table without triggering TLB shootdown.
+///
+/// # Safety
+///
+/// The caller must ensure that the targeted PML4 physical address is valid.
+pub unsafe fn update_user_page_flags_no_shootdown(
+    pml4_phys: u64,
+    page: Page<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<(), &'static str> {
     let pml4_virt = VirtAddr::new(pml4_phys + phys_mem_offset());
     let pml4: &mut PageTable = unsafe { &mut *pml4_virt.as_mut_ptr() };
     let mut mapper = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(phys_mem_offset())) };
@@ -345,7 +397,6 @@ pub unsafe fn update_user_page_flags(
     match unsafe { mapper.update_flags(page, flags) } {
         Ok(flush) => {
             flush.flush();
-            crate::arch::x86_64::smp::shootdown_tlb();
             Ok(())
         }
         Err(_) => Err("Failed to update page flags"),

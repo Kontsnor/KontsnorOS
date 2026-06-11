@@ -117,7 +117,7 @@ pub fn spawn_user_process(name: alloc::string::String, elf_data: &[u8]) -> pid::
             
             // Map page in user page table
             unsafe {
-                crate::memory::r#virtual::map_user_page(page_table_root, page, frame, flags)
+                crate::memory::r#virtual::map_user_page_no_shootdown(page_table_root, page, frame, flags)
                     .expect("Failed to map user segment page");
             }
             
@@ -170,7 +170,7 @@ pub fn spawn_user_process(name: alloc::string::String, elf_data: &[u8]) -> pid::
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE;
         
         unsafe {
-            crate::memory::r#virtual::map_user_page(page_table_root, page, frame, flags)
+            crate::memory::r#virtual::map_user_page_no_shootdown(page_table_root, page, frame, flags)
                 .expect("Failed to map user stack page");
         }
     }

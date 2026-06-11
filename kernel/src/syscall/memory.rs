@@ -114,7 +114,7 @@ pub fn sys_mmap(
             
             // Map the page
             let _ = unsafe {
-                crate::memory::r#virtual::map_user_page(page_table_root, page, frame, page_flags)
+                crate::memory::r#virtual::map_user_page_no_shootdown(page_table_root, page, frame, page_flags)
             };
 
             // Write content
@@ -130,14 +130,16 @@ pub fn sys_mmap(
             // Eager rollback on OOM
             let unmap_end_page = page;
             for unmap_page in Page::range(start_page, unmap_end_page) {
-                if let Ok(phys_addr) = unsafe { crate::memory::r#virtual::unmap_user_page(page_table_root, unmap_page) } {
+                if let Ok(phys_addr) = unsafe { crate::memory::r#virtual::unmap_user_page_no_shootdown(page_table_root, unmap_page) } {
                     crate::memory::physical::deallocate_frame(phys_addr);
                 }
             }
+            crate::arch::x86_64::smp::shootdown_tlb();
             return Errno::ENOMEM.into();
         }
     }
 
+    crate::arch::x86_64::smp::shootdown_tlb();
     resolved_addr as SyscallResult
 }
 
@@ -188,13 +190,17 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
     let mut unmapped_count = 0;
     for page in Page::range_inclusive(start_page, end_page) {
         let result = unsafe {
-            crate::memory::r#virtual::unmap_user_page(page_table_root, page)
+            crate::memory::r#virtual::unmap_user_page_no_shootdown(page_table_root, page)
         };
 
         if let Ok(phys_addr) = result {
             crate::memory::physical::deallocate_frame(phys_addr);
             unmapped_count += 1;
         }
+    }
+
+    if unmapped_count > 0 {
+        crate::arch::x86_64::smp::shootdown_tlb();
     }
 
     kprintln!("[syscall] munmap: successfully unmapped {} pages", unmapped_count);
@@ -247,12 +253,21 @@ pub fn sys_mprotect(addr: u64, length: usize, prot: i32) -> SyscallResult {
 
     let flags = prot_to_page_flags(prot);
 
+    let mut updated_count = 0;
     for page in Page::range_inclusive(start_page, end_page) {
         unsafe {
-            if let Err(_) = crate::memory::r#virtual::update_user_page_flags(page_table_root, page, flags) {
+            if let Err(_) = crate::memory::r#virtual::update_user_page_flags_no_shootdown(page_table_root, page, flags) {
+                if updated_count > 0 {
+                    crate::arch::x86_64::smp::shootdown_tlb();
+                }
                 return Errno::ENOMEM.into();
             }
         }
+        updated_count += 1;
+    }
+
+    if updated_count > 0 {
+        crate::arch::x86_64::smp::shootdown_tlb();
     }
 
     0 // Success

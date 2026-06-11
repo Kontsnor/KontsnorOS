@@ -328,3 +328,32 @@ pub fn stats() -> (usize, usize, usize) {
     let allocated = allocator.allocated_frames;
     (total, allocated, total - allocated)
 }
+
+/// Verify COW reference counting and frame reclaim behavior.
+pub fn test_cow_refcounts() {
+    kprintln!("[test] Starting COW refcount verification test...");
+    let (_, alloc_before, _) = stats();
+
+    // 1. Allocate a page frame
+    let phys = allocate_frame().expect("Failed to allocate frame in COW test");
+    let (_, alloc_after_alloc, _) = stats();
+    assert_eq!(alloc_after_alloc, alloc_before + 1);
+
+    // 2. Simulate fork: increment refcount of the frame to 2
+    increment_ref(phys);
+    
+    // 3. Simulate child resolving COW: allocate new child frame, decrement old frame refcount
+    let child_phys = allocate_frame().expect("Failed to allocate child frame in COW test");
+    let old_ref = decrement_ref(phys);
+    assert_eq!(old_ref, 1);
+    
+    // 4. Simulate child exit: free child's resolved frame
+    deallocate_frame(child_phys);
+    
+    // 5. Simulate parent exit: free parent's frame (refcount drops to 0, reclaimed)
+    deallocate_frame(phys);
+
+    let (_, alloc_after, _) = stats();
+    assert_eq!(alloc_after, alloc_before);
+    kprintln!("[test] COW refcount verification test PASSED!");
+}

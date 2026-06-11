@@ -119,6 +119,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crypto::prng::init_entropy(boot_info);
     kprintln!("[boot] CSPRNG initialized.");
 
+    // Run integration test for COW reference counting
+    memory::physical::test_cow_refcounts();
+
     // Initialize dynamic per-core GDT/TSS configuration
     arch::x86_64::gdt::init_heap();
     kprintln!("[boot] Dynamic GDT/TSS initialized.");

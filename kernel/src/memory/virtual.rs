@@ -449,7 +449,16 @@ pub fn free_user_page_table(pml4_phys: u64) -> Result<(), &'static str> {
                     }
 
                     let leaf_phys = pt_entry.frame().map_err(|_| "Invalid frame in PT")?.start_address().as_u64();
-                    super::physical::deallocate_frame(leaf_phys);
+                    if pt_entry.flags().contains(PageTableFlags::BIT_9) {
+                        // COW-shared: decrement reference count
+                        if super::physical::decrement_ref(leaf_phys) == 0 {
+                            // Last reference: restore and deallocate/free
+                            super::physical::increment_ref(leaf_phys);
+                            super::physical::deallocate_frame(leaf_phys);
+                        }
+                    } else {
+                        super::physical::deallocate_frame(leaf_phys);
+                    }
                 }
 
                 super::physical::deallocate_frame(pt_phys);

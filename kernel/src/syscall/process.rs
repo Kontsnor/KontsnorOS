@@ -629,7 +629,10 @@ pub fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
 }
 
 /// `set_tid_address()` — Set thread ID pointer.
-pub fn sys_set_tid_address(_tidptr: *mut i32) -> SyscallResult {
+pub fn sys_set_tid_address(tidptr: *mut i32) -> SyscallResult {
+    if !tidptr.is_null() && !super::fs::validate_user_ptr(tidptr as *const u8, core::mem::size_of::<i32>()) {
+        return Errno::EFAULT.into();
+    }
     let pid = crate::process::scheduler::current_pid().map(|p| p.as_u64()).unwrap_or(0);
     pid as i64
 }

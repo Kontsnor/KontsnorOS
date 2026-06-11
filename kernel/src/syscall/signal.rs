@@ -48,15 +48,21 @@ pub fn deliver_signal(pid: crate::process::pid::Pid, sig: i32) {
     }
     let mut sched_lock = scheduler::SCHEDULER.lock();
     if let Some(ref mut sched) = *sched_lock {
+        // Scan current_cpus to find which core (if any) is running the target task
+        let mut target_core = None;
+        for core_id in 0..32 {
+            if sched.current_cpus[core_id] == Some(pid) {
+                target_core = Some(core_id);
+                break;
+            }
+        }
+
         if let Some(task) = sched.get_task_mut(pid) {
             task.pending_signals |= 1 << (sig - 1);
-            if Some(pid) == scheduler::current_pid() {
+            if let Some(core_id) = target_core {
                 let pending_unblocked = task.pending_signals & !task.blocked_signals;
-                let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
                 unsafe {
-                    if apic_id < 32 {
-                        crate::syscall::CPU_SCRATCHES[apic_id].signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
-                    }
+                    crate::syscall::CPU_SCRATCHES[core_id].signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
                 }
             }
             sched.wake_task(pid);

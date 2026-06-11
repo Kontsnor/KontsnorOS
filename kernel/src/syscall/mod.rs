@@ -267,11 +267,10 @@ pub static mut CPU_SCRATCHES: [CpuScratch; 32] = [CpuScratch {
 pub fn set_kernel_stack(stack: u64) {
     unsafe {
         let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
-        if apic_id < 32 {
-            CPU_SCRATCHES[apic_id].kernel_rsp = stack;
-        } else {
-            CPU_SCRATCHES[0].kernel_rsp = stack;
+        if apic_id >= 32 {
+            panic!("APIC ID {} out of bounds (>= 32) in set_kernel_stack", apic_id);
         }
+        CPU_SCRATCHES[apic_id].kernel_rsp = stack;
     }
 }
 
@@ -322,7 +321,7 @@ pub extern "C" fn syscall_dispatch_rust(
                     }
                 }
                 stack_msg = alloc::format!("rsp={:#x} stack=[{:#x}, {:#x}, {:#x}, {:#x}]", 
-                    user_rsp, words[0], words[1], words[2], words[3]);
+                     user_rsp, words[0], words[1], words[2], words[3]);
             }
         }
 
@@ -424,11 +423,10 @@ pub fn init() {
 
         // 5. Configure IA32_GS_BASE (active GS base in kernel) to point to CPU_SCRATCHES slot for this core
         let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
-        let scratch_addr = if apic_id < 32 {
-            core::ptr::addr_of!(CPU_SCRATCHES[apic_id]) as u64
-        } else {
-            core::ptr::addr_of!(CPU_SCRATCHES[0]) as u64
-        };
+        if apic_id >= 32 {
+            panic!("APIC ID {} out of bounds (>= 32) in syscall::init", apic_id);
+        }
+        let scratch_addr = core::ptr::addr_of!(CPU_SCRATCHES[apic_id]) as u64;
         let mut gs_base_msr = Msr::new(0xC0000101);
         gs_base_msr.write(scratch_addr);
 

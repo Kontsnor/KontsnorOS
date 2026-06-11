@@ -117,8 +117,14 @@ pub struct CoreGdt {
     pub selectors: Selectors,
 }
 
-/// Thread-safe global cell for the active core GDT/TSS configuration.
-pub static CORE_GDT: crate::sync::spinlock::TicketLock<Option<CoreGdt>> = crate::sync::spinlock::TicketLock::new(None);
+/// Thread-safe global cell for the active core GDT/TSS configurations.
+pub static CORE_GDTS: crate::sync::spinlock::TicketLock<[Option<CoreGdt>; 32]> = 
+    crate::sync::spinlock::TicketLock::new([
+        None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None,
+    ]);
 
 /// Initialize the GDT and load segment registers.
 ///
@@ -141,15 +147,23 @@ pub fn init() {
 pub fn init_heap() {
     use alloc::boxed::Box;
 
+    let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
+    if apic_id >= 32 {
+        panic!("APIC ID {} out of bounds (>= 32) in init_heap", apic_id);
+    }
+
     let tss_mut = Box::leak(Box::new(TaskStateSegment::new()));
 
-    // Set up the double fault and page fault handler stacks using statically allocated buffers
+    // Allocate double-fault and page-fault stacks on the heap per-core to avoid sharing them
+    let double_fault_stack = Box::leak(Box::new([0u8; INTERRUPT_STACK_SIZE]));
+    let page_fault_stack = Box::leak(Box::new([0u8; INTERRUPT_STACK_SIZE]));
+
     tss_mut.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
-        let stack_start = VirtAddr::from_ptr(core::ptr::addr_of!(DOUBLE_FAULT_STACK));
+        let stack_start = VirtAddr::from_ptr(double_fault_stack.as_ptr());
         stack_start + INTERRUPT_STACK_SIZE as u64
     };
     tss_mut.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = {
-        let stack_start = VirtAddr::from_ptr(core::ptr::addr_of!(PAGE_FAULT_STACK));
+        let stack_start = VirtAddr::from_ptr(page_fault_stack.as_ptr());
         stack_start + INTERRUPT_STACK_SIZE as u64
     };
 
@@ -179,8 +193,8 @@ pub fn init_heap() {
         load_tss(selectors.tss);
     }
 
-    let mut lock = CORE_GDT.lock();
-    *lock = Some(CoreGdt {
+    let mut lock = CORE_GDTS.lock();
+    lock[apic_id] = Some(CoreGdt {
         gdt: gdt_ref,
         tss: tss_mut,
         selectors,
@@ -189,42 +203,50 @@ pub fn init_heap() {
 
 /// Get the kernel code segment selector.
 pub fn kernel_code_selector() -> SegmentSelector {
-    let lock = CORE_GDT.lock();
-    if let Some(ref core_gdt) = *lock {
-        core_gdt.selectors.kernel_code
-    } else {
-        GDT.1.kernel_code
+    let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
+    let lock = CORE_GDTS.lock();
+    if apic_id < 32 {
+        if let Some(ref core_gdt) = lock[apic_id] {
+            return core_gdt.selectors.kernel_code;
+        }
     }
+    GDT.1.kernel_code
 }
 
 /// Get the kernel data segment selector.
 pub fn kernel_data_selector() -> SegmentSelector {
-    let lock = CORE_GDT.lock();
-    if let Some(ref core_gdt) = *lock {
-        core_gdt.selectors.kernel_data
-    } else {
-        GDT.1.kernel_data
+    let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
+    let lock = CORE_GDTS.lock();
+    if apic_id < 32 {
+        if let Some(ref core_gdt) = lock[apic_id] {
+            return core_gdt.selectors.kernel_data;
+        }
     }
+    GDT.1.kernel_data
 }
 
 /// Get the user code segment selector.
 pub fn user_code_selector() -> SegmentSelector {
-    let lock = CORE_GDT.lock();
-    if let Some(ref core_gdt) = *lock {
-        core_gdt.selectors.user_code
-    } else {
-        GDT.1.user_code
+    let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
+    let lock = CORE_GDTS.lock();
+    if apic_id < 32 {
+        if let Some(ref core_gdt) = lock[apic_id] {
+            return core_gdt.selectors.user_code;
+        }
     }
+    GDT.1.user_code
 }
 
 /// Get the user data segment selector.
 pub fn user_data_selector() -> SegmentSelector {
-    let lock = CORE_GDT.lock();
-    if let Some(ref core_gdt) = *lock {
-        core_gdt.selectors.user_data
-    } else {
-        GDT.1.user_data
+    let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
+    let lock = CORE_GDTS.lock();
+    if apic_id < 32 {
+        if let Some(ref core_gdt) = lock[apic_id] {
+            return core_gdt.selectors.user_data;
+        }
     }
+    GDT.1.user_data
 }
 
 /// Set the interrupt stack (RSP0) in the TSS for privilege transitions.
@@ -233,8 +255,12 @@ pub fn user_data_selector() -> SegmentSelector {
 /// occurs while executing in user space (Ring 3), the CPU switches to the
 /// correct kernel stack for the active task.
 pub fn set_interrupt_stack(stack_top: u64) {
-    let mut lock = CORE_GDT.lock();
-    if let Some(ref mut core_gdt) = *lock {
+    let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
+    if apic_id >= 32 {
+        panic!("APIC ID {} out of bounds (>= 32) in set_interrupt_stack", apic_id);
+    }
+    let mut lock = CORE_GDTS.lock();
+    if let Some(ref mut core_gdt) = lock[apic_id] {
         core_gdt.tss.privilege_stack_table[0] = VirtAddr::new(stack_top);
     } else {
         // Fallback to static TSS if heap is not yet initialized

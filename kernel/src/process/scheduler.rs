@@ -214,19 +214,25 @@ impl Scheduler {
                     wq.wake_all_locked(self);
                 }
 
-                let curr_pid = self.current_pid();
-
                 if let Some(Some(ref mut parent_task)) = self.tasks.get_mut(parent_idx) {
                     parent_task.pending_signals |= 1 << (17 - 1);
-                    if Some(parent) == curr_pid {
-                        let pending_unblocked = parent_task.pending_signals & !parent_task.blocked_signals;
-                        let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
-                        unsafe {
-                            if apic_id < 32 {
-                                crate::syscall::CPU_SCRATCHES[apic_id].signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
-                            }
+                    
+                    // Scan current_cpus to find which core (if any) is running the parent task
+                    let mut parent_core = None;
+                    for core_id in 0..32 {
+                        if self.current_cpus[core_id] == Some(parent) {
+                            parent_core = Some(core_id);
+                            break;
                         }
                     }
+
+                    if let Some(core_id) = parent_core {
+                        let pending_unblocked = parent_task.pending_signals & !parent_task.blocked_signals;
+                        unsafe {
+                            crate::syscall::CPU_SCRATCHES[core_id].signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
+                        }
+                    }
+
                     // Wake parent task from blocked state if it was waiting
                     if parent_task.state == TaskState::Blocked {
                         parent_task.state = TaskState::Ready;

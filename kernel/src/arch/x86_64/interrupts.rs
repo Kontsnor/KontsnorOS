@@ -351,6 +351,7 @@ extern "x86-interrupt" fn ipi_halt_handler(_stack_frame: InterruptStackFrame) {
 extern "x86-interrupt" fn ipi_tlb_shootdown_handler(_stack_frame: InterruptStackFrame) {
     super::apic::lapic_eoi();
     x86_64::instructions::tlb::flush_all();
+    crate::arch::x86_64::smp::tlb_shootdown_ack();
 }
 
 extern "x86-interrupt" fn network_interrupt_handler(_stack_frame: InterruptStackFrame) {

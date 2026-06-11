@@ -3,6 +3,8 @@
 use spin::Mutex;
 use crate::kprintln;
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 /// Representation of a single CPU core.
 #[derive(Debug, Clone)]
 pub struct Cpu {
@@ -31,6 +33,12 @@ impl CpuManager {
 }
 
 static CPU_MANAGER: Mutex<CpuManager> = Mutex::new(CpuManager::new());
+
+/// Global lock for serializing TLB shootdowns across all cores.
+static TLB_SHOOTDOWN_LOCK: crate::sync::spinlock::TicketLock<()> = crate::sync::spinlock::TicketLock::new(());
+
+/// Global atomic counter for tracking TLB shootdown acknowledgements.
+static TLB_SHOOTDOWN_ACKS: AtomicU32 = AtomicU32::new(0);
 
 /// Initialize the CPU manager using core enumeration from the MADT.
 pub fn init() {
@@ -80,9 +88,28 @@ pub fn current_lapic_id() -> u8 {
 }
 
 /// Broadcast a TLB shootdown interrupt to all other logical CPU cores.
+///
+/// Under SMP, we broadcast the IPI and block until all other active cores
+/// have processed the flush, preventing use-after-free conditions.
 pub fn shootdown_tlb() {
-    if get_cpu_count() > 1 {
+    let cpu_count = get_cpu_count();
+    if cpu_count > 1 {
+        let _lock = TLB_SHOOTDOWN_LOCK.lock();
+        
+        let target_count = cpu_count - 1;
+        TLB_SHOOTDOWN_ACKS.store(target_count as u32, Ordering::SeqCst);
+        
         super::apic::broadcast_ipi_all_excluding_self(36);
+        
+        // Spin-wait until all other cores have acknowledged the TLB flush
+        while TLB_SHOOTDOWN_ACKS.load(Ordering::SeqCst) > 0 {
+            core::hint::spin_loop();
+        }
     }
+}
+
+/// Acknowledge a pending TLB shootdown. Called by the IPI handler.
+pub fn tlb_shootdown_ack() {
+    TLB_SHOOTDOWN_ACKS.fetch_sub(1, Ordering::SeqCst);
 }
 

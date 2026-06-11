@@ -224,6 +224,15 @@ pub fn allocate_frame() -> Option<u64> {
             if cache.count > 0 {
                 cache.count -= 1;
                 let frame = cache.frames[cache.count];
+                #[cfg(debug_assertions)]
+                {
+                    let idx = (frame / PAGE_SIZE as u64) as usize;
+                    debug_assert!(
+                        !FRAME_ALLOCATOR.lock().is_free(idx),
+                        "Frame {:#x} popped from core cache was already free in global bitmap (potential double-free)",
+                        frame
+                    );
+                }
                 Some(frame)
             } else {
                 // Cache is empty; bulk allocate from the global FRAME_ALLOCATOR

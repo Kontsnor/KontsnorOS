@@ -190,18 +190,39 @@ pub fn init_entropy(boot_info: &bootloader_api::BootInfo) {
     entropy[10..18].copy_from_slice(&mem_hash.to_le_bytes());
     
     // 5. RDRAND if supported
-    let mut rdrand_val = 0u64;
-    let success: u32;
+    let mut has_rdrand = false;
+    let mut ecx_val: u32 = 0;
     unsafe {
         core::arch::asm!(
-            "rdrand {0}",
-            "mov {1:e}, 1",
-            "jc 2f",
-            "mov {1:e}, 0",
-            "2:",
-            out(reg) rdrand_val,
-            out(reg) success,
+            "push rbx",
+            "mov eax, 1",
+            "cpuid",
+            "mov {0:e}, ecx",
+            "pop rbx",
+            out(reg) ecx_val,
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
         );
+    }
+    if (ecx_val & (1 << 30)) != 0 {
+        has_rdrand = true;
+    }
+
+    let mut rdrand_val = 0u64;
+    let mut success = 0u32;
+    if has_rdrand {
+        unsafe {
+            core::arch::asm!(
+                "rdrand {0}",
+                "mov {1:e}, 1",
+                "jc 2f",
+                "mov {1:e}, 0",
+                "2:",
+                out(reg) rdrand_val,
+                out(reg) success,
+            );
+        }
     }
     if success != 0 {
         entropy[18..26].copy_from_slice(&rdrand_val.to_le_bytes());

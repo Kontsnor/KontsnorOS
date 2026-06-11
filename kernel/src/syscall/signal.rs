@@ -320,11 +320,11 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
             rdi: unsafe { (*regs).rdi },
             rsi: unsafe { (*regs).rsi },
             rdx: unsafe { (*regs).rdx },
-            rcx: unsafe { (*regs).rip },
+            rcx: unsafe { (*regs).rip },   // Aliased to user RIP (rcx) on the syscall path
             r8: unsafe { (*regs).r8 },
             r9: unsafe { (*regs).r9 },
             r10: unsafe { (*regs).r10 },
-            r11: unsafe { (*regs).rflags },
+            r11: unsafe { (*regs).rflags }, // Aliased to user RFLAGS (r11) on the syscall path
             r12: unsafe { (*regs).r12 },
             r13: unsafe { (*regs).r13 },
             r14: unsafe { (*regs).r14 },

@@ -31,6 +31,7 @@ extern crate alloc;
 mod acpi;
 #[macro_use]
 mod arch;
+mod crypto;
 mod drivers;
 mod fs;
 mod ipc;
@@ -113,6 +114,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Initialize the kernel heap
     memory::heap::init().expect("Kernel heap initialization failed");
     kprintln!("[boot] Kernel heap initialized.");
+
+    // Initialize CSPRNG using boot-time entropy
+    crypto::prng::init_entropy(boot_info);
+    kprintln!("[boot] CSPRNG initialized.");
 
     // Initialize dynamic per-core GDT/TSS configuration
     arch::x86_64::gdt::init_heap();

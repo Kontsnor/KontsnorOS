@@ -965,10 +965,8 @@ pub fn sys_getrandom(buf: *mut u8, buflen: usize, _flags: u32) -> SyscallResult 
     if buf.is_null() { return Errno::EFAULT.into(); }
     if !validate_user_ptr(buf, buflen) { return Errno::EFAULT.into(); }
     let slice = unsafe { core::slice::from_raw_parts_mut(buf, buflen) };
-    let mut seed = 0x12345678u32;
-    for (i, b) in slice.iter_mut().enumerate() {
-        seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
-        *b = ((seed >> 16) & 0xFF) as u8 ^ (i as u8);
+    if !crate::crypto::prng::fill_bytes(slice) {
+        return Errno::EAGAIN.into();
     }
     buflen as SyscallResult
 }

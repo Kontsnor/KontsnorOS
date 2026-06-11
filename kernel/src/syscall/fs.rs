@@ -838,7 +838,10 @@ pub fn sys_rmdir(pathname: *const u8) -> SyscallResult {
     }
 
     match parent_inode.rmdir(name) {
-        Ok(_) => 0,
+        Ok(_) => {
+            crate::fs::vfs::invalidate_dentry(&resolved_path);
+            0
+        }
         Err(e) => e as SyscallResult,
     }
 }
@@ -868,7 +871,10 @@ pub fn sys_unlink(pathname: *const u8) -> SyscallResult {
     }
 
     match parent_inode.unlink(name) {
-        Ok(_) => 0,
+        Ok(_) => {
+            crate::fs::vfs::invalidate_dentry(&resolved_path);
+            0
+        }
         Err(e) => e as SyscallResult,
     }
 }
@@ -1028,6 +1034,8 @@ pub fn sys_rename(oldpath: *const u8, newpath: *const u8) -> SyscallResult {
 
     // Remove old file
     let _ = old_parent.unlink(old_name);
+    crate::fs::vfs::invalidate_dentry(&resolved_old);
+    crate::fs::vfs::invalidate_dentry(&resolved_new);
     0
 }
 

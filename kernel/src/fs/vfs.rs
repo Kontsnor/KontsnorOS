@@ -8,6 +8,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use alloc::format;
 use spin::RwLock;
 use crate::kprintln;
 
@@ -75,6 +76,8 @@ pub struct Vfs {
     mounts: BTreeMap<String, MountEntry>,
     /// Registered filesystem types.
     fs_types: Vec<FileSystemType>,
+    /// Dentry cache mapping absolute path strings to target inodes.
+    dentry_cache: RwLock<BTreeMap<String, Arc<dyn InodeOps>>>,
 }
 
 impl Vfs {
@@ -83,6 +86,7 @@ impl Vfs {
         Self {
             mounts: BTreeMap::new(),
             fs_types: Vec::new(),
+            dentry_cache: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -154,7 +158,13 @@ impl Vfs {
 
             let mut current = root;
             let components: Vec<&str> = remaining_path.split('/').filter(|c| !c.is_empty()).collect();
-            let mut resolved_till_now = String::from("/");
+
+            let mount_path = if remaining_path == "/" {
+                resolved_path.as_str()
+            } else {
+                &resolved_path[..resolved_path.len() - remaining_path.len()]
+            };
+            let mut resolved_till_now = String::from(mount_path);
 
             let n_comp = components.len();
             let mut i = 0;
@@ -162,7 +172,25 @@ impl Vfs {
 
             for component in components {
                 i += 1;
-                let next = current.lookup(component)?;
+                let path_key = if resolved_till_now.is_empty() || resolved_till_now == "/" {
+                    format!("/{}", component)
+                } else {
+                    format!("{}/{}", resolved_till_now, component)
+                };
+
+                let next = {
+                    let cache = self.dentry_cache.read();
+                    cache.get(&path_key).cloned()
+                };
+
+                let next = if let Some(n) = next {
+                    n
+                } else {
+                    let n = current.lookup(component)?;
+                    let mut cache = self.dentry_cache.write();
+                    cache.insert(path_key.clone(), n.clone());
+                    n
+                };
 
                 // Check if this component is a symlink
                 if next.inode().file_type == FileType::Symlink {
@@ -181,10 +209,7 @@ impl Vfs {
                 }
 
                 current = next;
-                if resolved_till_now != "/" {
-                    resolved_till_now.push('/');
-                }
-                resolved_till_now.push_str(component);
+                resolved_till_now = path_key;
             }
 
             if let Some((dir_path, target)) = symlink_target {
@@ -204,6 +229,18 @@ impl Vfs {
 
             return Some(current);
         }
+    }
+
+    /// Invalidate a dentry and all its descendants.
+    pub fn invalidate_dentry(&self, path: &str) {
+        let mut cache = self.dentry_cache.write();
+        cache.remove(path);
+        let prefix = if path.ends_with('/') {
+            String::from(path)
+        } else {
+            format!("{}/", path)
+        };
+        cache.retain(|k, _| !k.starts_with(&prefix));
     }
 }
 
@@ -234,6 +271,13 @@ pub fn lookup_follow(path: &str, follow_last: bool) -> Option<Arc<dyn InodeOps>>
 pub fn register_fs_type(fs_type: FileSystemType) {
     if let Some(ref mut vfs) = *VFS.write() {
         vfs.register_fs_type(fs_type);
+    }
+}
+
+/// Invalidate a directory entry in the cache.
+pub fn invalidate_dentry(path: &str) {
+    if let Some(ref vfs) = *VFS.read() {
+        vfs.invalidate_dentry(path);
     }
 }
 

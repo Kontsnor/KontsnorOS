@@ -100,13 +100,7 @@ fn read_blocks(device: &dyn BlockDevice, block: u64, buf: &mut [u8], block_size:
     let dev_block_size = device.block_size();
     let dev_blocks_per_fs_block = (block_size as u64) / dev_block_size;
     let start_dev_block = block * dev_blocks_per_fs_block;
-    
-    for i in 0..dev_blocks_per_fs_block {
-        let offset = (i * dev_block_size) as usize;
-        device.read_block(start_dev_block + i, &mut buf[offset..offset + dev_block_size as usize])
-            .map_err(|_| "Block device read error")?;
-    }
-    Ok(())
+    device.read_block(start_dev_block, buf).map_err(|_| "Block device read error")
 }
 
 /// Logical-to-physical block writing helper.
@@ -114,13 +108,7 @@ fn write_blocks(device: &dyn BlockDevice, block: u64, buf: &[u8], block_size: u3
     let dev_block_size = device.block_size();
     let dev_blocks_per_fs_block = (block_size as u64) / dev_block_size;
     let start_dev_block = block * dev_blocks_per_fs_block;
-    
-    for i in 0..dev_blocks_per_fs_block {
-        let offset = (i * dev_block_size) as usize;
-        device.write_block(start_dev_block + i, &buf[offset..offset + dev_block_size as usize])
-            .map_err(|_| "Block device write error")?;
-    }
-    Ok(())
+    device.write_block(start_dev_block, buf).map_err(|_| "Block device write error")
 }
 
 /// ext2 FileSystem implementation.
@@ -1152,6 +1140,8 @@ impl InodeOps for Ext2Inode {
                 Ok(b) => b,
                 Err(_) => return Err(-5), // EIO
             };
+
+
 
             let bytes_to_read = core::cmp::min(
                 buf.len() - read_bytes,

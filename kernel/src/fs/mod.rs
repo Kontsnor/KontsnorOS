@@ -78,7 +78,8 @@ pub fn init() {
         }
 
         // Try mounting the physical ATA drive
-        if let Ok(ext2_fs) = ext2::Ext2FileSystem::mount(ata_drive) {
+        let cached_drive = alloc::sync::Arc::new(crate::drivers::block::cache::BlockCache::new(ata_drive, 2048));
+        if let Ok(ext2_fs) = ext2::Ext2FileSystem::mount(cached_drive) {
             vfs::mount(alloc::string::String::from("/disk"), ext2_fs.clone());
             vfs::mount(alloc::string::String::from("/"), ext2_fs);
             kprintln!("[fs] Persistent ext2 ATA drive mounted at /disk and /.");

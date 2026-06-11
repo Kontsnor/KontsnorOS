@@ -15,12 +15,16 @@ impl AtaDrive {
     /// Polls the status register until the BSY bit is clear and DRDY bit is set.
     fn wait_ready(&self) -> Result<(), &'static str> {
         let mut status_port = Port::<u8>::new(0x1F7);
-        for _ in 0..1_000_000 {
+        for i in 0..1_000_000 {
             let status = unsafe { status_port.read() };
             if (status & 0x80) == 0 && (status & 0x40) != 0 {
                 return Ok(());
             }
-            core::hint::spin_loop();
+            if i >= 100 && i % 1000 == 0 {
+                crate::process::scheduler::yield_now();
+            } else {
+                core::hint::spin_loop();
+            }
         }
         Err("ATA Drive timeout waiting for ready")
     }
@@ -28,12 +32,16 @@ impl AtaDrive {
     /// Polls the status register until BSY is clear and DRQ (Data Request) is set.
     fn wait_data_request(&self) -> Result<(), &'static str> {
         let mut status_port = Port::<u8>::new(0x1F7);
-        for _ in 0..1_000_000 {
+        for i in 0..1_000_000 {
             let status = unsafe { status_port.read() };
             if (status & 0x80) == 0 && (status & 0x08) != 0 {
                 return Ok(());
             }
-            core::hint::spin_loop();
+            if i >= 100 && i % 1000 == 0 {
+                crate::process::scheduler::yield_now();
+            } else {
+                core::hint::spin_loop();
+            }
         }
         Err("ATA Drive timeout waiting for data request (DRQ)")
     }
@@ -81,53 +89,56 @@ impl AtaDrive {
         Ok(())
     }
 
-    /// Reads a 512-byte sector from the drive.
-    fn read_sector(&self, lba: u32, buf: &mut [u8]) -> Result<(), &'static str> {
-        if buf.len() < 512 {
-            return Err("Buffer too small for ATA sector");
-        }
-        
-        self.setup_lba(lba, 1)?;
+    /// Reads a chunk of consecutive sectors (up to 256) in a single command.
+    fn read_sectors_chunk(&self, lba: u32, sector_count: u32, buf: &mut [u8]) -> Result<(), &'static str> {
+        let sc_val = if sector_count == 256 { 0 } else { sector_count as u8 };
+        self.setup_lba(lba, sc_val)?;
         
         let mut command_port = Port::<u8>::new(0x1F7);
         unsafe { command_port.write(0x20); } // 0x20 = Read Sectors
         
-        self.io_delay();
-        self.wait_data_request()?;
-        
         let mut data_port = Port::<u16>::new(0x1F0);
-        for i in 0..256 {
-            let word = unsafe { data_port.read() };
-            let bytes = word.to_le_bytes();
-            buf[i * 2] = bytes[0];
-            buf[i * 2 + 1] = bytes[1];
+        for sector in 0..sector_count {
+            self.io_delay();
+            self.wait_data_request()?;
+            
+            let sector_offset = (sector * 512) as usize;
+            for i in 0..256 {
+                let word = unsafe { data_port.read() };
+                let bytes = word.to_le_bytes();
+                buf[sector_offset + i * 2] = bytes[0];
+                buf[sector_offset + i * 2 + 1] = bytes[1];
+            }
         }
         
         Ok(())
     }
 
-    /// Writes a 512-byte sector to the drive.
-    fn write_sector(&self, lba: u32, data: &[u8]) -> Result<(), &'static str> {
-        if data.len() < 512 {
-            return Err("Data too small for ATA sector");
-        }
-        
-        self.setup_lba(lba, 1)?;
+    /// Writes a chunk of consecutive sectors (up to 256) in a single command.
+    fn write_sectors_chunk(&self, lba: u32, sector_count: u32, data: &[u8]) -> Result<(), &'static str> {
+        let sc_val = if sector_count == 256 { 0 } else { sector_count as u8 };
+        self.setup_lba(lba, sc_val)?;
         
         let mut command_port = Port::<u8>::new(0x1F7);
         unsafe { command_port.write(0x30); } // 0x30 = Write Sectors
         
-        self.io_delay();
-        self.wait_data_request()?;
-        
         let mut data_port = Port::<u16>::new(0x1F0);
-        for i in 0..256 {
-            let word = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
-            unsafe { data_port.write(word); }
+        for sector in 0..sector_count {
+            self.io_delay();
+            self.wait_data_request()?;
+            
+            let sector_offset = (sector * 512) as usize;
+            for i in 0..256 {
+                let word = u16::from_le_bytes([
+                    data[sector_offset + i * 2],
+                    data[sector_offset + i * 2 + 1]
+                ]);
+                unsafe { data_port.write(word); }
+            }
+            
+            self.io_delay();
+            self.wait_ready()?;
         }
-        
-        self.io_delay();
-        self.wait_ready()?;
         
         Ok(())
     }
@@ -135,13 +146,39 @@ impl AtaDrive {
 
 impl BlockDevice for AtaDrive {
     fn read_block(&self, block: u64, buf: &mut [u8]) -> Result<(), DriverError> {
-        let lba = block as u32;
-        self.read_sector(lba, buf).map_err(|_| DriverError::IoError)
+        let mut lba = block as u32;
+        let sector_count = (buf.len() / 512) as u32;
+        let mut sectors_read = 0;
+        while sectors_read < sector_count {
+            let chunk = core::cmp::min(sector_count - sectors_read, 256);
+            let chunk_len = (chunk * 512) as usize;
+            self.read_sectors_chunk(
+                lba,
+                chunk,
+                &mut buf[(sectors_read * 512) as usize .. (sectors_read * 512) as usize + chunk_len]
+            ).map_err(|_| DriverError::IoError)?;
+            lba += chunk;
+            sectors_read += chunk;
+        }
+        Ok(())
     }
 
     fn write_block(&self, block: u64, data: &[u8]) -> Result<(), DriverError> {
-        let lba = block as u32;
-        self.write_sector(lba, data).map_err(|_| DriverError::IoError)
+        let mut lba = block as u32;
+        let sector_count = (data.len() / 512) as u32;
+        let mut sectors_written = 0;
+        while sectors_written < sector_count {
+            let chunk = core::cmp::min(sector_count - sectors_written, 256);
+            let chunk_len = (chunk * 512) as usize;
+            self.write_sectors_chunk(
+                lba,
+                chunk,
+                &data[(sectors_written * 512) as usize .. (sectors_written * 512) as usize + chunk_len]
+            ).map_err(|_| DriverError::IoError)?;
+            lba += chunk;
+            sectors_written += chunk;
+        }
+        Ok(())
     }
 
     fn block_size(&self) -> u64 {
@@ -149,7 +186,7 @@ impl BlockDevice for AtaDrive {
     }
 
     fn block_count(&self) -> u64 {
-        20480 // 10 MB raw disk divided by 512 bytes per block = 20480 blocks
+        131072 // 64 MB raw disk divided by 512 bytes per block = 131072 blocks
     }
 
     fn flush(&self) -> Result<(), DriverError> {

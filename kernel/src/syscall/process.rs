@@ -147,6 +147,7 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
 
     kprintln!("[syscall] execve(\"{}\") with {} args, {} env vars", path, argv.len(), envp.len());
 
+
     // Look up the file in the VFS
     let inode = match crate::fs::vfs::lookup_follow(&path, true) {
         Some(i) => i,
@@ -161,6 +162,7 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
     if file_size == 0 {
         return Errno::ENOEXEC.into();
     }
+
     let mut elf_buf = alloc::vec![0u8; file_size];
     match inode.read(0, &mut elf_buf) {
         Ok(_) => {},
@@ -251,11 +253,13 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
         }
     }
 
+
     // Parse the ELF
     let elf_info = match crate::process::elf::parse_elf(&elf_buf) {
         Ok(e) => e,
         Err(_) => return Errno::ENOEXEC.into(),
     };
+
 
     // Create a fresh user page table
     let new_page_table = match crate::memory::r#virtual::create_user_page_table() {
@@ -263,7 +267,7 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
         Err(_) => return Errno::ENOMEM.into(),
     };
 
-    // Map and load ELF segments
+
     use x86_64::structures::paging::{Page, PhysFrame, PageTableFlags, Size4KiB};
     use x86_64::{PhysAddr, VirtAddr};
 
@@ -322,6 +326,7 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
 
     let initial_brk = (max_vaddr + 4095) & !4095;
 
+
     // Map user stack
     let stack_size: u64 = 64 * 1024;
     let stack_bottom = crate::process::elf::USER_STACK_TOP - stack_size;
@@ -346,6 +351,7 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
         }
     }
 
+
     // Construct System V ABI compliant stack
     let user_sp = match crate::process::elf::construct_user_stack(
         &argv,
@@ -361,6 +367,7 @@ pub fn sys_execve(pathname: *const u8, _argv: *const *const u8, _envp: *const *c
     };
 
     let entry = elf_info.entry_point;
+
 
     // Reset signal state and update page table root for execve
     let old_page_table = {

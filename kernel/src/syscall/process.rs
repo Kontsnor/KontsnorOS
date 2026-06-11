@@ -1088,6 +1088,10 @@ pub fn sys_clone(
         let mut sched = scheduler::SCHEDULER.lock();
         if let Some(ref mut sched) = *sched {
             if let Some(parent_task) = sched.get_task(current_pid) {
+                // TODO: F-13: Implement shared fd_table reference counting for CLONE_FILES.
+                // Currently, CLONE_FILES is ignored and a deep clone of the fd_table is
+                // always performed, which breaks POSIX thread fd sharing semantics (e.g.
+                // close(fd) in one thread is not visible to the other thread).
                 child_task.fd_table = parent_task.fd_table.clone();
                 for slot in &child_task.fd_table {
                     if let Some(ref file_desc) = slot {

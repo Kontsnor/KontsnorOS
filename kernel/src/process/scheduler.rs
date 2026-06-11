@@ -74,7 +74,7 @@ impl Scheduler {
     }
 
     /// Add a new task to the scheduler.
-    pub fn add_task(&mut self, task: Task) {
+    pub fn add_task(&mut self, mut task: Task) {
         let pid = task.pid;
         let priority = task.priority as usize;
         let idx = pid.as_u64() as usize;
@@ -84,6 +84,7 @@ impl Scheduler {
             self.tasks.push(None);
         }
 
+        task.in_queue = true;
         self.tasks[idx] = Some(alloc::boxed::Box::new(task));
         self.queues[priority].push_back(pid);
     }
@@ -97,7 +98,8 @@ impl Scheduler {
         for queue in &mut self.queues {
             while let Some(pid) = queue.pop_front() {
                 let idx = pid.as_u64() as usize;
-                if let Some(Some(task)) = self.tasks.get(idx) {
+                if let Some(Some(task)) = self.tasks.get_mut(idx) {
+                    task.in_queue = false;
                     if task.state == TaskState::Ready {
                         return Some(pid);
                     }
@@ -161,10 +163,15 @@ impl Scheduler {
             queue.clear();
         }
 
-        for task in self.tasks.iter().flatten() {
+        for task in self.tasks.iter_mut().flatten() {
+            task.in_queue = false;
+        }
+
+        for task in self.tasks.iter_mut().flatten() {
             if task.state == TaskState::Ready {
                 let priority = task.priority as usize;
                 self.queues[priority].push_back(task.pid);
+                task.in_queue = true;
             }
         }
     }
@@ -183,8 +190,11 @@ impl Scheduler {
         if let Some(Some(task)) = self.tasks.get_mut(idx) {
             if task.state == TaskState::Blocked {
                 task.state = TaskState::Ready;
-                let priority = task.priority as usize;
-                self.queues[priority].push_back(pid);
+                if !task.in_queue {
+                    let priority = task.priority as usize;
+                    self.queues[priority].push_back(pid);
+                    task.in_queue = true;
+                }
             }
         }
     }
@@ -240,8 +250,11 @@ impl Scheduler {
                     // Wake parent task from blocked state if it was waiting
                     if parent_task.state == TaskState::Blocked {
                         parent_task.state = TaskState::Ready;
-                        let priority = parent_task.priority as usize;
-                        self.queues[priority].push_back(parent);
+                        if !parent_task.in_queue {
+                            let priority = parent_task.priority as usize;
+                            self.queues[priority].push_back(parent);
+                            parent_task.in_queue = true;
+                        }
                     }
                 }
             }
@@ -430,8 +443,11 @@ pub fn schedule() {
             if current_task.state == TaskState::Running {
                 current_task.state = TaskState::Ready;
                 // Re-enqueue current task in its priority queue
-                let prio = current_task.priority as usize;
-                scheduler.queues[prio].push_back(current_pid);
+                if !current_task.in_queue {
+                    let prio = current_task.priority as usize;
+                    scheduler.queues[prio].push_back(current_pid);
+                    current_task.in_queue = true;
+                }
             }
             &mut current_task.context as *mut super::context::CpuContext
         };

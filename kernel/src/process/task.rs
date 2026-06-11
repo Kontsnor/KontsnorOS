@@ -147,6 +147,9 @@ pub struct Task {
 
     /// Wait queue for child process state changes (e.g. wait4).
     pub child_wait_queue: Arc<crate::sync::wait_queue::WaitQueue>,
+
+    /// Tracks whether this task is currently queued in the scheduler priority queues.
+    pub in_queue: bool,
 }
 
 impl Task {
@@ -189,6 +192,7 @@ impl Task {
             sigactions: [SigAction { sa_handler: 0, sa_flags: 0, sa_restorer: 0, sa_mask: 0 }; 64],
             child_wait_queue: Arc::new(crate::sync::wait_queue::WaitQueue::new()),
             pgid: pid.as_u64(),
+            in_queue: false,
         }
     }
 

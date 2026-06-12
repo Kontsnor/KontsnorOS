@@ -66,16 +66,18 @@ graph TD
 
 ### 5. 🛡️ Quality & Security Assurance Agent (`security`)
 * **Role**: Vulnerability auditing, boundary checks, lock diagnostics, warning elimination, and test orchestration.
-* **Core Goal**: Maintain zero-warning compliance and protect user-space boundaries.
+* **Core Goal**: Maintain zero-warning compliance, verify security auditing, and extend/protect kernel boundaries.
 * **Responsibilities**:
-  - Auditing all syscall pointer parameters (`validate_user_ptr`) to prevent kernel space dereferences.
+  - Auditing all syscall pointer parameters (`validate_user_ptr` and `validate_user_ptr_write`) on all syscall boundaries to prevent kernel space dereferences and out-of-bounds writes.
+  - Extending and maintaining the in-kernel unit/integration testing framework.
+  - Checking security audit status across the kernel code.
   - Verifying the safety constraints of `unsafe` blocks, ensuring every block contains documented SAFETY justifications.
   - Enforcing zero compiler warnings and zero Clippy issues across the entire workspace.
   - Operating QEMU integration testing loops to guarantee system-wide stability.
 
 ---
 
-## 🔄 standard Operating Procedures (SOP)
+## 🔄 Standard Operating Procedures (SOP)
 
 When executing any task on the roadmap, the agent must follow this exact development lifecycle:
 
@@ -93,8 +95,9 @@ When executing any task on the roadmap, the agent must follow this exact develop
      ```
 
 4. **Continuous Quality Verification**:
-   Before finishing, run the QEMU verification flow to ensure user applications compile and execute cleanly:
+   Before finishing, run the test runner followed by the QEMU verification flow to ensure system-wide stability:
    ```bash
+   ./tools/run-tests.sh
    cargo clippy --workspace --all-targets -- -D warnings
    cargo fmt --check
    ./tools/run-qemu.sh --release

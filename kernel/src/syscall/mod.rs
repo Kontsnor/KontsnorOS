@@ -8,9 +8,9 @@ use crate::kprintln;
 pub mod fs;
 pub mod io;
 pub mod memory;
+pub mod net;
 pub mod process;
 pub mod signal;
-pub mod net;
 
 pub const DEBUG_SYSCALLS: bool = false;
 
@@ -112,9 +112,9 @@ pub struct SavedRegisters {
     pub r12: u64,
     pub rbx: u64,
     pub rbp: u64,
-    pub rip: u64, // rcx
+    pub rip: u64,    // rcx
     pub rflags: u64, // r11
-    pub rsp: u64, // User stack pointer, pushed first!
+    pub rsp: u64,    // User stack pointer, pushed first!
 }
 
 // ── Fast Syscall Assembly Entry Point ────────────────────────────────
@@ -122,38 +122,35 @@ pub struct SavedRegisters {
 core::arch::global_asm!(
     ".global syscall_entry",
     "syscall_entry:",
-    "swapgs",                             // Swap GS with Kernel GS
-    "mov gs:[0], rsp",                    // Save user RSP in CpuScratch.user_rsp
-    "mov rsp, gs:[8]",                    // Load kernel stack pointer from CpuScratch.kernel_rsp
-    
+    "swapgs",          // Swap GS with Kernel GS
+    "mov gs:[0], rsp", // Save user RSP in CpuScratch.user_rsp
+    "mov rsp, gs:[8]", // Load kernel stack pointer from CpuScratch.kernel_rsp
     // 1. Check if there are pending signals for the current task
-    "cmp qword ptr gs:[24], 0",           // gs:[24] is CpuScratch.signals_pending
-    "jne .Lsyscall_slow",                 // If signals are pending, go slow path
-    
+    "cmp qword ptr gs:[24], 0", // gs:[24] is CpuScratch.signals_pending
+    "jne .Lsyscall_slow",       // If signals are pending, go slow path
     // 2. Check if syscall is a fast-path candidate
-    "cmp rax, 39",                        // sys_getpid
+    "cmp rax, 39", // sys_getpid
     "je .Lsyscall_fast",
-    "cmp rax, 102",                       // sys_getuid
+    "cmp rax, 102", // sys_getuid
     "je .Lsyscall_fast",
-    "cmp rax, 104",                       // sys_getgid
+    "cmp rax, 104", // sys_getgid
     "je .Lsyscall_fast",
-    "cmp rax, 107",                       // sys_geteuid
+    "cmp rax, 107", // sys_geteuid
     "je .Lsyscall_fast",
-    "cmp rax, 108",                       // sys_getegid
+    "cmp rax, 108", // sys_getegid
     "je .Lsyscall_fast",
-    "cmp rax, 110",                       // sys_getppid
+    "cmp rax, 110", // sys_getppid
     "je .Lsyscall_fast",
-    "cmp rax, 186",                       // sys_gettid
+    "cmp rax, 186", // sys_gettid
     "je .Lsyscall_fast",
-    "cmp rax, 218",                       // sys_set_tid_address
+    "cmp rax, 218", // sys_set_tid_address
     "je .Lsyscall_fast",
-    
     // 3. Fall through to slow path
     ".Lsyscall_slow:",
     // Push registers in reverse order of SavedRegisters struct
     "push qword ptr gs:[0]", // User RSP (rsp)
-    "push r11", // User RFLAGS (rflags)
-    "push rcx", // User RIP (rip)
+    "push r11",              // User RFLAGS (rflags)
+    "push rcx",              // User RIP (rip)
     "push rbp",
     "push rbx",
     "push r12",
@@ -167,17 +164,13 @@ core::arch::global_asm!(
     "push rsi",
     "push rdi",
     "push rax", // Push rax so it is in the struct and we can modify/read it
-    
     // Pass pointer to saved registers (rsp) as 1st argument (rdi)
     "mov rdi, rsp",
     // Pass syscall number (rax) as 2nd argument (rsi)
     "mov rsi, rax",
-    
     "call syscall_dispatch_rust",
-    
     // Pop rax (return value, which might be modified by the syscall!)
     "pop rax",
-    
     // Restore general purpose registers
     "pop rdi",
     "pop rsi",
@@ -191,27 +184,24 @@ core::arch::global_asm!(
     "pop r12",
     "pop rbx",
     "pop rbp",
-    "pop rcx", // User RIP
-    "pop r11", // User RFLAGS
+    "pop rcx",              // User RIP
+    "pop r11",              // User RFLAGS
     "pop qword ptr gs:[0]", // User RSP
-    
     // Restore user stack pointer and swapgs back
     "mov rsp, gs:[0]",
     "swapgs",
     "sysretq",
-
     // 4. Fast path implementation
     ".Lsyscall_fast:",
     // Push caller-saved registers to preserve them
-    "push r11",             // User RFLAGS
-    "push rcx",             // User RIP
+    "push r11", // User RFLAGS
+    "push rcx", // User RIP
     "push r9",
     "push r8",
     "push r10",
     "push rdx",
     "push rsi",
     "push rdi",
-
     // Map System V ABI registers for Rust:
     // rdi = syscall_num (rax)
     // rsi = arg0        (rdi)
@@ -225,9 +215,7 @@ core::arch::global_asm!(
     "mov rdx, rsi",
     "mov rsi, rdi",
     "mov rdi, rax",
-
     "call syscall_fast_dispatch",
-
     // Restore preserved caller-saved registers
     "pop rdi",
     "pop rsi",
@@ -237,7 +225,6 @@ core::arch::global_asm!(
     "pop r9",
     "pop rcx",
     "pop r11",
-
     // Restore user stack pointer and swapgs back
     "mov rsp, gs:[0]",
     "swapgs",
@@ -268,7 +255,10 @@ pub fn set_kernel_stack(stack: u64) {
     unsafe {
         let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
         if apic_id >= 32 {
-            panic!("APIC ID {} out of bounds (>= 32) in set_kernel_stack", apic_id);
+            panic!(
+                "APIC ID {} out of bounds (>= 32) in set_kernel_stack",
+                apic_id
+            );
         }
         CPU_SCRATCHES[apic_id].kernel_rsp = stack;
     }
@@ -276,10 +266,7 @@ pub fn set_kernel_stack(stack: u64) {
 
 /// Dispatcher assembly calling wrapper.
 #[no_mangle]
-pub extern "C" fn syscall_dispatch_rust(
-    regs: *mut SavedRegisters,
-    syscall_num: u64,
-) -> i64 {
+pub extern "C" fn syscall_dispatch_rust(regs: *mut SavedRegisters, syscall_num: u64) -> i64 {
     if syscall_num == 15 {
         return crate::syscall::signal::sys_rt_sigreturn(regs);
     }
@@ -298,7 +285,9 @@ pub extern "C" fn syscall_dispatch_rust(
         let mut canary_msg = alloc::string::String::new();
         if fs_base != 0 {
             let canary_addr = fs_base + 0x28;
-            if let Some(phys) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(canary_addr)) {
+            if let Some(phys) =
+                crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(canary_addr))
+            {
                 let virt = phys.as_u64() + crate::memory::r#virtual::phys_mem_offset();
                 let canary_val = unsafe { *(virt as *const u64) };
                 canary_msg = alloc::format!("canary={:#x}", canary_val);
@@ -306,40 +295,60 @@ pub extern "C" fn syscall_dispatch_rust(
                 canary_msg = alloc::format!("canary_addr={:#x} (unmapped)", canary_addr);
             }
         }
-        
+
         // Print stack values
         let mut stack_msg = alloc::string::String::new();
         if user_rsp != 0 && user_rsp < 0x0000_7FFF_FFFF_FFFF {
-            if let Some(_phys) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(user_rsp)) {
+            if let Some(_phys) =
+                crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(user_rsp))
+            {
                 // print 4 words from RSP
                 let mut words = [0u64; 4];
                 for i in 0..4 {
                     let addr = user_rsp + (i * 8);
-                    if let Some(p) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(addr)) {
+                    if let Some(p) =
+                        crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(addr))
+                    {
                         let v = p.as_u64() + crate::memory::r#virtual::phys_mem_offset();
                         words[i as usize] = unsafe { *(v as *const u64) };
                     }
                 }
-                stack_msg = alloc::format!("rsp={:#x} stack=[{:#x}, {:#x}, {:#x}, {:#x}]", 
-                     user_rsp, words[0], words[1], words[2], words[3]);
+                stack_msg = alloc::format!(
+                    "rsp={:#x} stack=[{:#x}, {:#x}, {:#x}, {:#x}]",
+                    user_rsp,
+                    words[0],
+                    words[1],
+                    words[2],
+                    words[3]
+                );
             }
         }
 
-        crate::kprintln!("[debug syscall {}] args=[{:#x}, {:#x}, {:#x}] fs_base={:#x} {} {}", 
-            syscall_num, arg0, arg1, arg2, fs_base, canary_msg, stack_msg);
+        crate::kprintln!(
+            "[debug syscall {}] args=[{:#x}, {:#x}, {:#x}] fs_base={:#x} {} {}",
+            syscall_num,
+            arg0,
+            arg1,
+            arg2,
+            fs_base,
+            canary_msg,
+            stack_msg
+        );
     }
 
     let res = dispatch(regs, syscall_num, arg0, arg1, arg2, arg3, arg4, arg5);
-    
+
     if DEBUG_SYSCALLS {
         crate::kprintln!("[debug syscall {} ret] res={}", syscall_num, res);
-        
+
         if syscall_num == 16 {
             let user_rsp = unsafe { (*regs).rsp };
             let mut words_after = [0u64; 8];
             for i in 0..8 {
                 let addr = user_rsp + (i * 8);
-                if let Some(p) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(addr)) {
+                if let Some(p) =
+                    crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(addr))
+                {
                     let v = p.as_u64() + crate::memory::r#virtual::phys_mem_offset();
                     words_after[i as usize] = unsafe { *(v as *const u64) };
                 }
@@ -373,7 +382,7 @@ pub extern "C" fn syscall_fast_dispatch(
     _arg4: u64,
 ) -> i64 {
     match syscall_num {
-        39  => process::sys_getpid(),
+        39 => process::sys_getpid(),
         102 => process::sys_getuid(),
         104 => process::sys_getgid(),
         107 => process::sys_geteuid(),
@@ -419,7 +428,7 @@ pub fn init() {
         lstar_msr.write(syscall_entry as *const () as u64);
 
         // 4. Set FMASK flags to clear (clear Interrupt Flag IF, Direction Flag DF)
-        fmask_msr.write(0x200 | 0x400); 
+        fmask_msr.write(0x200 | 0x400);
 
         // 5. Configure IA32_GS_BASE (active GS base in kernel) to point to CPU_SCRATCHES slot for this core
         let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
@@ -451,15 +460,15 @@ pub fn dispatch(
 ) -> SyscallResult {
     match syscall_num {
         // File I/O
-        0  => fs::sys_read(arg0 as i32, arg1 as *mut u8, arg2 as usize),
-        1  => fs::sys_write(arg0 as i32, arg1 as *const u8, arg2 as usize),
-        2  => fs::sys_open(arg0 as *const u8, arg1 as i32, arg2 as u32),
-        3  => fs::sys_close(arg0 as i32),
-        4  => fs::sys_stat(arg0 as *const u8, arg1 as *mut fs::LinuxStat),
-        5  => fs::sys_fstat(arg0 as i32, arg1 as *mut fs::LinuxStat),
-        6  => fs::sys_lstat(arg0 as *const u8, arg1 as *mut fs::LinuxStat),
-        7  => fs::sys_poll(arg0 as *mut u8, arg1, arg2 as i32),
-        8  => fs::sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32),
+        0 => fs::sys_read(arg0 as i32, arg1 as *mut u8, arg2 as usize),
+        1 => fs::sys_write(arg0 as i32, arg1 as *const u8, arg2 as usize),
+        2 => fs::sys_open(arg0 as *const u8, arg1 as i32, arg2 as u32),
+        3 => fs::sys_close(arg0 as i32),
+        4 => fs::sys_stat(arg0 as *const u8, arg1 as *mut fs::LinuxStat),
+        5 => fs::sys_fstat(arg0 as i32, arg1 as *mut fs::LinuxStat),
+        6 => fs::sys_lstat(arg0 as *const u8, arg1 as *mut fs::LinuxStat),
+        7 => fs::sys_poll(arg0 as *mut u8, arg1, arg2 as i32),
+        8 => fs::sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32),
         16 => io::sys_ioctl(arg0 as i32, arg1, arg2),
         17 => fs::sys_pread64(arg0 as i32, arg1 as *mut u8, arg2 as usize, arg3 as i64),
         20 => fs::sys_writev(arg0 as i32, arg1 as *const fs::IoVec, arg2 as i32),
@@ -479,23 +488,54 @@ pub fn dispatch(
         89 => fs::sys_readlink(arg0 as *const u8, arg1 as *mut u8, arg2 as usize),
         217 => fs::sys_getdents64(arg0 as i32, arg1 as *mut u8, arg2 as usize),
         257 => fs::sys_openat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as u32),
-        262 => fs::sys_newfstatat(arg0 as i32, arg1 as *const u8, arg2 as *mut fs::LinuxStat, arg3 as i32),
+        262 => fs::sys_newfstatat(
+            arg0 as i32,
+            arg1 as *const u8,
+            arg2 as *mut fs::LinuxStat,
+            arg3 as i32,
+        ),
         266 => fs::sys_symlinkat(arg0 as *const u8, arg1 as i32, arg2 as *const u8),
-        267 => fs::sys_readlinkat(arg0 as i32, arg1 as *const u8, arg2 as *mut u8, arg3 as usize),
+        267 => fs::sys_readlinkat(
+            arg0 as i32,
+            arg1 as *const u8,
+            arg2 as *mut u8,
+            arg3 as usize,
+        ),
         269 => fs::sys_faccessat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as i32),
         // Memory
-        9  => memory::sys_mmap(arg0, arg1 as usize, arg2 as i32, arg3 as i32, arg4 as i32, _arg5 as i64),
+        9 => memory::sys_mmap(
+            arg0,
+            arg1 as usize,
+            arg2 as i32,
+            arg3 as i32,
+            arg4 as i32,
+            _arg5 as i64,
+        ),
         10 => memory::sys_mprotect(arg0, arg1 as usize, arg2 as i32),
         11 => memory::sys_munmap(arg0, arg1 as usize),
         12 => memory::sys_brk(arg0),
         // Process
-        13 => signal::sys_rt_sigaction(arg0 as i32, arg1 as *const crate::process::task::SigAction, arg2 as *mut crate::process::task::SigAction, arg3 as usize),
-        14 => signal::sys_rt_sigprocmask(arg0 as i32, arg1 as *const u64, arg2 as *mut u64, arg3 as usize),
+        13 => signal::sys_rt_sigaction(
+            arg0 as i32,
+            arg1 as *const crate::process::task::SigAction,
+            arg2 as *mut crate::process::task::SigAction,
+            arg3 as usize,
+        ),
+        14 => signal::sys_rt_sigprocmask(
+            arg0 as i32,
+            arg1 as *const u64,
+            arg2 as *mut u64,
+            arg3 as usize,
+        ),
         35 => process::sys_nanosleep(arg0 as *const u8, arg1 as *mut u8),
         39 => process::sys_getpid(),
         56 => process::sys_clone(arg0, arg1, arg2 as *mut i32, arg3 as *mut i32, arg4, regs),
         57 => process::sys_fork(regs),
-        59 => process::sys_execve(arg0 as *const u8, arg1 as *const *const u8, arg2 as *const *const u8),
+        59 => process::sys_execve(
+            arg0 as *const u8,
+            arg1 as *const *const u8,
+            arg2 as *const *const u8,
+        ),
         60 => process::sys_exit(arg0 as i32),
         61 => process::sys_wait4(arg0 as i32, arg1 as *mut i32, arg2 as i32, arg3 as *mut u8),
         62 => signal::sys_kill(arg0 as i32, arg1 as i32),
@@ -527,8 +567,22 @@ pub fn dispatch(
         41 => net::sys_socket(arg0 as i32, arg1 as i32, arg2 as i32),
         42 => net::sys_connect(arg0 as i32, arg1 as *const net::SockAddrIn, arg2 as u32),
         43 => net::sys_accept(arg0 as i32, arg1 as *mut net::SockAddrIn, arg2 as *mut u32),
-        44 => net::sys_sendto(arg0 as i32, arg1 as *const u8, arg2 as usize, arg3 as i32, arg4 as *const net::SockAddrIn, _arg5 as u32),
-        45 => net::sys_recvfrom(arg0 as i32, arg1 as *mut u8, arg2 as usize, arg3 as i32, arg4 as *mut net::SockAddrIn, _arg5 as *mut u32),
+        44 => net::sys_sendto(
+            arg0 as i32,
+            arg1 as *const u8,
+            arg2 as usize,
+            arg3 as i32,
+            arg4 as *const net::SockAddrIn,
+            _arg5 as u32,
+        ),
+        45 => net::sys_recvfrom(
+            arg0 as i32,
+            arg1 as *mut u8,
+            arg2 as usize,
+            arg3 as i32,
+            arg4 as *mut net::SockAddrIn,
+            _arg5 as *mut u32,
+        ),
         49 => net::sys_bind(arg0 as i32, arg1 as *const net::SockAddrIn, arg2 as u32),
         50 => net::sys_listen(arg0 as i32, arg1 as i32),
         _ => {
@@ -537,4 +591,3 @@ pub fn dispatch(
         }
     }
 }
-

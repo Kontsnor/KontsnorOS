@@ -10,9 +10,9 @@
 //! frame. A set bit means the frame is in use; a clear bit means it's free.
 //! This provides O(1) allocation (amortized) with efficient memory usage.
 
-use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
-use crate::sync::spinlock::TicketLock;
 use crate::kprintln;
+use crate::sync::spinlock::TicketLock;
+use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 
 use super::PAGE_SIZE;
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -339,15 +339,15 @@ pub fn test_cow_refcounts() {
 
     // 2. Simulate fork: increment refcount of the frame to 2
     increment_ref(phys);
-    
+
     // 3. Simulate child resolving COW: allocate new child frame, decrement old frame refcount
     let child_phys = allocate_frame().expect("Failed to allocate child frame in COW test");
     let old_ref = decrement_ref(phys);
     assert_eq!(old_ref, 1);
-    
+
     // 4. Simulate child exit: free child's resolved frame
     deallocate_frame(child_phys);
-    
+
     // 5. Simulate parent exit: free parent's frame (refcount drops to 0, reclaimed)
     deallocate_frame(phys);
 

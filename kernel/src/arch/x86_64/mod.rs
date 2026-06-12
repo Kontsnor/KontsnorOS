@@ -6,9 +6,9 @@
 //! - Serial port (UART) driver for early console output
 //! - CPU boot sequence
 
+pub mod apic;
 pub mod boot;
 pub mod gdt;
 pub mod interrupts;
 pub mod serial;
-pub mod apic;
 pub mod smp;

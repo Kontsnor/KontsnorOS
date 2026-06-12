@@ -17,10 +17,10 @@
 //! └─────────────────────────────────┘
 //! ```
 
+use crate::kprintln;
 use linked_list_allocator::LockedHeap;
 use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
-use crate::kprintln;
 
 use super::PAGE_SIZE;
 
@@ -66,7 +66,8 @@ pub fn init() -> Result<(), &'static str> {
         let page_addr = HEAP_START + (i as u64 * PAGE_SIZE as u64);
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(page_addr));
 
-        let frame_addr = super::physical::allocate_frame().ok_or("Out of physical memory for heap")?;
+        let frame_addr =
+            super::physical::allocate_frame().ok_or("Out of physical memory for heap")?;
         let frame = PhysFrame::containing_address(x86_64::PhysAddr::new(frame_addr));
 
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;

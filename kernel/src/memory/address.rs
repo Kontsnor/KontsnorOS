@@ -19,7 +19,10 @@ impl PhysAddr {
     /// On x86_64, physical addresses are limited to the lower 52 bits.
     pub const fn new(addr: u64) -> Self {
         // x86_64 supports up to 52-bit physical addresses
-        debug_assert!(addr & 0xFFF0_0000_0000_0000 == 0, "PhysAddr exceeds 52 bits");
+        debug_assert!(
+            addr & 0xFFF0_0000_0000_0000 == 0,
+            "PhysAddr exceeds 52 bits"
+        );
         Self(addr)
     }
 
@@ -86,10 +89,7 @@ impl VirtAddr {
     pub const fn new(addr: u64) -> Self {
         // Enforce canonical form
         let canonical = ((addr as i64) << 16 >> 16) as u64;
-        debug_assert!(
-            addr == canonical,
-            "VirtAddr is not in canonical form"
-        );
+        debug_assert!(addr == canonical, "VirtAddr is not in canonical form");
         Self(addr)
     }
 

@@ -176,4 +176,3 @@ pub fn build_datagram(
 
     Some(total_len)
 }
-

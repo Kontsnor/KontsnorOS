@@ -14,8 +14,8 @@
 use spin::Mutex;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
-    FrameAllocator as X86FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame,
-    Size4KiB,
+    FrameAllocator as X86FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
+    PhysFrame, Size4KiB,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -113,7 +113,8 @@ pub fn create_user_page_table() -> Result<u64, &'static str> {
 
     // Copy kernel mappings (entries 256 to 511) from the active PML4
     let (active_pml4_frame, _) = Cr3::read();
-    let active_pml4_virt = VirtAddr::new(active_pml4_frame.start_address().as_u64() + phys_mem_offset());
+    let active_pml4_virt =
+        VirtAddr::new(active_pml4_frame.start_address().as_u64() + phys_mem_offset());
     let active_pml4: &PageTable = unsafe { &*active_pml4_virt.as_ptr() };
 
     for i in 256..512 {
@@ -125,7 +126,11 @@ pub fn create_user_page_table() -> Result<u64, &'static str> {
     if pml4_index < 256 {
         return Err("Physical memory mapping overlaps user space");
     }
-    crate::kprintln!("[virtual] User PML4: cloning index {}, entry: {:?}", pml4_index, active_pml4[pml4_index as usize]);
+    crate::kprintln!(
+        "[virtual] User PML4: cloning index {}, entry: {:?}",
+        pml4_index,
+        active_pml4[pml4_index as usize]
+    );
     new_pml4[pml4_index as usize] = active_pml4[pml4_index as usize].clone();
 
     Ok(pml4_phys)
@@ -159,8 +164,8 @@ pub fn clone_parent_page_table(parent_pml4_phys: u64) -> Result<u64, &'static st
         }
 
         // Allocate a new child PDPT (Level 3)
-        let child_pdpt_phys = super::physical::allocate_frame()
-            .ok_or("Failed to allocate child PDPT frame")?;
+        let child_pdpt_phys =
+            super::physical::allocate_frame().ok_or("Failed to allocate child PDPT frame")?;
         let child_pdpt_virt = VirtAddr::new(child_pdpt_phys + phys_mem_offset());
         let child_pdpt: &mut PageTable = unsafe { &mut *child_pdpt_virt.as_mut_ptr() };
         child_pdpt.zero();
@@ -169,7 +174,11 @@ pub fn clone_parent_page_table(parent_pml4_phys: u64) -> Result<u64, &'static st
         child_pml4[i].set_addr(PhysAddr::new(child_pdpt_phys), parent_pml4_entry.flags());
 
         // Map parent PDPT
-        let parent_pdpt_phys = parent_pml4_entry.frame().map_err(|_| "Invalid frame in parent PML4")?.start_address().as_u64();
+        let parent_pdpt_phys = parent_pml4_entry
+            .frame()
+            .map_err(|_| "Invalid frame in parent PML4")?
+            .start_address()
+            .as_u64();
         let parent_pdpt_virt = VirtAddr::new(parent_pdpt_phys + phys_mem_offset());
         let parent_pdpt: &PageTable = unsafe { &*parent_pdpt_virt.as_ptr() };
 
@@ -180,8 +189,8 @@ pub fn clone_parent_page_table(parent_pml4_phys: u64) -> Result<u64, &'static st
             }
 
             // Allocate a new child PD (Level 2)
-            let child_pd_phys = super::physical::allocate_frame()
-                .ok_or("Failed to allocate child PD frame")?;
+            let child_pd_phys =
+                super::physical::allocate_frame().ok_or("Failed to allocate child PD frame")?;
             let child_pd_virt = VirtAddr::new(child_pd_phys + phys_mem_offset());
             let child_pd: &mut PageTable = unsafe { &mut *child_pd_virt.as_mut_ptr() };
             child_pd.zero();
@@ -190,7 +199,11 @@ pub fn clone_parent_page_table(parent_pml4_phys: u64) -> Result<u64, &'static st
             child_pdpt[j].set_addr(PhysAddr::new(child_pd_phys), parent_pdpt_entry.flags());
 
             // Map parent PD
-            let parent_pd_phys = parent_pdpt_entry.frame().map_err(|_| "Invalid frame in parent PDPT")?.start_address().as_u64();
+            let parent_pd_phys = parent_pdpt_entry
+                .frame()
+                .map_err(|_| "Invalid frame in parent PDPT")?
+                .start_address()
+                .as_u64();
             let parent_pd_virt = VirtAddr::new(parent_pd_phys + phys_mem_offset());
             let parent_pd: &PageTable = unsafe { &*parent_pd_virt.as_ptr() };
 
@@ -201,8 +214,8 @@ pub fn clone_parent_page_table(parent_pml4_phys: u64) -> Result<u64, &'static st
                 }
 
                 // Allocate a new child PT (Level 1)
-                let child_pt_phys = super::physical::allocate_frame()
-                    .ok_or("Failed to allocate child PT frame")?;
+                let child_pt_phys =
+                    super::physical::allocate_frame().ok_or("Failed to allocate child PT frame")?;
                 let child_pt_virt = VirtAddr::new(child_pt_phys + phys_mem_offset());
                 let child_pt: &mut PageTable = unsafe { &mut *child_pt_virt.as_mut_ptr() };
                 child_pt.zero();
@@ -211,7 +224,11 @@ pub fn clone_parent_page_table(parent_pml4_phys: u64) -> Result<u64, &'static st
                 child_pd[k].set_addr(PhysAddr::new(child_pt_phys), parent_pd_entry.flags());
 
                 // Map parent's PT (get mutable reference so we can write protect entries too)
-                let parent_pt_phys = parent_pd_entry.frame().map_err(|_| "Invalid frame in parent PD")?.start_address().as_u64();
+                let parent_pt_phys = parent_pd_entry
+                    .frame()
+                    .map_err(|_| "Invalid frame in parent PD")?
+                    .start_address()
+                    .as_u64();
                 let parent_pt_virt = VirtAddr::new(parent_pt_phys + phys_mem_offset());
                 let parent_pt_mut: &mut PageTable = unsafe { &mut *parent_pt_virt.as_mut_ptr() };
 
@@ -221,7 +238,9 @@ pub fn clone_parent_page_table(parent_pml4_phys: u64) -> Result<u64, &'static st
                         continue;
                     }
 
-                    let frame = parent_pt_entry.frame().map_err(|_| "Invalid frame in parent PT")?;
+                    let frame = parent_pt_entry
+                        .frame()
+                        .map_err(|_| "Invalid frame in parent PT")?;
                     let phys_addr = frame.start_address().as_u64();
 
                     let mut flags = parent_pt_entry.flags();
@@ -328,10 +347,7 @@ unsafe impl X86FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
 /// # Safety
 ///
 /// The caller must ensure that the targeted PML4 physical address is valid.
-pub unsafe fn unmap_user_page(
-    pml4_phys: u64,
-    page: Page<Size4KiB>,
-) -> Result<u64, &'static str> {
+pub unsafe fn unmap_user_page(pml4_phys: u64, page: Page<Size4KiB>) -> Result<u64, &'static str> {
     unsafe {
         let phys = unmap_user_page_no_shootdown(pml4_phys, page)?;
         crate::arch::x86_64::smp::shootdown_tlb();
@@ -418,7 +434,11 @@ pub fn free_user_page_table(pml4_phys: u64) -> Result<(), &'static str> {
             continue;
         }
 
-        let pdpt_phys = pml4_entry.frame().map_err(|_| "Invalid frame in PML4")?.start_address().as_u64();
+        let pdpt_phys = pml4_entry
+            .frame()
+            .map_err(|_| "Invalid frame in PML4")?
+            .start_address()
+            .as_u64();
         let pdpt_virt = VirtAddr::new(pdpt_phys + phys_mem_offset());
         let pdpt: &PageTable = unsafe { &*pdpt_virt.as_ptr() };
 
@@ -428,7 +448,11 @@ pub fn free_user_page_table(pml4_phys: u64) -> Result<(), &'static str> {
                 continue;
             }
 
-            let pd_phys = pdpt_entry.frame().map_err(|_| "Invalid frame in PDPT")?.start_address().as_u64();
+            let pd_phys = pdpt_entry
+                .frame()
+                .map_err(|_| "Invalid frame in PDPT")?
+                .start_address()
+                .as_u64();
             let pd_virt = VirtAddr::new(pd_phys + phys_mem_offset());
             let pd: &PageTable = unsafe { &*pd_virt.as_ptr() };
 
@@ -438,7 +462,11 @@ pub fn free_user_page_table(pml4_phys: u64) -> Result<(), &'static str> {
                     continue;
                 }
 
-                let pt_phys = pd_entry.frame().map_err(|_| "Invalid frame in PD")?.start_address().as_u64();
+                let pt_phys = pd_entry
+                    .frame()
+                    .map_err(|_| "Invalid frame in PD")?
+                    .start_address()
+                    .as_u64();
                 let pt_virt = VirtAddr::new(pt_phys + phys_mem_offset());
                 let pt: &PageTable = unsafe { &*pt_virt.as_ptr() };
 
@@ -448,7 +476,11 @@ pub fn free_user_page_table(pml4_phys: u64) -> Result<(), &'static str> {
                         continue;
                     }
 
-                    let leaf_phys = pt_entry.frame().map_err(|_| "Invalid frame in PT")?.start_address().as_u64();
+                    let leaf_phys = pt_entry
+                        .frame()
+                        .map_err(|_| "Invalid frame in PT")?
+                        .start_address()
+                        .as_u64();
                     if pt_entry.flags().contains(PageTableFlags::BIT_9) {
                         // COW-shared: decrement reference count
                         if super::physical::decrement_ref(leaf_phys) == 0 {
@@ -477,4 +509,3 @@ pub fn free_user_page_table(pml4_phys: u64) -> Result<(), &'static str> {
 
     Ok(())
 }
-

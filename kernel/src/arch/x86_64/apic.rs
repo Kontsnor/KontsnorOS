@@ -2,9 +2,9 @@
 //!
 //! Replaces the legacy 8259 PIC with modern APIC interrupt routing.
 
+use crate::kprintln;
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::instructions::port::Port;
-use crate::kprintln;
 
 /// Physical memory offset for virtual memory mapping.
 fn phys_offset() -> u64 {
@@ -43,7 +43,9 @@ unsafe fn lapic_read(reg: u32) -> u32 {
 unsafe fn lapic_write(reg: u32, val: u32) {
     let base = LAPIC_BASE.load(Ordering::Relaxed);
     if base != 0 {
-        unsafe { core::ptr::write_volatile((base + reg as u64) as *mut u32, val); }
+        unsafe {
+            core::ptr::write_volatile((base + reg as u64) as *mut u32, val);
+        }
     }
 }
 
@@ -148,7 +150,11 @@ pub fn init() {
     let lapic_virt = lapic_phys + phys_offset();
     LAPIC_BASE.store(lapic_virt, Ordering::SeqCst);
 
-    kprintln!("[apic] Local APIC base physical: {:#x}, virtual: {:#x}", lapic_phys, lapic_virt);
+    kprintln!(
+        "[apic] Local APIC base physical: {:#x}, virtual: {:#x}",
+        lapic_phys,
+        lapic_virt
+    );
 
     // 3. Set up I/O APIC base addresses
     if madt_info.io_apics.is_empty() {
@@ -159,8 +165,12 @@ pub fn init() {
     let ioapic_virt = ioapic_phys + phys_offset();
     IOAPIC_BASE.store(ioapic_virt, Ordering::SeqCst);
 
-    kprintln!("[apic] I/O APIC ID {} base physical: {:#x}, virtual: {:#x}", 
-        madt_info.io_apics[0].id, ioapic_phys, ioapic_virt);
+    kprintln!(
+        "[apic] I/O APIC ID {} base physical: {:#x}, virtual: {:#x}",
+        madt_info.io_apics[0].id,
+        ioapic_phys,
+        ioapic_virt
+    );
 
     // 4. Initialize Local APIC on the BSP (Bootstrap Processor)
     unsafe {
@@ -239,4 +249,3 @@ pub fn broadcast_ipi_all_excluding_self(vector: u8) {
         }
     }
 }
-

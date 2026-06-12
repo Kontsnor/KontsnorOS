@@ -1,14 +1,14 @@
 //! Unified Socket implementation and VFS Inode wrapper.
 
+use super::ipv4::Ipv4Addr;
+use super::tcp::TcpState;
+use super::udp::UdpDatagram;
+use crate::fs::inode::{FileType, Inode, InodeOps};
+use crate::sync::wait_queue::WaitQueue;
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use alloc::collections::VecDeque;
 use spin::Mutex;
-use crate::fs::inode::{InodeOps, Inode, FileType};
-use crate::sync::wait_queue::WaitQueue;
-use super::ipv4::Ipv4Addr;
-use super::udp::UdpDatagram;
-use super::tcp::TcpState;
 
 /// Representation of a socket.
 pub struct Socket {
@@ -87,7 +87,8 @@ impl InodeOps for SocketInode {
 
     fn read(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
         let mut sock = self.socket.lock();
-        if sock.sock_type == 1 { // SOCK_STREAM (TCP)
+        if sock.sock_type == 1 {
+            // SOCK_STREAM (TCP)
             if sock.tcp_state == TcpState::Closed {
                 return Err(-104); // ECONNRESET
             }
@@ -108,7 +109,8 @@ impl InodeOps for SocketInode {
                 sock.tcp_rcv_nxt = sock.tcp_rcv_nxt.wrapping_add(n as u32);
             }
             Ok(n)
-        } else if sock.sock_type == 2 { // SOCK_DGRAM (UDP)
+        } else if sock.sock_type == 2 {
+            // SOCK_DGRAM (UDP)
             if sock.udp_recv_queue.is_empty() {
                 let wq = sock.wait_queue.clone();
                 drop(sock);
@@ -129,7 +131,8 @@ impl InodeOps for SocketInode {
 
     fn write(&self, _offset: u64, data: &[u8]) -> Result<usize, i32> {
         let sock_type = self.socket.lock().sock_type;
-        if sock_type == 1 { // SOCK_STREAM (TCP)
+        if sock_type == 1 {
+            // SOCK_STREAM (TCP)
             let (local_ip, remote_ip, local_port, remote_port, tcp_snd_nxt, tcp_rcv_nxt) = {
                 let sock = self.socket.lock();
                 if sock.tcp_state != TcpState::Established {
@@ -144,11 +147,11 @@ impl InodeOps for SocketInode {
                     sock.tcp_rcv_nxt,
                 )
             };
-            
+
             let payload = data.to_vec();
             let mut tcp_buf = [0u8; 1500];
             let flags = 0x10 | 0x08; // ACK | PSH
-            
+
             let tcp_len = super::tcp::build_tcp_packet(
                 &mut tcp_buf,
                 local_port,
@@ -157,17 +160,24 @@ impl InodeOps for SocketInode {
                 tcp_rcv_nxt,
                 flags,
                 &payload,
-            ).ok_or(-5)?; // EIO
-            
-            super::ipv4::send_packet(local_ip, remote_ip, super::ipv4::PROTO_TCP, &tcp_buf[..tcp_len])
-                .map_err(|_| -101)?; // ENETUNREACH
-                
+            )
+            .ok_or(-5)?; // EIO
+
+            super::ipv4::send_packet(
+                local_ip,
+                remote_ip,
+                super::ipv4::PROTO_TCP,
+                &tcp_buf[..tcp_len],
+            )
+            .map_err(|_| -101)?; // ENETUNREACH
+
             {
                 let mut sock = self.socket.lock();
                 sock.tcp_snd_nxt = sock.tcp_snd_nxt.wrapping_add(payload.len() as u32);
             }
             Ok(payload.len())
-        } else if sock_type == 2 { // SOCK_DGRAM (UDP)
+        } else if sock_type == 2 {
+            // SOCK_DGRAM (UDP)
             let (remote_ip, remote_port, local_ip, local_port) = {
                 let sock = self.socket.lock();
                 (
@@ -177,12 +187,18 @@ impl InodeOps for SocketInode {
                     sock.local_port.unwrap_or(50000),
                 )
             };
-            
+
             let mut udp_buf = [0u8; 2048];
-            let udp_len = super::udp::build_datagram(&mut udp_buf, local_port, remote_port, data).ok_or(-22)?;
-            
-            super::ipv4::send_packet(local_ip, remote_ip, super::ipv4::PROTO_UDP, &udp_buf[..udp_len])
-                .map_err(|_| -101)?; // ENETUNREACH
+            let udp_len = super::udp::build_datagram(&mut udp_buf, local_port, remote_port, data)
+                .ok_or(-22)?;
+
+            super::ipv4::send_packet(
+                local_ip,
+                remote_ip,
+                super::ipv4::PROTO_UDP,
+                &udp_buf[..udp_len],
+            )
+            .map_err(|_| -101)?; // ENETUNREACH
             Ok(data.len())
         } else {
             Err(-22) // EINVAL
@@ -194,7 +210,7 @@ impl Drop for SocketInode {
     fn drop(&mut self) {
         let mut sock = self.socket.lock();
         sock.tcp_state = TcpState::Closed;
-        
+
         let target_addr = sock.local_addr;
         let target_port = sock.local_port;
         if let Some(port) = target_port {
@@ -223,9 +239,13 @@ pub fn find_udp_socket(local_ip: Ipv4Addr, local_port: u16) -> Option<Arc<Mutex<
     let reg = SOCKET_REGISTRY.lock();
     for s in reg.iter() {
         let s_lock = s.lock();
-        if s_lock.sock_type == 2 { // SOCK_DGRAM
-            if s_lock.local_port == Some(local_port) && 
-               (s_lock.local_addr == Some(local_ip) || s_lock.local_addr == Some(Ipv4Addr::UNSPECIFIED) || s_lock.local_addr.is_none()) {
+        if s_lock.sock_type == 2 {
+            // SOCK_DGRAM
+            if s_lock.local_port == Some(local_port)
+                && (s_lock.local_addr == Some(local_ip)
+                    || s_lock.local_addr == Some(Ipv4Addr::UNSPECIFIED)
+                    || s_lock.local_addr.is_none())
+            {
                 return Some(s.clone());
             }
         }
@@ -238,9 +258,13 @@ pub fn find_tcp_listener(local_ip: Ipv4Addr, local_port: u16) -> Option<Arc<Mute
     let reg = SOCKET_REGISTRY.lock();
     for s in reg.iter() {
         let s_lock = s.lock();
-        if s_lock.sock_type == 1 && s_lock.tcp_state == TcpState::Listen { // TCP Listen
-            if s_lock.local_port == Some(local_port) && 
-               (s_lock.local_addr == Some(local_ip) || s_lock.local_addr == Some(Ipv4Addr::UNSPECIFIED) || s_lock.local_addr.is_none()) {
+        if s_lock.sock_type == 1 && s_lock.tcp_state == TcpState::Listen {
+            // TCP Listen
+            if s_lock.local_port == Some(local_port)
+                && (s_lock.local_addr == Some(local_ip)
+                    || s_lock.local_addr == Some(Ipv4Addr::UNSPECIFIED)
+                    || s_lock.local_addr.is_none())
+            {
                 return Some(s.clone());
             }
         }
@@ -249,13 +273,22 @@ pub fn find_tcp_listener(local_ip: Ipv4Addr, local_port: u16) -> Option<Arc<Mute
 }
 
 /// Find an established TCP connection.
-pub fn find_tcp_connection(local_ip: Ipv4Addr, local_port: u16, remote_ip: Ipv4Addr, remote_port: u16) -> Option<Arc<Mutex<Socket>>> {
+pub fn find_tcp_connection(
+    local_ip: Ipv4Addr,
+    local_port: u16,
+    remote_ip: Ipv4Addr,
+    remote_port: u16,
+) -> Option<Arc<Mutex<Socket>>> {
     let reg = SOCKET_REGISTRY.lock();
     for s in reg.iter() {
         let s_lock = s.lock();
-        if s_lock.sock_type == 1 { // TCP
-            if s_lock.local_port == Some(local_port) && s_lock.remote_port == Some(remote_port) &&
-               s_lock.local_addr == Some(local_ip) && s_lock.remote_addr == Some(remote_ip) {
+        if s_lock.sock_type == 1 {
+            // TCP
+            if s_lock.local_port == Some(local_port)
+                && s_lock.remote_port == Some(remote_port)
+                && s_lock.local_addr == Some(local_ip)
+                && s_lock.remote_addr == Some(remote_ip)
+            {
                 return Some(s.clone());
             }
         }

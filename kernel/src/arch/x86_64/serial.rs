@@ -13,9 +13,9 @@
 //! kprintln!("[boot] Memory initialized: {} KiB free", free_kb);
 //! ```
 
+use lazy_static::lazy_static;
 use spin::Mutex;
 use uart_16550::SerialPort;
-use lazy_static::lazy_static;
 
 /// Standard COM1 I/O port address.
 const COM1_PORT: u16 = 0x3F8;
@@ -65,8 +65,8 @@ pub fn try_read_byte() -> Option<u8> {
 ///
 /// Used by TTY devices to output user-space write() data to the console.
 pub fn write_byte(byte: u8) {
-    use x86_64::instructions::interrupts;
     use core::fmt::Write;
+    use x86_64::instructions::interrupts;
     interrupts::without_interrupts(|| {
         let _ = SERIAL1.lock().write_fmt(format_args!("{}", byte as char));
         if let Some(ref mut console) = *crate::drivers::gpu::bochs::GRAPHICS_CONSOLE.lock() {

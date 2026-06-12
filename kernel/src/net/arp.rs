@@ -105,10 +105,7 @@ pub fn init() {
 /// Look up a MAC address for an IP address.
 pub fn lookup(ip: Ipv4Addr) -> Option<[u8; 6]> {
     let cache = ARP_CACHE.lock();
-    cache
-        .as_ref()?
-        .get(&ip.to_u32())
-        .map(|entry| entry.mac)
+    cache.as_ref()?.get(&ip.to_u32()).map(|entry| entry.mac)
 }
 
 /// Insert or update an ARP cache entry.
@@ -130,7 +127,7 @@ pub fn handle_packet(src_mac: [u8; 6], payload: &[u8]) {
     if let Some(packet) = ArpPacket::parse(payload) {
         let sender_ip = packet.sender_ip_addr();
         let target_ip = packet.target_ip_addr();
-        
+
         // Update cache
         update(sender_ip, src_mac);
 
@@ -151,7 +148,10 @@ pub fn handle_packet(src_mac: [u8; 6], payload: &[u8]) {
                 };
 
                 let reply_bytes = unsafe {
-                    core::slice::from_raw_parts(&reply as *const ArpPacket as *const u8, core::mem::size_of::<ArpPacket>())
+                    core::slice::from_raw_parts(
+                        &reply as *const ArpPacket as *const u8,
+                        core::mem::size_of::<ArpPacket>(),
+                    )
                 };
 
                 let mut eth_buf = [0u8; 64];
@@ -185,7 +185,10 @@ pub fn send_request(target_ip: Ipv4Addr) {
         };
 
         let req_bytes = unsafe {
-            core::slice::from_raw_parts(&req as *const ArpPacket as *const u8, core::mem::size_of::<ArpPacket>())
+            core::slice::from_raw_parts(
+                &req as *const ArpPacket as *const u8,
+                core::mem::size_of::<ArpPacket>(),
+            )
         };
 
         let mut eth_buf = [0u8; 64];
@@ -200,4 +203,3 @@ pub fn send_request(target_ip: Ipv4Addr) {
         }
     }
 }
-

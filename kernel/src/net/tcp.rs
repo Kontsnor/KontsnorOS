@@ -26,11 +26,10 @@
 //!              └──────────┘                   └──────────┘
 //! ```
 
+use super::ipv4::Ipv4Addr;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use spin::Mutex;
-use super::ipv4::Ipv4Addr;
-
 
 /// TCP header (20 bytes minimum).
 #[derive(Debug, Clone, Copy)]
@@ -112,13 +111,13 @@ pub struct TcpConnection {
     /// Current state.
     pub state: TcpState,
     /// Send sequence variables.
-    pub snd_una: u32,     // Oldest unacknowledged sequence number
+    pub snd_una: u32, // Oldest unacknowledged sequence number
     /// Next sequence number to send.
-    pub snd_nxt: u32,     // Next sequence number to send
+    pub snd_nxt: u32, // Next sequence number to send
     /// Send window size.
     pub snd_wnd: u16,
     /// Receive sequence variables.
-    pub rcv_nxt: u32,     // Next expected sequence number
+    pub rcv_nxt: u32, // Next expected sequence number
     /// Receive window size.
     pub rcv_wnd: u16,
     /// Initial send sequence number.
@@ -233,8 +232,7 @@ impl TcpHeader {
 }
 
 /// Global TCP connection table.
-static TCP_CONNECTIONS: Mutex<Option<BTreeMap<TcpEndpoint, TcpConnection>>> =
-    Mutex::new(None);
+static TCP_CONNECTIONS: Mutex<Option<BTreeMap<TcpEndpoint, TcpConnection>>> = Mutex::new(None);
 
 /// Initialize the TCP subsystem.
 pub fn init() {
@@ -270,9 +268,8 @@ pub fn build_tcp_packet(
         urgent_ptr: 0,
     };
 
-    let header_bytes = unsafe {
-        core::slice::from_raw_parts(&header as *const TcpHeader as *const u8, 20)
-    };
+    let header_bytes =
+        unsafe { core::slice::from_raw_parts(&header as *const TcpHeader as *const u8, 20) };
     buf[0..20].copy_from_slice(header_bytes);
     buf[20..total_len].copy_from_slice(payload);
 
@@ -291,12 +288,22 @@ pub fn handle_packet(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, payload: &[u8]) {
         let ack = header.ack_num_host();
         let flags = header.flags();
 
-
-
-        if let Some(sock_arc) = super::socket::find_tcp_connection(dst_ip, dst_port, src_ip, src_port) {
+        if let Some(sock_arc) =
+            super::socket::find_tcp_connection(dst_ip, dst_port, src_ip, src_port)
+        {
             let reply = {
                 let mut sock = sock_arc.lock();
-                process_segment(&mut sock, src_ip, dst_ip, src_port, dst_port, seq, ack, flags, tcp_payload)
+                process_segment(
+                    &mut sock,
+                    src_ip,
+                    dst_ip,
+                    src_port,
+                    dst_port,
+                    seq,
+                    ack,
+                    flags,
+                    tcp_payload,
+                )
             };
             if let Some((reply_seq, reply_ack, reply_flags)) = reply {
                 let mut tcp_buf = [0u8; 128];
@@ -321,7 +328,11 @@ pub fn handle_packet(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, payload: &[u8]) {
             if flags & TCP_SYN != 0 {
                 let mut listener = listener_arc.lock();
                 if listener.tcp_backlog.len() < listener.tcp_max_backlog {
-                    let child = Arc::new(Mutex::new(super::socket::Socket::new(listener.domain, listener.sock_type, listener.protocol)));
+                    let child = Arc::new(Mutex::new(super::socket::Socket::new(
+                        listener.domain,
+                        listener.sock_type,
+                        listener.protocol,
+                    )));
                     let child_snd_nxt;
                     let child_rcv_nxt;
                     {
@@ -379,7 +390,6 @@ fn process_segment(
     flags: u16,
     payload: &[u8],
 ) -> Option<(u32, u32, u16)> {
-
     let mut reply = None;
     match sock.tcp_state {
         TcpState::SynSent => {
@@ -410,7 +420,7 @@ fn process_segment(
                     if sock.tcp_recv_buf.len() + payload.len() <= max_buf_limit {
                         sock.tcp_recv_buf.extend_from_slice(payload);
                         sock.tcp_rcv_nxt = seq.wrapping_add(payload.len() as u32);
-                        
+
                         reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK));
                         sock.wait_queue.wake_all();
                     } else {
@@ -422,7 +432,7 @@ fn process_segment(
             if flags & TCP_FIN != 0 {
                 sock.tcp_rcv_nxt = seq.wrapping_add(1);
                 sock.tcp_state = TcpState::CloseWait;
-                
+
                 reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK));
                 sock.wait_queue.wake_all();
             }
@@ -450,4 +460,3 @@ fn process_segment(
     }
     reply
 }
-

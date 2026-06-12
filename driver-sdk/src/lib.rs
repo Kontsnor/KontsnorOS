@@ -65,16 +65,16 @@
 
 extern crate alloc;
 
-mod traits;
+mod alloc_api;
 mod bus;
 mod dma;
-mod io;
 mod interrupt;
-mod alloc_api;
+mod io;
+mod traits;
 
-pub use traits::*;
+pub use alloc_api::*;
 pub use bus::*;
 pub use dma::*;
-pub use io::*;
 pub use interrupt::*;
-pub use alloc_api::*;
+pub use io::*;
+pub use traits::*;

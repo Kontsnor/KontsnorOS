@@ -88,7 +88,8 @@ impl InodeOps for DevStdin {
                     // If ISIG is enabled and Ctrl+C is typed, deliver SIGINT immediately!
                     if isig && byte == 0x03 {
                         if let Some(current_pid) = crate::process::scheduler::current_pid() {
-                            crate::syscall::signal::deliver_signal(current_pid, 2); // SIGINT = 2
+                            crate::syscall::signal::deliver_signal(current_pid, 2);
+                            // SIGINT = 2
                         }
                         interrupted = Some(-4); // EINTR
                     }
@@ -155,13 +156,11 @@ impl InodeOps for DevStdin {
 
             // Cooperatively exit on signals
             if let Some(current_pid) = crate::process::scheduler::current_pid() {
-                let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
-                if let Some(ref mut sched) = *sched_lock {
-                    if let Some(task) = sched.get_task(current_pid) {
-                        let unblocked = task.pending_signals & !task.blocked_signals;
-                        if unblocked != 0 {
-                            return Err(-4); // EINTR
-                        }
+                if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+                    let task = task_arc.lock();
+                    let unblocked = task.pending_signals & !task.blocked_signals;
+                    if unblocked != 0 {
+                        return Err(-4); // EINTR
                     }
                 }
             }
@@ -190,8 +189,12 @@ impl InodeOps for DevStdin {
 
     fn ioctl(&self, request: u64, arg: u64) -> Result<u64, i32> {
         match request {
-            0x5401 => { // TCGETS
-                if !crate::syscall::fs::validate_user_ptr(arg as *const u8, core::mem::size_of::<Termios>()) {
+            0x5401 => {
+                // TCGETS
+                if !crate::syscall::fs::validate_user_ptr(
+                    arg as *const u8,
+                    core::mem::size_of::<Termios>(),
+                ) {
                     return Err(-14); // EFAULT
                 }
                 let termios = TTY_TERMIOS.lock();
@@ -200,8 +203,12 @@ impl InodeOps for DevStdin {
                 }
                 Ok(0)
             }
-            0x5402 | 0x5403 | 0x5404 => { // TCSETS, TCSETSW, TCSETSF
-                if !crate::syscall::fs::validate_user_ptr(arg as *const u8, core::mem::size_of::<Termios>()) {
+            0x5402 | 0x5403 | 0x5404 => {
+                // TCSETS, TCSETSW, TCSETSF
+                if !crate::syscall::fs::validate_user_ptr(
+                    arg as *const u8,
+                    core::mem::size_of::<Termios>(),
+                ) {
                     return Err(-14); // EFAULT
                 }
                 let mut termios = TTY_TERMIOS.lock();
@@ -210,8 +217,12 @@ impl InodeOps for DevStdin {
                 }
                 Ok(0)
             }
-            0x5413 => { // TIOCGWINSZ
-                if !crate::syscall::fs::validate_user_ptr(arg as *const u8, core::mem::size_of::<Winsize>()) {
+            0x5413 => {
+                // TIOCGWINSZ
+                if !crate::syscall::fs::validate_user_ptr(
+                    arg as *const u8,
+                    core::mem::size_of::<Winsize>(),
+                ) {
                     return Err(-14); // EFAULT
                 }
                 let ws = Winsize {
@@ -225,8 +236,12 @@ impl InodeOps for DevStdin {
                 }
                 Ok(0)
             }
-            0x540F => { // TIOCGPGRP
-                if !crate::syscall::fs::validate_user_ptr(arg as *mut i32 as *const u8, core::mem::size_of::<i32>()) {
+            0x540F => {
+                // TIOCGPGRP
+                if !crate::syscall::fs::validate_user_ptr(
+                    arg as *mut i32 as *const u8,
+                    core::mem::size_of::<i32>(),
+                ) {
                     return Err(-14); // EFAULT
                 }
                 unsafe {
@@ -234,8 +249,12 @@ impl InodeOps for DevStdin {
                 }
                 Ok(0)
             }
-            0x5410 => { // TIOCSPGRP
-                if !crate::syscall::fs::validate_user_ptr(arg as *const i32 as *const u8, core::mem::size_of::<i32>()) {
+            0x5410 => {
+                // TIOCSPGRP
+                if !crate::syscall::fs::validate_user_ptr(
+                    arg as *const i32 as *const u8,
+                    core::mem::size_of::<i32>(),
+                ) {
                     return Err(-14); // EFAULT
                 }
                 Ok(0)
@@ -310,7 +329,9 @@ impl InodeOps for DevTty {
     }
 
     fn read(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
-        let stdin = DevStdin { inode: Inode::new(10, FileType::CharDevice) };
+        let stdin = DevStdin {
+            inode: Inode::new(10, FileType::CharDevice),
+        };
         stdin.read(_offset, buf)
     }
 
@@ -322,7 +343,9 @@ impl InodeOps for DevTty {
     }
 
     fn ioctl(&self, request: u64, arg: u64) -> Result<u64, i32> {
-        let stdin = DevStdin { inode: Inode::new(10, FileType::CharDevice) };
+        let stdin = DevStdin {
+            inode: Inode::new(10, FileType::CharDevice),
+        };
         stdin.ioctl(request, arg)
     }
 

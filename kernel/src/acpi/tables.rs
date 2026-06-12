@@ -169,9 +169,7 @@ pub fn parse_rsdp(phys_addr: u64) -> Result<RsdpInfo, AcpiError> {
     }
 
     // Validate checksum (first 20 bytes)
-    let bytes = unsafe {
-        core::slice::from_raw_parts(virt_addr as *const u8, 20)
-    };
+    let bytes = unsafe { core::slice::from_raw_parts(virt_addr as *const u8, 20) };
     let sum: u8 = bytes.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
     if sum != 0 {
         return Err(AcpiError::InvalidChecksum);
@@ -202,7 +200,7 @@ pub fn parse_rsdp(phys_addr: u64) -> Result<RsdpInfo, AcpiError> {
 /// 2. BIOS ROM area (0xE0000 - 0xFFFFF)
 pub fn scan_for_rsdp() -> Option<u64> {
     let phys_offset = crate::memory::r#virtual::phys_mem_offset();
-    
+
     // Scan the BIOS ROM area
     let start = 0xE0000u64;
     let end = 0xFFFFFu64;
@@ -215,9 +213,8 @@ pub fn scan_for_rsdp() -> Option<u64> {
 
         if sig == RSDP_SIGNATURE {
             // Verify checksum
-            let bytes = unsafe {
-                core::slice::from_raw_parts((addr + phys_offset) as *const u8, 20)
-            };
+            let bytes =
+                unsafe { core::slice::from_raw_parts((addr + phys_offset) as *const u8, 20) };
             let sum: u8 = bytes.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
             if sum == 0 {
                 return Some(addr);
@@ -231,7 +228,11 @@ pub fn scan_for_rsdp() -> Option<u64> {
 }
 
 /// Traverse the XSDT/RSDT to locate a table by signature.
-pub fn find_table(xsdt_phys_addr: u64, signature: &[u8; 4], revision: u8) -> Result<u64, AcpiError> {
+pub fn find_table(
+    xsdt_phys_addr: u64,
+    signature: &[u8; 4],
+    revision: u8,
+) -> Result<u64, AcpiError> {
     if xsdt_phys_addr == 0 {
         return Err(AcpiError::InvalidAddress);
     }
@@ -305,20 +306,13 @@ pub fn parse_madt(madt_addr: u64) -> Result<MadtInfo, AcpiError> {
     // After the SDT header (36 bytes), the MADT has:
     // - 4 bytes: Local APIC Address
     // - 4 bytes: Flags
-    let madt_data = unsafe {
-        core::slice::from_raw_parts(
-            virt_addr as *const u8,
-            header.length as usize,
-        )
-    };
+    let madt_data =
+        unsafe { core::slice::from_raw_parts(virt_addr as *const u8, header.length as usize) };
 
-    let local_apic_address = u32::from_le_bytes([
-        madt_data[36], madt_data[37], madt_data[38], madt_data[39],
-    ]);
+    let local_apic_address =
+        u32::from_le_bytes([madt_data[36], madt_data[37], madt_data[38], madt_data[39]]);
 
-    let flags = u32::from_le_bytes([
-        madt_data[40], madt_data[41], madt_data[42], madt_data[43],
-    ]);
+    let flags = u32::from_le_bytes([madt_data[40], madt_data[41], madt_data[42], madt_data[43]]);
 
     let has_8259_pic = flags & 1 != 0;
 
@@ -389,7 +383,11 @@ pub fn parse_madt(madt_addr: u64) -> Result<MadtInfo, AcpiError> {
         offset += entry_len;
     }
 
-    kprintln!("[acpi] MADT: {} CPUs, {} I/O APICs", cpus.len(), io_apics.len());
+    kprintln!(
+        "[acpi] MADT: {} CPUs, {} I/O APICs",
+        cpus.len(),
+        io_apics.len()
+    );
 
     Ok(MadtInfo {
         local_apic_address,

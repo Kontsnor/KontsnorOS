@@ -4,8 +4,8 @@
 //! This module provides a custom panic handler that outputs diagnostic
 //! information to the serial console and halts the CPU.
 
-use core::panic::PanicInfo;
 use crate::kprintln;
+use core::panic::PanicInfo;
 
 /// Custom panic handler — prints panic info to serial and halts.
 ///

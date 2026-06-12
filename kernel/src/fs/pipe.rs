@@ -196,7 +196,7 @@ impl Drop for PipeWriter {
 /// Construct a new unidirectional VFS pipe, returning (Reader, Writer) tuple.
 pub fn make_pipe() -> (Arc<dyn InodeOps>, Arc<dyn InodeOps>) {
     let state = Arc::new(PipeState::new());
-    
+
     let reader = Arc::new(PipeReader {
         inode: Inode::new(0, FileType::Pipe),
         state: state.clone(),

@@ -23,9 +23,9 @@ pub mod ethernet;
 pub mod icmp;
 pub mod interface;
 pub mod ipv4;
+pub mod socket;
 pub mod tcp;
 pub mod udp;
-pub mod socket;
 
 use crate::kprintln;
 

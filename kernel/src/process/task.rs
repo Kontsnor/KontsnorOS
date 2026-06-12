@@ -189,7 +189,12 @@ impl Task {
             mmap_bump: 0x0000_5000_0000_0000u64,
             pending_signals: 0,
             blocked_signals: 0,
-            sigactions: [SigAction { sa_handler: 0, sa_flags: 0, sa_restorer: 0, sa_mask: 0 }; 64],
+            sigactions: [SigAction {
+                sa_handler: 0,
+                sa_flags: 0,
+                sa_restorer: 0,
+                sa_mask: 0,
+            }; 64],
             child_wait_queue: Arc::new(crate::sync::wait_queue::WaitQueue::new()),
             pgid: pid.as_u64(),
             in_queue: false,
@@ -229,7 +234,9 @@ impl Drop for Task {
         }
 
         // Free the page table root and all mapping tables (if it's a user address space)
-        if self.page_table_root != 0 && self.page_table_root != crate::memory::r#virtual::kernel_pml4_phys() {
+        if self.page_table_root != 0
+            && self.page_table_root != crate::memory::r#virtual::kernel_pml4_phys()
+        {
             let _ = crate::memory::r#virtual::free_user_page_table(self.page_table_root);
         }
     }

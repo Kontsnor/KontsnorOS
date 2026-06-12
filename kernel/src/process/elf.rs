@@ -279,9 +279,7 @@ pub fn parse_elf(data: &[u8]) -> Result<ElfInfo, ElfError> {
         let ph_start = ph_offset + i * ph_entry_size;
 
         // SAFETY: We verified bounds above.
-        let phdr = unsafe {
-            &*(data[ph_start..].as_ptr() as *const Elf64ProgramHeader)
-        };
+        let phdr = unsafe { &*(data[ph_start..].as_ptr() as *const Elf64ProgramHeader) };
 
         match phdr.p_type {
             PT_LOAD => {
@@ -355,7 +353,9 @@ pub const USER_SPACE_TOP: u64 = 0x0000_7FFF_FFFF_FFFF;
 /// Safely copies a null-terminated array of null-terminated string pointers from user-space.
 ///
 /// Uses the active page table (caller's context) to read pointers and strings.
-pub unsafe fn copy_argv_from_user(mut argv_ptr: *const *const u8) -> Option<alloc::vec::Vec<alloc::string::String>> {
+pub unsafe fn copy_argv_from_user(
+    mut argv_ptr: *const *const u8,
+) -> Option<alloc::vec::Vec<alloc::string::String>> {
     if argv_ptr.is_null() {
         return Some(alloc::vec::Vec::new());
     }
@@ -368,7 +368,8 @@ pub unsafe fn copy_argv_from_user(mut argv_ptr: *const *const u8) -> Option<allo
         let s = unsafe { crate::syscall::fs::copy_string_from_user_pub(str_ptr) }?;
         args.push(s);
         argv_ptr = unsafe { argv_ptr.add(1) };
-        if args.len() > 512 { // Sanity check to avoid infinite loops or huge allocations
+        if args.len() > 512 {
+            // Sanity check to avoid infinite loops or huge allocations
             return None;
         }
     }
@@ -496,4 +497,3 @@ pub fn construct_user_stack(
     let user_sp = (USER_STACK_TOP - 4096) + rsp_pos as u64;
     Ok(user_sp)
 }
-

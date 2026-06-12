@@ -1,7 +1,7 @@
 //! Symmetric Multiprocessing (SMP) support and CPU core manager.
 
-use spin::Mutex;
 use crate::kprintln;
+use spin::Mutex;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -35,7 +35,8 @@ impl CpuManager {
 static CPU_MANAGER: Mutex<CpuManager> = Mutex::new(CpuManager::new());
 
 /// Global lock for serializing TLB shootdowns across all cores.
-static TLB_SHOOTDOWN_LOCK: crate::sync::spinlock::TicketLock<()> = crate::sync::spinlock::TicketLock::new(());
+static TLB_SHOOTDOWN_LOCK: crate::sync::spinlock::TicketLock<()> =
+    crate::sync::spinlock::TicketLock::new(());
 
 /// Global atomic counter for tracking TLB shootdown acknowledgements.
 static TLB_SHOOTDOWN_ACKS: AtomicU32 = AtomicU32::new(0);
@@ -74,7 +75,10 @@ pub fn init() {
     }
     manager.count = count;
 
-    kprintln!("[smp] CPU Manager initialized with {} logical cores.", count);
+    kprintln!(
+        "[smp] CPU Manager initialized with {} logical cores.",
+        count
+    );
 }
 
 /// Retrieve the number of logical CPU cores.
@@ -106,12 +110,12 @@ pub fn shootdown_tlb() {
         );
 
         let _lock = TLB_SHOOTDOWN_LOCK.lock();
-        
+
         let target_count = cpu_count - 1;
         TLB_SHOOTDOWN_ACKS.store(target_count as u32, Ordering::SeqCst);
-        
+
         super::apic::broadcast_ipi_all_excluding_self(36);
-        
+
         // Spin-wait until all other cores have acknowledged the TLB flush
         while TLB_SHOOTDOWN_ACKS.load(Ordering::SeqCst) > 0 {
             core::hint::spin_loop();
@@ -123,4 +127,3 @@ pub fn shootdown_tlb() {
 pub fn tlb_shootdown_ack() {
     TLB_SHOOTDOWN_ACKS.fetch_sub(1, Ordering::SeqCst);
 }
-

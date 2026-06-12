@@ -3,10 +3,10 @@
 //! Provides a virtual block device pre-populated in memory with a minimal
 //! valid ext2 filesystem layout, useful for self-contained testing.
 
+use crate::drivers::traits::{BlockDevice, DriverError, DriverInfo};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
-use crate::drivers::traits::{BlockDevice, DriverError, DriverInfo};
 
 /// A memory-backed virtual block device.
 pub struct RamDisk {
@@ -116,7 +116,7 @@ pub fn create_ext2_ramdisk() -> Arc<dyn BlockDevice> {
 
     // 3. Populate Inode Table (Block 5, offset 5 * 1024 = 5120)
     let it_offset = 5120;
-    
+
     // Root Directory is Inode 2 (offset inside table = 1 * 128 = 128 bytes)
     let ino2_offset = it_offset + 128;
     // i_mode = 0x41ED (directory, rwxr-xr-x)
@@ -217,11 +217,12 @@ pub fn create_ext2_ramdisk() -> Arc<dyn BlockDevice> {
     }
     // Map i_block[12] (singly-indirect pointer) to block 50
     let sib_block = 50u32;
-    data[ino16_offset + 40 + 12 * 4..ino16_offset + 40 + 12 * 4 + 4].copy_from_slice(&sib_block.to_le_bytes());
+    data[ino16_offset + 40 + 12 * 4..ino16_offset + 40 + 12 * 4 + 4]
+        .copy_from_slice(&sib_block.to_le_bytes());
 
     // 4. Populate Root Directory Entries (Block 9, offset 9 * 1024 = 9216)
     let dir_offset = 9216;
-    
+
     // Entry 1: "." -> Inode 2
     data[dir_offset..dir_offset + 4].copy_from_slice(&2u32.to_le_bytes()); // Inode 2
     data[dir_offset + 4..dir_offset + 6].copy_from_slice(&12u16.to_le_bytes()); // rec_len
@@ -338,7 +339,9 @@ pub fn create_ext2_ramdisk() -> Arc<dyn BlockDevice> {
         version: alloc::string::String::from("1.0.0"),
         author: alloc::string::String::from("KontsnorOS Team"),
         license: alloc::string::String::from("MIT"),
-        description: alloc::string::String::from("In-memory ramdisk pre-populated with ext2 file system"),
+        description: alloc::string::String::from(
+            "In-memory ramdisk pre-populated with ext2 file system",
+        ),
     };
 
     Arc::new(RamDisk {
@@ -346,4 +349,3 @@ pub fn create_ext2_ramdisk() -> Arc<dyn BlockDevice> {
         info,
     })
 }
-

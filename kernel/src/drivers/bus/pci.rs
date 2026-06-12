@@ -10,10 +10,10 @@
 //! - Port 0xCF8: CONFIG_ADDRESS (32-bit)
 //! - Port 0xCFC: CONFIG_DATA (32-bit)
 
+use crate::kprintln;
 use alloc::vec::Vec;
 use spin::Mutex;
 use x86_64::instructions::port::Port;
-use crate::kprintln;
 
 /// CONFIG_ADDRESS I/O port.
 const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
@@ -244,4 +244,3 @@ pub fn write_config(bus: u8, device: u8, function: u8, offset: u8, val: u32) {
         data_port.write(val);
     }
 }
-

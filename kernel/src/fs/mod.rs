@@ -26,10 +26,10 @@ pub mod inode;
 pub mod path;
 pub mod pipe;
 pub mod procfs;
+pub mod pty;
 pub mod tmpfs;
 pub mod tty;
 pub mod vfs;
-pub mod pty;
 
 /// Initialize the Virtual File System.
 pub fn init() {
@@ -40,7 +40,7 @@ pub fn init() {
 
     // Create the RAM disk pre-populated with our ext2 filesystem
     let ramdisk = crate::drivers::ramdisk::create_ext2_ramdisk();
-    
+
     let mut mounted_ata = false;
 
     // Probe the physical ATA Primary Slave drive
@@ -53,8 +53,14 @@ pub fn init() {
                 let mut success = true;
                 for block_idx in 0..256 {
                     let mut block_data = [0u8; 512];
-                    if ramdisk.read_block(block_idx as u64, &mut block_data).is_ok() {
-                        if ata_drive.write_block(block_idx as u64, &block_data).is_err() {
+                    if ramdisk
+                        .read_block(block_idx as u64, &mut block_data)
+                        .is_ok()
+                    {
+                        if ata_drive
+                            .write_block(block_idx as u64, &block_data)
+                            .is_err()
+                        {
                             kprintln!("[fs] Failed to write block {} to ATA drive.", block_idx);
                             success = false;
                             break;
@@ -78,7 +84,9 @@ pub fn init() {
         }
 
         // Try mounting the physical ATA drive
-        let cached_drive = alloc::sync::Arc::new(crate::drivers::block::cache::BlockCache::new(ata_drive, 2048));
+        let cached_drive = alloc::sync::Arc::new(crate::drivers::block::cache::BlockCache::new(
+            ata_drive, 2048,
+        ));
         if let Ok(ext2_fs) = ext2::Ext2FileSystem::mount(cached_drive) {
             vfs::mount(alloc::string::String::from("/disk"), ext2_fs.clone());
             vfs::mount(alloc::string::String::from("/"), ext2_fs);

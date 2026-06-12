@@ -4,8 +4,8 @@
 //! PID 0 is reserved for the kernel idle task.
 //! PID 1 is reserved for the init process.
 
-use core::sync::atomic::{AtomicU64, Ordering};
 use crate::kprintln;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// The next PID to allocate.
 /// Starts at 2 (0 = idle, 1 = init).

@@ -1,11 +1,11 @@
 //! Thread-safe Least Recently Used (LRU) block buffer cache for KontsnorOS.
 
+use crate::drivers::traits::{BlockDevice, DriverError, DriverInfo};
+use crate::kprintln;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
-use crate::drivers::traits::{BlockDevice, DriverError, DriverInfo};
-use crate::kprintln;
 
 struct CacheEntry {
     data: Vec<u8>,
@@ -102,10 +102,13 @@ impl BlockDevice for BlockCache {
                         inner.entries.remove(&b);
                     }
                 }
-                inner.entries.insert(curr_block, CacheEntry {
-                    data: block_slice.to_vec(),
-                    last_access: counter,
-                });
+                inner.entries.insert(
+                    curr_block,
+                    CacheEntry {
+                        data: block_slice.to_vec(),
+                        last_access: counter,
+                    },
+                );
             } else {
                 let entry = inner.entries.get_mut(&curr_block).unwrap();
                 entry.last_access = counter;
@@ -153,10 +156,13 @@ impl BlockDevice for BlockCache {
                         inner.entries.remove(&b);
                     }
                 }
-                inner.entries.insert(curr_block, CacheEntry {
-                    data: block_slice.to_vec(),
-                    last_access: counter,
-                });
+                inner.entries.insert(
+                    curr_block,
+                    CacheEntry {
+                        data: block_slice.to_vec(),
+                        last_access: counter,
+                    },
+                );
             }
         }
 

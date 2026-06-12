@@ -13,18 +13,18 @@
 //! modular driver development. Third-party drivers (e.g., from NVIDIA
 //! or AMD) implement the public traits from the `driver-sdk` crate.
 
+pub mod block;
 pub mod bus;
 pub mod console;
 pub mod gpu;
 pub mod keyboard;
-pub mod traits;
-pub mod ramdisk;
-pub mod block;
 pub mod net;
+pub mod ramdisk;
+pub mod traits;
 
+use crate::kprintln;
 use alloc::vec::Vec;
 use spin::Mutex;
-use crate::kprintln;
 
 use traits::DriverInfo;
 
@@ -47,7 +47,11 @@ pub fn init() {
 
 /// Register a driver with the kernel.
 pub fn register_driver(info: DriverInfo) {
-    kprintln!("[drivers] Registered driver: {} v{}", info.name, info.version);
+    kprintln!(
+        "[drivers] Registered driver: {} v{}",
+        info.name,
+        info.version
+    );
     DRIVER_REGISTRY.lock().push(info);
 }
 

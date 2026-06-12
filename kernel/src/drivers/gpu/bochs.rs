@@ -5,15 +5,15 @@
 //! and provides a standard ASCII font graphics console with ANSI escape parsing.
 
 use alloc::string::String;
-use alloc::vec::Vec;
 use alloc::vec;
+use alloc::vec::Vec;
 use spin::Mutex;
 use x86_64::instructions::port::Port;
 
+use crate::drivers::gpu::framebuffer::Color;
 use crate::drivers::traits::{
     DisplayInfo, DisplayMode, DriverError, DriverInfo, FramebufferInfo, GpuDevice,
 };
-use crate::drivers::gpu::framebuffer::Color;
 
 // Bochs VBE Register Indices
 const VBE_DISPI_INDEX_ID: u16 = 0;
@@ -73,7 +73,11 @@ impl BochsGpu {
         unsafe {
             let dest = self.lfb_virt as *mut u32;
             let back = self.backbuffer.lock();
-            core::ptr::copy_nonoverlapping(back.as_ptr(), dest, (self.width * self.height) as usize);
+            core::ptr::copy_nonoverlapping(
+                back.as_ptr(),
+                dest,
+                (self.width * self.height) as usize,
+            );
         }
     }
 }
@@ -111,7 +115,10 @@ impl GpuDevice for BochsGpuDevice {
         write_vbe(VBE_DISPI_INDEX_XRES, mode.width as u16);
         write_vbe(VBE_DISPI_INDEX_YRES, mode.height as u16);
         write_vbe(VBE_DISPI_INDEX_BPP, mode.bpp as u16);
-        write_vbe(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED);
+        write_vbe(
+            VBE_DISPI_INDEX_ENABLE,
+            VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED,
+        );
         Ok(())
     }
 
@@ -184,7 +191,11 @@ impl GraphicsConsole {
             for x_offset in 0..8 {
                 let pixel_x = col * 8 + x_offset;
                 let bit = (row_byte >> (7 - x_offset)) & 1;
-                let color = if bit == 1 { self.fg_color } else { self.bg_color };
+                let color = if bit == 1 {
+                    self.fg_color
+                } else {
+                    self.bg_color
+                };
 
                 let index = pixel_y * 1024 + pixel_x;
                 back[index] = color.to_argb32();
@@ -249,7 +260,15 @@ impl GraphicsConsole {
     }
 
     /// Draw a horizontal progress bar.
-    pub fn draw_progress_bar(&self, x: usize, y: usize, w: usize, h: usize, progress_percent: usize, color: Color) {
+    pub fn draw_progress_bar(
+        &self,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        progress_percent: usize,
+        color: Color,
+    ) {
         let mut back = self.gpu.backbuffer.lock();
         let fill_w = (w * progress_percent) / 100;
 
@@ -287,13 +306,25 @@ impl GraphicsConsole {
 
         // Draw system title and description
         self.draw_string_scaled(200, 250, "KontsnorOS", 4, Color::BRAND_ACCENT);
-        self.draw_string_scaled(200, 330, "A Unix-Compatible Hybrid Kernel in Rust", 1, Color::WHITE);
+        self.draw_string_scaled(
+            200,
+            330,
+            "A Unix-Compatible Hybrid Kernel in Rust",
+            1,
+            Color::WHITE,
+        );
 
         // Draw loading bar
         self.draw_progress_bar(200, 380, 624, 6, 60, Color::BRAND_BLUE);
 
         // Subtext
-        self.draw_string_scaled(200, 410, "Initializing hardware subsystems...", 1, Color::rgb(150, 170, 190));
+        self.draw_string_scaled(
+            200,
+            410,
+            "Initializing hardware subsystems...",
+            1,
+            Color::rgb(150, 170, 190),
+        );
     }
 
     /// Write a character byte, parsing ANSI escapes.
@@ -338,7 +369,10 @@ impl GraphicsConsole {
                     self.ansi_state = AnsiState::Normal;
                 }
             }
-            AnsiState::Bracket { mut params, current_param } => {
+            AnsiState::Bracket {
+                mut params,
+                current_param,
+            } => {
                 if c >= b'0' && c <= b'9' {
                     let digit = (c - b'0') as u32;
                     let val = current_param.unwrap_or(0) * 10 + digit;
@@ -380,13 +414,13 @@ impl GraphicsConsole {
                 1 => {
                     bold = true;
                 }
-                30 => self.fg_color = Color::rgb(0, 0, 0),       // Black
-                31 => self.fg_color = Color::rgb(205, 0, 0),     // Red
-                32 => self.fg_color = Color::rgb(0, 205, 0),     // Green
-                33 => self.fg_color = Color::rgb(205, 205, 0),   // Yellow
-                34 => self.fg_color = Color::rgb(0, 0, 238),     // Blue
-                35 => self.fg_color = Color::rgb(205, 0, 205),   // Magenta
-                36 => self.fg_color = Color::rgb(0, 205, 205),   // Cyan
+                30 => self.fg_color = Color::rgb(0, 0, 0), // Black
+                31 => self.fg_color = Color::rgb(205, 0, 0), // Red
+                32 => self.fg_color = Color::rgb(0, 205, 0), // Green
+                33 => self.fg_color = Color::rgb(205, 205, 0), // Yellow
+                34 => self.fg_color = Color::rgb(0, 0, 238), // Blue
+                35 => self.fg_color = Color::rgb(205, 0, 205), // Magenta
+                36 => self.fg_color = Color::rgb(0, 205, 205), // Cyan
                 37 => self.fg_color = Color::rgb(229, 229, 229), // White
                 39 => self.fg_color = Color::WHITE,
                 40 => self.bg_color = Color::rgb(0, 0, 0),
@@ -466,7 +500,10 @@ pub fn init() {
     write_vbe(VBE_DISPI_INDEX_XRES, width as u16);
     write_vbe(VBE_DISPI_INDEX_YRES, height as u16);
     write_vbe(VBE_DISPI_INDEX_BPP, bpp as u16);
-    write_vbe(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED);
+    write_vbe(
+        VBE_DISPI_INDEX_ENABLE,
+        VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED,
+    );
 
     let mut backbuffer = Vec::with_capacity((width * height) as usize);
     backbuffer.resize((width * height) as usize, 0);

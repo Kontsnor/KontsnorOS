@@ -8,7 +8,6 @@
 //! - RFLAGS
 //! - Segment registers (not needed in 64-bit flat model)
 
-
 /// Saved CPU register context for a task.
 ///
 /// This structure holds all the registers that need to be preserved
@@ -125,38 +124,31 @@ impl CpuContext {
 /// After this function, execution continues at the point where `new_ctx`
 /// was previously saved — effectively "returning" into a different task.
 #[unsafe(naked)]
-pub unsafe extern "C" fn switch_context(
-    _old_ctx: *mut CpuContext,
-    _new_ctx: *const CpuContext,
-) {
+pub unsafe extern "C" fn switch_context(_old_ctx: *mut CpuContext, _new_ctx: *const CpuContext) {
     // SAFETY: This is a naked function that manually manages the
     // stack and registers. The caller guarantees valid context pointers.
     core::arch::naked_asm!(
         // ── Save old context ───────────────────────────────────────
         // rdi = old_ctx pointer
-        "mov [rdi + 0x00], rbx",        // Save rbx
-        "mov [rdi + 0x08], rbp",        // Save rbp
-        "mov [rdi + 0x10], r12",        // Save r12
-        "mov [rdi + 0x18], r13",        // Save r13
-        "mov [rdi + 0x20], r14",        // Save r14
-        "mov [rdi + 0x28], r15",        // Save r15
-        "lea rax, [rsp + 8]",           // Get RSP before the call
-        "mov [rdi + 0x30], rax",        // Save it
-
+        "mov [rdi + 0x00], rbx", // Save rbx
+        "mov [rdi + 0x08], rbp", // Save rbp
+        "mov [rdi + 0x10], r12", // Save r12
+        "mov [rdi + 0x18], r13", // Save r13
+        "mov [rdi + 0x20], r14", // Save r14
+        "mov [rdi + 0x28], r15", // Save r15
+        "lea rax, [rsp + 8]",    // Get RSP before the call
+        "mov [rdi + 0x30], rax", // Save it
         // Save the return address (the address after the call
         // to switch_context in the old task)
-        "mov rax, [rsp]",               // Get return address from stack
-        "mov [rdi + 0x38], rax",        // Save as rip
-
+        "mov rax, [rsp]",        // Get return address from stack
+        "mov [rdi + 0x38], rax", // Save as rip
         // Save RFLAGS
         "pushfq",
         "pop rax",
         "mov [rdi + 0x40], rax",
-
         // Save CR3 (current page table)
         "mov rax, cr3",
         "mov [rdi + 0x48], rax",
-
         // Note: We skip saving FS_BASE, GS_BASE, and KERNEL_GS_BASE MSRs via rdmsr.
         // They are kept up-to-date in CpuContext via sys_arch_prctl / initialization.
 
@@ -167,49 +159,43 @@ pub unsafe extern "C" fn switch_context(
         // so that we don't dereference old context [rdi] afterwards.
         // We use rbx and rbp temporarily; they will be overwritten when restoring
         // the new context anyway.
-        "mov rbx, [rdi + 0x50]",        // rbx = old fs_base
-        "mov rbp, [rdi + 0x60]",        // rbp = old kernel_gs_base
-
+        "mov rbx, [rdi + 0x50]", // rbx = old fs_base
+        "mov rbp, [rdi + 0x60]", // rbp = old kernel_gs_base
         // Check if we need to switch page tables
-        "mov rax, [rsi + 0x48]",        // Load new CR3
-        "test rax, rax",                // Skip if CR3 is 0 (kernel task)
+        "mov rax, [rsi + 0x48]", // Load new CR3
+        "test rax, rax",         // Skip if CR3 is 0 (kernel task)
         "jz 2f",
-        "mov rcx, cr3",                 // Current CR3
-        "cmp rax, rcx",                 // Same page table?
-        "je 2f",                        // Skip if same
-        "mov cr3, rax",                 // Switch page tables (flushes TLB)
+        "mov rcx, cr3", // Current CR3
+        "cmp rax, rcx", // Same page table?
+        "je 2f",        // Skip if same
+        "mov cr3, rax", // Switch page tables (flushes TLB)
         "2:",
-
         // Switch stack FIRST, so we are on a valid, mapped stack in the new page table
         "mov rsp, [rsi + 0x30]",
-
         // Restore RFLAGS
         "mov rax, [rsi + 0x40]",
         "push rax",
         "popfq",
-
         // Restore FS_BASE MSR only if it changed
-        "mov rax, [rsi + 0x50]",        // Load new fs_base
-        "cmp rax, rbx",                 // Compare with cached old fs_base
-        "je 3f",                        // Skip if same
+        "mov rax, [rsi + 0x50]", // Load new fs_base
+        "cmp rax, rbx",          // Compare with cached old fs_base
+        "je 3f",                 // Skip if same
         "mov rdx, rax",
-        "shr rdx, 32",                  // High 32 bits of new fs_base in edx
-        "mov ecx, 0xC0000100",          // FS_BASE MSR
-        "wrmsr",                        // Writes edx:eax to MSR
+        "shr rdx, 32",         // High 32 bits of new fs_base in edx
+        "mov ecx, 0xC0000100", // FS_BASE MSR
+        "wrmsr",               // Writes edx:eax to MSR
         "3:",
-
         // Note: GS_BASE is permanently pinned to the core's scratch block, so we never restore it here.
 
         // Restore KERNEL_GS_BASE MSR only if it changed
-        "mov rax, [rsi + 0x60]",        // Load new kernel_gs_base
-        "cmp rax, rbp",                 // Compare with cached old kernel_gs_base
-        "je 4f",                        // Skip if same
+        "mov rax, [rsi + 0x60]", // Load new kernel_gs_base
+        "cmp rax, rbp",          // Compare with cached old kernel_gs_base
+        "je 4f",                 // Skip if same
         "mov rdx, rax",
-        "shr rdx, 32",                  // High 32 bits of new kernel_gs_base in edx
-        "mov ecx, 0xC0000102",          // KERNEL_GS_BASE MSR
-        "wrmsr",                        // Writes edx:eax to MSR
+        "shr rdx, 32",         // High 32 bits of new kernel_gs_base in edx
+        "mov ecx, 0xC0000102", // KERNEL_GS_BASE MSR
+        "wrmsr",               // Writes edx:eax to MSR
         "4:",
-
         // Restore callee-saved registers
         "mov rbx, [rsi + 0x00]",
         "mov rbp, [rsi + 0x08]",
@@ -217,7 +203,6 @@ pub unsafe extern "C" fn switch_context(
         "mov r13, [rsi + 0x18]",
         "mov r14, [rsi + 0x20]",
         "mov r15, [rsi + 0x28]",
-
         // Jump to the new task's saved instruction pointer.
         // We push the RIP onto the new stack and ret into it,
         // which simulates a normal function return.
@@ -275,7 +260,6 @@ pub unsafe extern "C" fn enter_user_mode(
     core::arch::naked_asm!(
         // Switch CR3 to user page table (passed in rdx)
         "mov cr3, rdx",
-
         // Build the iretq stack frame:
         // SS (User Data segment selector passed in r8)
         "push r8",
@@ -287,7 +271,6 @@ pub unsafe extern "C" fn enter_user_mode(
         "push rcx",
         // RIP (Entry point, passed in rdi)
         "push rdi",
-
         // Zero out all general-purpose registers to prevent register leaks
         "xor rax, rax",
         "xor rbx, rbx",
@@ -304,7 +287,6 @@ pub unsafe extern "C" fn enter_user_mode(
         "xor r13, r13",
         "xor r14, r14",
         "xor r15, r15",
-
         "swapgs",
         // Switch to user-space!
         "iretq"
@@ -320,8 +302,8 @@ pub unsafe extern "C" fn enter_user_mode(
 #[unsafe(naked)]
 pub unsafe extern "C" fn fork_child_return() -> ! {
     core::arch::naked_asm!(
-        "pop rax",          // Pop and discard the parent's rax
-        "xor rax, rax",     // rax = 0 (child process return value)
+        "pop rax",      // Pop and discard the parent's rax
+        "xor rax, rax", // rax = 0 (child process return value)
         "pop rdi",
         "pop rsi",
         "pop rdx",
@@ -334,12 +316,10 @@ pub unsafe extern "C" fn fork_child_return() -> ! {
         "pop r12",
         "pop rbx",
         "pop rbp",
-        "pop rcx",          // User RIP
-        "pop r11",          // User RFLAGS
-        "pop rsp",          // Restore User RSP
+        "pop rcx", // User RIP
+        "pop r11", // User RFLAGS
+        "pop rsp", // Restore User RSP
         "swapgs",
         "sysretq"
     );
 }
-
-

@@ -18,11 +18,11 @@
 //! | 32     | PIC (IRQ 0)        | Timer                           |
 //! | 33     | PIC (IRQ 1)        | Keyboard                        |
 
+use crate::kprintln;
 use lazy_static::lazy_static;
 use pic8259::ChainedPics;
 use spin::Mutex;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
-use crate::kprintln;
 
 use super::gdt;
 
@@ -63,8 +63,6 @@ impl InterruptIndex {
     fn as_u8(self) -> u8 {
         self as u8
     }
-
-
 }
 
 lazy_static! {
@@ -175,7 +173,10 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     kprintln!("[EXCEPTION] General Protection Fault");
     kprintln!("  Error Code: {:#x}", error_code);
     kprintln!("{:#?}", stack_frame);
-    panic!("Unhandled general protection fault (error code: {:#x})", error_code);
+    panic!(
+        "Unhandled general protection fault (error code: {:#x})",
+        error_code
+    );
 }
 
 extern "x86-interrupt" fn double_fault_handler(
@@ -193,8 +194,8 @@ extern "x86-interrupt" fn page_fault_handler(
     error_code: PageFaultErrorCode,
 ) {
     use x86_64::registers::control::{Cr2, Cr3};
-    use x86_64::{VirtAddr, PhysAddr};
     use x86_64::structures::paging::{PageTable, PageTableFlags};
+    use x86_64::{PhysAddr, VirtAddr};
 
     let fault_addr = Cr2::read().unwrap();
 
@@ -243,9 +244,15 @@ extern "x86-interrupt" fn page_fault_handler(
                                             let idx = (old_phys / 4096) as usize;
 
                                             use core::sync::atomic::Ordering;
-                                            let is_sole_owner = crate::memory::physical::FRAME_REFS[idx].compare_exchange(
-                                                1, 1, Ordering::SeqCst, Ordering::SeqCst
-                                            ).is_ok();
+                                            let is_sole_owner = crate::memory::physical::FRAME_REFS
+                                                [idx]
+                                                .compare_exchange(
+                                                    1,
+                                                    1,
+                                                    Ordering::SeqCst,
+                                                    Ordering::SeqCst,
+                                                )
+                                                .is_ok();
 
                                             if is_sole_owner {
                                                 // Not shared anymore! Mark as writable directly
@@ -258,32 +265,49 @@ extern "x86-interrupt" fn page_fault_handler(
                                                 return; // Fault resolved!
                                             } else {
                                                 // Shared page! Allocate a new page frame, copy contents, and map writable
-                                                if let Some(new_phys) = crate::memory::physical::allocate_frame() {
-                                                    let src_ptr = (old_phys + phys_mem_offset) as *const u8;
-                                                    let dest_ptr = (new_phys + phys_mem_offset) as *mut u8;
+                                                if let Some(new_phys) =
+                                                    crate::memory::physical::allocate_frame()
+                                                {
+                                                    let src_ptr =
+                                                        (old_phys + phys_mem_offset) as *const u8;
+                                                    let dest_ptr =
+                                                        (new_phys + phys_mem_offset) as *mut u8;
 
                                                     unsafe {
-                                                        core::ptr::copy_nonoverlapping(src_ptr, dest_ptr, 4096);
+                                                        core::ptr::copy_nonoverlapping(
+                                                            src_ptr, dest_ptr, 4096,
+                                                        );
                                                     }
 
                                                     // Decrement old frame's reference count
-                                                    crate::memory::physical::decrement_ref(old_phys);
+                                                    crate::memory::physical::decrement_ref(
+                                                        old_phys,
+                                                    );
 
                                                     // Re-verify that pt_entry still points to old_phys before writing
                                                     if let Ok(current_frame) = pt_entry.frame() {
-                                                        if current_frame.start_address().as_u64() == old_phys {
+                                                        if current_frame.start_address().as_u64()
+                                                            == old_phys
+                                                        {
                                                             flags.remove(PageTableFlags::BIT_9);
                                                             flags.insert(PageTableFlags::WRITABLE);
-                                                            pt_entry.set_addr(PhysAddr::new(new_phys), flags);
+                                                            pt_entry.set_addr(
+                                                                PhysAddr::new(new_phys),
+                                                                flags,
+                                                            );
 
                                                             // Flush local TLB for this virtual address
-                                                            x86_64::instructions::tlb::flush(fault_addr);
+                                                            x86_64::instructions::tlb::flush(
+                                                                fault_addr,
+                                                            );
                                                         } else {
                                                             // Another core already handled the page fault, deallocate the new frame
                                                             crate::memory::physical::deallocate_frame(new_phys);
                                                         }
                                                     } else {
-                                                        crate::memory::physical::deallocate_frame(new_phys);
+                                                        crate::memory::physical::deallocate_frame(
+                                                            new_phys,
+                                                        );
                                                     }
                                                     return; // Fault resolved!
                                                 }
@@ -375,4 +399,3 @@ extern "x86-interrupt" fn network_interrupt_handler(_stack_frame: InterruptStack
 pub fn timer_ticks() -> u64 {
     TIMER_TICKS.load(core::sync::atomic::Ordering::Acquire)
 }
-

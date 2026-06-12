@@ -9,13 +9,13 @@
 //! - `/dev/random` — reads return random bytes
 //! - `/dev/console` — kernel console
 
+use crate::kprintln;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use spin::RwLock;
-use crate::kprintln;
 
 use super::inode::{DirEntry, FileType, Inode, InodeOps};
 use super::vfs::FileSystem;
@@ -159,10 +159,7 @@ pub fn init() {
     });
     *PTS_DIR.write() = Some(pts.clone());
 
-    entries.insert(
-        String::from("pts"),
-        pts as Arc<dyn InodeOps>,
-    );
+    entries.insert(String::from("pts"), pts as Arc<dyn InodeOps>);
 
     // Create /dev/ptmx dummy device
     entries.insert(
@@ -184,10 +181,10 @@ pub fn init() {
     *DEVFS.write() = Some(devfs);
 
     // Register TTY character devices: stdin, stdout, stderr, tty
-    register_device("stdin",  super::tty::make_stdin());
+    register_device("stdin", super::tty::make_stdin());
     register_device("stdout", super::tty::make_stdout());
     register_device("stderr", super::tty::make_stderr());
-    register_device("tty",    super::tty::make_tty());
+    register_device("tty", super::tty::make_tty());
 }
 
 /// Register a new device node in devfs.

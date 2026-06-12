@@ -41,15 +41,15 @@ mod ipc;
 mod memory;
 mod net;
 mod panic;
-#[cfg(feature = "test")]
-pub mod test;
 mod process;
 mod sync;
 mod syscall;
+#[cfg(feature = "test")]
+pub mod test;
 mod util;
 
-use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use bootloader_api::config::Mapping;
+use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 
 /// Bootloader configuration — request kernel mapping at higher half.
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
@@ -158,7 +158,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         match inode.read(0, &mut buf) {
             Ok(bytes_read) => {
                 if let Ok(content_str) = core::str::from_utf8(&buf[0..bytes_read]) {
-                    kprintln!("[ext2] Successfully read /disk/hello.txt ({} bytes): \"{}\"", bytes_read, content_str);
+                    kprintln!(
+                        "[ext2] Successfully read /disk/hello.txt ({} bytes): \"{}\"",
+                        bytes_read,
+                        content_str
+                    );
                 } else {
                     kprintln!("[ext2] Read file but content is not valid UTF-8.");
                 }
@@ -212,7 +216,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let mut buf = alloc::vec![0u8; size];
             match inode.read(0, &mut buf) {
                 Ok(bytes_read) => {
-                    kprintln!("[boot] Loaded {} ({} bytes) from VFS, spawning...", shell_path, bytes_read);
+                    kprintln!(
+                        "[boot] Loaded {} ({} bytes) from VFS, spawning...",
+                        shell_path,
+                        bytes_read
+                    );
                     process::spawn_user_process(alloc::string::String::from("bash"), &buf);
                 }
                 Err(e) => {

@@ -36,10 +36,7 @@ impl Color {
 
     /// Convert to a 32-bit ARGB value.
     pub const fn to_argb32(self) -> u32 {
-        ((self.a as u32) << 24)
-            | ((self.r as u32) << 16)
-            | ((self.g as u32) << 8)
-            | (self.b as u32)
+        ((self.a as u32) << 24) | ((self.r as u32) << 16) | ((self.g as u32) << 8) | (self.b as u32)
     }
 }
 

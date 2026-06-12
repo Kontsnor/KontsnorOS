@@ -4,7 +4,6 @@
 
 use spin::Mutex;
 
-
 /// IPv4 header (20 bytes minimum, up to 60 with options).
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
@@ -84,9 +83,9 @@ impl Ipv4Addr {
     /// Check if this is a private address (RFC 1918).
     pub fn is_private(&self) -> bool {
         match self.octets[0] {
-            10 => true,                                    // 10.0.0.0/8
-            172 => (16..=31).contains(&self.octets[1]),    // 172.16.0.0/12
-            192 => self.octets[1] == 168,                  // 192.168.0.0/16
+            10 => true,                                 // 10.0.0.0/8
+            172 => (16..=31).contains(&self.octets[1]), // 172.16.0.0/12
+            192 => self.octets[1] == 168,               // 192.168.0.0/16
             _ => false,
         }
     }
@@ -157,9 +156,7 @@ impl Ipv4Header {
     /// Verify the header checksum.
     pub fn verify_checksum(&self) -> bool {
         let ihl = self.header_length();
-        let data = unsafe {
-            core::slice::from_raw_parts(self as *const _ as *const u8, ihl)
-        };
+        let data = unsafe { core::slice::from_raw_parts(self as *const _ as *const u8, ihl) };
         internet_checksum(data) == 0
     }
 }
@@ -224,7 +221,10 @@ impl RoutingTable {
         self.routes.push(route);
         // Sort by netmask specificity (most specific first)
         self.routes.sort_by(|a, b| {
-            b.netmask.to_u32().count_ones().cmp(&a.netmask.to_u32().count_ones())
+            b.netmask
+                .to_u32()
+                .count_ones()
+                .cmp(&a.netmask.to_u32().count_ones())
         });
     }
 
@@ -342,14 +342,12 @@ pub fn build_ipv4_packet(
         dst_addr: dst_ip,
     };
 
-    let header_bytes = unsafe {
-        core::slice::from_raw_parts(&header as *const Ipv4Header as *const u8, 20)
-    };
+    let header_bytes =
+        unsafe { core::slice::from_raw_parts(&header as *const Ipv4Header as *const u8, 20) };
     header.checksum = internet_checksum(header_bytes).to_be();
 
-    let header_bytes_updated = unsafe {
-        core::slice::from_raw_parts(&header as *const Ipv4Header as *const u8, 20)
-    };
+    let header_bytes_updated =
+        unsafe { core::slice::from_raw_parts(&header as *const Ipv4Header as *const u8, 20) };
     buf[0..20].copy_from_slice(header_bytes_updated);
     buf[20..total_len].copy_from_slice(payload);
 
@@ -387,17 +385,20 @@ pub fn send_packet(
     if dst_mac.is_none() {
         super::arp::send_request(next_hop);
         let start_ticks = crate::arch::x86_64::interrupts::timer_ticks();
-        while dst_mac.is_none() && crate::arch::x86_64::interrupts::timer_ticks() - start_ticks < 5 {
+        while dst_mac.is_none() && crate::arch::x86_64::interrupts::timer_ticks() - start_ticks < 5
+        {
             core::hint::spin_loop();
             dst_mac = super::arp::lookup(next_hop);
         }
     }
 
     let dst_mac = dst_mac.ok_or("ARP resolution failed")?;
-    let (_, local_mac) = super::interface::get_first_ethernet_interface().ok_or("No ethernet interface up")?;
+    let (_, local_mac) =
+        super::interface::get_first_ethernet_interface().ok_or("No ethernet interface up")?;
 
     let mut ip_buf = [0u8; 1600];
-    let ip_len = build_ipv4_packet(&mut ip_buf, src_ip, dst_ip, protocol, payload).ok_or("IP packet too large")?;
+    let ip_len = build_ipv4_packet(&mut ip_buf, src_ip, dst_ip, protocol, payload)
+        .ok_or("IP packet too large")?;
 
     let mut eth_buf = [0u8; 1620];
     let eth_len = super::ethernet::build_frame(
@@ -406,9 +407,9 @@ pub fn send_packet(
         local_mac,
         super::ethernet::ETHERTYPE_IPV4,
         &ip_buf[..ip_len],
-    ).ok_or("Ethernet frame too large")?;
+    )
+    .ok_or("Ethernet frame too large")?;
 
     let _ = crate::drivers::net::e1000::send_packet(&eth_buf[..eth_len]);
     Ok(())
 }
-

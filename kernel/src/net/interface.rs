@@ -93,11 +93,7 @@ impl NetworkInterface {
     /// Bring the interface up.
     pub fn up(&mut self) {
         self.is_up = true;
-        kprintln!(
-            "[net] Interface {} is UP ({})",
-            self.name,
-            self.ipv4_addr
-        );
+        kprintln!("[net] Interface {} is UP ({})", self.name, self.ipv4_addr);
     }
 
     /// Bring the interface down.
@@ -141,11 +137,7 @@ pub fn register_interface(iface: NetworkInterface) {
 
 /// Get the number of registered interfaces.
 pub fn interface_count() -> usize {
-    INTERFACES
-        .lock()
-        .as_ref()
-        .map(|v| v.len())
-        .unwrap_or(0)
+    INTERFACES.lock().as_ref().map(|v| v.len()).unwrap_or(0)
 }
 
 /// Find a registered interface by IP.
@@ -171,4 +163,3 @@ pub fn get_first_ethernet_interface() -> Option<(Ipv4Addr, [u8; 6])> {
     }
     None
 }
-

@@ -4,15 +4,15 @@
 //! filesystem implementations, routing operations to the correct
 //! filesystem driver based on the mount point.
 
+use crate::kprintln;
 use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use alloc::format;
 use spin::RwLock;
-use crate::kprintln;
 
-use super::inode::{InodeOps, FileType};
+use super::inode::{FileType, InodeOps};
 
 /// The global VFS instance.
 static VFS: RwLock<Option<Vfs>> = RwLock::new(None);
@@ -99,13 +99,8 @@ impl Vfs {
     /// Mount a filesystem at the given path.
     pub fn mount(&mut self, path: String, filesystem: Arc<dyn FileSystem>) {
         kprintln!("[vfs] Mounting {} at {}", filesystem.name(), path);
-        self.mounts.insert(
-            path.clone(),
-            MountEntry {
-                path,
-                filesystem,
-            },
-        );
+        self.mounts
+            .insert(path.clone(), MountEntry { path, filesystem });
     }
 
     /// Unmount the filesystem at the given path.
@@ -157,7 +152,10 @@ impl Vfs {
             let root = fs.root()?;
 
             let mut current = root;
-            let components: Vec<&str> = remaining_path.split('/').filter(|c| !c.is_empty()).collect();
+            let components: Vec<&str> = remaining_path
+                .split('/')
+                .filter(|c| !c.is_empty())
+                .collect();
 
             let mount_path = if remaining_path == "/" {
                 resolved_path.as_str()
@@ -200,7 +198,8 @@ impl Vfs {
                         let mut target_buf = alloc::vec![0u8; 4096];
                         if let Ok(n) = next.read(0, &mut target_buf) {
                             if let Ok(target_str) = core::str::from_utf8(&target_buf[..n]) {
-                                symlink_target = Some((resolved_till_now.clone(), String::from(target_str)));
+                                symlink_target =
+                                    Some((resolved_till_now.clone(), String::from(target_str)));
                                 break;
                             }
                         }
@@ -222,7 +221,8 @@ impl Vfs {
                 if target.starts_with('/') {
                     resolved_path = crate::fs::path::normalize(&target);
                 } else {
-                    resolved_path = crate::fs::path::normalize(&crate::fs::path::join(&dir_path, &target));
+                    resolved_path =
+                        crate::fs::path::normalize(&crate::fs::path::join(&dir_path, &target));
                 }
                 continue;
             }
@@ -289,13 +289,8 @@ pub fn resolve_relative_path(path: &str) -> String {
     } else {
         // Retrieve current task's cwd
         let cwd = if let Some(pid) = crate::process::scheduler::current_pid() {
-            let sched = crate::process::scheduler::SCHEDULER.lock();
-            if let Some(ref s) = *sched {
-                if let Some(task) = s.get_task(pid) {
-                    task.cwd.clone()
-                } else {
-                    alloc::string::String::from("/")
-                }
+            if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+                task_arc.lock().cwd.clone()
             } else {
                 alloc::string::String::from("/")
             }
@@ -305,4 +300,3 @@ pub fn resolve_relative_path(path: &str) -> String {
         crate::fs::path::normalize(&crate::fs::path::join(&cwd, path))
     }
 }
-

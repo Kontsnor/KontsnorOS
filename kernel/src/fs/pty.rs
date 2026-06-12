@@ -67,13 +67,11 @@ impl InodeOps for PtyMaster {
 
             // Interruptible by signals
             if let Some(current_pid) = crate::process::scheduler::current_pid() {
-                let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
-                if let Some(ref mut sched) = *sched_lock {
-                    if let Some(task) = sched.get_task(current_pid) {
-                        let unblocked = task.pending_signals & !task.blocked_signals;
-                        if unblocked != 0 {
-                            return Err(-4); // EINTR
-                        }
+                if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+                    let task = task_arc.lock();
+                    let unblocked = task.pending_signals & !task.blocked_signals;
+                    if unblocked != 0 {
+                        return Err(-4); // EINTR
                     }
                 }
             }
@@ -141,8 +139,12 @@ impl InodeOps for PtyMaster {
 
     fn ioctl(&self, request: u64, arg: u64) -> Result<u64, i32> {
         match request {
-            0x5413 => { // TIOCGWINSZ
-                if !crate::syscall::fs::validate_user_ptr(arg as *const u8, core::mem::size_of::<Winsize>()) {
+            0x5413 => {
+                // TIOCGWINSZ
+                if !crate::syscall::fs::validate_user_ptr(
+                    arg as *const u8,
+                    core::mem::size_of::<Winsize>(),
+                ) {
                     return Err(-14); // EFAULT
                 }
                 let ws = self.shared.winsize.lock();
@@ -151,8 +153,12 @@ impl InodeOps for PtyMaster {
                 }
                 Ok(0)
             }
-            0x5414 => { // TIOCSWINSZ
-                if !crate::syscall::fs::validate_user_ptr(arg as *const u8, core::mem::size_of::<Winsize>()) {
+            0x5414 => {
+                // TIOCSWINSZ
+                if !crate::syscall::fs::validate_user_ptr(
+                    arg as *const u8,
+                    core::mem::size_of::<Winsize>(),
+                ) {
                     return Err(-14); // EFAULT
                 }
                 let mut ws = self.shared.winsize.lock();
@@ -205,13 +211,11 @@ impl InodeOps for PtySlave {
 
             // Interruptible by signals
             if let Some(current_pid) = crate::process::scheduler::current_pid() {
-                let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
-                if let Some(ref mut sched) = *sched_lock {
-                    if let Some(task) = sched.get_task(current_pid) {
-                        let unblocked = task.pending_signals & !task.blocked_signals;
-                        if unblocked != 0 {
-                            return Err(-4); // EINTR
-                        }
+                if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+                    let task = task_arc.lock();
+                    let unblocked = task.pending_signals & !task.blocked_signals;
+                    if unblocked != 0 {
+                        return Err(-4); // EINTR
                     }
                 }
             }
@@ -229,8 +233,12 @@ impl InodeOps for PtySlave {
 
     fn ioctl(&self, request: u64, arg: u64) -> Result<u64, i32> {
         match request {
-            0x5401 => { // TCGETS
-                if !crate::syscall::fs::validate_user_ptr(arg as *const u8, core::mem::size_of::<Termios>()) {
+            0x5401 => {
+                // TCGETS
+                if !crate::syscall::fs::validate_user_ptr(
+                    arg as *const u8,
+                    core::mem::size_of::<Termios>(),
+                ) {
                     return Err(-14); // EFAULT
                 }
                 let t = self.shared.termios.lock();
@@ -239,8 +247,12 @@ impl InodeOps for PtySlave {
                 }
                 Ok(0)
             }
-            0x5402 | 0x5403 | 0x5404 => { // TCSETS, TCSETSW, TCSETSF
-                if !crate::syscall::fs::validate_user_ptr(arg as *const u8, core::mem::size_of::<Termios>()) {
+            0x5402 | 0x5403 | 0x5404 => {
+                // TCSETS, TCSETSW, TCSETSF
+                if !crate::syscall::fs::validate_user_ptr(
+                    arg as *const u8,
+                    core::mem::size_of::<Termios>(),
+                ) {
                     return Err(-14); // EFAULT
                 }
                 let mut t = self.shared.termios.lock();
@@ -249,8 +261,12 @@ impl InodeOps for PtySlave {
                 }
                 Ok(0)
             }
-            0x5413 => { // TIOCGWINSZ
-                if !crate::syscall::fs::validate_user_ptr(arg as *const u8, core::mem::size_of::<Winsize>()) {
+            0x5413 => {
+                // TIOCGWINSZ
+                if !crate::syscall::fs::validate_user_ptr(
+                    arg as *const u8,
+                    core::mem::size_of::<Winsize>(),
+                ) {
                     return Err(-14); // EFAULT
                 }
                 let ws = self.shared.winsize.lock();
@@ -259,8 +275,12 @@ impl InodeOps for PtySlave {
                 }
                 Ok(0)
             }
-            0x5414 => { // TIOCSWINSZ
-                if !crate::syscall::fs::validate_user_ptr(arg as *const u8, core::mem::size_of::<Winsize>()) {
+            0x5414 => {
+                // TIOCSWINSZ
+                if !crate::syscall::fs::validate_user_ptr(
+                    arg as *const u8,
+                    core::mem::size_of::<Winsize>(),
+                ) {
                     return Err(-14); // EFAULT
                 }
                 let mut ws = self.shared.winsize.lock();
@@ -269,8 +289,12 @@ impl InodeOps for PtySlave {
                 }
                 Ok(0)
             }
-            0x540F => { // TIOCGPGRP
-                if !crate::syscall::fs::validate_user_ptr(arg as *mut i32 as *const u8, core::mem::size_of::<i32>()) {
+            0x540F => {
+                // TIOCGPGRP
+                if !crate::syscall::fs::validate_user_ptr(
+                    arg as *mut i32 as *const u8,
+                    core::mem::size_of::<i32>(),
+                ) {
                     return Err(-14); // EFAULT
                 }
                 let pgid = *self.shared.foreground_pgid.lock() as i32;
@@ -279,8 +303,12 @@ impl InodeOps for PtySlave {
                 }
                 Ok(0)
             }
-            0x5410 => { // TIOCSPGRP
-                if !crate::syscall::fs::validate_user_ptr(arg as *const i32 as *const u8, core::mem::size_of::<i32>()) {
+            0x5410 => {
+                // TIOCSPGRP
+                if !crate::syscall::fs::validate_user_ptr(
+                    arg as *const i32 as *const u8,
+                    core::mem::size_of::<i32>(),
+                ) {
                     return Err(-14); // EFAULT
                 }
                 let pgid = unsafe { core::ptr::read(arg as *const i32) } as u64;
@@ -298,30 +326,31 @@ pub fn deliver_signal_to_pgrp(pgid: u64, sig: i32) {
     if sig < 1 || sig > 64 || pgid == 0 {
         return;
     }
-    let mut sched_lock = scheduler::SCHEDULER.lock();
-    if let Some(ref mut sched) = *sched_lock {
-        let mut pids_to_wake = alloc::vec::Vec::new();
-        let curr_pid = scheduler::current_pid();
-        for task_opt in sched.tasks.iter_mut() {
-            if let Some(ref mut task) = task_opt {
-                if task.pgid == pgid {
-                    task.pending_signals |= 1 << (sig - 1);
-                    if Some(task.pid) == curr_pid {
-                        let pending_unblocked = task.pending_signals & !task.blocked_signals;
-                        let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
-                        unsafe {
-                            if apic_id < 32 {
-                                crate::syscall::CPU_SCRATCHES[apic_id].signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
-                            }
+    let tasks = scheduler::TASKS.read();
+    let mut pids_to_wake = alloc::vec::Vec::new();
+    let curr_pid = scheduler::current_pid();
+    for task_opt in tasks.iter() {
+        if let Some(task_arc) = task_opt {
+            let mut task = task_arc.lock();
+            if task.pgid == pgid {
+                task.pending_signals |= 1 << (sig - 1);
+                if Some(task.pid) == curr_pid {
+                    let pending_unblocked = task.pending_signals & !task.blocked_signals;
+                    let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
+                    unsafe {
+                        if apic_id < 32 {
+                            crate::syscall::CPU_SCRATCHES[apic_id].signals_pending =
+                                if pending_unblocked != 0 { 1 } else { 0 };
                         }
                     }
-                    pids_to_wake.push(task.pid);
                 }
+                pids_to_wake.push(task.pid);
             }
         }
-        for pid in pids_to_wake {
-            sched.wake_task(pid);
-        }
+    }
+    drop(tasks);
+    for pid in pids_to_wake {
+        scheduler::wake_task(pid);
     }
 }
 

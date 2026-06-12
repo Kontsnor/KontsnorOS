@@ -18,7 +18,7 @@
 //! | 5     | TSS             | 0   | Task State Segment             |
 
 use lazy_static::lazy_static;
-use x86_64::instructions::segmentation::{CS, Segment};
+use x86_64::instructions::segmentation::{Segment, CS};
 use x86_64::instructions::tables::load_tss;
 use x86_64::registers::segmentation::SegmentSelector;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
@@ -118,26 +118,49 @@ pub struct CoreGdt {
 }
 
 /// Thread-safe global cell for the active core GDT/TSS configurations.
-pub static CORE_GDTS: crate::sync::spinlock::TicketLock<[Option<CoreGdt>; 32]> = 
+pub static CORE_GDTS: crate::sync::spinlock::TicketLock<[Option<CoreGdt>; 32]> =
     crate::sync::spinlock::TicketLock::new([
-        None, None, None, None, None, None, None, None,
-        None, None, None, None, None, None, None, None,
-        None, None, None, None, None, None, None, None,
-        None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None,
     ]);
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-core TSS pointers for lockless access in set_interrupt_stack.
 pub static CORE_TSS_PTRS: [AtomicU64; 32] = [
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
 
 /// Initialize the GDT and load segment registers.
@@ -169,7 +192,11 @@ pub fn init_heap() {
     // F-14: Protect against double-initialization of the same slot
     {
         let lock = CORE_GDTS.lock();
-        assert!(lock[apic_id].is_none(), "init_heap called twice for APIC ID {}", apic_id);
+        assert!(
+            lock[apic_id].is_none(),
+            "init_heap called twice for APIC ID {}",
+            apic_id
+        );
     }
 
     let tss_mut = Box::leak(Box::new(TaskStateSegment::new()));
@@ -260,7 +287,10 @@ pub fn user_data_selector() -> SegmentSelector {
 pub fn set_interrupt_stack(stack_top: u64) {
     let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
     if apic_id >= 32 {
-        panic!("APIC ID {} out of bounds (>= 32) in set_interrupt_stack", apic_id);
+        panic!(
+            "APIC ID {} out of bounds (>= 32) in set_interrupt_stack",
+            apic_id
+        );
     }
     // F-07: Access per-core TSS locklessly to prevent deadlocks with SCHEDULER lock
     let tss_addr = CORE_TSS_PTRS[apic_id].load(Ordering::Acquire);
@@ -277,4 +307,3 @@ pub fn set_interrupt_stack(stack_top: u64) {
         }
     }
 }
-

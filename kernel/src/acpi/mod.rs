@@ -5,9 +5,9 @@
 
 pub mod tables;
 
-use spin::Mutex;
-use crate::kprintln;
 use self::tables::MadtInfo;
+use crate::kprintln;
+use spin::Mutex;
 
 /// Globally stored MADT information.
 static MADT_INFO: Mutex<Option<MadtInfo>> = Mutex::new(None);
@@ -39,12 +39,18 @@ pub fn init(rsdp_addr: Option<u64>) {
         Ok(rsdp_info) => {
             kprintln!("[acpi] OEM ID: {}", rsdp_info.oem_id);
             kprintln!("[acpi] Revision: {}", rsdp_info.revision);
-            kprintln!("[acpi] XSDT/RSDT physical address: {:#x}", rsdp_info.xsdt_address);
+            kprintln!(
+                "[acpi] XSDT/RSDT physical address: {:#x}",
+                rsdp_info.xsdt_address
+            );
 
             // Search for MADT ("APIC") in XSDT/RSDT
             match tables::find_table(rsdp_info.xsdt_address, b"APIC", rsdp_info.revision) {
                 Ok(madt_phys) => {
-                    kprintln!("[acpi] Found MADT (APIC) table at physical {:#x}", madt_phys);
+                    kprintln!(
+                        "[acpi] Found MADT (APIC) table at physical {:#x}",
+                        madt_phys
+                    );
                     match tables::parse_madt(madt_phys) {
                         Ok(madt_info) => {
                             kprintln!("[acpi] Successfully parsed MADT.");

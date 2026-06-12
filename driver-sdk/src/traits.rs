@@ -69,7 +69,9 @@ pub trait BlockDevice: Send + Sync {
     /// Get the total number of blocks.
     fn block_count(&self) -> u64;
     /// Flush cached writes.
-    fn flush(&self) -> Result<(), DriverError> { Ok(()) }
+    fn flush(&self) -> Result<(), DriverError> {
+        Ok(())
+    }
     /// Get driver information.
     fn info(&self) -> DriverInfo;
 }

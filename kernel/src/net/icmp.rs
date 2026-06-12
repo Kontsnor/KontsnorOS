@@ -93,9 +93,9 @@ pub fn build_echo_reply(
         return None;
     }
 
-    buf[0] = ICMP_ECHO_REPLY;  // Type
-    buf[1] = 0;                 // Code
-    buf[2] = 0;                 // Checksum (zeroed for computation)
+    buf[0] = ICMP_ECHO_REPLY; // Type
+    buf[1] = 0; // Code
+    buf[2] = 0; // Checksum (zeroed for computation)
     buf[3] = 0;
     buf[4..6].copy_from_slice(&identifier.to_be_bytes());
     buf[6..8].copy_from_slice(&sequence.to_be_bytes());
@@ -153,4 +153,3 @@ pub fn handle_packet(src_ip: ipv4::Ipv4Addr, payload: &[u8]) {
         }
     }
 }
-

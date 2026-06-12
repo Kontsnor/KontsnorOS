@@ -1,8 +1,8 @@
 //! Intel e1000 Gigabit Ethernet Driver (82540EM).
 
+use crate::drivers::traits::{DriverError, DriverInfo, LinkStatus, NetDevice};
 use alloc::sync::Arc;
 use spin::Mutex;
-use crate::drivers::traits::{NetDevice, DriverError, DriverInfo, LinkStatus};
 
 // Register Offsets
 const REG_CTRL: u32 = 0x0000;
@@ -80,9 +80,7 @@ impl E1000 {
 
     fn read_reg(&self, offset: u32) -> u32 {
         let ptr = (self.bar0_virt + offset as u64) as *const u32;
-        unsafe {
-            ptr.read_volatile()
-        }
+        unsafe { ptr.read_volatile() }
     }
 
     fn recv_packet(&mut self, buf: &mut [u8]) -> Result<usize, DriverError> {
@@ -115,9 +113,11 @@ impl E1000 {
 
     fn send_packet(&mut self, data: &[u8]) -> Result<(), DriverError> {
         let desc_ptr = unsafe { self.tx_ring.add(self.tx_idx) };
-        
+
         let mut timeout = 0;
-        while unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*desc_ptr).status)) } & 0x01 == 0 {
+        while unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*desc_ptr).status)) } & 0x01
+            == 0
+        {
             timeout += 1;
             if timeout > 1000000 {
                 return Err(DriverError::Timeout);
@@ -134,7 +134,8 @@ impl E1000 {
         unsafe {
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc_ptr).length), len as u16);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc_ptr).status), 0);
-            core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc_ptr).cmd), 0x0B); // EOP | IFCS | RS
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc_ptr).cmd), 0x0B);
+            // EOP | IFCS | RS
         }
 
         self.write_reg(REG_TDT, ((self.tx_idx + 1) % NUM_TX_DESC) as u32);
@@ -200,15 +201,21 @@ pub unsafe fn init(bus: u8, device: u8, function: u8) {
     let base_phys = (bar0 & 0xFFFFFFF0) as u64;
     let base_virt = base_phys + crate::memory::r#virtual::phys_mem_offset();
 
-    crate::kprintln!("[e1000] Initializing controller at phys: {:#x}, virt: {:#x}", base_phys, base_virt);
+    crate::kprintln!(
+        "[e1000] Initializing controller at phys: {:#x}, virt: {:#x}",
+        base_phys,
+        base_virt
+    );
 
-    let rx_ring_phys = crate::memory::physical::allocate_frame().expect("e1000: out of memory for Rx ring");
+    let rx_ring_phys =
+        crate::memory::physical::allocate_frame().expect("e1000: out of memory for Rx ring");
     let rx_ring_virt = (rx_ring_phys + crate::memory::r#virtual::phys_mem_offset()) as *mut RxDesc;
     unsafe {
         core::ptr::write_bytes(rx_ring_virt, 0, NUM_RX_DESC);
     }
 
-    let tx_ring_phys = crate::memory::physical::allocate_frame().expect("e1000: out of memory for Tx ring");
+    let tx_ring_phys =
+        crate::memory::physical::allocate_frame().expect("e1000: out of memory for Tx ring");
     let tx_ring_virt = (tx_ring_phys + crate::memory::r#virtual::phys_mem_offset()) as *mut TxDesc;
     unsafe {
         core::ptr::write_bytes(tx_ring_virt, 0, NUM_TX_DESC);
@@ -217,7 +224,8 @@ pub unsafe fn init(bus: u8, device: u8, function: u8) {
     let mut rx_bufs_phys = [0u64; NUM_RX_DESC];
     let mut rx_bufs_virt = [0u64; NUM_RX_DESC];
     for i in 0..NUM_RX_DESC {
-        let p = crate::memory::physical::allocate_frame().expect("e1000: out of memory for Rx buffer");
+        let p =
+            crate::memory::physical::allocate_frame().expect("e1000: out of memory for Rx buffer");
         rx_bufs_phys[i] = p;
         rx_bufs_virt[i] = p + crate::memory::r#virtual::phys_mem_offset();
         unsafe {
@@ -230,7 +238,8 @@ pub unsafe fn init(bus: u8, device: u8, function: u8) {
     let mut tx_bufs_phys = [0u64; NUM_TX_DESC];
     let mut tx_bufs_virt = [0u64; NUM_TX_DESC];
     for i in 0..NUM_TX_DESC {
-        let p = crate::memory::physical::allocate_frame().expect("e1000: out of memory for Tx buffer");
+        let p =
+            crate::memory::physical::allocate_frame().expect("e1000: out of memory for Tx buffer");
         tx_bufs_phys[i] = p;
         tx_bufs_virt[i] = p + crate::memory::r#virtual::phys_mem_offset();
         unsafe {
@@ -263,7 +272,7 @@ pub unsafe fn init(bus: u8, device: u8, function: u8) {
             break;
         }
     }
-    
+
     e1000.write_reg(REG_CTRL, e1000.read_reg(REG_CTRL) | (1 << 6)); // SLU
 
     let ral = e1000.read_reg(REG_RAL);
@@ -278,7 +287,12 @@ pub unsafe fn init(bus: u8, device: u8, function: u8) {
 
     crate::kprintln!(
         "[e1000] MAC address: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        mac[0],
+        mac[1],
+        mac[2],
+        mac[3],
+        mac[4],
+        mac[5]
     );
 
     for i in 0..128 {

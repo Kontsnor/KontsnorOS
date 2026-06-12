@@ -9,7 +9,7 @@
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicU64, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// A ticket-based spinlock.
 ///

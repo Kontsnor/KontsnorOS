@@ -55,6 +55,20 @@ The kernel's physical memory mapping layout is consolidated at a fixed mapping b
 ### Thread Local Storage (TLS)
 User-space thread-local storage is supported by saving and restoring the CPU's `FS_BASE` model-specific register (`0xC0000100`) during context switches. Child threads created via `sys_fork` and `sys_clone` inherit their parent's TLS register settings if not explicitly overridden by TLS configuration flags.
 
+### CPU-Local Storage (CpuScratch)
+To support lock-free core operations and thread tracking, each CPU core maps its `GS_BASE` Model-Specific Register (MSR `0xC0000101`) to an element in the static `CPU_SCRATCHES: [CpuScratch; 32]` array based on its Local APIC ID. The `CpuScratch` block stores:
+- `user_rsp`: User stack pointer.
+- `kernel_rsp`: Kernel stack pointer.
+- `current_pid`: Currently running task's PID.
+- `signals_pending`: Pending signals flag.
+
+By pinning `GS_BASE` to `CpuScratch`, the kernel performs **Lock-Free Thread Tracking**, retrieving the active task's PID in assembly via `gs:[16]` without acquiring the global scheduler lock.
+
+### Batched TLB Shootdowns
+To maintain page mapping coherency across cores while avoiding expensive Inter-Processor Interrupt (IPI) storms during multi-page range operations (e.g. `mmap`, `munmap`, or `mprotect`), KontsnorOS implements a batched protocol:
+- **No-Shootdown Modification**: Page tables are updated page-by-page in a loop using `_no_shootdown` primitives (e.g., `map_user_page_no_shootdown`).
+- **Single Broadcast**: At the syscall or operation boundary, a single `shootdown_tlb()` is fired, broadcasting one IPI (vector `36`) to all other cores and waiting for them to acknowledge. This avoids sending one IPI per page.
+
 ---
 
 ## Syscall Interface
@@ -64,6 +78,9 @@ KontsnorOS implements the POSIX system call interface using the `syscall` / `sys
 - **Registers**: `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9` for arguments.
 - **Return**: `rax` for results (negative values indicate standard error codes).
 - **Numbering**: Linux/x86_64 compatible syscall numbers (e.g. `clone` = 56, `fork` = 57, `execve` = 59, `exit_group` = 231).
+
+### Fast Path & Lock-Free PID Lookups
+For lightweight system calls (e.g., `sys_getpid`), the assembly entry point retrieves the current thread's PID directly from `gs:[16]` (corresponding to `CpuScratch.current_pid`). This fast path bypasses the global scheduler lock, avoiding inter-core lock contention.
 
 ### Syscall Memory Hardening
 

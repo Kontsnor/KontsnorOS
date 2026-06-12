@@ -116,6 +116,98 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
     child_pid.as_u64() as SyscallResult
 }
 
+/// Helper to map loadable ELF segments into the user page table.
+///
+/// Returns the maximum virtual address mapped on success.
+fn map_elf_segments(
+    new_page_table: u64,
+    segments: &[crate::process::elf::LoadSegment],
+    elf_buf: &[u8],
+    bias: u64,
+) -> Result<u64, Errno> {
+    use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
+    use x86_64::{PhysAddr, VirtAddr};
+
+    let mut max_vaddr = 0;
+    for segment in segments {
+        if segment.mem_size == 0 {
+            continue;
+        }
+
+        let vaddr = segment.vaddr + bias;
+        let end = vaddr + segment.mem_size;
+        if end > max_vaddr {
+            max_vaddr = end;
+        }
+
+        let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
+        let end_page =
+            Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr + segment.mem_size - 1));
+
+        for page in Page::range_inclusive(start_page, end_page) {
+            let phys = match crate::memory::physical::allocate_frame() {
+                Some(p) => p,
+                None => return Err(Errno::ENOMEM),
+            };
+            let frame = PhysFrame::containing_address(PhysAddr::new(phys));
+            let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+            if segment.flags.write {
+                flags |= PageTableFlags::WRITABLE;
+            }
+            if !segment.flags.execute {
+                flags |= PageTableFlags::NO_EXECUTE;
+            }
+
+            // SAFETY: The new_page_table is a valid PML4 page table root constructed for user space.
+            // The allocated physical frame is valid and page boundaries are respected.
+            unsafe {
+                if crate::memory::r#virtual::map_user_page_no_shootdown(
+                    new_page_table,
+                    page,
+                    frame,
+                    flags,
+                )
+                .is_err()
+                {
+                    return Err(Errno::ENOMEM);
+                }
+            }
+
+            // Copy segment data
+            let dest = (phys + crate::memory::r#virtual::phys_mem_offset()) as *mut u8;
+            // SAFETY: dest is a valid kernel virtual mapping of the newly allocated physical frame.
+            let dest_slice = unsafe { core::slice::from_raw_parts_mut(dest, 4096) };
+            dest_slice.fill(0);
+
+            let page_va = page.start_address().as_u64();
+            let seg_start = vaddr;
+
+            let page_offset_in_seg = if page_va > seg_start {
+                page_va - seg_start
+            } else {
+                0
+            };
+            let seg_offset_in_page = if page_va < seg_start {
+                seg_start - page_va
+            } else {
+                0
+            };
+
+            if page_offset_in_seg < segment.file_size {
+                let copy_len = core::cmp::min(
+                    4096 - seg_offset_in_page,
+                    segment.file_size - page_offset_in_seg,
+                );
+                let src_start = (segment.file_offset + page_offset_in_seg) as usize;
+                let dst_start = seg_offset_in_page as usize;
+                dest_slice[dst_start..dst_start + copy_len as usize]
+                    .copy_from_slice(&elf_buf[src_start..src_start + copy_len as usize]);
+            }
+        }
+    }
+    Ok(max_vaddr)
+}
+
 /// `execve(pathname, argv, envp)` — Execute a program.
 ///
 /// Loads a new ELF binary from the VFS, replacing the current process image.
@@ -282,82 +374,57 @@ pub fn sys_execve(
     use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
     use x86_64::{PhysAddr, VirtAddr};
 
-    let mut max_vaddr = 0;
-    for segment in &elf_info.segments {
-        if segment.mem_size == 0 {
-            continue;
+    let main_max_vaddr = match map_elf_segments(new_page_table, &elf_info.segments, &elf_buf, 0) {
+        Ok(addr) => addr,
+        Err(e) => return e as SyscallResult,
+    };
+
+    let initial_brk = (main_max_vaddr + 4095) & !4095;
+
+    let mut entry = elf_info.entry_point;
+    let mut interpreter_base = 0;
+    if let Some(ref interp_path) = elf_info.interpreter {
+        let interp_inode = match crate::fs::vfs::lookup_follow(interp_path, true) {
+            Some(i) => i,
+            None => {
+                kprintln!("[syscall] execve: interpreter not found: {}", interp_path);
+                return Errno::ENOENT.into();
+            }
+        };
+
+        if let Err(e) =
+            crate::fs::inode::check_permission(interp_inode.inode(), crate::fs::inode::MAY_EXEC)
+        {
+            return e as SyscallResult;
         }
 
-        let end = segment.vaddr + segment.mem_size;
-        if end > max_vaddr {
-            max_vaddr = end;
+        let interp_size = interp_inode.inode().size as usize;
+        if interp_size == 0 {
+            return Errno::ENOEXEC.into();
+        }
+        let mut interp_elf_buf = alloc::vec![0u8; interp_size];
+        match interp_inode.read(0, &mut interp_elf_buf) {
+            Ok(_) => {}
+            Err(e) => return e as SyscallResult,
         }
 
-        let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(segment.vaddr));
-        let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(
-            segment.vaddr + segment.mem_size - 1,
-        ));
+        let interp_info = match crate::process::elf::parse_elf(&interp_elf_buf) {
+            Ok(e) => e,
+            Err(_) => return Errno::ENOEXEC.into(),
+        };
 
-        for page in Page::range_inclusive(start_page, end_page) {
-            let phys = match crate::memory::physical::allocate_frame() {
-                Some(p) => p,
-                None => return Errno::ENOMEM.into(),
-            };
-            let frame = PhysFrame::containing_address(PhysAddr::new(phys));
-            let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-            if segment.flags.write {
-                flags |= PageTableFlags::WRITABLE;
-            }
-            if !segment.flags.execute {
-                flags |= PageTableFlags::NO_EXECUTE;
-            }
-
-            unsafe {
-                if crate::memory::r#virtual::map_user_page_no_shootdown(
-                    new_page_table,
-                    page,
-                    frame,
-                    flags,
-                )
-                .is_err()
-                {
-                    return Errno::ENOMEM.into();
-                }
-            }
-
-            // Copy segment data
-            let dest = (phys + crate::memory::r#virtual::phys_mem_offset()) as *mut u8;
-            let dest_slice = unsafe { core::slice::from_raw_parts_mut(dest, 4096) };
-            dest_slice.fill(0);
-
-            let page_va = page.start_address().as_u64();
-            let seg_start = segment.vaddr;
-
-            let page_offset_in_seg = if page_va > seg_start {
-                page_va - seg_start
-            } else {
-                0
-            };
-            let seg_offset_in_page = if page_va < seg_start {
-                seg_start - page_va
-            } else {
-                0
-            };
-
-            if page_offset_in_seg < segment.file_size {
-                let copy_len = core::cmp::min(
-                    4096 - seg_offset_in_page,
-                    segment.file_size - page_offset_in_seg,
-                );
-                let src_start = (segment.file_offset + page_offset_in_seg) as usize;
-                let dst_start = seg_offset_in_page as usize;
-                dest_slice[dst_start..dst_start + copy_len as usize]
-                    .copy_from_slice(&elf_buf[src_start..src_start + copy_len as usize]);
-            }
+        interpreter_base = 0x0000_7FFF_F7F0_0000;
+        match map_elf_segments(
+            new_page_table,
+            &interp_info.segments,
+            &interp_elf_buf,
+            interpreter_base,
+        ) {
+            Ok(_) => {}
+            Err(e) => return e as SyscallResult,
         }
+        entry = interp_info.entry_point + interpreter_base;
     }
-
-    let initial_brk = (max_vaddr + 4095) & !4095;
 
     // Map user stack
     let stack_size: u64 = 64 * 1024;
@@ -380,6 +447,7 @@ pub fn sys_execve(
             | PageTableFlags::WRITABLE
             | PageTableFlags::USER_ACCESSIBLE
             | PageTableFlags::NO_EXECUTE;
+        // SAFETY: The page table root points to a valid PML4 page table structure and frame/page parameters are valid.
         unsafe {
             if crate::memory::r#virtual::map_user_page_no_shootdown(
                 new_page_table,
@@ -403,6 +471,7 @@ pub fn sys_execve(
         elf_info.phdr,
         elf_info.phnum,
         elf_info.phent,
+        interpreter_base,
     ) {
         Ok(sp) => sp,
         Err(e) => return e.into(),

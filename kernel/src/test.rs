@@ -571,3 +571,163 @@ fn test_dirty_page_flush() {
     let _ = disk_dir.unlink("flush_test.txt");
     kprintln!("[test] Dirty page flush test PASSED!");
 }
+
+#[test_case]
+fn test_auxiliary_vectors() {
+    kprintln!("[test] Starting auxiliary vector verification test...");
+    let phys = crate::memory::physical::allocate_frame().expect("Failed to allocate frame");
+
+    let argv = [alloc::string::String::from("test_arg")];
+    let envp = [alloc::string::String::from("TEST_ENV=1")];
+    let entry_point = 0x10002000;
+    let phdr = 0x30004000;
+    let phnum = 4;
+    let phent = 56;
+    let interpreter_base = 0x0000_7FFF_F7F0_0000;
+
+    let user_sp = crate::process::elf::construct_user_stack(
+        &argv,
+        &envp,
+        phys,
+        entry_point,
+        phdr,
+        phnum,
+        phent,
+        interpreter_base,
+    )
+    .expect("Failed to construct user stack");
+
+    // Read the stack from the allocated page.
+    let page_virt = (phys + crate::memory::r#virtual::phys_mem_offset()) as *const u8;
+
+    // The stack pointer returned is at some offset in the stack top.
+    // Let's translate user_sp to the offset in our page.
+    // stack top is USER_STACK_TOP = 0x0000_7FFF_FFFF_0000.
+    // page is USER_STACK_TOP - 4096.
+    let page_base_vaddr = crate::process::elf::USER_STACK_TOP - 4096;
+    assert!(user_sp >= page_base_vaddr);
+    assert!(user_sp < crate::process::elf::USER_STACK_TOP);
+    let offset_in_page = (user_sp - page_base_vaddr) as usize;
+
+    // Now let's parse the stack starting at `page_virt + offset_in_page`.
+    // SAFETY: The stack_ptr is a valid pointer within the page boundary of the allocated frame.
+    let stack_ptr = unsafe { page_virt.add(offset_in_page) } as *const u64;
+
+    let argc = unsafe { stack_ptr.read() };
+    assert_eq!(argc, 1);
+
+    let arg0_ptr = unsafe { stack_ptr.add(1).read() };
+    assert!(arg0_ptr > 0);
+
+    let argv_null = unsafe { stack_ptr.add(2).read() };
+    assert_eq!(argv_null, 0);
+
+    let env0_ptr = unsafe { stack_ptr.add(3).read() };
+    assert!(env0_ptr > 0);
+
+    let envp_null = unsafe { stack_ptr.add(4).read() };
+    assert_eq!(envp_null, 0);
+
+    // The auxiliary vectors start at index 5.
+    let mut aux_idx = 5;
+    let mut found_phdr = false;
+    let mut found_base = false;
+    let mut found_entry = false;
+    let mut found_phent = false;
+    let mut found_phnum = false;
+    let mut found_pagesz = false;
+    let mut found_random = false;
+
+    loop {
+        let type_ = unsafe { stack_ptr.add(aux_idx).read() };
+        let val = unsafe { stack_ptr.add(aux_idx + 1).read() };
+        if type_ == 0 {
+            break;
+        }
+        match type_ {
+            3 => {
+                // AT_PHDR
+                assert_eq!(val, phdr);
+                found_phdr = true;
+            }
+            4 => {
+                // AT_PHENT
+                assert_eq!(val, phent);
+                found_phent = true;
+            }
+            5 => {
+                // AT_PHNUM
+                assert_eq!(val, phnum);
+                found_phnum = true;
+            }
+            6 => {
+                // AT_PAGESZ
+                assert_eq!(val, 4096);
+                found_pagesz = true;
+            }
+            7 => {
+                // AT_BASE
+                assert_eq!(val, interpreter_base);
+                found_base = true;
+            }
+            9 => {
+                // AT_ENTRY
+                assert_eq!(val, entry_point);
+                found_entry = true;
+            }
+            25 => {
+                // AT_RANDOM
+                assert!(val > 0);
+                found_random = true;
+            }
+            _ => {}
+        }
+        aux_idx += 2;
+    }
+
+    assert!(found_phdr, "AT_PHDR not found or incorrect");
+    assert!(found_phent, "AT_PHENT not found or incorrect");
+    assert!(found_phnum, "AT_PHNUM not found or incorrect");
+    assert!(found_pagesz, "AT_PAGESZ not found or incorrect");
+    assert!(found_base, "AT_BASE not found or incorrect");
+    assert!(found_entry, "AT_ENTRY not found or incorrect");
+    assert!(found_random, "AT_RANDOM not found or incorrect");
+
+    crate::memory::physical::deallocate_frame(phys);
+    kprintln!("[test] Auxiliary vector verification test PASSED!");
+}
+
+#[test_case]
+fn test_userspace_wrfsbase() {
+    kprintln!("[test] Starting WRFSBASE verification test...");
+
+    let test_val = 0x0000_1234_5678_9ABCu64;
+
+    // Save current FS_BASE
+    let orig_fs = x86_64::registers::model_specific::FsBase::read().as_u64();
+
+    // Write new FS_BASE using wrfsbase instruction
+    // SAFETY: Enabling FSGSBASE CR4 bit during early initialization guarantees
+    // the wrfsbase instruction is supported and safe to execute.
+    unsafe {
+        core::arch::asm!(
+            "wrfsbase {}",
+            in(reg) test_val,
+        );
+    }
+
+    // Read and verify
+    let new_fs = x86_64::registers::model_specific::FsBase::read().as_u64();
+    assert_eq!(new_fs, test_val);
+
+    // Restore original FS_BASE
+    // SAFETY: Restoring the original FS_BASE is required to maintain the kernel's thread state.
+    unsafe {
+        core::arch::asm!(
+            "wrfsbase {}",
+            in(reg) orig_fs,
+        );
+    }
+
+    kprintln!("[test] WRFSBASE verification test PASSED!");
+}

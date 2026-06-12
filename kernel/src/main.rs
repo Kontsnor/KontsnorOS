@@ -95,11 +95,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     arch::x86_64::interrupts::init_pics();
     kprintln!("[boot] PIC initialized.");
 
-    kprintln!("[boot] Enabling SSE...");
+    kprintln!("[boot] Enabling SSE and FSGSBASE...");
     unsafe {
         arch::x86_64::boot::enable_sse();
+        arch::x86_64::boot::enable_fsgsbase();
     }
-    kprintln!("[boot] SSE enabled.");
+    kprintln!("[boot] SSE and FSGSBASE enabled.");
 
     // ── Phase 3: Memory initialization ─────────────────────────────────
     kprintln!("[boot] Initializing memory subsystem...");

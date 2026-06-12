@@ -183,6 +183,8 @@ pub struct ElfInfo {
     pub phnum: u64,
     /// Size of program header entry.
     pub phent: u64,
+    /// Dynamic interpreter path, if any.
+    pub interpreter: Option<alloc::string::String>,
 }
 
 /// A segment that needs to be loaded into memory.
@@ -273,6 +275,7 @@ pub fn parse_elf(data: &[u8]) -> Result<ElfInfo, ElfError> {
 
     let mut segments = alloc::vec::Vec::new();
     let mut stack_size: u64 = 0;
+    let mut interpreter = None;
 
     // Parse program headers
     for i in 0..ph_count {
@@ -309,6 +312,20 @@ pub fn parse_elf(data: &[u8]) -> Result<ElfInfo, ElfError> {
             PT_GNU_STACK => {
                 stack_size = phdr.p_memsz;
             }
+            PT_INTERP => {
+                let file_offset = phdr.p_offset as usize;
+                let file_size = phdr.p_filesz as usize;
+                if file_offset + file_size <= data.len() {
+                    let mut path_bytes = &data[file_offset..file_offset + file_size];
+                    // Strip trailing null bytes
+                    while path_bytes.ends_with(&[0]) {
+                        path_bytes = &path_bytes[..path_bytes.len() - 1];
+                    }
+                    if let Ok(path_str) = core::str::from_utf8(path_bytes) {
+                        interpreter = Some(alloc::string::String::from(path_str));
+                    }
+                }
+            }
             _ => {
                 // Ignore other segment types for now
             }
@@ -335,6 +352,7 @@ pub fn parse_elf(data: &[u8]) -> Result<ElfInfo, ElfError> {
         phdr: phdr_vaddr,
         phnum: ph_count as u64,
         phent: ph_entry_size as u64,
+        interpreter,
     })
 }
 
@@ -388,6 +406,7 @@ pub fn construct_user_stack(
     phdr: u64,
     phnum: u64,
     phent: u64,
+    interpreter_base: u64,
 ) -> Result<u64, crate::syscall::Errno> {
     let mut page_buf = alloc::vec![0u8; 4096];
     let mut str_pos = 4096;
@@ -434,18 +453,19 @@ pub fn construct_user_stack(
 
     // Auxiliary vector entries required by musl-libc
     let auxv = [
-        (3u64, phdr),          // AT_PHDR
-        (4u64, phent),         // AT_PHENT
-        (5u64, phnum),         // AT_PHNUM
-        (6u64, 4096),          // AT_PAGESZ
-        (9u64, entry_point),   // AT_ENTRY
-        (11u64, 0),            // AT_UID
-        (12u64, 0),            // AT_EUID
-        (13u64, 0),            // AT_GID
-        (14u64, 0),            // AT_EGID
-        (23u64, 0),            // AT_SECURE
-        (25u64, random_vaddr), // AT_RANDOM
-        (0u64, 0),             // AT_NULL
+        (3u64, phdr),             // AT_PHDR
+        (4u64, phent),            // AT_PHENT
+        (5u64, phnum),            // AT_PHNUM
+        (6u64, 4096),             // AT_PAGESZ
+        (7u64, interpreter_base), // AT_BASE
+        (9u64, entry_point),      // AT_ENTRY
+        (11u64, 0),               // AT_UID
+        (12u64, 0),               // AT_EUID
+        (13u64, 0),               // AT_GID
+        (14u64, 0),               // AT_EGID
+        (23u64, 0),               // AT_SECURE
+        (25u64, random_vaddr),    // AT_RANDOM
+        (0u64, 0),                // AT_NULL
     ];
 
     // 3. Calculate space for pointers:

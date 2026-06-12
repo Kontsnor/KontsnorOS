@@ -193,6 +193,7 @@ pub fn spawn_user_process_with_pid(name: alloc::string::String, elf_data: &[u8],
         elf_info.phdr,
         elf_info.phnum,
         elf_info.phent,
+        0, // interpreter_base is 0 for statically linked spawned user processes
     )
     .expect("Failed to construct user stack");
 

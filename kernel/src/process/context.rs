@@ -149,7 +149,10 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut CpuContext, _new_ctx: *co
         // Save CR3 (current page table)
         "mov rax, cr3",
         "mov [rdi + 0x48], rax",
-        // Note: We skip saving FS_BASE, GS_BASE, and KERNEL_GS_BASE MSRs via rdmsr.
+        // Save FS_BASE using rdfsbase (since userspace can now modify FS_BASE directly)
+        "rdfsbase rax",
+        "mov [rdi + 0x50], rax",
+        // Note: We skip saving GS_BASE and KERNEL_GS_BASE MSRs via rdmsr.
         // They are kept up-to-date in CpuContext via sys_arch_prctl / initialization.
 
         // ── Restore new context ────────────────────────────────────

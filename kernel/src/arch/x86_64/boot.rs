@@ -25,6 +25,7 @@ pub fn init() {
     // Enable SSE support (required for user-space programs compiled with SSE)
     unsafe {
         enable_sse();
+        enable_fsgsbase();
     }
 }
 
@@ -42,5 +43,17 @@ pub unsafe fn enable_sse() {
     cr0.insert(Cr0Flags::MONITOR_COPROCESSOR);
     unsafe {
         Cr0::write(cr0);
+    }
+}
+
+pub unsafe fn enable_fsgsbase() {
+    // SAFETY: Enabling FSGSBASE CR4 bit is safe on x86_64 processors
+    unsafe {
+        core::arch::asm!(
+            "mov rax, cr4",
+            "or rax, 0x10000", // Bit 16 (FSGSBASE)
+            "mov cr4, rax",
+            out("rax") _,
+        );
     }
 }

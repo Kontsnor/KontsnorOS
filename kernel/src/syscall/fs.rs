@@ -277,6 +277,24 @@ pub fn sys_open(pathname: *const u8, flags: i32, _mode: u32) -> SyscallResult {
                 if i.inode().is_dir() && crate::fs::file::OpenFlags(flags_u32).is_writable() {
                     return Errno::EISDIR.into();
                 }
+
+                // Check permissions on the existing file
+                let open_flags = crate::fs::file::OpenFlags(flags_u32);
+                if open_flags.is_readable() {
+                    if let Err(e) =
+                        crate::fs::inode::check_permission(i.inode(), crate::fs::inode::MAY_READ)
+                    {
+                        return e as SyscallResult;
+                    }
+                }
+                if open_flags.is_writable() {
+                    if let Err(e) =
+                        crate::fs::inode::check_permission(i.inode(), crate::fs::inode::MAY_WRITE)
+                    {
+                        return e as SyscallResult;
+                    }
+                }
+
                 // If O_TRUNC is set and it is a regular file, truncate it to 0 size
                 if (flags_u32 & crate::fs::file::OpenFlags::O_TRUNC != 0) && i.inode().is_file() {
                     if let Err(e) = i.truncate(0) {
@@ -296,6 +314,21 @@ pub fn sys_open(pathname: *const u8, flags: i32, _mode: u32) -> SyscallResult {
                     if !parent_inode.inode().is_dir() {
                         return Errno::ENOTDIR.into();
                     }
+
+                    // Verify write and execute permissions on the parent directory
+                    if let Err(e) = crate::fs::inode::check_permission(
+                        parent_inode.inode(),
+                        crate::fs::inode::MAY_WRITE,
+                    ) {
+                        return e as SyscallResult;
+                    }
+                    if let Err(e) = crate::fs::inode::check_permission(
+                        parent_inode.inode(),
+                        crate::fs::inode::MAY_EXEC,
+                    ) {
+                        return e as SyscallResult;
+                    }
+
                     match parent_inode.create(name, crate::fs::inode::FileType::Regular) {
                         Some(new_i) => new_i,
                         None => return Errno::EACCES.into(),
@@ -718,14 +751,18 @@ pub fn sys_faccessat(dfd: i32, pathname: *const u8, mode: i32, _flags: i32) -> S
 
     let inode = inode_ops.inode();
     if mode != 0 {
-        if (mode & 4) != 0 && !inode.permissions.owner_read() {
-            return Errno::EACCES.into();
+        let mut mask = 0;
+        if (mode & 4) != 0 {
+            mask |= crate::fs::inode::MAY_READ;
         }
-        if (mode & 2) != 0 && !inode.permissions.owner_write() {
-            return Errno::EACCES.into();
+        if (mode & 2) != 0 {
+            mask |= crate::fs::inode::MAY_WRITE;
         }
-        if (mode & 1) != 0 && !inode.permissions.owner_exec() {
-            return Errno::EACCES.into();
+        if (mode & 1) != 0 {
+            mask |= crate::fs::inode::MAY_EXEC;
+        }
+        if let Err(e) = crate::fs::inode::check_permission(inode, mask) {
+            return e as SyscallResult;
         }
     }
 
@@ -861,6 +898,17 @@ pub fn sys_mkdir(pathname: *const u8, _mode: u32) -> SyscallResult {
         return Errno::ENOTDIR.into();
     }
 
+    if let Err(e) =
+        crate::fs::inode::check_permission(parent_inode.inode(), crate::fs::inode::MAY_WRITE)
+    {
+        return e as SyscallResult;
+    }
+    if let Err(e) =
+        crate::fs::inode::check_permission(parent_inode.inode(), crate::fs::inode::MAY_EXEC)
+    {
+        return e as SyscallResult;
+    }
+
     match parent_inode.mkdir(name) {
         Some(_) => 0,
         None => Errno::EACCES.into(),
@@ -889,6 +937,17 @@ pub fn sys_rmdir(pathname: *const u8) -> SyscallResult {
     // Make sure parent is a directory
     if parent_inode.inode().file_type != crate::fs::inode::FileType::Directory {
         return Errno::ENOTDIR.into();
+    }
+
+    if let Err(e) =
+        crate::fs::inode::check_permission(parent_inode.inode(), crate::fs::inode::MAY_WRITE)
+    {
+        return e as SyscallResult;
+    }
+    if let Err(e) =
+        crate::fs::inode::check_permission(parent_inode.inode(), crate::fs::inode::MAY_EXEC)
+    {
+        return e as SyscallResult;
     }
 
     match parent_inode.rmdir(name) {
@@ -922,6 +981,17 @@ pub fn sys_unlink(pathname: *const u8) -> SyscallResult {
     // Make sure parent is a directory
     if parent_inode.inode().file_type != crate::fs::inode::FileType::Directory {
         return Errno::ENOTDIR.into();
+    }
+
+    if let Err(e) =
+        crate::fs::inode::check_permission(parent_inode.inode(), crate::fs::inode::MAY_WRITE)
+    {
+        return e as SyscallResult;
+    }
+    if let Err(e) =
+        crate::fs::inode::check_permission(parent_inode.inode(), crate::fs::inode::MAY_EXEC)
+    {
+        return e as SyscallResult;
     }
 
     match parent_inode.unlink(name) {

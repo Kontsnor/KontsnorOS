@@ -4,6 +4,7 @@
 //! device, pipe, socket). The inode contains metadata about the object
 //! and pointers to its data.
 
+use crate::syscall::Errno;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -148,6 +149,50 @@ pub struct DirEntry {
     pub file_type: FileType,
 }
 
+pub const MAY_EXEC: u16 = 0o100;
+pub const MAY_WRITE: u16 = 0o200;
+pub const MAY_READ: u16 = 0o400;
+
+/// Check permission logic.
+pub fn check_permission(inode: &Inode, mask: u16) -> Result<(), Errno> {
+    let (euid, egid) = if let Some(pid) = crate::process::scheduler::current_pid() {
+        if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+            let task = task_arc.lock();
+            (task.euid, task.egid)
+        } else {
+            (0, 0)
+        }
+    } else {
+        (0, 0)
+    };
+
+    if euid == 0 {
+        // Root Bypass
+        if (mask & MAY_EXEC) != 0 && inode.file_type == FileType::Regular {
+            if (inode.permissions.mode & 0o111) == 0 {
+                return Err(Errno::EACCES);
+            }
+        }
+        return Ok(());
+    }
+
+    if euid == inode.uid {
+        if (inode.permissions.mode & mask) == mask {
+            return Ok(());
+        }
+    } else if egid == inode.gid {
+        if ((inode.permissions.mode << 3) & mask) == mask {
+            return Ok(());
+        }
+    } else {
+        if ((inode.permissions.mode << 6) & mask) == mask {
+            return Ok(());
+        }
+    }
+
+    Err(Errno::EACCES)
+}
+
 /// Trait for inode operations — implemented by each filesystem.
 ///
 /// This is the primary interface between the VFS and filesystem drivers.
@@ -155,6 +200,16 @@ pub struct DirEntry {
 pub trait InodeOps: Send + Sync {
     /// Get the inode metadata.
     fn inode(&self) -> &Inode;
+
+    /// Set permissions.
+    fn set_permissions(&self, _mode: u16) -> Result<(), i32> {
+        Err(-1) // EPERM
+    }
+
+    /// Set owner and group.
+    fn set_owner(&self, _uid: u32, _gid: u32) -> Result<(), i32> {
+        Err(-1) // EPERM
+    }
 
     /// Return the inner socket if this inode is a socket.
     fn as_socket(&self) -> Option<Arc<Mutex<crate::net::socket::Socket>>> {

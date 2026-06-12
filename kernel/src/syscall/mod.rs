@@ -442,6 +442,8 @@ pub fn init() {
         // 6. Configure IA32_KERNEL_GS_BASE MSR to 0 (swapped GS base, initially 0 for user space)
         let mut kernel_gs_msr = Msr::new(0xC0000102);
         kernel_gs_msr.write(0);
+
+        crate::process::scheduler::GS_BASE_ACTIVE.store(true, core::sync::atomic::Ordering::SeqCst);
     }
 
     kprintln!("[syscall] Syscall MSR registers configured. Syscall interface ready.");
@@ -561,6 +563,8 @@ pub fn dispatch(
         // Identity
         102 => process::sys_getuid(),
         104 => process::sys_getgid(),
+        105 => process::sys_setuid(arg0 as u32),
+        106 => process::sys_setgid(arg0 as u32),
         107 => process::sys_geteuid(),
         108 => process::sys_getegid(),
         // Network

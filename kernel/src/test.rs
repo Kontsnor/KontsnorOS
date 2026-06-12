@@ -197,3 +197,166 @@ fn test_orphan_reparenting() {
     let parent = parent_arc.lock();
     assert_eq!(parent.state, crate::process::task::TaskState::Zombie);
 }
+
+#[test_case]
+fn test_vfs_permissions() {
+    let pid = crate::process::scheduler::current_pid().expect("No current task");
+    let task_arc = crate::process::scheduler::get_task_arc(pid).expect("No task arc");
+
+    // Save original task credentials
+    let (orig_uid, orig_gid, orig_euid, orig_egid) = {
+        let t = task_arc.lock();
+        (t.uid, t.gid, t.euid, t.egid)
+    };
+
+    // Reset to root (0)
+    {
+        let mut t = task_arc.lock();
+        t.uid = 0;
+        t.gid = 0;
+        t.euid = 0;
+        t.egid = 0;
+    }
+
+    // 1. Check getuid / getgid / geteuid / getegid system calls
+    assert_eq!(crate::syscall::process::sys_getuid(), 0);
+    assert_eq!(crate::syscall::process::sys_getgid(), 0);
+    assert_eq!(crate::syscall::process::sys_geteuid(), 0);
+    assert_eq!(crate::syscall::process::sys_getegid(), 0);
+
+    // 2. setuid / setgid as root
+    assert_eq!(crate::syscall::process::sys_setuid(1000), 0);
+    assert_eq!(crate::syscall::process::sys_getuid(), 1000);
+    assert_eq!(crate::syscall::process::sys_geteuid(), 1000);
+
+    assert_eq!(crate::syscall::process::sys_setgid(2000), 0);
+    assert_eq!(crate::syscall::process::sys_getgid(), 2000);
+    assert_eq!(crate::syscall::process::sys_getegid(), 2000);
+
+    // 3. Restricting unauthorized credential changes (non-root setting UID to arbitrary values)
+    assert_eq!(
+        crate::syscall::process::sys_setuid(1001),
+        crate::syscall::Errno::EPERM as i64
+    );
+    assert_eq!(crate::syscall::process::sys_setuid(1000), 0);
+
+    assert_eq!(
+        crate::syscall::process::sys_setgid(2001),
+        crate::syscall::Errno::EPERM as i64
+    );
+    assert_eq!(crate::syscall::process::sys_setgid(2000), 0);
+
+    // 4. Access denial (EACCES) when attempting to open a file with incorrect permissions
+    {
+        let mut t = task_arc.lock();
+        t.uid = 0;
+        t.gid = 0;
+        t.euid = 0;
+        t.egid = 0;
+    }
+
+    let tmp_dir = crate::fs::vfs::lookup("/tmp").expect("Failed to lookup /tmp");
+    let test_dir = tmp_dir
+        .mkdir("perm_test_dir")
+        .expect("Failed to create /tmp/perm_test_dir");
+
+    let test_file = test_dir
+        .create("test_file.txt", crate::fs::inode::FileType::Regular)
+        .expect("Failed to create test file");
+
+    test_file
+        .set_owner(1000, 2000)
+        .expect("Failed to set owner");
+    test_file
+        .set_permissions(0o600)
+        .expect("Failed to set permissions");
+
+    // Make caller a different user (UID 3000, GID 3000)
+    {
+        let mut t = task_arc.lock();
+        t.uid = 3000;
+        t.gid = 3000;
+        t.euid = 3000;
+        t.egid = 3000;
+    }
+
+    // Try to check permission for test_file.txt
+    let looked_up =
+        crate::fs::vfs::lookup("/tmp/perm_test_dir/test_file.txt").expect("Lookup failed");
+    assert_eq!(
+        crate::fs::inode::check_permission(looked_up.inode(), crate::fs::inode::MAY_READ),
+        Err(crate::syscall::Errno::EACCES)
+    );
+
+    // If we are owner (UID 1000), it should succeed
+    {
+        let mut t = task_arc.lock();
+        t.euid = 1000;
+    }
+    assert_eq!(
+        crate::fs::inode::check_permission(looked_up.inode(), crate::fs::inode::MAY_READ),
+        Ok(())
+    );
+
+    // 5. Access denial when attempting to lookup a path containing a directory without execute permissions
+    {
+        let mut t = task_arc.lock();
+        t.uid = 0;
+        t.gid = 0;
+        t.euid = 0;
+        t.egid = 0;
+    }
+    test_dir
+        .set_permissions(0o600)
+        .expect("Failed to set dir permissions");
+
+    // Make caller a different user (UID 3000, GID 3000)
+    {
+        let mut t = task_arc.lock();
+        t.uid = 3000;
+        t.gid = 3000;
+        t.euid = 3000;
+        t.egid = 3000;
+    }
+
+    // Try to lookup path (should return None because intermediate directory has no execute permission for other)
+    assert!(crate::fs::vfs::lookup("/tmp/perm_test_dir/test_file.txt").is_none());
+
+    // 6. Privilege elevation in execve when launching a set-UID file (using calculate_exec_creds)
+    let (elevated_euid, elevated_egid) = crate::syscall::process::calculate_exec_creds(
+        0o4755, // set-UID set
+        0,      // owner is root
+        0, 1000, 1000,
+    );
+    assert_eq!(elevated_euid, 0);
+    assert_eq!(elevated_egid, 1000);
+
+    let (elevated_euid_gid, elevated_egid_gid) = crate::syscall::process::calculate_exec_creds(
+        0o2755, // set-GID set
+        0, 0, // group is root
+        1000, 1000,
+    );
+    assert_eq!(elevated_euid_gid, 1000);
+    assert_eq!(elevated_egid_gid, 0);
+
+    // Clean up
+    {
+        let mut t = task_arc.lock();
+        t.uid = 0;
+        t.gid = 0;
+        t.euid = 0;
+        t.egid = 0;
+    }
+    test_dir
+        .set_permissions(0o777)
+        .expect("Restore permissions");
+    let _ = test_dir.unlink("test_file.txt");
+    let _ = tmp_dir.rmdir("perm_test_dir");
+    {
+        let mut t = task_arc.lock();
+        t.uid = orig_uid;
+        t.gid = orig_gid;
+        t.euid = orig_euid;
+        t.egid = orig_egid;
+    }
+}

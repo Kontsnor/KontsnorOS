@@ -386,8 +386,14 @@ pub fn tick() {
     }
 }
 
+pub static GS_BASE_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Get the current task's PID (lock-free).
 pub fn current_pid() -> Option<Pid> {
+    if !GS_BASE_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     let pid_val: u64;
     unsafe {
         core::arch::asm!(

@@ -169,6 +169,13 @@ impl Vfs {
             let mut symlink_target = None;
 
             for component in components {
+                // Verify execute permission on the directory component before traversing/looking up the next one
+                if let Err(_) =
+                    crate::fs::inode::check_permission(current.inode(), crate::fs::inode::MAY_EXEC)
+                {
+                    return None;
+                }
+
                 i += 1;
                 let path_key = if resolved_till_now.is_empty() || resolved_till_now == "/" {
                     format!("/{}", component)

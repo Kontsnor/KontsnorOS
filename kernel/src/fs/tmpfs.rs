@@ -43,13 +43,25 @@ impl FileSystem for TmpFs {
 
 /// A tmpfs directory.
 pub struct TmpFsDir {
-    inode: Inode,
+    inode: RwLock<Inode>,
     entries: RwLock<BTreeMap<String, Arc<dyn InodeOps>>>,
 }
 
 impl InodeOps for TmpFsDir {
     fn inode(&self) -> &Inode {
-        &self.inode
+        unsafe { &*(&*self.inode.read() as *const Inode) }
+    }
+
+    fn set_permissions(&self, mode: u16) -> Result<(), i32> {
+        self.inode.write().permissions.mode = mode;
+        Ok(())
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) -> Result<(), i32> {
+        let mut inode = self.inode.write();
+        inode.uid = uid;
+        inode.gid = gid;
+        Ok(())
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn InodeOps>> {
@@ -63,7 +75,7 @@ impl InodeOps for TmpFsDir {
                 data: RwLock::new(Vec::new()),
             }),
             FileType::Directory => Arc::new(TmpFsDir {
-                inode: Inode::new(alloc_ino(), FileType::Directory),
+                inode: RwLock::new(Inode::new(alloc_ino(), FileType::Directory)),
                 entries: RwLock::new(BTreeMap::new()),
             }),
             _ => return None,
@@ -117,12 +129,12 @@ impl InodeOps for TmpFsDir {
         let mut result = vec![
             DirEntry {
                 name: String::from("."),
-                ino: self.inode.ino,
+                ino: self.inode().ino,
                 file_type: FileType::Directory,
             },
             DirEntry {
                 name: String::from(".."),
-                ino: self.inode.ino,
+                ino: self.inode().ino,
                 file_type: FileType::Directory,
             },
         ];
@@ -156,6 +168,18 @@ impl InodeOps for TmpFsFile {
             // use interior mutability differently.
             &*(&*self.inode.read() as *const Inode)
         }
+    }
+
+    fn set_permissions(&self, mode: u16) -> Result<(), i32> {
+        self.inode.write().permissions.mode = mode;
+        Ok(())
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) -> Result<(), i32> {
+        let mut inode = self.inode.write();
+        inode.uid = uid;
+        inode.gid = gid;
+        Ok(())
     }
 
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
@@ -202,7 +226,7 @@ impl InodeOps for TmpFsFile {
 /// Initialize tmpfs and mount at `/tmp`.
 pub fn init() {
     let root = Arc::new(TmpFsDir {
-        inode: Inode::new(alloc_ino(), FileType::Directory),
+        inode: RwLock::new(Inode::new(alloc_ino(), FileType::Directory)),
         entries: RwLock::new(BTreeMap::new()),
     });
 

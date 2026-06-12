@@ -150,6 +150,15 @@ pub struct Task {
 
     /// Tracks whether this task is currently queued in the scheduler priority queues.
     pub in_queue: bool,
+
+    /// Real User ID
+    pub uid: u32,
+    /// Real Group ID
+    pub gid: u32,
+    /// Effective User ID
+    pub euid: u32,
+    /// Effective Group ID
+    pub egid: u32,
 }
 
 impl Task {
@@ -198,6 +207,10 @@ impl Task {
             child_wait_queue: Arc::new(crate::sync::wait_queue::WaitQueue::new()),
             pgid: pid.as_u64(),
             in_queue: false,
+            uid: 0,
+            gid: 0,
+            euid: 0,
+            egid: 0,
         }
     }
 

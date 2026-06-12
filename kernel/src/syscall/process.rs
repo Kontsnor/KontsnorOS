@@ -64,6 +64,10 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
             child_task.brk = parent_task.brk;
             child_task.cwd = parent_task.cwd.clone();
             child_task.mmap_bump = parent_task.mmap_bump;
+            child_task.uid = parent_task.uid;
+            child_task.gid = parent_task.gid;
+            child_task.euid = parent_task.euid;
+            child_task.egid = parent_task.egid;
         } else {
             return Errno::ESRCH.into();
         }
@@ -158,6 +162,11 @@ pub fn sys_execve(
             return Errno::ENOENT.into();
         }
     };
+
+    // Verify execute permission on the executable file
+    if let Err(e) = crate::fs::inode::check_permission(inode.inode(), crate::fs::inode::MAY_EXEC) {
+        return e as SyscallResult;
+    }
 
     // Read the ELF binary
     let file_size = inode.inode().size as usize;
@@ -414,6 +423,19 @@ pub fn sys_execve(
         };
         if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
             let mut task = task_arc.lock();
+
+            // Set-UID and Set-GID executable support
+            let exec_mode = inode.inode().permissions.mode;
+            let (new_euid, new_egid) = calculate_exec_creds(
+                exec_mode,
+                inode.inode().uid,
+                inode.inode().gid,
+                task.uid,
+                task.gid,
+            );
+            task.euid = new_euid;
+            task.egid = new_egid;
+
             for action in task.sigactions.iter_mut() {
                 if action.sa_handler != 1 {
                     // If not SIG_IGN
@@ -663,22 +685,119 @@ pub fn sys_brk(addr: u64) -> SyscallResult {
 
 /// `getuid()` — Get real user ID.
 pub fn sys_getuid() -> SyscallResult {
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return 0,
+    };
+    if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+        return task_arc.lock().uid as SyscallResult;
+    }
     0
 }
 
 /// `getgid()` — Get real group ID.
 pub fn sys_getgid() -> SyscallResult {
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return 0,
+    };
+    if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+        return task_arc.lock().gid as SyscallResult;
+    }
     0
 }
 
 /// `geteuid()` — Get effective user ID.
 pub fn sys_geteuid() -> SyscallResult {
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return 0,
+    };
+    if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+        return task_arc.lock().euid as SyscallResult;
+    }
     0
 }
 
 /// `getegid()` — Get effective group ID.
 pub fn sys_getegid() -> SyscallResult {
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return 0,
+    };
+    if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+        return task_arc.lock().egid as SyscallResult;
+    }
     0
+}
+
+/// Helper to calculate new EUID/EGID for execve.
+pub fn calculate_exec_creds(
+    mode: u16,
+    file_uid: u32,
+    file_gid: u32,
+    real_uid: u32,
+    real_gid: u32,
+) -> (u32, u32) {
+    let euid = if mode & 0o4000 != 0 {
+        file_uid
+    } else {
+        real_uid
+    };
+    let egid = if mode & 0o2000 != 0 {
+        file_gid
+    } else {
+        real_gid
+    };
+    (euid, egid)
+}
+
+/// `setuid(uid)` — Set user ID.
+pub fn sys_setuid(uid: u32) -> SyscallResult {
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+        let mut task = task_arc.lock();
+        if task.euid == 0 {
+            task.uid = uid;
+            task.euid = uid;
+            return 0;
+        } else {
+            if uid == task.uid {
+                task.euid = uid;
+                return 0;
+            } else {
+                return Errno::EPERM.into();
+            }
+        }
+    }
+    Errno::ESRCH.into()
+}
+
+/// `setgid(gid)` — Set group ID.
+pub fn sys_setgid(gid: u32) -> SyscallResult {
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+        let mut task = task_arc.lock();
+        if task.egid == 0 {
+            task.gid = gid;
+            task.egid = gid;
+            return 0;
+        } else {
+            if gid == task.gid {
+                task.egid = gid;
+                return 0;
+            } else {
+                return Errno::EPERM.into();
+            }
+        }
+    }
+    Errno::ESRCH.into()
 }
 
 /// `arch_prctl()` — Set thread base register (FS_BASE).

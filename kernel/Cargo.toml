@@ -37,6 +37,12 @@ features = ["spin_no_std"]
 [dependencies.bootloader_api]
 version = "0.11"
 
+[[bin]]
+name = "kontsnor-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
 [features]
 default = []
 test = []

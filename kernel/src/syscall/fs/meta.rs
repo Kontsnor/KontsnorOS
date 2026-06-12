@@ -1,0 +1,751 @@
+//! File metadata and directory system calls.
+
+use super::super::{Errno, SyscallResult};
+use crate::fs::inode::{check_permission, FileType, MAY_EXEC, MAY_READ, MAY_WRITE};
+use crate::kprintln;
+use crate::process::fd as proc_fd;
+use crate::syscall::validation::{
+    copy_string_from_user, validate_user_ptr, validate_user_ptr_write,
+};
+use alloc::vec::Vec;
+
+#[repr(C)]
+struct LinuxDirent64 {
+    d_ino: u64,
+    d_off: i64,
+    d_reclen: u16,
+    d_type: u8,
+}
+
+/// `getdents64(fd, dirp, count)` — Get directory entries.
+pub fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
+    if fd < 0 || dirp.is_null() || count == 0 {
+        return Errno::EINVAL.into();
+    }
+    if !validate_user_ptr(dirp as *const u8, count) {
+        return Errno::EFAULT.into();
+    }
+
+    let inode = match proc_fd::current_task_read_fd(fd) {
+        Some(i) => i,
+        None => return Errno::EBADF.into(),
+    };
+
+    if !inode.inode().is_dir() {
+        return Errno::ENOTDIR.into();
+    }
+
+    let entries = inode.readdir();
+    let mut current_idx = proc_fd::get_fd_offset(fd).unwrap_or(0) as usize;
+    let mut bytes_written = 0;
+
+    while current_idx < entries.len() {
+        let entry = &entries[current_idx];
+        let name_bytes = entry.name.as_bytes();
+        let name_len = name_bytes.len();
+
+        // 19 bytes before name (8 + 8 + 2 + 1), align up to 8
+        let reclen = (19 + name_len + 1 + 7) & !7;
+
+        if bytes_written + reclen > count {
+            if bytes_written == 0 {
+                return Errno::EINVAL.into();
+            }
+            break;
+        }
+
+        let dest_ptr = unsafe { dirp.add(bytes_written) };
+
+        let d_type = match entry.file_type {
+            FileType::Directory => 4,
+            FileType::Regular => 8,
+            FileType::CharDevice => 2,
+            FileType::BlockDevice => 6,
+            FileType::Pipe => 1,
+            FileType::Socket => 12,
+            FileType::Symlink => 10,
+        };
+
+        let header = LinuxDirent64 {
+            d_ino: entry.ino,
+            d_off: (current_idx + 1) as i64,
+            d_reclen: reclen as u16,
+            d_type,
+        };
+
+        unsafe {
+            core::ptr::write(dest_ptr as *mut LinuxDirent64, header);
+            let name_dest = dest_ptr.add(19);
+            core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_dest, name_len);
+            *name_dest.add(name_len) = 0;
+        }
+
+        bytes_written += reclen;
+        current_idx += 1;
+    }
+
+    proc_fd::set_fd_offset(fd, current_idx as u64);
+    bytes_written as SyscallResult
+}
+
+/// `chdir(pathname)` — Change working directory.
+pub fn sys_chdir(pathname: *const u8) -> SyscallResult {
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+
+    // Lookup the directory in VFS
+    let inode = match crate::fs::vfs::lookup(&resolved_path) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    // Verify it is a directory
+    if !inode.inode().is_dir() {
+        return Errno::ENOTDIR.into();
+    }
+
+    // Update current task's cwd
+    let current_pid = match crate::process::scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+
+    let task_arc = match crate::process::scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
+    };
+    task_arc.lock().cwd = resolved_path;
+    0 // Success
+}
+
+/// `getcwd(buf, size)` — Get current working directory.
+pub fn sys_getcwd(buf: *mut u8, size: usize) -> SyscallResult {
+    if buf.is_null() || size == 0 {
+        return Errno::EINVAL.into();
+    }
+    if !validate_user_ptr(buf as *const u8, size) {
+        return Errno::EFAULT.into();
+    }
+
+    let current_pid = match crate::process::scheduler::current_pid() {
+        Some(p) => p,
+        None => return 0, // returns NULL on error
+    };
+
+    let task_arc = match crate::process::scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return 0,
+    };
+    let cwd = task_arc.lock().cwd.clone();
+
+    let cwd_bytes = cwd.as_bytes();
+    if cwd_bytes.len() + 1 > size {
+        return Errno::EINVAL.into(); // buffer too small
+    }
+
+    // Write to user space
+    unsafe {
+        core::ptr::copy_nonoverlapping(cwd_bytes.as_ptr(), buf, cwd_bytes.len());
+        buf.add(cwd_bytes.len()).write(0); // null terminator
+    }
+
+    buf as SyscallResult
+}
+
+/// Linux stat structure layout (x86_64 ABI compatible)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LinuxStat {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_nlink: u64,
+    pub st_mode: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub __pad0: u32,
+    pub st_rdev: u64,
+    pub st_size: i64,
+    pub st_blksize: i64,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_atime_nsec: i64,
+    pub st_mtime: i64,
+    pub st_mtime_nsec: i64,
+    pub st_ctime: i64,
+    pub st_ctime_nsec: i64,
+    pub __unused: [i64; 3],
+}
+
+fn file_type_to_st_mode(file_type: FileType) -> u32 {
+    match file_type {
+        FileType::Regular => 0o100000,
+        FileType::Directory => 0o040000,
+        FileType::CharDevice => 0o020000,
+        FileType::BlockDevice => 0o060000,
+        FileType::Pipe => 0o010000,
+        FileType::Symlink => 0o120000,
+        FileType::Socket => 0o140000,
+    }
+}
+
+fn populate_stat(inode_ops: &dyn crate::fs::inode::InodeOps) -> LinuxStat {
+    let inode = inode_ops.inode();
+    let mode = file_type_to_st_mode(inode.file_type) | (inode.permissions.mode as u32);
+
+    LinuxStat {
+        st_dev: 0,
+        st_ino: inode.ino,
+        st_nlink: inode.nlink as u64,
+        st_mode: mode,
+        st_uid: inode.uid,
+        st_gid: inode.gid,
+        __pad0: 0,
+        st_rdev: inode.rdev,
+        st_size: inode.size as i64,
+        st_blksize: 1024,
+        st_blocks: inode.blocks as i64,
+        st_atime: inode.atime as i64,
+        st_atime_nsec: 0,
+        st_mtime: inode.mtime as i64,
+        st_mtime_nsec: 0,
+        st_ctime: inode.ctime as i64,
+        st_ctime_nsec: 0,
+        __unused: [0; 3],
+    }
+}
+
+/// `fstat(fd, statbuf)` — Get file status by descriptor.
+pub fn sys_fstat(fd: i32, statbuf: *mut LinuxStat) -> SyscallResult {
+    if statbuf.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if !validate_user_ptr(statbuf as *const u8, core::mem::size_of::<LinuxStat>()) {
+        return Errno::EFAULT.into();
+    }
+    let inode_ops = match proc_fd::current_task_read_fd(fd) {
+        Some(i) => i,
+        None => return Errno::EBADF.into(),
+    };
+    let stat = populate_stat(inode_ops.as_ref());
+    unsafe {
+        statbuf.write(stat);
+    }
+    0
+}
+
+/// `newfstatat(dfd, pathname, statbuf, flags)` — Get file status relative to directory fd.
+pub fn sys_newfstatat(
+    dfd: i32,
+    pathname: *const u8,
+    statbuf: *mut LinuxStat,
+    _flags: i32,
+) -> SyscallResult {
+    if pathname.is_null() || statbuf.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if !validate_user_ptr(statbuf as *const u8, core::mem::size_of::<LinuxStat>()) {
+        return Errno::EFAULT.into();
+    }
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved_path = if raw_path.starts_with('/') {
+        raw_path
+    } else if dfd == -100 {
+        // AT_FDCWD
+        crate::fs::vfs::resolve_relative_path(&raw_path)
+    } else {
+        crate::fs::vfs::resolve_relative_path(&raw_path)
+    };
+
+    let follow_last = (_flags & 0x100) == 0; // AT_SYMLINK_NOFOLLOW = 0x100
+
+    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved_path, follow_last) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    let stat = populate_stat(inode_ops.as_ref());
+    unsafe {
+        statbuf.write(stat);
+    }
+    0
+}
+
+/// `faccessat(dfd, pathname, mode, flags)` — Check user's permissions for a file relative to directory fd.
+pub fn sys_faccessat(dfd: i32, pathname: *const u8, mode: i32, _flags: i32) -> SyscallResult {
+    if pathname.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved_path = if raw_path.starts_with('/') {
+        raw_path
+    } else if dfd == -100 {
+        // AT_FDCWD
+        crate::fs::vfs::resolve_relative_path(&raw_path)
+    } else {
+        crate::fs::vfs::resolve_relative_path(&raw_path)
+    };
+
+    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved_path, true) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    let inode = inode_ops.inode();
+    if mode != 0 {
+        let mut mask = 0;
+        if (mode & 4) != 0 {
+            mask |= MAY_READ;
+        }
+        if (mode & 2) != 0 {
+            mask |= MAY_WRITE;
+        }
+        if (mode & 1) != 0 {
+            mask |= MAY_EXEC;
+        }
+        if let Err(e) = check_permission(inode, mask) {
+            return e as SyscallResult;
+        }
+    }
+
+    0
+}
+
+/// `mkdir(pathname, mode)` — Create a directory.
+pub fn sys_mkdir(pathname: *const u8, _mode: u32) -> SyscallResult {
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+    kprintln!("[syscall] mkdir(\"{}\")", resolved_path);
+
+    // Check if the destination already exists
+    if crate::fs::vfs::lookup(&resolved_path).is_some() {
+        return Errno::EEXIST.into();
+    }
+
+    // Split resolved_path into parent directory and base name
+    let (parent_path, name) = crate::fs::path::split_path(&resolved_path);
+
+    // Lookup parent directory
+    let parent_inode = match crate::fs::vfs::lookup(parent_path) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    // Make sure parent is a directory
+    if parent_inode.inode().file_type != FileType::Directory {
+        return Errno::ENOTDIR.into();
+    }
+
+    if let Err(e) = check_permission(parent_inode.inode(), MAY_WRITE) {
+        return e as SyscallResult;
+    }
+    if let Err(e) = check_permission(parent_inode.inode(), MAY_EXEC) {
+        return e as SyscallResult;
+    }
+
+    match parent_inode.mkdir(name) {
+        Some(_) => 0,
+        None => Errno::EACCES.into(),
+    }
+}
+
+/// `rmdir(pathname)` — Remove a directory.
+pub fn sys_rmdir(pathname: *const u8) -> SyscallResult {
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+    kprintln!("[syscall] rmdir(\"{}\")", resolved_path);
+
+    // Split resolved_path into parent directory and base name
+    let (parent_path, name) = crate::fs::path::split_path(&resolved_path);
+
+    // Lookup parent directory
+    let parent_inode = match crate::fs::vfs::lookup(parent_path) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    // Make sure parent is a directory
+    if parent_inode.inode().file_type != FileType::Directory {
+        return Errno::ENOTDIR.into();
+    }
+
+    if let Err(e) = check_permission(parent_inode.inode(), MAY_WRITE) {
+        return e as SyscallResult;
+    }
+    if let Err(e) = check_permission(parent_inode.inode(), MAY_EXEC) {
+        return e as SyscallResult;
+    }
+
+    match parent_inode.rmdir(name) {
+        Ok(_) => {
+            crate::fs::vfs::invalidate_dentry(&resolved_path);
+            0
+        }
+        Err(e) => e as SyscallResult,
+    }
+}
+
+/// `unlink(pathname)` — Remove a file.
+pub fn sys_unlink(pathname: *const u8) -> SyscallResult {
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+    kprintln!("[syscall] unlink(\"{}\")", resolved_path);
+
+    // Split resolved_path into parent directory and base name
+    let (parent_path, name) = crate::fs::path::split_path(&resolved_path);
+
+    // Lookup parent directory
+    let parent_inode = match crate::fs::vfs::lookup(parent_path) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    // Make sure parent is a directory
+    if parent_inode.inode().file_type != FileType::Directory {
+        return Errno::ENOTDIR.into();
+    }
+
+    if let Err(e) = check_permission(parent_inode.inode(), MAY_WRITE) {
+        return e as SyscallResult;
+    }
+    if let Err(e) = check_permission(parent_inode.inode(), MAY_EXEC) {
+        return e as SyscallResult;
+    }
+
+    match parent_inode.unlink(name) {
+        Ok(_) => {
+            crate::fs::vfs::invalidate_dentry(&resolved_path);
+            0
+        }
+        Err(e) => e as SyscallResult,
+    }
+}
+
+/// `stat(pathname, statbuf)` — Get file status by path.
+pub fn sys_stat(pathname: *const u8, statbuf: *mut LinuxStat) -> SyscallResult {
+    if statbuf.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if !validate_user_ptr(statbuf as *const u8, core::mem::size_of::<LinuxStat>()) {
+        return Errno::EFAULT.into();
+    }
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved = crate::fs::vfs::resolve_relative_path(&raw_path);
+    if crate::syscall::DEBUG_SYSCALLS {
+        kprintln!("[syscall] stat(\"{}\")", resolved);
+    }
+
+    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved, true) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    let stat = populate_stat(inode_ops.as_ref());
+    unsafe {
+        statbuf.write(stat);
+    }
+    0
+}
+
+/// `lstat(pathname, statbuf)` — Get file status by path, not following symlinks.
+pub fn sys_lstat(pathname: *const u8, statbuf: *mut LinuxStat) -> SyscallResult {
+    if statbuf.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if !validate_user_ptr(statbuf as *const u8, core::mem::size_of::<LinuxStat>()) {
+        return Errno::EFAULT.into();
+    }
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved = crate::fs::vfs::resolve_relative_path(&raw_path);
+    if crate::syscall::DEBUG_SYSCALLS {
+        kprintln!("[syscall] lstat(\"{}\")", resolved);
+    }
+
+    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved, false) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    let stat = populate_stat(inode_ops.as_ref());
+    unsafe {
+        statbuf.write(stat);
+    }
+    0
+}
+
+/// `access(pathname, mode)` — Check file accessibility.
+///
+/// We defer to `faccessat` with `AT_FDCWD` and no flags.
+pub fn sys_access(pathname: *const u8, mode: i32) -> SyscallResult {
+    sys_faccessat(-100, pathname, mode, 0)
+}
+
+/// `rename(oldpath, newpath)` — Rename a file or directory.
+pub fn sys_rename(oldpath: *const u8, newpath: *const u8) -> SyscallResult {
+    let raw_old = match unsafe { copy_string_from_user(oldpath) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let raw_new = match unsafe { copy_string_from_user(newpath) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved_old = crate::fs::vfs::resolve_relative_path(&raw_old);
+    let resolved_new = crate::fs::vfs::resolve_relative_path(&raw_new);
+    kprintln!(
+        "[syscall] rename(\"{}\" -> \"{}\")",
+        resolved_old,
+        resolved_new
+    );
+
+    // Split paths into parent + name
+    let (old_parent_path, old_name) = crate::fs::path::split_path(&resolved_old);
+    let (new_parent_path, new_name) = crate::fs::path::split_path(&resolved_new);
+
+    let old_parent = match crate::fs::vfs::lookup(old_parent_path) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    // For now: read the file data, create at new location, remove at old location.
+    // This works for regular files in tmpfs; directory rename is not supported.
+    let src_inode_ops = match crate::fs::vfs::lookup(&resolved_old) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    let file_size = src_inode_ops.inode().size as usize;
+    let mut buf = alloc::vec![0u8; file_size];
+    if file_size > 0 {
+        let _ = src_inode_ops.read(0, &mut buf);
+    }
+
+    // Create file at new location
+    let new_parent = match crate::fs::vfs::lookup(new_parent_path) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+    let new_inode = match new_parent.create(new_name, FileType::Regular) {
+        Some(i) => i,
+        None => return Errno::ENOSPC.into(),
+    };
+    if file_size > 0 {
+        let _ = new_inode.write(0, &buf);
+    }
+
+    // Remove old file
+    let _ = old_parent.unlink(old_name);
+    crate::fs::vfs::invalidate_dentry(&resolved_old);
+    crate::fs::vfs::invalidate_dentry(&resolved_new);
+    0
+}
+
+/// `link(oldpath, newpath)` — Create a hard link.
+///
+/// KontsnorOS does not support hard links; return EPERM.
+pub fn sys_link(_oldpath: *const u8, _newpath: *const u8) -> SyscallResult {
+    Errno::EPERM.into()
+}
+
+/// `readlink(pathname, buf, bufsize)` — Read the value of a symbolic link.
+pub fn sys_readlink(pathname: *const u8, buf: *mut u8, bufsize: usize) -> SyscallResult {
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+    if crate::syscall::DEBUG_SYSCALLS {
+        kprintln!("[syscall] readlink(\"{}\")", resolved_path);
+    }
+
+    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved_path, false) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    if inode_ops.inode().file_type != FileType::Symlink {
+        return Errno::EINVAL.into();
+    }
+
+    if buf.is_null() || bufsize == 0 {
+        return 0;
+    }
+    if !validate_user_ptr(buf as *const u8, bufsize) {
+        return Errno::EFAULT.into();
+    }
+
+    let mut kernel_buf = alloc::vec![0u8; bufsize];
+    match inode_ops.read(0, &mut kernel_buf) {
+        Ok(n) => {
+            unsafe {
+                core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf, n);
+            }
+            n as SyscallResult
+        }
+        Err(e) => e as SyscallResult,
+    }
+}
+
+/// `readlinkat(dirfd, pathname, buf, bufsize)` — `readlink` relative to a directory fd.
+pub fn sys_readlinkat(
+    dirfd: i32,
+    pathname: *const u8,
+    buf: *mut u8,
+    bufsize: usize,
+) -> SyscallResult {
+    if dirfd == -100 {
+        // AT_FDCWD
+        sys_readlink(pathname, buf, bufsize)
+    } else {
+        if crate::syscall::DEBUG_SYSCALLS {
+            kprintln!("[syscall] sys_readlinkat: only AT_FDCWD is supported currently");
+        }
+        Errno::ENOSYS.into()
+    }
+}
+
+/// `symlink(target, linkpath)` — Create a symbolic link.
+pub fn sys_symlink(target: *const u8, linkpath: *const u8) -> SyscallResult {
+    let raw_target = match unsafe { copy_string_from_user(target) } {
+        Some(t) => t,
+        None => return Errno::EFAULT.into(),
+    };
+    let raw_linkpath = match unsafe { copy_string_from_user(linkpath) } {
+        Some(l) => l,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved_linkpath = crate::fs::vfs::resolve_relative_path(&raw_linkpath);
+    if crate::syscall::DEBUG_SYSCALLS {
+        kprintln!(
+            "[syscall] symlink(\"{}\" -> \"{}\")",
+            resolved_linkpath,
+            raw_target
+        );
+    }
+
+    // Check if the destination linkpath already exists
+    if crate::fs::vfs::lookup(&resolved_linkpath).is_some() {
+        return Errno::EEXIST.into();
+    }
+
+    // Split resolved_linkpath into parent directory and base name
+    let (parent_path, name) = crate::fs::path::split_path(&resolved_linkpath);
+
+    // Lookup parent directory
+    let parent_inode = match crate::fs::vfs::lookup(parent_path) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    // Make sure parent is a directory
+    if parent_inode.inode().file_type != FileType::Directory {
+        return Errno::ENOTDIR.into();
+    }
+
+    // Create the symlink inode
+    let symlink_inode = match parent_inode.create(name, FileType::Symlink) {
+        Some(i) => i,
+        None => return Errno::ENOSPC.into(),
+    };
+
+    // Write the target path into the symlink file
+    let target_bytes = raw_target.as_bytes();
+    match symlink_inode.write(0, target_bytes) {
+        Ok(n) if n == target_bytes.len() => 0,
+        Ok(_) => Errno::ENOSPC.into(),
+        Err(e) => e as SyscallResult,
+    }
+}
+
+/// `symlinkat(target, newdirfd, linkpath)` — Create a symbolic link relative to a directory fd.
+pub fn sys_symlinkat(target: *const u8, newdirfd: i32, linkpath: *const u8) -> SyscallResult {
+    if newdirfd == -100 {
+        // AT_FDCWD
+        sys_symlink(target, linkpath)
+    } else {
+        if crate::syscall::DEBUG_SYSCALLS {
+            kprintln!("[syscall] sys_symlinkat: only AT_FDCWD is supported currently");
+        }
+        Errno::ENOSYS.into()
+    }
+}
+
+/// `poll` fd event struct.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+/// `poll(fds, nfds, timeout)` — Wait for events on file descriptors.
+///
+/// Stub: marks all fds as having POLLIN|POLLOUT ready and returns immediately.
+/// A real implementation would block in the scheduler until events fire.
+pub fn sys_poll(fds: *mut u8, nfds: u64, _timeout: i32) -> SyscallResult {
+    if fds.is_null() || nfds == 0 {
+        return 0;
+    }
+    let total_size = match (nfds as usize).checked_mul(core::mem::size_of::<PollFd>()) {
+        Some(s) => s,
+        None => return Errno::EINVAL.into(),
+    };
+    if validate_user_ptr_write(fds, total_size).is_err() {
+        return Errno::EFAULT.into();
+    }
+
+    let mut local_fds = alloc::vec![PollFd { fd: 0, events: 0, revents: 0 }; nfds as usize];
+    unsafe {
+        core::ptr::copy_nonoverlapping(fds as *const PollFd, local_fds.as_mut_ptr(), nfds as usize);
+    }
+
+    let mut ready = 0i64;
+    for pfd in local_fds.iter_mut() {
+        if pfd.fd >= 0 {
+            pfd.revents = pfd.events;
+            ready += 1;
+        } else {
+            pfd.revents = 0;
+        }
+    }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(local_fds.as_ptr(), fds as *mut PollFd, nfds as usize);
+    }
+
+    ready as SyscallResult
+}

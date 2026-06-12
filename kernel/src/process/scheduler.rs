@@ -28,7 +28,7 @@ pub(crate) static TASKS: KRwLock<Vec<Option<Arc<spin::Mutex<Task>>>>> = KRwLock:
 /// The Multi-Level Feedback Queue scheduler.
 pub struct Scheduler {
     /// Priority queues — one per priority level.
-    queues: [VecDeque<Pid>; NUM_PRIORITIES],
+    pub(crate) queues: [VecDeque<Pid>; NUM_PRIORITIES],
 
     /// The currently running task's PID per CPU core.
     pub(crate) current_cpus: [Option<Pid>; 32],
@@ -414,22 +414,7 @@ pub fn yield_now() {
     schedule();
 }
 
-/// Exits the currently running task.
-pub fn exit_current_thread(exit_code: i32) -> ! {
-    x86_64::instructions::interrupts::disable();
-    if let Some(current_pid) = current_pid() {
-        if let Some(ref mut scheduler) = *SCHEDULER.lock() {
-            scheduler.exit_task(current_pid, exit_code);
-        }
-    }
-
-    schedule();
-
-    // If there is absolutely no other task left (should not happen due to idle task)
-    loop {
-        x86_64::instructions::hlt();
-    }
-}
+pub use super::lifecycle::exit_current_thread;
 
 /// Trigger the scheduler to run the next ready task.
 pub fn schedule() {
@@ -574,30 +559,4 @@ pub fn set_bootstrap_thread(task: Task) {
     }
 }
 
-/// Block a task.
-pub fn block_task(pid: Pid) {
-    let idx = pid.as_u64() as usize;
-    let tasks = TASKS.read();
-    if let Some(Some(task_arc)) = tasks.get(idx) {
-        task_arc.lock().state = TaskState::Blocked;
-    }
-}
-
-/// Wake up a blocked task.
-pub fn wake_task(pid: Pid) {
-    let idx = pid.as_u64() as usize;
-    let tasks = TASKS.read();
-    if let Some(Some(task_arc)) = tasks.get(idx) {
-        let mut task = task_arc.lock();
-        if task.state == TaskState::Blocked {
-            task.state = TaskState::Ready;
-            if !task.in_queue {
-                if let Some(ref mut scheduler) = *SCHEDULER.lock() {
-                    let priority = task.priority as usize;
-                    scheduler.queues[priority].push_back(pid);
-                    task.in_queue = true;
-                }
-            }
-        }
-    }
-}
+pub use super::lifecycle::{block_task, wake_task};

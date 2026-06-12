@@ -11,6 +11,7 @@ pub mod memory;
 pub mod net;
 pub mod process;
 pub mod signal;
+pub mod validation;
 
 pub const DEBUG_SYSCALLS: bool = false;
 

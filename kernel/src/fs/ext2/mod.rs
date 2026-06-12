@@ -554,11 +554,27 @@ impl InodeOps for Ext2Inode {
     }
 
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
-        self.read_file(offset, buf)
+        if self.inode().file_type == FileType::Regular {
+            self.read_page_cache(offset, buf)
+        } else {
+            self.read_file(offset, buf)
+        }
     }
 
     fn write(&self, offset: u64, buf: &[u8]) -> Result<usize, i32> {
-        self.write_file(offset, buf)
+        if self.inode().file_type == FileType::Regular {
+            self.write_page_cache(offset, buf)
+        } else {
+            self.write_file(offset, buf)
+        }
+    }
+
+    fn read_direct(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
+        self.read_file(offset, buf)
+    }
+
+    fn write_direct(&self, offset: u64, data: &[u8]) -> Result<usize, i32> {
+        self.write_file(offset, data)
     }
 
     fn create(&self, name: &str, file_type: FileType) -> Option<Arc<dyn InodeOps>> {

@@ -156,6 +156,22 @@ pub fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
     total_written as SyscallResult
 }
 
+/// `fsync(fd)` — Commit file buffer cache/page cache changes to disk.
+pub fn sys_fsync(fd: i32) -> SyscallResult {
+    if fd < 0 {
+        return Errno::EBADF.into();
+    }
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+
+    match crate::memory::page_cache::flush_all_for_inode(&file_desc.inode) {
+        Ok(_) => 0,
+        Err(e) => e as SyscallResult,
+    }
+}
+
 /// `lseek(fd, offset, whence)` — Reposition file offset.
 pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> SyscallResult {
     if fd < 0 {

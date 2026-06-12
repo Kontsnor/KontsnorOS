@@ -31,7 +31,7 @@ pub fn sys_mmap(
 ) -> SyscallResult {
     use crate::process::fd as proc_fd;
     use crate::process::scheduler;
-    use x86_64::structures::paging::{Page, PhysFrame, Size4KiB};
+    use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
     use x86_64::{PhysAddr, VirtAddr};
 
     kprintln!(
@@ -47,8 +47,9 @@ pub fn sys_mmap(
         return Errno::EINVAL.into();
     }
 
-    // We support anonymous private mappings and private file mappings
+    // We support anonymous private mappings and private/shared file mappings
     let is_anon = (flags & 0x20) != 0 || fd == -1;
+    let is_shared = (flags & 0x01) != 0;
 
     let file_desc = if !is_anon {
         match proc_fd::current_task_get_file_desc(fd) {
@@ -115,44 +116,102 @@ pub fn sys_mmap(
     let page_flags = prot_to_page_flags(prot);
 
     for page in Page::range_inclusive(start_page, end_page) {
-        if let Some(phys) = crate::memory::physical::allocate_frame() {
-            let frame = PhysFrame::containing_address(PhysAddr::new(phys));
+        let page_offset = page.start_address().as_u64() - resolved_addr;
+        let file_offset = offset as u64 + page_offset;
 
-            // Map the page
-            let _ = unsafe {
-                crate::memory::r#virtual::map_user_page_no_shootdown(
-                    page_table_root,
-                    page,
-                    frame,
-                    page_flags,
-                )
-            };
-
-            // Write content
-            let dest = (phys + crate::memory::r#virtual::phys_mem_offset()) as *mut u8;
-            let dest_slice = unsafe { core::slice::from_raw_parts_mut(dest, 4096) };
-            dest_slice.fill(0);
-
-            if let Some(ref desc) = file_desc {
-                let page_file_offset =
-                    offset as u64 + (page.start_address().as_u64() - resolved_addr);
-                let _ = desc.inode.read(page_file_offset, dest_slice);
+        let phys = if is_anon {
+            if let Some(p) = crate::memory::physical::allocate_frame() {
+                // Zero the anon frame
+                let dest = (p + crate::memory::r#virtual::phys_mem_offset()) as *mut u8;
+                unsafe {
+                    core::ptr::write_bytes(dest, 0, 4096);
+                }
+                p
+            } else {
+                // Eager rollback on OOM
+                let unmap_end_page = page;
+                for unmap_page in Page::range(start_page, unmap_end_page) {
+                    if let Ok(phys_addr) = unsafe {
+                        crate::memory::r#virtual::unmap_user_page_no_shootdown(
+                            page_table_root,
+                            unmap_page,
+                        )
+                    } {
+                        crate::memory::physical::deallocate_frame(phys_addr);
+                    }
+                }
+                crate::arch::x86_64::smp::shootdown_tlb();
+                return Errno::ENOMEM.into();
             }
         } else {
-            // Eager rollback on OOM
-            let unmap_end_page = page;
-            for unmap_page in Page::range(start_page, unmap_end_page) {
-                if let Ok(phys_addr) = unsafe {
-                    crate::memory::r#virtual::unmap_user_page_no_shootdown(
-                        page_table_root,
-                        unmap_page,
-                    )
-                } {
-                    crate::memory::physical::deallocate_frame(phys_addr);
+            // File-backed mapping: retrieve from page cache
+            match crate::memory::page_cache::get_or_create_page(
+                &file_desc.as_ref().unwrap().inode,
+                file_offset,
+            ) {
+                Ok(p) => p,
+                Err(_) => {
+                    // Eager rollback on OOM
+                    let unmap_end_page = page;
+                    for unmap_page in Page::range(start_page, unmap_end_page) {
+                        if let Ok(phys_addr) = unsafe {
+                            crate::memory::r#virtual::unmap_user_page_no_shootdown(
+                                page_table_root,
+                                unmap_page,
+                            )
+                        } {
+                            crate::memory::physical::deallocate_frame(phys_addr);
+                        }
+                    }
+                    crate::arch::x86_64::smp::shootdown_tlb();
+                    return Errno::ENOMEM.into();
                 }
             }
-            crate::arch::x86_64::smp::shootdown_tlb();
-            return Errno::ENOMEM.into();
+        };
+
+        let frame = PhysFrame::containing_address(PhysAddr::new(phys));
+
+        let actual_flags = if !is_anon && !is_shared && (prot & 2) != 0 {
+            // Private + Writable -> Copy-On-Write!
+            let mut flags = page_flags;
+            flags.remove(PageTableFlags::WRITABLE);
+            flags.insert(PageTableFlags::BIT_9);
+            flags
+        } else {
+            page_flags
+        };
+
+        // Map the page
+        let _ = unsafe {
+            crate::memory::r#virtual::map_user_page_no_shootdown(
+                page_table_root,
+                page,
+                frame,
+                actual_flags,
+            )
+        };
+
+        // If it's file-backed, we must increment the reference count because we mapped a page cache frame
+        if !is_anon {
+            crate::memory::physical::increment_ref(phys);
+        }
+    }
+
+    // Add to task's mmap_regions
+    {
+        let task_arc = match scheduler::get_task_arc(current_pid) {
+            Some(t) => t,
+            None => return Errno::ESRCH.into(),
+        };
+        let mut task = task_arc.lock();
+        if let Some(ref desc) = file_desc {
+            task.mmap_regions.push(crate::process::task::MappedRegion {
+                start: resolved_addr,
+                len: aligned_len,
+                inode_ino: desc.inode.inode().ino,
+                offset: offset as u64,
+                is_shared,
+            });
         }
     }
 
@@ -207,6 +266,44 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
             crate::memory::physical::deallocate_frame(phys_addr);
             unmapped_count += 1;
         }
+    }
+
+    // unmap and remove/shrink task.mmap_regions
+    {
+        let mut task = task_arc.lock();
+        let mut new_regions = alloc::vec::Vec::new();
+        let unmap_start = addr;
+        let unmap_end = addr + aligned_len as u64;
+
+        for r in task.mmap_regions.iter() {
+            let r_start = r.start;
+            let r_end = r.start + r.len as u64;
+
+            if r_end <= unmap_start || r_start >= unmap_end {
+                new_regions.push(r.clone());
+            } else {
+                if r_start < unmap_start {
+                    new_regions.push(crate::process::task::MappedRegion {
+                        start: r_start,
+                        len: (unmap_start - r_start) as usize,
+                        inode_ino: r.inode_ino,
+                        offset: r.offset,
+                        is_shared: r.is_shared,
+                    });
+                }
+                if r_end > unmap_end {
+                    let diff = unmap_end - r_start;
+                    new_regions.push(crate::process::task::MappedRegion {
+                        start: unmap_end,
+                        len: (r_end - unmap_end) as usize,
+                        inode_ino: r.inode_ino,
+                        offset: r.offset + diff,
+                        is_shared: r.is_shared,
+                    });
+                }
+            }
+        }
+        task.mmap_regions = new_regions;
     }
 
     if unmapped_count > 0 {

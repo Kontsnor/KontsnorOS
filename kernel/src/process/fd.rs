@@ -108,16 +108,23 @@ pub fn current_task_close_fd(fd: i32) -> bool {
     };
     let mut task = task_arc.lock();
 
-    if let Some(slot) = task.fd_table.get_mut(fd_idx) {
-        if let Some(desc) = slot.take() {
-            let mut rc = desc.ref_count.lock();
-            if *rc > 0 {
-                *rc -= 1;
-            }
-            return true;
+    let desc = if let Some(slot) = task.fd_table.get_mut(fd_idx) {
+        slot.take()
+    } else {
+        None
+    };
+
+    drop(task); // Drop the task lock before dropping the desc (which might trigger Drop calling flush_all_for_inode)
+
+    if let Some(desc) = desc {
+        let mut rc = desc.ref_count.lock();
+        if *rc > 0 {
+            *rc -= 1;
         }
+        true
+    } else {
+        false
     }
-    false
 }
 
 /// Duplicate an existing file descriptor `fd` in the current task's fd_table.

@@ -360,3 +360,214 @@ fn test_vfs_permissions() {
         t.egid = orig_egid;
     }
 }
+
+#[test_case]
+fn test_shared_mapping_communication() {
+    kprintln!("[test] Starting shared mapping communication test...");
+    // 1. Create and open file on ext2 via VFS directly
+    let disk_dir = crate::fs::vfs::lookup("/disk").expect("Failed to lookup /disk");
+    let _ = disk_dir.unlink("shared_test.txt");
+    let inode = disk_dir
+        .create("shared_test.txt", crate::fs::inode::FileType::Regular)
+        .expect("Failed to create shared_test.txt");
+
+    // 2. Write 4096 bytes directly using InodeOps::write to populate/extend it
+    let data = [0u8; 4096];
+    let written = inode
+        .write(0, &data)
+        .expect("Failed to write to shared_test.txt");
+    assert_eq!(written, 4096);
+
+    // Allocate file descriptor manually
+    let fd = crate::process::fd::current_task_alloc_fd(inode.clone())
+        .expect("Failed to allocate file descriptor");
+
+    // 3. mmap it with MAP_SHARED
+    let addr1 = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x01, fd, 0); // PROT_READ|WRITE, MAP_SHARED
+    assert!(addr1 > 0);
+
+    // 4. Simulate fork by cloning page table
+    let current_pid = crate::process::scheduler::current_pid().unwrap();
+    let parent_task_arc = crate::process::scheduler::get_task_arc(current_pid).unwrap();
+    let (parent_cr3, mmap_regions) = {
+        let task = parent_task_arc.lock();
+        (task.page_table_root, task.mmap_regions.clone())
+    };
+    let child_cr3 = crate::memory::r#virtual::clone_parent_page_table(parent_cr3, &mmap_regions)
+        .expect("Failed to clone page table");
+
+    // Verify both point to same physical address
+    let vaddr = x86_64::VirtAddr::new(addr1 as u64);
+    let pte_parent = unsafe { crate::memory::page_cache::get_page_table_entry(parent_cr3, vaddr) }
+        .expect("Parent PTE missing");
+    let pte_child = unsafe { crate::memory::page_cache::get_page_table_entry(child_cr3, vaddr) }
+        .expect("Child PTE missing");
+
+    let phys_parent = pte_parent.addr().as_u64();
+    let phys_child = pte_child.addr().as_u64();
+    assert_eq!(phys_parent, phys_child);
+
+    // Write magic value in parent mapping
+    let ptr = addr1 as *mut u64;
+    unsafe {
+        ptr.write_volatile(0xDEADBEEF12345678);
+    }
+    kprintln!("[test] Wrote magic value to virtual ptr {:#x}", addr1);
+
+    // Read magic value from virtual mapping directly
+    let direct_val = unsafe { ptr.read_volatile() };
+    kprintln!(
+        "[test] Read magic value from virtual mapping: {:#x}",
+        direct_val
+    );
+
+    // Read magic value from child's mapped physical address
+    let phys_offset = crate::memory::r#virtual::phys_mem_offset();
+    kprintln!(
+        "[test] phys_parent={:#x}, phys_child={:#x}, phys_offset={:#x}",
+        phys_parent,
+        phys_child,
+        phys_offset
+    );
+    let child_ptr = (phys_child + phys_offset) as *const u64;
+    let read_val = unsafe { child_ptr.read_volatile() };
+    kprintln!(
+        "[test] Read magic value from child_ptr={:#x}: {:#x}",
+        child_ptr as u64,
+        read_val
+    );
+    assert_eq!(read_val, 0xDEADBEEF12345678);
+
+    // Clean up
+    crate::syscall::memory::sys_munmap(addr1 as u64, 4096);
+    crate::process::fd::current_task_close_fd(fd);
+    let _ = crate::memory::r#virtual::free_user_page_table(child_cr3);
+    let _ = disk_dir.unlink("shared_test.txt");
+    kprintln!("[test] Shared mapping communication test PASSED!");
+}
+
+#[test_case]
+fn test_page_cache_isolation() {
+    kprintln!("[test] Starting page cache isolation test...");
+    // 1. Create and open file on ext2 via VFS directly
+    let disk_dir = crate::fs::vfs::lookup("/disk").expect("Failed to lookup /disk");
+    let _ = disk_dir.unlink("private_test.txt");
+    let inode = disk_dir
+        .create("private_test.txt", crate::fs::inode::FileType::Regular)
+        .expect("Failed to create private_test.txt");
+
+    // 2. Write 4096 bytes directly using InodeOps::write to populate/extend it
+    let data = [0u8; 4096];
+    let written = inode
+        .write(0, &data)
+        .expect("Failed to write to private_test.txt");
+    assert_eq!(written, 4096);
+
+    // Allocate file descriptor manually
+    let fd = crate::process::fd::current_task_alloc_fd(inode.clone())
+        .expect("Failed to allocate file descriptor");
+
+    // Map MAP_PRIVATE
+    let addr_priv = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x02, fd, 0);
+    assert!(addr_priv > 0);
+
+    // Map MAP_SHARED (to monitor the underlying file/cache state)
+    let addr_shared = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x01, fd, 0);
+    assert!(addr_shared > 0);
+
+    // Write to private mapping (will trigger COW page fault)
+    let priv_ptr = addr_priv as *mut u64;
+    unsafe {
+        priv_ptr.write_volatile(0x1122334455667788);
+    }
+
+    // Verify private mapping has the new value
+    let priv_val = unsafe { priv_ptr.read_volatile() };
+    assert_eq!(priv_val, 0x1122334455667788);
+
+    // Verify shared mapping still has 0 (isolation)
+    let shared_ptr = addr_shared as *const u64;
+    let shared_val = unsafe { shared_ptr.read_volatile() };
+    assert_eq!(shared_val, 0);
+
+    // Verify underlying file still has 0
+    let mut read_buf = [0u8; 8];
+    let read_res = inode
+        .read(0, &mut read_buf)
+        .expect("Failed to read from private_test.txt");
+    assert_eq!(read_res, 8);
+    let file_val = u64::from_ne_bytes(read_buf);
+    assert_eq!(file_val, 0);
+
+    // Clean up
+    crate::syscall::memory::sys_munmap(addr_priv as u64, 4096);
+    crate::syscall::memory::sys_munmap(addr_shared as u64, 4096);
+    crate::process::fd::current_task_close_fd(fd);
+    let _ = disk_dir.unlink("private_test.txt");
+    kprintln!("[test] Page cache isolation test PASSED!");
+}
+
+#[test_case]
+fn test_dirty_page_flush() {
+    kprintln!("[test] Starting dirty page flush test...");
+    // 1. Create and open file on ext2 via VFS directly
+    let disk_dir = crate::fs::vfs::lookup("/disk").expect("Failed to lookup /disk");
+    kprintln!("[test] Looked up /disk");
+    let _ = disk_dir.unlink("flush_test.txt");
+    kprintln!("[test] Unlinked if existed");
+    let inode = disk_dir
+        .create("flush_test.txt", crate::fs::inode::FileType::Regular)
+        .expect("Failed to create flush_test.txt");
+    kprintln!("[test] Created file");
+
+    // 2. Write 4096 bytes directly using InodeOps::write to populate/extend it
+    let data = [0u8; 4096];
+    let written = inode
+        .write(0, &data)
+        .expect("Failed to write to flush_test.txt");
+    kprintln!("[test] Wrote 4096 bytes");
+    assert_eq!(written, 4096);
+
+    // Allocate file descriptor manually
+    let fd = crate::process::fd::current_task_alloc_fd(inode.clone())
+        .expect("Failed to allocate file descriptor");
+    kprintln!("[test] Allocated fd: {}", fd);
+
+    // Map MAP_SHARED
+    let addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x01, fd, 0);
+    kprintln!("[test] Called sys_mmap: {:#x}", addr);
+    assert!(addr > 0);
+
+    // Write magic value to the shared mapping
+    let ptr = addr as *mut u64;
+    unsafe {
+        ptr.write_volatile(0x8877665544332211);
+    }
+    kprintln!("[test] Wrote magic value to mapping");
+
+    // Verify that the disk still has 0 before fsync (since it's only in page cache / memory)
+    let mut read_buf = [0u8; 8];
+    let res = inode.read_direct(0, &mut read_buf);
+    kprintln!("[test] Read direct from disk");
+    assert!(res.is_ok());
+    let val_before = u64::from_ne_bytes(read_buf);
+    assert_eq!(val_before, 0);
+
+    // Call fsync to commit changes
+    kprintln!("[test] Calling sys_fsync");
+    let fsync_res = crate::syscall::fs::sys_fsync(fd);
+    kprintln!("[test] sys_fsync returned: {}", fsync_res);
+    assert_eq!(fsync_res, 0);
+
+    // Verify that the disk now has the magic value after fsync
+    let res = inode.read_direct(0, &mut read_buf);
+    assert!(res.is_ok());
+    let val_after = u64::from_ne_bytes(read_buf);
+    assert_eq!(val_after, 0x8877665544332211);
+
+    // Clean up
+    crate::syscall::memory::sys_munmap(addr as u64, 4096);
+    crate::process::fd::current_task_close_fd(fd);
+    let _ = disk_dir.unlink("flush_test.txt");
+    kprintln!("[test] Dirty page flush test PASSED!");
+}

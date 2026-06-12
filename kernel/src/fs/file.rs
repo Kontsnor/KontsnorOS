@@ -146,6 +146,14 @@ impl FileDescription {
     }
 }
 
+impl Drop for FileDescription {
+    fn drop(&mut self) {
+        if self.inode.inode().file_type == crate::fs::inode::FileType::Regular {
+            let _ = crate::memory::page_cache::flush_all_for_inode(&self.inode);
+        }
+    }
+}
+
 /// Per-process file descriptor table.
 pub struct FdTable {
     /// Array of file descriptors. `None` means the fd is available.

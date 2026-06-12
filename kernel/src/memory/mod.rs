@@ -8,6 +8,7 @@
 
 pub mod address;
 pub mod heap;
+pub mod page_cache;
 pub mod physical;
 pub mod r#virtual;
 

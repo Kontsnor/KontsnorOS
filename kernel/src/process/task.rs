@@ -76,6 +76,21 @@ pub struct SigAction {
     pub sa_mask: u64,
 }
 
+/// Represents a memory-mapped file region in the process virtual memory.
+#[derive(Clone, Debug)]
+pub struct MappedRegion {
+    /// Start virtual address.
+    pub start: u64,
+    /// Size of the region in bytes.
+    pub len: usize,
+    /// Backing file inode number.
+    pub inode_ino: u64,
+    /// Offset within the file.
+    pub offset: u64,
+    /// Whether the mapping is shared (MAP_SHARED).
+    pub is_shared: bool,
+}
+
 /// A Task Control Block (TCB).
 ///
 /// Contains all the information the kernel needs to manage a task:
@@ -135,6 +150,9 @@ pub struct Task {
 
     /// Current mmap bump allocator pointer.
     pub mmap_bump: u64,
+
+    /// Memory mapped file regions.
+    pub mmap_regions: Vec<MappedRegion>,
 
     /// Pending signals mask.
     pub pending_signals: u64,
@@ -196,6 +214,7 @@ impl Task {
             brk: 0,
             cwd: String::from("/"),
             mmap_bump: 0x0000_5000_0000_0000u64,
+            mmap_regions: Vec::new(),
             pending_signals: 0,
             blocked_signals: 0,
             sigactions: [SigAction {

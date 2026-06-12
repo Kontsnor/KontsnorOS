@@ -2,7 +2,7 @@
 
 use super::{read_blocks, write_blocks};
 use super::{Ext2Inode, Ext2RawInode};
-use crate::fs::inode::FileType;
+use crate::fs::inode::{FileType, InodeOps};
 
 impl Ext2Inode {
     /// Resolve logical block number to physical disk block using a provided raw inode reference.
@@ -480,5 +480,110 @@ impl Ext2Inode {
 
         self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?;
         Ok(())
+    }
+
+    /// Read data from regular file or symlink using the Page Cache.
+    pub fn read_page_cache(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
+        let file_size = self.inode().size;
+        if offset >= file_size {
+            return Ok(0);
+        }
+
+        let mut read_bytes = 0;
+        let mut current_offset = offset;
+
+        while read_bytes < buf.len() && current_offset < file_size {
+            let file_block_offset = current_offset & !4095;
+            let page_offset = (current_offset % 4096) as usize;
+
+            let phys_page = match crate::memory::page_cache::get_or_create_page_inner(
+                self,
+                file_block_offset,
+            ) {
+                Ok(p) => p,
+                Err(_) => return Err(-5), // EIO
+            };
+
+            let bytes_to_read = core::cmp::min(
+                buf.len() - read_bytes,
+                core::cmp::min(4096 - page_offset, (file_size - current_offset) as usize),
+            );
+
+            let phys_offset = phys_page + crate::memory::r#virtual::phys_mem_offset();
+            let src_slice = unsafe { core::slice::from_raw_parts(phys_offset as *const u8, 4096) };
+
+            buf[read_bytes..read_bytes + bytes_to_read]
+                .copy_from_slice(&src_slice[page_offset..page_offset + bytes_to_read]);
+
+            read_bytes += bytes_to_read;
+            current_offset += bytes_to_read as u64;
+        }
+
+        Ok(read_bytes)
+    }
+
+    /// Write data to regular file or symlink using the Page Cache.
+    pub fn write_page_cache(&self, offset: u64, buf: &[u8]) -> Result<usize, i32> {
+        let mut raw = self.raw.lock();
+        let mut vfs = self.vfs_inode.lock();
+
+        let mut written_bytes = 0;
+        let mut current_offset = offset;
+
+        while written_bytes < buf.len() {
+            let file_block = (current_offset / self.fs.block_size as u64) as u32;
+            let block_offset = (current_offset % self.fs.block_size as u64) as usize;
+
+            // Resolve or allocate physical disk block to reserve disk space
+            let _phys_block = self
+                .get_or_alloc_block(&mut raw, file_block)
+                .map_err(|_| -5)?; // EIO
+
+            let bytes_to_write = core::cmp::min(
+                buf.len() - written_bytes,
+                self.fs.block_size as usize - block_offset,
+            );
+
+            let file_block_offset = current_offset & !4095;
+            let page_offset = (current_offset % 4096) as usize;
+
+            // Drop locks before accessing page cache to prevent double-locking deadlocks on self.vfs_inode
+            drop(raw);
+            drop(vfs);
+
+            let page_phys = match crate::memory::page_cache::get_or_create_page_inner(
+                self,
+                file_block_offset,
+            ) {
+                Ok(p) => p,
+                Err(_) => return Err(-5), // EIO
+            };
+
+            let phys_offset = page_phys + crate::memory::r#virtual::phys_mem_offset();
+            let dest_slice =
+                unsafe { core::slice::from_raw_parts_mut(phys_offset as *mut u8, 4096) };
+
+            dest_slice[page_offset..page_offset + bytes_to_write]
+                .copy_from_slice(&buf[written_bytes..written_bytes + bytes_to_write]);
+
+            crate::memory::page_cache::mark_dirty(self.ino as u64, file_block_offset);
+
+            written_bytes += bytes_to_write;
+            current_offset += bytes_to_write as u64;
+
+            // Re-acquire locks for the next block allocation check or loop finalization
+            raw = self.raw.lock();
+            vfs = self.vfs_inode.lock();
+        }
+
+        if current_offset > vfs.size {
+            vfs.size = current_offset;
+            raw.i_size = current_offset as u32;
+        }
+        vfs.blocks = raw.i_blocks as u64;
+
+        self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?;
+
+        Ok(written_bytes)
     }
 }

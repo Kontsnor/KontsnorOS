@@ -226,9 +226,19 @@ pub trait InodeOps: Send + Sync {
         Err(-1) // EPERM
     }
 
+    /// Read data directly from the storage backing (bypassing the page cache).
+    fn read_direct(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
+        self.read(offset, buf)
+    }
+
     /// Write data to this inode.
     fn write(&self, _offset: u64, _data: &[u8]) -> Result<usize, i32> {
         Err(-1) // EPERM
+    }
+
+    /// Write data directly to the storage backing (bypassing the page cache).
+    fn write_direct(&self, offset: u64, data: &[u8]) -> Result<usize, i32> {
+        self.write(offset, data)
     }
 
     /// Create a new file in this directory.

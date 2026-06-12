@@ -24,16 +24,20 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
         None => return Errno::ESRCH.into(),
     };
 
-    let parent_cr3 = match scheduler::get_task_arc(current_pid) {
-        Some(task_arc) => task_arc.lock().page_table_root,
+    let (parent_cr3, mmap_regions) = match scheduler::get_task_arc(current_pid) {
+        Some(task_arc) => {
+            let task = task_arc.lock();
+            (task.page_table_root, task.mmap_regions.clone())
+        }
         None => return Errno::ESRCH.into(),
     };
 
     // Create a cloned user page table from the parent's page table root
-    let child_page_table = match crate::memory::r#virtual::clone_parent_page_table(parent_cr3) {
-        Ok(pt) => pt,
-        Err(_) => return Errno::ENOMEM.into(),
-    };
+    let child_page_table =
+        match crate::memory::r#virtual::clone_parent_page_table(parent_cr3, &mmap_regions) {
+            Ok(pt) => pt,
+            Err(_) => return Errno::ENOMEM.into(),
+        };
 
     // ── Allocate new PID and build child TCB ──────────────────────────────────
     let child_pid = pid::allocate();
@@ -59,6 +63,7 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
             child_task.brk = parent_task.brk;
             child_task.cwd = parent_task.cwd.clone();
             child_task.mmap_bump = parent_task.mmap_bump;
+            child_task.mmap_regions = parent_task.mmap_regions.clone();
             child_task.uid = parent_task.uid;
             child_task.gid = parent_task.gid;
             child_task.euid = parent_task.euid;
@@ -461,6 +466,7 @@ pub fn sys_execve(
             task.page_table_root = new_page_table;
             task.brk = initial_brk; // Dynamically calculated start of heap
             task.context.fs_base = 0; // Clear TLS base for new process
+            task.mmap_regions.clear();
             old
         } else {
             0
@@ -728,15 +734,19 @@ pub fn sys_clone(
         None => return Errno::ESRCH.into(),
     };
 
-    let parent_cr3 = match scheduler::get_task_arc(current_pid) {
-        Some(task_arc) => task_arc.lock().page_table_root,
+    let (parent_cr3, mmap_regions) = match scheduler::get_task_arc(current_pid) {
+        Some(task_arc) => {
+            let task = task_arc.lock();
+            (task.page_table_root, task.mmap_regions.clone())
+        }
         None => return Errno::ESRCH.into(),
     };
 
-    let child_page_table = match crate::memory::r#virtual::clone_parent_page_table(parent_cr3) {
-        Ok(pt) => pt,
-        Err(_) => return Errno::ENOMEM.into(),
-    };
+    let child_page_table =
+        match crate::memory::r#virtual::clone_parent_page_table(parent_cr3, &mmap_regions) {
+            Ok(pt) => pt,
+            Err(_) => return Errno::ENOMEM.into(),
+        };
 
     let child_pid = pid::allocate();
     let mut child_task = Task::new(
@@ -759,6 +769,7 @@ pub fn sys_clone(
             child_task.brk = parent_task.brk;
             child_task.cwd = parent_task.cwd.clone();
             child_task.mmap_bump = parent_task.mmap_bump;
+            child_task.mmap_regions = parent_task.mmap_regions.clone();
         } else {
             return Errno::ESRCH.into();
         }

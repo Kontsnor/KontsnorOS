@@ -139,7 +139,10 @@ pub fn create_user_page_table() -> Result<u64, &'static str> {
 /// Clone a parent page table by allocating a new PML4 frame and recursively
 /// deep-cloning all user page table structures (PML4, PDPT, PD, PT) for user
 /// space entries (0..256), while marking writable entries as Copy-on-Write (COW).
-pub fn clone_parent_page_table(parent_pml4_phys: u64) -> Result<u64, &'static str> {
+pub fn clone_parent_page_table(
+    parent_pml4_phys: u64,
+    mmap_regions: &[crate::process::task::MappedRegion],
+) -> Result<u64, &'static str> {
     // 1. Create a clean child PML4 pre-populated with kernel entries
     let child_pml4_phys = create_user_page_table()?;
 
@@ -247,7 +250,16 @@ pub fn clone_parent_page_table(parent_pml4_phys: u64) -> Result<u64, &'static st
                     let is_writable = flags.contains(PageTableFlags::WRITABLE);
                     let is_cow = flags.contains(PageTableFlags::BIT_9);
 
-                    if is_writable || is_cow {
+                    let vaddr = ((i as u64) << 39)
+                        | ((j as u64) << 30)
+                        | ((k as u64) << 21)
+                        | ((l as u64) << 12);
+
+                    let is_shared_mapping = mmap_regions
+                        .iter()
+                        .any(|r| vaddr >= r.start && vaddr < r.start + r.len as u64 && r.is_shared);
+
+                    if (is_writable || is_cow) && !is_shared_mapping {
                         // Mark as Copy-on-Write: clear WRITABLE, add BIT_9
                         flags.remove(PageTableFlags::WRITABLE);
                         flags.insert(PageTableFlags::BIT_9);

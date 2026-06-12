@@ -1,26 +1,11 @@
 //! Process scheduler — Multi-Level Feedback Queue (MLFQ).
-//!
-//! The scheduler manages which tasks run on the CPU. KontsnorOS uses
-//! a Multi-Level Feedback Queue (MLFQ) algorithm, which provides:
-//!
-//! - **Good interactive response**: High-priority tasks run first
-//! - **Fairness**: Tasks that use too much CPU time are demoted
-//! - **No starvation**: Periodic priority boost prevents starvation
-//!
-//! ## Priority Queues
-//!
-//! ```text
-//! Queue 0 (RealTime):  [task] → [task] → ...  (highest priority)
-//! Queue 1 (High):      [task] → [task] → ...
-//! Queue 2 (Normal):    [task] → [task] → ...
-//! Queue 3 (Low):       [task] → [task] → ...
-//! Queue 4 (Idle):      [task] → [task] → ...  (lowest priority)
-//! ```
 
-use alloc::collections::VecDeque;
-use alloc::vec::Vec;
-use crate::sync::spinlock::TicketLock;
 use crate::kprintln;
+use crate::sync::rwlock::KRwLock;
+use crate::sync::spinlock::TicketLock;
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use super::pid::Pid;
 use super::task::{Priority, Task, TaskState};
@@ -37,13 +22,13 @@ const BOOST_INTERVAL: u64 = 1000;
 /// The global scheduler instance.
 pub(crate) static SCHEDULER: TicketLock<Option<Scheduler>> = TicketLock::new(None);
 
+/// The global master task table.
+pub(crate) static TASKS: KRwLock<Vec<Option<Arc<spin::Mutex<Task>>>>> = KRwLock::new(Vec::new());
+
 /// The Multi-Level Feedback Queue scheduler.
 pub struct Scheduler {
     /// Priority queues — one per priority level.
     queues: [VecDeque<Pid>; NUM_PRIORITIES],
-
-    /// All tasks indexed by PID.
-    pub(crate) tasks: Vec<Option<alloc::boxed::Box<Task>>>,
 
     /// The currently running task's PID per CPU core.
     pub(crate) current_cpus: [Option<Pid>; 32],
@@ -53,6 +38,13 @@ pub struct Scheduler {
 
     /// Total number of context switches performed.
     context_switches: u64,
+}
+
+/// Get a clone of a task's Arc by PID.
+pub fn get_task_arc(pid: Pid) -> Option<Arc<spin::Mutex<Task>>> {
+    let tasks = TASKS.read();
+    let idx = pid.as_u64() as usize;
+    tasks.get(idx)?.as_ref().cloned()
 }
 
 impl Scheduler {
@@ -66,27 +58,10 @@ impl Scheduler {
                 VecDeque::new(),
                 VecDeque::new(),
             ],
-            tasks: Vec::new(),
             current_cpus: [None; 32],
             ticks_since_boost: 0,
             context_switches: 0,
         }
-    }
-
-    /// Add a new task to the scheduler.
-    pub fn add_task(&mut self, mut task: Task) {
-        let pid = task.pid;
-        let priority = task.priority as usize;
-        let idx = pid.as_u64() as usize;
-
-        // Ensure the task vector is large enough
-        while self.tasks.len() <= idx {
-            self.tasks.push(None);
-        }
-
-        task.in_queue = true;
-        self.tasks[idx] = Some(alloc::boxed::Box::new(task));
-        self.queues[priority].push_back(pid);
     }
 
     /// Select the next task to run.
@@ -94,11 +69,13 @@ impl Scheduler {
     /// Returns the PID of the highest-priority ready task, or None
     /// if no tasks are ready.
     pub fn pick_next(&mut self) -> Option<Pid> {
+        let tasks = TASKS.read();
         // Check queues from highest to lowest priority
         for queue in &mut self.queues {
             while let Some(pid) = queue.pop_front() {
                 let idx = pid.as_u64() as usize;
-                if let Some(Some(task)) = self.tasks.get_mut(idx) {
+                if let Some(Some(task_arc)) = tasks.get(idx) {
+                    let mut task = task_arc.lock();
                     task.in_queue = false;
                     if task.state == TaskState::Ready {
                         return Some(pid);
@@ -124,7 +101,9 @@ impl Scheduler {
         if apic_id < 32 {
             if let Some(current_pid) = self.current_cpus[apic_id] {
                 let idx = current_pid.as_u64() as usize;
-                if let Some(Some(task)) = self.tasks.get_mut(idx) {
+                let tasks = TASKS.read();
+                if let Some(Some(task_arc)) = tasks.get(idx) {
+                    let mut task = task_arc.lock();
                     task.cpu_ticks += 1;
                     if task.cpu_ticks % TIME_QUANTUM == 0 {
                         // Demote the task if it's not already at the lowest priority
@@ -144,17 +123,16 @@ impl Scheduler {
     }
 
     /// Boost all tasks to the highest non-realtime priority.
-    ///
-    /// This prevents starvation by periodically moving all tasks
-    /// back to a high priority queue.
-    ///
-    /// Invariant: Running tasks are boosted in priority, but their PIDs are
-    /// not re-added to the queues here. Instead, they will be re-enqueued
-    /// with their boosted priority by `schedule()` when they yield or are preempted.
     fn boost_priorities(&mut self) {
-        for task in self.tasks.iter_mut().flatten() {
-            if task.priority > Priority::High && (task.state == TaskState::Ready || task.state == TaskState::Running) {
-                task.priority = Priority::High;
+        let tasks = TASKS.read();
+        for task_opt in tasks.iter() {
+            if let Some(task_arc) = task_opt {
+                let mut task = task_arc.lock();
+                if task.priority > Priority::High
+                    && (task.state == TaskState::Ready || task.state == TaskState::Running)
+                {
+                    task.priority = Priority::High;
+                }
             }
         }
 
@@ -163,15 +141,20 @@ impl Scheduler {
             queue.clear();
         }
 
-        for task in self.tasks.iter_mut().flatten() {
-            task.in_queue = false;
+        for task_opt in tasks.iter() {
+            if let Some(task_arc) = task_opt {
+                task_arc.lock().in_queue = false;
+            }
         }
 
-        for task in self.tasks.iter_mut().flatten() {
-            if task.state == TaskState::Ready {
-                let priority = task.priority as usize;
-                self.queues[priority].push_back(task.pid);
-                task.in_queue = true;
+        for task_opt in tasks.iter() {
+            if let Some(task_arc) = task_opt {
+                let mut task = task_arc.lock();
+                if task.state == TaskState::Ready {
+                    let priority = task.priority as usize;
+                    self.queues[priority].push_back(task.pid);
+                    task.in_queue = true;
+                }
             }
         }
     }
@@ -179,15 +162,18 @@ impl Scheduler {
     /// Mark a task as blocked.
     pub fn block_task(&mut self, pid: Pid) {
         let idx = pid.as_u64() as usize;
-        if let Some(Some(task)) = self.tasks.get_mut(idx) {
-            task.state = TaskState::Blocked;
+        let tasks = TASKS.read();
+        if let Some(Some(task_arc)) = tasks.get(idx) {
+            task_arc.lock().state = TaskState::Blocked;
         }
     }
 
     /// Wake up a blocked task, making it ready to run.
     pub fn wake_task(&mut self, pid: Pid) {
         let idx = pid.as_u64() as usize;
-        if let Some(Some(task)) = self.tasks.get_mut(idx) {
+        let tasks = TASKS.read();
+        if let Some(Some(task_arc)) = tasks.get(idx) {
+            let mut task = task_arc.lock();
             if task.state == TaskState::Blocked {
                 task.state = TaskState::Ready;
                 if !task.in_queue {
@@ -203,12 +189,15 @@ impl Scheduler {
     pub fn exit_task(&mut self, pid: Pid, exit_code: i32) {
         let idx = pid.as_u64() as usize;
         let mut parent_pid = None;
-        if let Some(Some(task)) = self.tasks.get_mut(idx) {
+        let tasks = TASKS.read();
+        if let Some(Some(task_arc)) = tasks.get(idx) {
+            let mut task = task_arc.lock();
             task.state = TaskState::Zombie;
             task.exit_code = Some(exit_code);
             task.fd_table.clear();
             parent_pid = Some(task.parent_pid);
         }
+        drop(tasks); // Drop TASKS read lock before calling wake_task to keep correct order
 
         if let Some(parent) = parent_pid {
             // Wake the parent task if it was blocked waiting
@@ -216,45 +205,44 @@ impl Scheduler {
 
             // Deliver SIGCHLD (17) to the parent's pending signals
             let parent_idx = parent.as_u64() as usize;
-            if parent_idx < self.tasks.len() {
-                // Clone the child wait queue Arc to avoid holding a mutable borrow of self.tasks
-                let child_wait_queue = if let Some(Some(ref parent_task)) = self.tasks.get(parent_idx) {
-                    Some(parent_task.child_wait_queue.clone())
-                } else {
-                    None
+            let tasks = TASKS.read();
+            if let Some(Some(parent_task_arc)) = tasks.get(parent_idx) {
+                // Clone the child wait queue Arc to avoid holding a lock borrow
+                let child_wait_queue = {
+                    let parent_task = parent_task_arc.lock();
+                    parent_task.child_wait_queue.clone()
                 };
 
-                if let Some(wq) = child_wait_queue {
-                    wq.wake_all_locked(self);
+                child_wait_queue.wake_all_locked(self);
+
+                let mut parent_task = parent_task_arc.lock();
+                parent_task.pending_signals |= 1 << (17 - 1);
+
+                // Scan current_cpus to find which core (if any) is running the parent task
+                let mut parent_core = None;
+                for core_id in 0..32 {
+                    if self.current_cpus[core_id] == Some(parent) {
+                        parent_core = Some(core_id);
+                        break;
+                    }
                 }
 
-                if let Some(Some(ref mut parent_task)) = self.tasks.get_mut(parent_idx) {
-                    parent_task.pending_signals |= 1 << (17 - 1);
-                    
-                    // Scan current_cpus to find which core (if any) is running the parent task
-                    let mut parent_core = None;
-                    for core_id in 0..32 {
-                        if self.current_cpus[core_id] == Some(parent) {
-                            parent_core = Some(core_id);
-                            break;
-                        }
+                if let Some(core_id) = parent_core {
+                    let pending_unblocked =
+                        parent_task.pending_signals & !parent_task.blocked_signals;
+                    unsafe {
+                        crate::syscall::CPU_SCRATCHES[core_id].signals_pending =
+                            if pending_unblocked != 0 { 1 } else { 0 };
                     }
+                }
 
-                    if let Some(core_id) = parent_core {
-                        let pending_unblocked = parent_task.pending_signals & !parent_task.blocked_signals;
-                        unsafe {
-                            crate::syscall::CPU_SCRATCHES[core_id].signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
-                        }
-                    }
-
-                    // Wake parent task from blocked state if it was waiting
-                    if parent_task.state == TaskState::Blocked {
-                        parent_task.state = TaskState::Ready;
-                        if !parent_task.in_queue {
-                            let priority = parent_task.priority as usize;
-                            self.queues[priority].push_back(parent);
-                            parent_task.in_queue = true;
-                        }
+                // Wake parent task from blocked state if it was waiting
+                if parent_task.state == TaskState::Blocked {
+                    parent_task.state = TaskState::Ready;
+                    if !parent_task.in_queue {
+                        let priority = parent_task.priority as usize;
+                        self.queues[priority].push_back(parent);
+                        parent_task.in_queue = true;
                     }
                 }
             }
@@ -271,27 +259,29 @@ impl Scheduler {
         }
     }
 
-    /// Get a reference to a task by PID.
-    pub fn get_task(&self, pid: Pid) -> Option<&Task> {
+    /// Add a task to this scheduler instance.
+    pub fn add_task(&mut self, task: Task) {
+        let pid = task.pid;
+        let priority = task.priority as usize;
         let idx = pid.as_u64() as usize;
-        self.tasks.get(idx)?.as_ref().map(|t| &**t)
-    }
 
-    /// Get a mutable reference to a task by PID.
-    pub fn get_task_mut(&mut self, pid: Pid) -> Option<&mut Task> {
-        let idx = pid.as_u64() as usize;
-        self.tasks.get_mut(idx)?.as_mut().map(|t| &mut **t)
+        let task_arc = Arc::new(spin::Mutex::new(task));
+        task_arc.lock().in_queue = true;
+
+        let mut tasks = TASKS.write();
+        while tasks.len() <= idx {
+            tasks.push(None);
+        }
+        tasks[idx] = Some(task_arc);
+        drop(tasks);
+
+        self.queues[priority].push_back(pid);
     }
 }
 
 #[unsafe(naked)]
 extern "C" fn idle_trampoline() -> ! {
-    core::arch::naked_asm!(
-        "sti",
-        "1:",
-        "hlt",
-        "jmp 1b"
-    );
+    core::arch::naked_asm!("sti", "1:", "hlt", "jmp 1b");
 }
 
 /// Initialize the scheduler with the idle task.
@@ -300,19 +290,19 @@ pub fn init() {
 
     // Create the idle task (PID 0)
     let mut idle_task = Task::idle();
-    
+
     // Allocate stack for idle task (32 KiB)
     let layout = alloc::alloc::Layout::from_size_align(32768, 16).unwrap();
     let stack_base = unsafe { alloc::alloc::alloc(layout) } as u64;
     idle_task.kernel_stack_base = stack_base;
     idle_task.kernel_stack_size = 32768;
-    
+
     let stack_top = stack_base + 32768;
     let stack_top_aligned = stack_top & !0xF;
-    
+
     let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
     let cr3_val = cr3_frame.start_address().as_u64();
-    
+
     let context = super::context::CpuContext::new(
         idle_trampoline as *const () as u64,
         stack_top_aligned,
@@ -320,7 +310,16 @@ pub fn init() {
     );
     idle_task.context = context;
 
-    scheduler.add_task(idle_task);
+    let idx = Pid::IDLE.as_u64() as usize;
+    let task_arc = Arc::new(spin::Mutex::new(idle_task));
+
+    let mut tasks = TASKS.write();
+    while tasks.len() <= idx {
+        tasks.push(None);
+    }
+    tasks[idx] = Some(task_arc);
+    drop(tasks);
+
     for slot in scheduler.current_cpus.iter_mut() {
         *slot = Some(Pid::IDLE);
     }
@@ -331,10 +330,23 @@ pub fn init() {
 
 /// Add a task to the scheduler.
 pub fn add_task(task: Task) {
+    let pid = task.pid;
+    let name = task.name.clone();
+    let priority = task.priority as usize;
+    let idx = pid.as_u64() as usize;
+
+    let task_arc = Arc::new(spin::Mutex::new(task));
+    task_arc.lock().in_queue = true;
+
+    let mut tasks = TASKS.write();
+    while tasks.len() <= idx {
+        tasks.push(None);
+    }
+    tasks[idx] = Some(task_arc);
+    drop(tasks);
+
     if let Some(ref mut scheduler) = *SCHEDULER.lock() {
-        let pid = task.pid;
-        let name = task.name.clone();
-        scheduler.add_task(task);
+        scheduler.queues[priority].push_back(pid);
         kprintln!("[scheduler] Added task: PID {} ({})", pid, name);
     }
 }
@@ -386,9 +398,6 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
 }
 
 /// Trigger the scheduler to run the next ready task.
-///
-/// This disables interrupts, selects the highest priority task, releases the global
-/// scheduler lock to prevent deadlocks, and invokes the assembly switch_context.
 pub fn schedule() {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut sched_lock = SCHEDULER.lock();
@@ -413,8 +422,12 @@ pub fn schedule() {
             None => {
                 // No other ready tasks; keep running current if it's still runnable
                 let current_idx = current_pid.as_u64() as usize;
-                if let Some(Some(current_task)) = scheduler.tasks.get(current_idx) {
-                    if current_task.state == TaskState::Running || current_task.state == TaskState::Ready {
+                let tasks = TASKS.read();
+                if let Some(Some(current_task_arc)) = tasks.get(current_idx) {
+                    let current_task = current_task_arc.lock();
+                    if current_task.state == TaskState::Running
+                        || current_task.state == TaskState::Ready
+                    {
                         return;
                     }
                 }
@@ -426,8 +439,9 @@ pub fn schedule() {
         if next_pid == current_pid {
             // Restore current task's state to Running if it was set to Ready
             let current_idx = current_pid.as_u64() as usize;
-            if let Some(Some(ref mut current_task)) = scheduler.tasks.get_mut(current_idx) {
-                current_task.state = TaskState::Running;
+            let tasks = TASKS.read();
+            if let Some(Some(current_task_arc)) = tasks.get(current_idx) {
+                current_task_arc.lock().state = TaskState::Running;
             }
             return; // No switch needed
         }
@@ -436,10 +450,14 @@ pub fn schedule() {
         let current_idx = current_pid.as_u64() as usize;
         let next_idx = next_pid.as_u64() as usize;
 
-        // Get stable pointers to the task context structures (they are boxed in the heap,
-        // so their memory addresses are stable and won't change even if tasks reallocates!)
+        // Get stable pointers to the task context structures from heap-allocated Tasks in Arc.
+        let tasks = TASKS.read();
+        let current_task_arc = tasks[current_idx].clone().expect("Current task missing");
+        let next_task_arc = tasks[next_idx].clone().expect("Next task missing");
+        drop(tasks); // Release TASKS read lock
+
         let old_ctx_ptr = {
-            let current_task = scheduler.tasks[current_idx].as_mut().expect("Current task missing");
+            let mut current_task = current_task_arc.lock();
             if current_task.state == TaskState::Running {
                 current_task.state = TaskState::Ready;
                 // Re-enqueue current task in its priority queue
@@ -454,7 +472,7 @@ pub fn schedule() {
 
         let mut pending_unblocked = 0;
         let new_ctx_ptr = {
-            let next_task = scheduler.tasks[next_idx].as_mut().expect("Next task missing");
+            let mut next_task = next_task_arc.lock();
             next_task.state = TaskState::Running;
 
             // Set the active task's kernel stack pointer in syscall module and TSS
@@ -476,14 +494,15 @@ pub fn schedule() {
         unsafe {
             if apic_id < 32 {
                 crate::syscall::CPU_SCRATCHES[apic_id].current_pid = next_pid.as_u64();
-                crate::syscall::CPU_SCRATCHES[apic_id].signals_pending = if pending_unblocked != 0 { 1 } else { 0 };
+                crate::syscall::CPU_SCRATCHES[apic_id].signals_pending =
+                    if pending_unblocked != 0 { 1 } else { 0 };
             }
         }
 
         // Drop lock before switching to prevent deadlock
         drop(sched_lock);
 
-        // Perform raw context switch directly using the stable heap pointers
+        // Perform raw context switch directly
         unsafe {
             super::context::switch_context(old_ctx_ptr, new_ctx_ptr);
         }
@@ -492,16 +511,20 @@ pub fn schedule() {
 
 /// Register the current boot thread as a running task in the scheduler (PID 1).
 pub fn set_bootstrap_thread(task: Task) {
+    let pid = task.pid;
+    let idx = pid.as_u64() as usize;
+
+    let task_arc = Arc::new(spin::Mutex::new(task));
+    task_arc.lock().state = TaskState::Running;
+
+    let mut tasks = TASKS.write();
+    while tasks.len() <= idx {
+        tasks.push(None);
+    }
+    tasks[idx] = Some(task_arc);
+    drop(tasks);
+
     if let Some(ref mut scheduler) = *SCHEDULER.lock() {
-        let pid = task.pid;
-        scheduler.add_task(task);
-        
-        // Find the newly added task and set its state to Running
-        let idx = pid.as_u64() as usize;
-        if let Some(Some(ref mut t)) = scheduler.tasks.get_mut(idx) {
-            t.state = TaskState::Running;
-        }
-        
         let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
         if apic_id < 32 {
             scheduler.current_cpus[apic_id] = Some(pid);
@@ -519,15 +542,28 @@ pub fn set_bootstrap_thread(task: Task) {
 
 /// Block a task.
 pub fn block_task(pid: Pid) {
-    if let Some(ref mut scheduler) = *SCHEDULER.lock() {
-        scheduler.block_task(pid);
+    let idx = pid.as_u64() as usize;
+    let tasks = TASKS.read();
+    if let Some(Some(task_arc)) = tasks.get(idx) {
+        task_arc.lock().state = TaskState::Blocked;
     }
 }
 
 /// Wake up a blocked task.
 pub fn wake_task(pid: Pid) {
-    if let Some(ref mut scheduler) = *SCHEDULER.lock() {
-        scheduler.wake_task(pid);
+    let idx = pid.as_u64() as usize;
+    let tasks = TASKS.read();
+    if let Some(Some(task_arc)) = tasks.get(idx) {
+        let mut task = task_arc.lock();
+        if task.state == TaskState::Blocked {
+            task.state = TaskState::Ready;
+            if !task.in_queue {
+                if let Some(ref mut scheduler) = *SCHEDULER.lock() {
+                    let priority = task.priority as usize;
+                    scheduler.queues[priority].push_back(pid);
+                    task.in_queue = true;
+                }
+            }
+        }
     }
 }
-

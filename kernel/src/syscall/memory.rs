@@ -7,10 +7,12 @@ use crate::kprintln;
 fn prot_to_page_flags(prot: i32) -> x86_64::structures::paging::PageTableFlags {
     use x86_64::structures::paging::PageTableFlags;
     let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-    if (prot & 2) != 0 { // PROT_WRITE
+    if (prot & 2) != 0 {
+        // PROT_WRITE
         flags |= PageTableFlags::WRITABLE;
     }
-    if (prot & 4) == 0 { // NOT PROT_EXEC
+    if (prot & 4) == 0 {
+        // NOT PROT_EXEC
         flags |= PageTableFlags::NO_EXECUTE;
     }
     flags
@@ -27,12 +29,19 @@ pub fn sys_mmap(
     fd: i32,
     offset: i64,
 ) -> SyscallResult {
-    use crate::process::scheduler;
     use crate::process::fd as proc_fd;
+    use crate::process::scheduler;
     use x86_64::structures::paging::{Page, PhysFrame, Size4KiB};
     use x86_64::{PhysAddr, VirtAddr};
 
-    kprintln!("[syscall] mmap(addr={:#x}, len={}, prot={:#x}, flags={:#x}, fd={})", addr, length, prot, flags, fd);
+    kprintln!(
+        "[syscall] mmap(addr={:#x}, len={}, prot={:#x}, flags={:#x}, fd={})",
+        addr,
+        length,
+        prot,
+        flags,
+        fd
+    );
 
     if length == 0 {
         return Errno::EINVAL.into();
@@ -63,15 +72,11 @@ pub fn sys_mmap(
 
     // Get current mmap_bump and page table root
     let (resolved_addr, page_table_root) = {
-        let mut sched_lock = scheduler::SCHEDULER.lock();
-        let scheduler = match sched_lock.as_mut() {
-            Some(s) => s,
-            None => return Errno::ESRCH.into(),
-        };
-        let task = match scheduler.get_task_mut(current_pid) {
+        let task_arc = match scheduler::get_task_arc(current_pid) {
             Some(t) => t,
             None => return Errno::ESRCH.into(),
         };
+        let mut task = task_arc.lock();
 
         let resolved = if addr == 0 {
             let current_bump = task.mmap_bump;
@@ -104,17 +109,23 @@ pub fn sys_mmap(
 
     // Map pages in the resolved range
     let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(resolved_addr));
-    let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(resolved_addr + aligned_len as u64 - 1));
+    let end_page =
+        Page::<Size4KiB>::containing_address(VirtAddr::new(resolved_addr + aligned_len as u64 - 1));
 
     let page_flags = prot_to_page_flags(prot);
 
     for page in Page::range_inclusive(start_page, end_page) {
         if let Some(phys) = crate::memory::physical::allocate_frame() {
             let frame = PhysFrame::containing_address(PhysAddr::new(phys));
-            
+
             // Map the page
             let _ = unsafe {
-                crate::memory::r#virtual::map_user_page_no_shootdown(page_table_root, page, frame, page_flags)
+                crate::memory::r#virtual::map_user_page_no_shootdown(
+                    page_table_root,
+                    page,
+                    frame,
+                    page_flags,
+                )
             };
 
             // Write content
@@ -123,14 +134,20 @@ pub fn sys_mmap(
             dest_slice.fill(0);
 
             if let Some(ref desc) = file_desc {
-                let page_file_offset = offset as u64 + (page.start_address().as_u64() - resolved_addr);
+                let page_file_offset =
+                    offset as u64 + (page.start_address().as_u64() - resolved_addr);
                 let _ = desc.inode.read(page_file_offset, dest_slice);
             }
         } else {
             // Eager rollback on OOM
             let unmap_end_page = page;
             for unmap_page in Page::range(start_page, unmap_end_page) {
-                if let Ok(phys_addr) = unsafe { crate::memory::r#virtual::unmap_user_page_no_shootdown(page_table_root, unmap_page) } {
+                if let Ok(phys_addr) = unsafe {
+                    crate::memory::r#virtual::unmap_user_page_no_shootdown(
+                        page_table_root,
+                        unmap_page,
+                    )
+                } {
                     crate::memory::physical::deallocate_frame(phys_addr);
                 }
             }
@@ -160,18 +177,11 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
         None => return Errno::ESRCH.into(),
     };
 
-    let page_table_root = {
-        let sched_lock = scheduler::SCHEDULER.lock();
-        let scheduler = match sched_lock.as_ref() {
-            Some(s) => s,
-            None => return Errno::ESRCH.into(),
-        };
-        let task = match scheduler.get_task(current_pid) {
-            Some(t) => t,
-            None => return Errno::ESRCH.into(),
-        };
-        task.page_table_root
+    let task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
     };
+    let page_table_root = task_arc.lock().page_table_root;
 
     let aligned_len = match length.checked_add(4095) {
         Some(len) => len & !4095,
@@ -203,7 +213,10 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
         crate::arch::x86_64::smp::shootdown_tlb();
     }
 
-    kprintln!("[syscall] munmap: successfully unmapped {} pages", unmapped_count);
+    kprintln!(
+        "[syscall] munmap: successfully unmapped {} pages",
+        unmapped_count
+    );
     0 // Success
 }
 
@@ -213,7 +226,12 @@ pub fn sys_mprotect(addr: u64, length: usize, prot: i32) -> SyscallResult {
     use x86_64::structures::paging::{Page, Size4KiB};
     use x86_64::VirtAddr;
 
-    kprintln!("[syscall] mprotect(addr={:#x}, len={}, prot={:#x})", addr, length, prot);
+    kprintln!(
+        "[syscall] mprotect(addr={:#x}, len={}, prot={:#x})",
+        addr,
+        length,
+        prot
+    );
 
     if length == 0 || (addr & 4095) != 0 {
         return Errno::EINVAL.into();
@@ -224,18 +242,11 @@ pub fn sys_mprotect(addr: u64, length: usize, prot: i32) -> SyscallResult {
         None => return Errno::ESRCH.into(),
     };
 
-    let page_table_root = {
-        let sched_lock = scheduler::SCHEDULER.lock();
-        let scheduler = match sched_lock.as_ref() {
-            Some(s) => s,
-            None => return Errno::ESRCH.into(),
-        };
-        let task = match scheduler.get_task(current_pid) {
-            Some(t) => t,
-            None => return Errno::ESRCH.into(),
-        };
-        task.page_table_root
+    let task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
     };
+    let page_table_root = task_arc.lock().page_table_root;
 
     let aligned_len = match length.checked_add(4095) {
         Some(len) => len & !4095,
@@ -256,7 +267,11 @@ pub fn sys_mprotect(addr: u64, length: usize, prot: i32) -> SyscallResult {
     let mut updated_count = 0;
     for page in Page::range_inclusive(start_page, end_page) {
         unsafe {
-            if let Err(_) = crate::memory::r#virtual::update_user_page_flags_no_shootdown(page_table_root, page, flags) {
+            if let Err(_) = crate::memory::r#virtual::update_user_page_flags_no_shootdown(
+                page_table_root,
+                page,
+                flags,
+            ) {
                 if updated_count > 0 {
                     crate::arch::x86_64::smp::shootdown_tlb();
                 }

@@ -28,15 +28,13 @@ impl WaitQueue {
 
         // F-09: Acquire SCHEDULER lock first to close the missed wakeup TOCTOU window
         let mut sched_lock = scheduler::SCHEDULER.lock();
-        
+
         // Add the current task to the wait queue under both locks
         self.pids.lock().push_back(current_pid);
 
-        // Mark the task as Blocked under the scheduler lock
-        if let Some(ref mut sched) = *sched_lock {
-            if let Some(task) = sched.get_task_mut(current_pid) {
-                task.state = TaskState::Blocked;
-            }
+        // Mark the task as Blocked
+        if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+            task_arc.lock().state = TaskState::Blocked;
         }
 
         // Release the scheduler lock before rescheduling

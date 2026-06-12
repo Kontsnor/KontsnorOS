@@ -65,7 +65,8 @@ fn panic(info: &PanicInfo) -> ! {
 
 #[test_case]
 fn test_trivial() {
-    assert_eq!(1 + 1, 2);
+    let two = 2;
+    assert_eq!(1 + 1, two);
 }
 
 #[test_case]
@@ -91,15 +92,20 @@ fn test_vfs_path_resolution() {
 
     // Create a subdirectory under /tmp (which is tmpfs)
     let tmp_dir = crate::fs::vfs::lookup("/tmp").expect("Failed to lookup /tmp");
-    let test_dir = tmp_dir.mkdir("test_dir").expect("Failed to create /tmp/test_dir");
-    
+    let test_dir = tmp_dir
+        .mkdir("test_dir")
+        .expect("Failed to create /tmp/test_dir");
+
     // Create a file under /tmp/test_dir
-    let test_file = test_dir.create("test.txt", crate::fs::inode::FileType::Regular)
+    let test_file = test_dir
+        .create("test.txt", crate::fs::inode::FileType::Regular)
         .expect("Failed to create /tmp/test_dir/test.txt");
-    
+
     // Write data to the file
     let test_data = b"Hello, VFS!";
-    let written = test_file.write(0, test_data).expect("Failed to write to test.txt");
+    let written = test_file
+        .write(0, test_data)
+        .expect("Failed to write to test.txt");
     assert_eq!(written, test_data.len());
 
     // Invalidate the cache to ensure we test true lookup resolution
@@ -109,7 +115,9 @@ fn test_vfs_path_resolution() {
     let looked_up = crate::fs::vfs::lookup("/tmp/test_dir/test.txt")
         .expect("Failed to lookup /tmp/test_dir/test.txt after cache invalidation");
     let mut read_buf = [0u8; 32];
-    let read_len = looked_up.read(0, &mut read_buf).expect("Failed to read from test.txt");
+    let read_len = looked_up
+        .read(0, &mut read_buf)
+        .expect("Failed to read from test.txt");
     assert_eq!(read_len, test_data.len());
     assert_eq!(&read_buf[..read_len], test_data);
 }
@@ -120,17 +128,20 @@ fn test_scheduler_priority_queues() {
 
     // Create mock tasks with High, Normal, and Low priorities
     let pid_high = crate::process::pid::Pid::from_raw(10);
-    let mut task_high = crate::process::task::Task::new(pid_high, alloc::string::String::from("high_prio"), 0);
+    let mut task_high =
+        crate::process::task::Task::new(pid_high, alloc::string::String::from("high_prio"), 0);
     task_high.priority = crate::process::task::Priority::High;
     task_high.state = crate::process::task::TaskState::Ready;
 
     let pid_normal = crate::process::pid::Pid::from_raw(11);
-    let mut task_normal = crate::process::task::Task::new(pid_normal, alloc::string::String::from("normal_prio"), 0);
+    let mut task_normal =
+        crate::process::task::Task::new(pid_normal, alloc::string::String::from("normal_prio"), 0);
     task_normal.priority = crate::process::task::Priority::Normal;
     task_normal.state = crate::process::task::TaskState::Ready;
 
     let pid_low = crate::process::pid::Pid::from_raw(12);
-    let mut task_low = crate::process::task::Task::new(pid_low, alloc::string::String::from("low_prio"), 0);
+    let mut task_low =
+        crate::process::task::Task::new(pid_low, alloc::string::String::from("low_prio"), 0);
     task_low.priority = crate::process::task::Priority::Low;
     task_low.state = crate::process::task::TaskState::Ready;
 

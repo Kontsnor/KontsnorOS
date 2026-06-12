@@ -83,7 +83,6 @@ pub(crate) unsafe fn copy_string_from_user_pub(ptr: *const u8) -> Option<alloc::
     unsafe { copy_string_from_user(ptr) }
 }
 
-
 // ── Syscall implementations ───────────────────────────────────────────────────
 
 /// `read(fd, buf, count)` — Read from a file descriptor.
@@ -108,7 +107,9 @@ pub fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
 
     let is_pipe = file_desc.inode.inode().file_type == crate::fs::inode::FileType::Pipe;
     if is_pipe {
-        let pid_str = crate::process::scheduler::current_pid().map(|p| p.as_u64()).unwrap_or(0);
+        let pid_str = crate::process::scheduler::current_pid()
+            .map(|p| p.as_u64())
+            .unwrap_or(0);
         crate::kprintln!("[syscall pid={}] sys_read on pipe fd {}", pid_str, fd);
     }
 
@@ -125,7 +126,11 @@ pub fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
                 }
                 total_read += n;
                 if is_pipe {
-                    crate::kprintln!("[syscall] sys_read on pipe fd {} chunk returned {} bytes", fd, n);
+                    crate::kprintln!(
+                        "[syscall] sys_read on pipe fd {} chunk returned {} bytes",
+                        fd,
+                        n
+                    );
                 }
                 if n < chunk_size {
                     break;
@@ -133,7 +138,11 @@ pub fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
             }
             Err(e) => {
                 if is_pipe {
-                    crate::kprintln!("[syscall] sys_read on pipe fd {} failed with error {}", fd, e);
+                    crate::kprintln!(
+                        "[syscall] sys_read on pipe fd {} failed with error {}",
+                        fd,
+                        e
+                    );
                 }
                 if total_read > 0 {
                     break;
@@ -168,8 +177,15 @@ pub fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
 
     let is_pipe = file_desc.inode.inode().file_type == crate::fs::inode::FileType::Pipe;
     if is_pipe {
-        let pid_str = crate::process::scheduler::current_pid().map(|p| p.as_u64()).unwrap_or(0);
-        crate::kprintln!("[syscall pid={}] sys_write on pipe fd {} count {}", pid_str, fd, count);
+        let pid_str = crate::process::scheduler::current_pid()
+            .map(|p| p.as_u64())
+            .unwrap_or(0);
+        crate::kprintln!(
+            "[syscall pid={}] sys_write on pipe fd {} count {}",
+            pid_str,
+            fd,
+            count
+        );
     }
 
     let mut total_written = 0;
@@ -178,14 +194,22 @@ pub fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
     while total_written < count {
         let chunk_size = core::cmp::min(count - total_written, 4096);
         unsafe {
-            core::ptr::copy_nonoverlapping(buf.add(total_written), temp_buf.as_mut_ptr(), chunk_size);
+            core::ptr::copy_nonoverlapping(
+                buf.add(total_written),
+                temp_buf.as_mut_ptr(),
+                chunk_size,
+            );
         }
         match file_desc.write(&temp_buf[..chunk_size]) {
             Ok(0) => break,
             Ok(n) => {
                 total_written += n;
                 if is_pipe {
-                    crate::kprintln!("[syscall] sys_write on pipe fd {} returned {} bytes written", fd, n);
+                    crate::kprintln!(
+                        "[syscall] sys_write on pipe fd {} returned {} bytes written",
+                        fd,
+                        n
+                    );
                 }
                 if n < chunk_size {
                     break;
@@ -193,7 +217,11 @@ pub fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
             }
             Err(e) => {
                 if is_pipe {
-                    crate::kprintln!("[syscall] sys_write on pipe fd {} failed with error {}", fd, e);
+                    crate::kprintln!(
+                        "[syscall] sys_write on pipe fd {} failed with error {}",
+                        fd,
+                        e
+                    );
                 }
                 if total_written > 0 {
                     break;
@@ -241,8 +269,7 @@ pub fn sys_open(pathname: *const u8, flags: i32, _mode: u32) -> SyscallResult {
                     return Errno::EEXIST.into();
                 }
                 // If O_DIRECTORY is set and it is not a directory, return ENOTDIR
-                if (flags_u32 & crate::fs::file::OpenFlags::O_DIRECTORY != 0)
-                    && !i.inode().is_dir()
+                if (flags_u32 & crate::fs::file::OpenFlags::O_DIRECTORY != 0) && !i.inode().is_dir()
                 {
                     return Errno::ENOTDIR.into();
                 }
@@ -251,9 +278,7 @@ pub fn sys_open(pathname: *const u8, flags: i32, _mode: u32) -> SyscallResult {
                     return Errno::EISDIR.into();
                 }
                 // If O_TRUNC is set and it is a regular file, truncate it to 0 size
-                if (flags_u32 & crate::fs::file::OpenFlags::O_TRUNC != 0)
-                    && i.inode().is_file()
-                {
+                if (flags_u32 & crate::fs::file::OpenFlags::O_TRUNC != 0) && i.inode().is_file() {
                     if let Err(e) = i.truncate(0) {
                         return e as SyscallResult;
                     }
@@ -297,7 +322,9 @@ pub fn sys_close(fd: i32) -> SyscallResult {
         .map(|i| i.inode().file_type == crate::fs::inode::FileType::Pipe)
         .unwrap_or(false);
     if is_pipe {
-        let pid_str = crate::process::scheduler::current_pid().map(|p| p.as_u64()).unwrap_or(0);
+        let pid_str = crate::process::scheduler::current_pid()
+            .map(|p| p.as_u64())
+            .unwrap_or(0);
         crate::kprintln!("[syscall pid={}] sys_close on pipe fd {}", pid_str, fd);
     }
     if proc_fd::current_task_close_fd(fd) {
@@ -343,8 +370,15 @@ pub fn sys_dup2(oldfd: i32, newfd: i32) -> SyscallResult {
         .map(|i| i.inode().file_type == crate::fs::inode::FileType::Pipe)
         .unwrap_or(false);
     if is_pipe {
-        let pid_str = crate::process::scheduler::current_pid().map(|p| p.as_u64()).unwrap_or(0);
-        crate::kprintln!("[syscall pid={}] sys_dup2(oldfd={}, newfd={}) on pipe", pid_str, oldfd, newfd);
+        let pid_str = crate::process::scheduler::current_pid()
+            .map(|p| p.as_u64())
+            .unwrap_or(0);
+        crate::kprintln!(
+            "[syscall pid={}] sys_dup2(oldfd={}, newfd={}) on pipe",
+            pid_str,
+            oldfd,
+            newfd
+        );
     }
     match proc_fd::current_task_dup2_fd(oldfd, newfd) {
         Some(fd) => fd as SyscallResult,
@@ -386,7 +420,7 @@ pub fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
         let entry = &entries[current_idx];
         let name_bytes = entry.name.as_bytes();
         let name_len = name_bytes.len();
-        
+
         // 19 bytes before name (8 + 8 + 2 + 1), align up to 8
         let reclen = (19 + name_len + 1 + 7) & !7;
 
@@ -494,17 +528,11 @@ pub fn sys_chdir(pathname: *const u8) -> SyscallResult {
         None => return Errno::ESRCH.into(),
     };
 
-    let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
-    let scheduler = match sched_lock.as_mut() {
-        Some(s) => s,
-        None => return Errno::ESRCH.into(),
-    };
-    let task = match scheduler.get_task_mut(current_pid) {
+    let task_arc = match crate::process::scheduler::get_task_arc(current_pid) {
         Some(t) => t,
         None => return Errno::ESRCH.into(),
     };
-
-    task.cwd = resolved_path;
+    task_arc.lock().cwd = resolved_path;
     0 // Success
 }
 
@@ -522,18 +550,11 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> SyscallResult {
         None => return 0, // returns NULL on error
     };
 
-    let cwd = {
-        let sched_lock = crate::process::scheduler::SCHEDULER.lock();
-        let scheduler = match sched_lock.as_ref() {
-            Some(s) => s,
-            None => return 0,
-        };
-        let task = match scheduler.get_task(current_pid) {
-            Some(t) => t,
-            None => return 0,
-        };
-        task.cwd.clone()
+    let task_arc = match crate::process::scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return 0,
     };
+    let cwd = task_arc.lock().cwd.clone();
 
     let cwd_bytes = cwd.as_bytes();
     if cwd_bytes.len() + 1 > size {
@@ -588,7 +609,7 @@ fn file_type_to_st_mode(file_type: crate::fs::inode::FileType) -> u32 {
 fn populate_stat(inode_ops: &dyn crate::fs::inode::InodeOps) -> LinuxStat {
     let inode = inode_ops.inode();
     let mode = file_type_to_st_mode(inode.file_type) | (inode.permissions.mode as u32);
-    
+
     LinuxStat {
         st_dev: 0,
         st_ino: inode.ino,
@@ -650,7 +671,8 @@ pub fn sys_newfstatat(
 
     let resolved_path = if raw_path.starts_with('/') {
         raw_path
-    } else if dfd == -100 { // AT_FDCWD
+    } else if dfd == -100 {
+        // AT_FDCWD
         crate::fs::vfs::resolve_relative_path(&raw_path)
     } else {
         crate::fs::vfs::resolve_relative_path(&raw_path)
@@ -671,12 +693,7 @@ pub fn sys_newfstatat(
 }
 
 /// `faccessat(dfd, pathname, mode, flags)` — Check user's permissions for a file relative to directory fd.
-pub fn sys_faccessat(
-    dfd: i32,
-    pathname: *const u8,
-    mode: i32,
-    _flags: i32,
-) -> SyscallResult {
+pub fn sys_faccessat(dfd: i32, pathname: *const u8, mode: i32, _flags: i32) -> SyscallResult {
     if pathname.is_null() {
         return Errno::EFAULT.into();
     }
@@ -687,7 +704,8 @@ pub fn sys_faccessat(
 
     let resolved_path = if raw_path.starts_with('/') {
         raw_path
-    } else if dfd == -100 { // AT_FDCWD
+    } else if dfd == -100 {
+        // AT_FDCWD
         crate::fs::vfs::resolve_relative_path(&raw_path)
     } else {
         crate::fs::vfs::resolve_relative_path(&raw_path)
@@ -717,88 +735,98 @@ pub fn sys_faccessat(
 /// `fcntl(fd, cmd, arg)` — File control.
 pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
     match cmd {
-        0 => { // F_DUPFD
+        0 => {
+            // F_DUPFD
             let start_fd = arg as i32;
             if start_fd < 0 {
                 return Errno::EINVAL.into();
             }
-            
+
             let current_pid = match crate::process::scheduler::current_pid() {
                 Some(p) => p,
                 None => return Errno::ESRCH.into(),
             };
-            let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
-            let scheduler = match sched_lock.as_mut() {
-                Some(s) => s,
-                None => return Errno::ESRCH.into(),
-            };
-            let task = match scheduler.get_task_mut(current_pid) {
+            let task_arc = match crate::process::scheduler::get_task_arc(current_pid) {
                 Some(t) => t,
                 None => return Errno::ESRCH.into(),
             };
-            
+            let mut task = task_arc.lock();
+
             let file_desc = match task.fd_table.get(fd as usize) {
                 Some(Some(desc)) => desc.clone(),
                 _ => return Errno::EBADF.into(),
             };
-            
+
             *file_desc.ref_count.lock() += 1;
-            
+
             let mut new_fd = start_fd;
-            while (new_fd as usize) < task.fd_table.len() && task.fd_table[new_fd as usize].is_some() {
+            while (new_fd as usize) < task.fd_table.len()
+                && task.fd_table[new_fd as usize].is_some()
+            {
                 new_fd += 1;
             }
-            
+
             if (new_fd as usize) >= task.fd_table.len() {
                 task.fd_table.resize(new_fd as usize + 1, None);
             }
             task.fd_table[new_fd as usize] = Some(file_desc);
-            
-            kprintln!("[syscall] fcntl(fd={}, F_DUPFD, arg={}) -> {}", fd, arg, new_fd);
+
+            kprintln!(
+                "[syscall] fcntl(fd={}, F_DUPFD, arg={}) -> {}",
+                fd,
+                arg,
+                new_fd
+            );
             new_fd as i64
         }
-        1 => { // F_GETFD
+        1 => {
+            // F_GETFD
             0
         }
-        2 => { // F_SETFD
+        2 => {
+            // F_SETFD
             0
         }
-        3 => { // F_GETFL
+        3 => {
+            // F_GETFL
             let current_pid = match crate::process::scheduler::current_pid() {
                 Some(p) => p,
                 None => return Errno::ESRCH.into(),
             };
-            let sched_lock = crate::process::scheduler::SCHEDULER.lock();
-            if let Some(ref scheduler) = *sched_lock {
-                if let Some(task) = scheduler.get_task(current_pid) {
-                    if let Some(Some(desc)) = task.fd_table.get(fd as usize) {
-                        return desc.flags.lock().0 as i64;
-                    }
+            if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+                let task = task_arc.lock();
+                if let Some(Some(desc)) = task.fd_table.get(fd as usize) {
+                    return desc.flags.lock().0 as i64;
                 }
             }
             Errno::EBADF.into()
         }
-        4 => { // F_SETFL
+        4 => {
+            // F_SETFL
             let current_pid = match crate::process::scheduler::current_pid() {
                 Some(p) => p,
                 None => return Errno::ESRCH.into(),
             };
-            let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
-            if let Some(ref mut scheduler) = *sched_lock {
-                if let Some(task) = scheduler.get_task_mut(current_pid) {
-                    if let Some(Some(desc)) = task.fd_table.get_mut(fd as usize) {
-                        let allowed_flags = crate::fs::file::OpenFlags::O_APPEND | crate::fs::file::OpenFlags::O_NONBLOCK;
-                        let mut flags = desc.flags.lock();
-                        let old_val = flags.0;
-                        flags.0 = (old_val & !allowed_flags) | (arg as u32 & allowed_flags);
-                        return 0;
-                    }
+            if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+                let mut task = task_arc.lock();
+                if let Some(Some(desc)) = task.fd_table.get_mut(fd as usize) {
+                    let allowed_flags = crate::fs::file::OpenFlags::O_APPEND
+                        | crate::fs::file::OpenFlags::O_NONBLOCK;
+                    let mut flags = desc.flags.lock();
+                    let old_val = flags.0;
+                    flags.0 = (old_val & !allowed_flags) | (arg as u32 & allowed_flags);
+                    return 0;
                 }
             }
             Errno::EBADF.into()
         }
         _ => {
-            kprintln!("[syscall] fcntl(fd={}, cmd={}, arg={}) -> ENOSYS", fd, cmd, arg);
+            kprintln!(
+                "[syscall] fcntl(fd={}, cmd={}, arg={}) -> ENOSYS",
+                fd,
+                cmd,
+                arg
+            );
             Errno::ENOSYS.into()
         }
     }
@@ -1021,7 +1049,11 @@ pub fn sys_rename(oldpath: *const u8, newpath: *const u8) -> SyscallResult {
 
     let resolved_old = crate::fs::vfs::resolve_relative_path(&raw_old);
     let resolved_new = crate::fs::vfs::resolve_relative_path(&raw_new);
-    kprintln!("[syscall] rename(\"{}\" -> \"{}\")", resolved_old, resolved_new);
+    kprintln!(
+        "[syscall] rename(\"{}\" -> \"{}\")",
+        resolved_old,
+        resolved_new
+    );
 
     // Split paths into parent + name
     let (old_parent_path, old_name) = crate::fs::path::split_path(&resolved_old);
@@ -1118,7 +1150,8 @@ pub fn sys_readlinkat(
     buf: *mut u8,
     bufsize: usize,
 ) -> SyscallResult {
-    if dirfd == -100 { // AT_FDCWD
+    if dirfd == -100 {
+        // AT_FDCWD
         sys_readlink(pathname, buf, bufsize)
     } else {
         if super::DEBUG_SYSCALLS {
@@ -1141,7 +1174,11 @@ pub fn sys_symlink(target: *const u8, linkpath: *const u8) -> SyscallResult {
 
     let resolved_linkpath = crate::fs::vfs::resolve_relative_path(&raw_linkpath);
     if super::DEBUG_SYSCALLS {
-        kprintln!("[syscall] symlink(\"{}\" -> \"{}\")", resolved_linkpath, raw_target);
+        kprintln!(
+            "[syscall] symlink(\"{}\" -> \"{}\")",
+            resolved_linkpath,
+            raw_target
+        );
     }
 
     // Check if the destination linkpath already exists
@@ -1180,7 +1217,8 @@ pub fn sys_symlink(target: *const u8, linkpath: *const u8) -> SyscallResult {
 
 /// `symlinkat(target, newdirfd, linkpath)` — Create a symbolic link relative to a directory fd.
 pub fn sys_symlinkat(target: *const u8, newdirfd: i32, linkpath: *const u8) -> SyscallResult {
-    if newdirfd == -100 { // AT_FDCWD
+    if newdirfd == -100 {
+        // AT_FDCWD
         sys_symlink(target, linkpath)
     } else {
         if super::DEBUG_SYSCALLS {
@@ -1194,8 +1232,8 @@ pub fn sys_symlinkat(target: *const u8, newdirfd: i32, linkpath: *const u8) -> S
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct PollFd {
-    fd:      i32,
-    events:  i16,
+    fd: i32,
+    events: i16,
     revents: i16,
 }
 
@@ -1262,7 +1300,10 @@ pub fn sys_pread64(fd: i32, buf: *mut u8, count: usize, offset: i64) -> SyscallR
     while total_read < count {
         let chunk_size = core::cmp::min(count - total_read, 4096);
         let chunk_offset = offset + total_read as i64;
-        match file.inode.read(chunk_offset as u64, &mut temp_buf[..chunk_size]) {
+        match file
+            .inode
+            .read(chunk_offset as u64, &mut temp_buf[..chunk_size])
+        {
             Ok(0) => break,
             Ok(n) => {
                 unsafe {
@@ -1298,19 +1339,27 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: i32) -> SyscallResult {
     if iov.is_null() || iovcnt <= 0 || iovcnt > 1024 {
         return Errno::EINVAL.into();
     }
-    if !validate_user_ptr(iov as *const u8, iovcnt as usize * core::mem::size_of::<IoVec>()) {
+    if !validate_user_ptr(
+        iov as *const u8,
+        iovcnt as usize * core::mem::size_of::<IoVec>(),
+    ) {
         return Errno::EFAULT.into();
     }
-    let mut local_iov = alloc::vec![IoVec { iov_base: core::ptr::null(), iov_len: 0 }; iovcnt as usize];
+    let mut local_iov =
+        alloc::vec![IoVec { iov_base: core::ptr::null(), iov_len: 0 }; iovcnt as usize];
     unsafe {
         core::ptr::copy_nonoverlapping(iov, local_iov.as_mut_ptr(), iovcnt as usize);
     }
     let mut total_written = 0;
     for io in local_iov {
-        if io.iov_len == 0 { continue; }
+        if io.iov_len == 0 {
+            continue;
+        }
         let ret = sys_write(fd, io.iov_base, io.iov_len);
         if ret < 0 {
-            if total_written > 0 { break; }
+            if total_written > 0 {
+                break;
+            }
             return ret;
         }
         total_written += ret;
@@ -1320,7 +1369,8 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: i32) -> SyscallResult {
 
 /// `openat(dfd, pathname, flags, mode)` — Open file relative to directory file descriptor.
 pub fn sys_openat(dfd: i32, pathname: *const u8, flags: i32, mode: u32) -> SyscallResult {
-    if dfd == -100 { // AT_FDCWD
+    if dfd == -100 {
+        // AT_FDCWD
         sys_open(pathname, flags, mode)
     } else {
         if pathname.is_null() {
@@ -1336,4 +1386,3 @@ pub fn sys_openat(dfd: i32, pathname: *const u8, flags: i32, mode: u32) -> Sysca
         }
     }
 }
-

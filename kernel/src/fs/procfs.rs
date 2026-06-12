@@ -15,7 +15,6 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-
 use super::inode::{DirEntry, FileType, Inode, InodeOps};
 use super::vfs::FileSystem;
 
@@ -141,23 +140,23 @@ fn gen_uptime() -> String {
 fn gen_tasks() -> String {
     let mut out = String::new();
     out.push_str("PID  PPID  STATE    NAME\n");
-    if let Some(sched) = crate::process::scheduler::SCHEDULER.lock().as_ref() {
-        for slot in &sched.tasks {
-            if let Some(task) = slot {
-                let state_str = match task.state {
-                    crate::process::task::TaskState::Ready => "Ready",
-                    crate::process::task::TaskState::Running => "Running",
-                    crate::process::task::TaskState::Blocked => "Blocked",
-                    crate::process::task::TaskState::Zombie => "Zombie",
-                };
-                out.push_str(&format!(
-                    "{:<5} {:<5} {:<8} {}\n",
-                    task.pid.as_u64(),
-                    task.parent_pid.as_u64(),
-                    state_str,
-                    task.name
-                ));
-            }
+    let tasks = crate::process::scheduler::TASKS.read();
+    for slot in tasks.iter() {
+        if let Some(task_arc) = slot {
+            let task = task_arc.lock();
+            let state_str = match task.state {
+                crate::process::task::TaskState::Ready => "Ready",
+                crate::process::task::TaskState::Running => "Running",
+                crate::process::task::TaskState::Blocked => "Blocked",
+                crate::process::task::TaskState::Zombie => "Zombie",
+            };
+            out.push_str(&format!(
+                "{:<5} {:<5} {:<8} {}\n",
+                task.pid.as_u64(),
+                task.parent_pid.as_u64(),
+                state_str,
+                task.name
+            ));
         }
     }
     out

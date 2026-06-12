@@ -1,13 +1,9 @@
 //! File descriptor helpers for the current process.
-//!
-//! These functions safely access the current task's file descriptor table
-//! through the scheduler lock, returning `Arc<dyn InodeOps>` clones or
-//! sharing `Arc<FileDescription>` references so that callers can implement
-//! POSIX-compliant file offset sharing.
 
-use alloc::sync::Arc;
-use crate::fs::inode::InodeOps;
 use crate::fs::file::{FileDescription, OpenFlags};
+use crate::fs::inode::InodeOps;
+use crate::process::scheduler;
+use alloc::sync::Arc;
 
 /// Retrieve the file seek offset for descriptor `fd`.
 pub fn get_fd_offset(fd: i32) -> Option<u64> {
@@ -15,10 +11,9 @@ pub fn get_fd_offset(fd: i32) -> Option<u64> {
         return None;
     }
     let fd_idx = fd as usize;
-    let current_pid = crate::process::scheduler::current_pid()?;
-    let sched_lock = crate::process::scheduler::SCHEDULER.lock();
-    let scheduler = sched_lock.as_ref()?;
-    let task = scheduler.get_task(current_pid)?;
+    let current_pid = scheduler::current_pid()?;
+    let task_arc = scheduler::get_task_arc(current_pid)?;
+    let task = task_arc.lock();
     let file_desc = task.fd_table.get(fd_idx)?.as_ref()?;
     let offset = *file_desc.offset.lock();
     Some(offset)
@@ -30,10 +25,9 @@ pub fn set_fd_offset(fd: i32, offset: u64) -> Option<()> {
         return None;
     }
     let fd_idx = fd as usize;
-    let current_pid = crate::process::scheduler::current_pid()?;
-    let sched_lock = crate::process::scheduler::SCHEDULER.lock();
-    let scheduler = sched_lock.as_ref()?;
-    let task = scheduler.get_task(current_pid)?;
+    let current_pid = scheduler::current_pid()?;
+    let task_arc = scheduler::get_task_arc(current_pid)?;
+    let task = task_arc.lock();
     let file_desc = task.fd_table.get(fd_idx)?.as_ref()?;
     *file_desc.offset.lock() = offset;
     Some(())
@@ -41,20 +35,18 @@ pub fn set_fd_offset(fd: i32, offset: u64) -> Option<()> {
 
 /// Retrieve a clone of the inode backing file descriptor `fd` in the
 /// currently running task.
-///
-/// Returns `None` if `fd` is out of range or not open.
 pub fn current_task_read_fd(fd: i32) -> Option<Arc<dyn InodeOps>> {
     if fd < 0 {
         return None;
     }
     let fd_idx = fd as usize;
-
-    let current_pid = crate::process::scheduler::current_pid()?;
-    let sched_lock = crate::process::scheduler::SCHEDULER.lock();
-    let scheduler = sched_lock.as_ref()?;
-    let task = scheduler.get_task(current_pid)?;
-
-    task.fd_table.get(fd_idx)?.as_ref().map(|desc| desc.inode.clone())
+    let current_pid = scheduler::current_pid()?;
+    let task_arc = scheduler::get_task_arc(current_pid)?;
+    let task = task_arc.lock();
+    task.fd_table
+        .get(fd_idx)?
+        .as_ref()
+        .map(|desc| desc.inode.clone())
 }
 
 /// Retrieve a clone of the FileDescription backing file descriptor `fd`
@@ -64,12 +56,9 @@ pub fn current_task_get_file_desc(fd: i32) -> Option<Arc<FileDescription>> {
         return None;
     }
     let fd_idx = fd as usize;
-
-    let current_pid = crate::process::scheduler::current_pid()?;
-    let sched_lock = crate::process::scheduler::SCHEDULER.lock();
-    let scheduler = sched_lock.as_ref()?;
-    let task = scheduler.get_task(current_pid)?;
-
+    let current_pid = scheduler::current_pid()?;
+    let task_arc = scheduler::get_task_arc(current_pid)?;
+    let task = task_arc.lock();
     task.fd_table.get(fd_idx)?.as_ref().cloned()
 }
 
@@ -81,12 +70,9 @@ pub fn current_task_alloc_fd(inode: Arc<dyn InodeOps>) -> Option<i32> {
 
 /// Allocate the next free file descriptor slot with specified flags.
 pub fn current_task_alloc_fd_with_flags(inode: Arc<dyn InodeOps>, flags: OpenFlags) -> Option<i32> {
-    let current_pid = crate::process::scheduler::current_pid()?;
-
-    let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
-    let scheduler = sched_lock.as_mut()?;
-    let task = scheduler.get_task_mut(current_pid)?;
-
+    let current_pid = scheduler::current_pid()?;
+    let task_arc = scheduler::get_task_arc(current_pid)?;
+    let mut task = task_arc.lock();
     let file_desc = Arc::new(FileDescription::new(inode, flags));
 
     // Find first free slot (first None entry)
@@ -107,28 +93,20 @@ pub fn current_task_alloc_fd_with_flags(inode: Arc<dyn InodeOps>, flags: OpenFla
 }
 
 /// Close file descriptor `fd` in the current task's fd_table.
-///
-/// Returns `true` if the fd was open and has been closed.
 pub fn current_task_close_fd(fd: i32) -> bool {
     if fd < 0 {
         return false;
     }
     let fd_idx = fd as usize;
-
-    let current_pid = match crate::process::scheduler::current_pid() {
+    let current_pid = match scheduler::current_pid() {
         Some(p) => p,
         None => return false,
     };
-
-    let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
-    let scheduler = match sched_lock.as_mut() {
-        Some(s) => s,
-        None => return false,
-    };
-    let task = match scheduler.get_task_mut(current_pid) {
+    let task_arc = match scheduler::get_task_arc(current_pid) {
         Some(t) => t,
         None => return false,
     };
+    let mut task = task_arc.lock();
 
     if let Some(slot) = task.fd_table.get_mut(fd_idx) {
         if let Some(desc) = slot.take() {
@@ -143,18 +121,14 @@ pub fn current_task_close_fd(fd: i32) -> bool {
 }
 
 /// Duplicate an existing file descriptor `fd` in the current task's fd_table.
-///
-/// Returns the new file descriptor number, or `None` on failure.
 pub fn current_task_dup_fd(fd: i32) -> Option<i32> {
     if fd < 0 {
         return None;
     }
     let fd_idx = fd as usize;
-    let current_pid = crate::process::scheduler::current_pid()?;
-
-    let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
-    let scheduler = sched_lock.as_mut()?;
-    let task = scheduler.get_task_mut(current_pid)?;
+    let current_pid = scheduler::current_pid()?;
+    let task_arc = scheduler::get_task_arc(current_pid)?;
+    let mut task = task_arc.lock();
 
     let file_desc = task.fd_table.get(fd_idx)?.as_ref().cloned()?;
     *file_desc.ref_count.lock() += 1;
@@ -177,19 +151,15 @@ pub fn current_task_dup_fd(fd: i32) -> Option<i32> {
 }
 
 /// Duplicate an existing file descriptor `oldfd` onto `newfd` in the current task's fd_table.
-///
-/// If `newfd` was already open, it is closed first. If `oldfd == newfd`, it just returns `newfd`
-/// without closing.
-/// Returns the new file descriptor number, or `None` on failure.
 pub fn current_task_dup2_fd(oldfd: i32, newfd: i32) -> Option<i32> {
     if oldfd < 0 || newfd < 0 || newfd >= 1024 {
         return None;
     }
+    let current_pid = scheduler::current_pid()?;
+    let task_arc = scheduler::get_task_arc(current_pid)?;
+
     if oldfd == newfd {
-        let current_pid = crate::process::scheduler::current_pid()?;
-        let sched_lock = crate::process::scheduler::SCHEDULER.lock();
-        let scheduler = sched_lock.as_ref()?;
-        let task = scheduler.get_task(current_pid)?;
+        let task = task_arc.lock();
         if task.fd_table.get(oldfd as usize)?.as_ref().is_some() {
             return Some(newfd);
         } else {
@@ -197,12 +167,7 @@ pub fn current_task_dup2_fd(oldfd: i32, newfd: i32) -> Option<i32> {
         }
     }
 
-    let current_pid = crate::process::scheduler::current_pid()?;
-
-    let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
-    let scheduler = sched_lock.as_mut()?;
-    let task = scheduler.get_task_mut(current_pid)?;
-
+    let mut task = task_arc.lock();
     let file_desc = task.fd_table.get(oldfd as usize)?.as_ref().cloned()?;
     *file_desc.ref_count.lock() += 1;
 

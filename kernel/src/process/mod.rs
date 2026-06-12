@@ -86,7 +86,17 @@ pub fn init() {
 }
 
 /// Spawn a new Ring 3 user process from ELF data.
+/// Spawn a new Ring 3 user process from ELF data.
 pub fn spawn_user_process(name: alloc::string::String, elf_data: &[u8]) -> pid::Pid {
+    spawn_user_process_with_pid(name, elf_data, pid::allocate())
+}
+
+/// Spawn a new Ring 3 user process from ELF data with a specific PID.
+pub fn spawn_user_process_with_pid(
+    name: alloc::string::String,
+    elf_data: &[u8],
+    pid: pid::Pid,
+) -> pid::Pid {
     let elf_info = elf::parse_elf(elf_data).expect("Failed to parse user process ELF");
 
     // Create new user PML4 page table (clones kernel mappings)
@@ -224,7 +234,6 @@ pub fn spawn_user_process(name: alloc::string::String, elf_data: &[u8]) -> pid::
     let initial_brk = (max_vaddr + 4095) & !4095;
 
     // Create new process TCB
-    let pid = pid::allocate();
     let mut task = task::Task::new(pid, name, page_table_root);
     task.brk = initial_brk;
 

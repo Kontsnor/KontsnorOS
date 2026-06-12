@@ -187,6 +187,34 @@ impl Scheduler {
 
     /// Terminate a task.
     pub fn exit_task(&mut self, pid: Pid, exit_code: i32) {
+        // Re-parent orphan children of the exiting task to PID 1 (INIT)
+        let mut adopted_any = false;
+        let tasks = TASKS.read();
+        for task_opt in tasks.iter() {
+            if let Some(task_arc) = task_opt {
+                let mut other_task = task_arc.lock();
+                if other_task.parent_pid == pid {
+                    other_task.parent_pid = Pid::INIT;
+                    adopted_any = true;
+                }
+            }
+        }
+        drop(tasks);
+
+        if adopted_any {
+            let init_idx = Pid::INIT.as_u64() as usize;
+            let tasks = TASKS.read();
+            if let Some(Some(init_task_arc)) = tasks.get(init_idx) {
+                let init_wait_queue = {
+                    let init_task = init_task_arc.lock();
+                    init_task.child_wait_queue.clone()
+                };
+                init_wait_queue.wake_all_locked(self);
+                self.wake_task(Pid::INIT);
+            }
+            drop(tasks);
+        }
+
         let idx = pid.as_u64() as usize;
         let mut parent_pid = None;
         let tasks = TASKS.read();

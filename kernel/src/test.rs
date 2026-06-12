@@ -156,3 +156,44 @@ fn test_scheduler_priority_queues() {
     assert_eq!(sched.pick_next(), Some(pid_low));
     assert_eq!(sched.pick_next(), None);
 }
+
+#[test_case]
+fn test_orphan_reparenting() {
+    let mut sched = crate::process::scheduler::Scheduler::new();
+
+    // Create a mock init task (PID 1) so it exists in TASKS
+    let pid_init = crate::process::pid::Pid::from_raw(1);
+    let mut task_init =
+        crate::process::task::Task::new(pid_init, alloc::string::String::from("init"), 0);
+    task_init.state = crate::process::task::TaskState::Blocked;
+    sched.add_task(task_init);
+
+    // Create parent task (PID 20)
+    let pid_parent = crate::process::pid::Pid::from_raw(20);
+    let mut task_parent =
+        crate::process::task::Task::new(pid_parent, alloc::string::String::from("parent"), 0);
+    task_parent.state = crate::process::task::TaskState::Ready;
+    sched.add_task(task_parent);
+
+    // Create child task (PID 21) whose parent is the parent task
+    let pid_child = crate::process::pid::Pid::from_raw(21);
+    let mut task_child =
+        crate::process::task::Task::new(pid_child, alloc::string::String::from("child"), 0);
+    task_child.parent_pid = pid_parent;
+    task_child.state = crate::process::task::TaskState::Ready;
+    sched.add_task(task_child);
+
+    // Exit the parent task
+    sched.exit_task(pid_parent, 0);
+
+    // Verify child has been re-parented to PID 1 (INIT)
+    let child_arc = crate::process::scheduler::get_task_arc(pid_child).expect("Child task missing");
+    let child = child_arc.lock();
+    assert_eq!(child.parent_pid, crate::process::pid::Pid::INIT);
+
+    // Verify parent has transitioned to Zombie
+    let parent_arc =
+        crate::process::scheduler::get_task_arc(pid_parent).expect("Parent task missing");
+    let parent = parent_arc.lock();
+    assert_eq!(parent.state, crate::process::task::TaskState::Zombie);
+}

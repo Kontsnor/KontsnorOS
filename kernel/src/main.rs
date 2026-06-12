@@ -204,31 +204,62 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     #[cfg(not(feature = "test"))]
     {
-        // Spawn Ring 3 user shell from ext2 RAM disk
-        let shell_path = if fs::vfs::lookup("/bin/bash").is_some() {
-            "/bin/bash"
-        } else {
-            "/bin/sh"
-        };
-        kprintln!("[boot] Spawning Ring 3 → Ring 3 shell: {}...", shell_path);
-        if let Some(inode) = fs::vfs::lookup(shell_path) {
+        // Clear the graphics console to enter terminal mode
+        if let Some(ref mut console) = *crate::drivers::gpu::bochs::GRAPHICS_CONSOLE.lock() {
+            console.clear(crate::drivers::gpu::framebuffer::Color::BLACK);
+            console.gpu.blit();
+        }
+
+        // Disable standard text mode console log prints from mirroring to the graphics screen
+        crate::drivers::gpu::bochs::DISABLE_CONSOLE_MIRROR
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+
+        // Allocate a new PTY master/slave pair and set up active routing
+        let master = crate::fs::pty::allocate_new_pty().expect("Failed to allocate PTY");
+        *crate::fs::pty::ACTIVE_PTY_MASTER.lock() = Some(master.clone());
+        crate::fs::pty::start_pty_io_loop();
+
+        // Spawn Ring 3 user init from ext2 RAM disk as PID 1
+        let init_path = "/sbin/init";
+        kprintln!("[boot] Spawning Ring 3 → Ring 3 init: {}...", init_path);
+        if let Some(inode) = fs::vfs::lookup(init_path) {
             let size = inode.inode().size as usize;
             let mut buf = alloc::vec![0u8; size];
             match inode.read(0, &mut buf) {
                 Ok(bytes_read) => {
                     kprintln!(
                         "[boot] Loaded {} ({} bytes) from VFS, spawning...",
-                        shell_path,
+                        init_path,
                         bytes_read
                     );
-                    process::spawn_user_process(alloc::string::String::from("bash"), &buf);
+                    let pid = process::spawn_user_process_with_pid(
+                        alloc::string::String::from("init"),
+                        &buf,
+                        crate::process::pid::Pid::INIT,
+                    );
+
+                    // Connect spawned init's fd 0, 1, 2 to the PTY slave device (/dev/pts/0)
+                    let slave =
+                        crate::fs::vfs::lookup("/dev/pts/0").expect("Failed to lookup PTY slave");
+                    if let Some(task_arc) = process::scheduler::get_task_arc(pid) {
+                        let mut task = task_arc.lock();
+                        task.fd_table.clear();
+                        let slave_desc =
+                            alloc::sync::Arc::new(crate::fs::file::FileDescription::new(
+                                slave,
+                                crate::fs::file::OpenFlags(crate::fs::file::OpenFlags::O_RDWR),
+                            ));
+                        task.fd_table.push(Some(slave_desc.clone())); // fd 0
+                        task.fd_table.push(Some(slave_desc.clone())); // fd 1
+                        task.fd_table.push(Some(slave_desc.clone())); // fd 2
+                    }
                 }
                 Err(e) => {
-                    kprintln!("[boot] Failed to read {}: error {}", shell_path, e);
+                    kprintln!("[boot] Failed to read {}: error {}", init_path, e);
                 }
             }
         } else {
-            kprintln!("[boot] {} not found on mounted ext2 disk!", shell_path);
+            kprintln!("[boot] {} not found on mounted ext2 disk!", init_path);
         }
 
         // Spawn freestanding network test binary
@@ -236,12 +267,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             kprintln!("[boot] Spawning freestanding network test binary...");
             let net_test_elf = process::create_net_test_elf();
             process::spawn_user_process(alloc::string::String::from("net_test"), net_test_elf);
-        }
-
-        // Clear the graphics console to enter terminal mode
-        if let Some(ref mut console) = *crate::drivers::gpu::bochs::GRAPHICS_CONSOLE.lock() {
-            console.clear(crate::drivers::gpu::framebuffer::Color::BLACK);
-            console.gpu.blit();
         }
     }
 

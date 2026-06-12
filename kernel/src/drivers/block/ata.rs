@@ -1,15 +1,38 @@
-//! Writable IDE/ATA PIO block device driver for KontsnorOS.
+//! Writable IDE/ATA Bus Master DMA block device driver for KontsnorOS.
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use spin::Mutex;
 use x86_64::instructions::port::Port;
 use crate::drivers::traits::{BlockDevice, DriverError, DriverInfo};
 use crate::kprintln;
 
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug)]
+struct PrdEntry {
+    phys_addr: u32,
+    byte_count_eot: u32, // Lower 16 bits: byte count, Bit 31: End-of-Table
+}
+
+struct AtaDriveInner {
+    dma_base: Option<u16>,
+    prdt_phys: u64,
+    prdt_virt: *mut PrdEntry,
+}
+
+// SAFETY: The PRD physical and virtual buffers are thread-safe and protected by a Mutex.
+unsafe impl Send for AtaDriveInner {}
+unsafe impl Sync for AtaDriveInner {}
+
 /// ATA Primary Slave drive implementation.
 pub struct AtaDrive {
     info: DriverInfo,
+    inner: Mutex<AtaDriveInner>,
 }
+
+// SAFETY: AtaDrive implements safe multithreaded serialization.
+unsafe impl Send for AtaDrive {}
+unsafe impl Sync for AtaDrive {}
 
 impl AtaDrive {
     /// Polls the status register until the BSY bit is clear and DRDY bit is set.
@@ -186,13 +209,14 @@ impl BlockDevice for AtaDrive {
     }
 
     fn block_count(&self) -> u64 {
-        131072 // 64 MB raw disk divided by 512 bytes per block = 131072 blocks
+        131072
     }
 
     fn flush(&self) -> Result<(), DriverError> {
+        let _inner = self.inner.lock();
         let mut command_port = Port::<u8>::new(0x1F7);
         self.wait_ready().map_err(|_| DriverError::Timeout)?;
-        unsafe { command_port.write(0xE7); } // 0xE7 = Cache Flush
+        unsafe { command_port.write(0xE7); }
         self.wait_ready().map_err(|_| DriverError::Timeout)?;
         Ok(())
     }
@@ -202,43 +226,66 @@ impl BlockDevice for AtaDrive {
     }
 }
 
-/// Probes the registers to check if the Primary Slave drive is present.
 fn probe_ata_drive() -> bool {
     let mut drive_head_port = Port::<u8>::new(0x1F6);
     let mut lba_low_port = Port::<u8>::new(0x1F3);
     let mut lba_mid_port = Port::<u8>::new(0x1F4);
     
     unsafe {
-        // Select Primary Slave (0xF0 selects LBA mode & Slave)
         drive_head_port.write(0xF0);
-        
-        // Write pattern values to check consistency
         lba_low_port.write(0x55);
         lba_mid_port.write(0xAA);
-        
-        // Read back pattern
         let low = lba_low_port.read();
         let mid = lba_mid_port.read();
-        
         low == 0x55 && mid == 0xAA
     }
 }
 
-/// Probes and initializes the ATA Primary Slave drive.
+fn find_ata_pci_dma() -> Option<u16> {
+    crate::drivers::bus::pci::init();
+    let devices = crate::drivers::bus::pci::find_device(0x8086, 0x7010);
+    if devices.is_empty() {
+        return None;
+    }
+    let dev = &devices[0];
+    let bar4 = crate::drivers::bus::pci::read_config(dev.bus, dev.device, dev.function, 0x20);
+    if bar4 == 0 || bar4 == 0xFFFFFFFF {
+        return None;
+    }
+    if bar4 & 1 == 0 {
+        return None;
+    }
+    let base_addr = (bar4 & 0xFFFFFFFC) as u16;
+    let cmd = crate::drivers::bus::pci::read_config(dev.bus, dev.device, dev.function, 0x04);
+    crate::drivers::bus::pci::write_config(dev.bus, dev.device, dev.function, 0x04, cmd | 0x05);
+    Some(base_addr)
+}
+
 pub fn init_ata_drive() -> Option<Arc<dyn BlockDevice>> {
     if probe_ata_drive() {
-        kprintln!("[ata] Detected Primary Slave hard disk drive.");
+        let dma_base = find_ata_pci_dma();
+        let prdt_phys = crate::memory::physical::allocate_frame().expect("ata: out of memory for PRDT");
+        let prdt_virt = (prdt_phys + crate::memory::r#virtual::phys_mem_offset()) as *mut PrdEntry;
+        unsafe {
+            core::ptr::write_bytes(prdt_virt as *mut u8, 0, 4096);
+        }
         let info = DriverInfo {
             name: String::from("ata-drive"),
             version: String::from("0.1.0"),
             author: String::from("Antigravity Systems"),
             license: String::from("MIT"),
-            description: String::from("Standard IDE/ATA PIO Primary Slave disk driver"),
+            description: String::from("Standard IDE/ATA Primary Slave disk driver with Bus Master DMA"),
         };
         crate::drivers::register_driver(info.clone());
-        Some(Arc::new(AtaDrive { info }))
+        Some(Arc::new(AtaDrive {
+            info,
+            inner: Mutex::new(AtaDriveInner {
+                dma_base,
+                prdt_phys,
+                prdt_virt,
+            }),
+        }))
     } else {
-        kprintln!("[ata] Primary Slave hard disk drive not detected.");
         None
     }
 }

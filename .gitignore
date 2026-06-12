@@ -21,3 +21,7 @@ qemu_output.log
 busybox-build/
 busybox/
 busybox
+
+# User space binaries
+tools/init
+

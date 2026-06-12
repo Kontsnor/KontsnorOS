@@ -21,6 +21,9 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 #![feature(alloc_error_handler)]
+#![cfg_attr(feature = "test", feature(custom_test_frameworks))]
+#![cfg_attr(feature = "test", reexport_test_harness_main = "test_main")]
+#![cfg_attr(feature = "test", test_runner(crate::test::test_runner))]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(warnings)]
 
@@ -38,6 +41,8 @@ mod ipc;
 mod memory;
 mod net;
 mod panic;
+#[cfg(feature = "test")]
+pub mod test;
 mod process;
 mod sync;
 mod syscall;
@@ -193,40 +198,43 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     syscall::init();
     kprintln!("[boot] Syscall interface initialized.");
 
-    // Spawn Ring 3 user shell from ext2 RAM disk
-    let shell_path = if fs::vfs::lookup("/bin/bash").is_some() {
-        "/bin/bash"
-    } else {
-        "/bin/sh"
-    };
-    kprintln!("[boot] Spawning Ring 3 → Ring 3 shell: {}...", shell_path);
-    if let Some(inode) = fs::vfs::lookup(shell_path) {
-        let size = inode.inode().size as usize;
-        let mut buf = alloc::vec![0u8; size];
-        match inode.read(0, &mut buf) {
-            Ok(bytes_read) => {
-                kprintln!("[boot] Loaded {} ({} bytes) from VFS, spawning...", shell_path, bytes_read);
-                process::spawn_user_process(alloc::string::String::from("bash"), &buf);
+    #[cfg(not(feature = "test"))]
+    {
+        // Spawn Ring 3 user shell from ext2 RAM disk
+        let shell_path = if fs::vfs::lookup("/bin/bash").is_some() {
+            "/bin/bash"
+        } else {
+            "/bin/sh"
+        };
+        kprintln!("[boot] Spawning Ring 3 → Ring 3 shell: {}...", shell_path);
+        if let Some(inode) = fs::vfs::lookup(shell_path) {
+            let size = inode.inode().size as usize;
+            let mut buf = alloc::vec![0u8; size];
+            match inode.read(0, &mut buf) {
+                Ok(bytes_read) => {
+                    kprintln!("[boot] Loaded {} ({} bytes) from VFS, spawning...", shell_path, bytes_read);
+                    process::spawn_user_process(alloc::string::String::from("bash"), &buf);
+                }
+                Err(e) => {
+                    kprintln!("[boot] Failed to read {}: error {}", shell_path, e);
+                }
             }
-            Err(e) => {
-                kprintln!("[boot] Failed to read {}: error {}", shell_path, e);
-            }
+        } else {
+            kprintln!("[boot] {} not found on mounted ext2 disk!", shell_path);
         }
-    } else {
-        kprintln!("[boot] {} not found on mounted ext2 disk!", shell_path);
-    }
 
-    // Spawn freestanding network test binary
-    if ENABLE_NET_TESTS {
-        kprintln!("[boot] Spawning freestanding network test binary...");
-        let net_test_elf = process::create_net_test_elf();
-        process::spawn_user_process(alloc::string::String::from("net_test"), net_test_elf);
-    }
+        // Spawn freestanding network test binary
+        if ENABLE_NET_TESTS {
+            kprintln!("[boot] Spawning freestanding network test binary...");
+            let net_test_elf = process::create_net_test_elf();
+            process::spawn_user_process(alloc::string::String::from("net_test"), net_test_elf);
+        }
 
-    // Clear the graphics console to enter terminal mode
-    if let Some(ref mut console) = *crate::drivers::gpu::bochs::GRAPHICS_CONSOLE.lock() {
-        console.clear(crate::drivers::gpu::framebuffer::Color::BLACK);
-        console.gpu.blit();
+        // Clear the graphics console to enter terminal mode
+        if let Some(ref mut console) = *crate::drivers::gpu::bochs::GRAPHICS_CONSOLE.lock() {
+            console.clear(crate::drivers::gpu::framebuffer::Color::BLACK);
+            console.gpu.blit();
+        }
     }
 
     // ── Boot complete ──────────────────────────────────────────────────
@@ -241,7 +249,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     x86_64::instructions::interrupts::enable();
     kprintln!("[kernel] Interrupts enabled. Yielding to ready threads...");
 
+    #[cfg(feature = "test")]
+    {
+        kprintln!("[boot] Running in test mode...");
+        test_main();
+    }
+
     // Yield control to let the spawned demo threads run
+    #[cfg(not(feature = "test"))]
     process::scheduler::yield_now();
 
     kprintln!("[main] Returned to bootstrap thread. Halting.");

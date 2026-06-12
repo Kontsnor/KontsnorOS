@@ -57,7 +57,7 @@ pub struct Scheduler {
 
 impl Scheduler {
     /// Create a new scheduler.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             queues: [
                 VecDeque::new(),

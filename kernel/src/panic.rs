@@ -13,6 +13,7 @@ use crate::kprintln;
 ///
 /// This function is called by the Rust runtime when a panic occurs.
 /// It must never return, and it must not allocate or panic itself.
+#[cfg(not(feature = "test"))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     // Disable interrupts to prevent further complications

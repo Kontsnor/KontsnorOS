@@ -44,12 +44,20 @@ impl MmioRegion {
     }
 
     /// Read a 64-bit value from the MMIO region.
+    ///
+    /// # Safety
+    ///
+    /// The offset must be within the region bounds and properly aligned.
     pub unsafe fn read_u64(&self, offset: u64) -> u64 {
         let addr = (self.base + offset) as *const u64;
         unsafe { core::ptr::read_volatile(addr) }
     }
 
     /// Write a 64-bit value to the MMIO region.
+    ///
+    /// # Safety
+    ///
+    /// The offset must be within the region bounds and properly aligned.
     pub unsafe fn write_u64(&self, offset: u64, value: u64) {
         let addr = (self.base + offset) as *mut u64;
         unsafe { core::ptr::write_volatile(addr, value) }

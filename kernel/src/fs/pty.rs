@@ -399,3 +399,74 @@ pub fn allocate_new_pty() -> Result<Arc<dyn InodeOps>, i32> {
 
     Ok(master as Arc<dyn InodeOps>)
 }
+
+/// Global active PTY master reference.
+pub static ACTIVE_PTY_MASTER: spin::Mutex<Option<Arc<dyn InodeOps>>> = spin::Mutex::new(None);
+
+fn pty_flusher_thread() {
+    let mut buf = [0u8; 128];
+    loop {
+        let master_opt = ACTIVE_PTY_MASTER.lock().clone();
+        if let Some(master) = master_opt {
+            match master.read(0, &mut buf) {
+                Ok(n) if n > 0 => {
+                    if let Some(ref mut console) =
+                        *crate::drivers::gpu::bochs::GRAPHICS_CONSOLE.lock()
+                    {
+                        for &byte in &buf[..n] {
+                            console.write_char(byte);
+                        }
+                        console.gpu.blit();
+                    }
+                }
+                _ => {}
+            }
+        }
+        crate::process::scheduler::yield_now();
+    }
+}
+
+fn pty_router_thread() {
+    loop {
+        // Poll serial input for QEMU stdio
+        if let Some(ch) = crate::arch::x86_64::serial::try_read_byte() {
+            let mut byte = ch;
+            if byte == b'\r' {
+                byte = b'\n';
+            }
+            crate::drivers::keyboard::push_char(byte);
+        }
+
+        // Drain keyboard input buffer and write to the PTY master
+        let mut temp_buf = [0u8; 64];
+        let mut count = 0;
+        while count < temp_buf.len() {
+            if let Some(ch) = crate::drivers::keyboard::try_read_char() {
+                temp_buf[count] = ch;
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        if count > 0 {
+            let master_opt = ACTIVE_PTY_MASTER.lock().clone();
+            if let Some(master) = master_opt {
+                let _ = master.write(0, &temp_buf[..count]);
+            }
+        }
+
+        crate::process::scheduler::yield_now();
+    }
+}
+
+/// Starts the PTY master I/O flusher and router threads.
+pub fn start_pty_io_loop() {
+    crate::process::spawn_kernel_thread(
+        alloc::string::String::from("pty_flusher"),
+        pty_flusher_thread,
+    );
+    crate::process::spawn_kernel_thread(
+        alloc::string::String::from("pty_router"),
+        pty_router_thread,
+    );
+}

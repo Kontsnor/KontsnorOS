@@ -9,6 +9,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use spin::Mutex;
 use x86_64::instructions::port::Port;
+use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
+use x86_64::{PhysAddr, VirtAddr};
 
 use crate::drivers::gpu::framebuffer::Color;
 use crate::drivers::traits::{
@@ -40,6 +42,7 @@ const VBE_DISPI_IOPORT_DATA: u16 = 0x01CF;
 fn write_vbe(index: u16, val: u16) {
     let mut index_port = Port::<u16>::new(VBE_DISPI_IOPORT_INDEX);
     let mut data_port = Port::<u16>::new(VBE_DISPI_IOPORT_DATA);
+    // SAFETY: Writing to Bochs VBE configuration ports is standard register access for setting display resolutions and modes.
     unsafe {
         index_port.write(index);
         data_port.write(val);
@@ -50,6 +53,7 @@ fn write_vbe(index: u16, val: u16) {
 fn read_vbe(index: u16) -> u16 {
     let mut index_port = Port::<u16>::new(VBE_DISPI_IOPORT_INDEX);
     let mut data_port = Port::<u16>::new(VBE_DISPI_IOPORT_DATA);
+    // SAFETY: Reading from Bochs VBE configuration ports is standard register access for querying display state.
     unsafe {
         index_port.write(index);
         data_port.read()
@@ -70,6 +74,8 @@ pub struct BochsGpu {
 impl BochsGpu {
     /// Copy the backbuffer to the physical linear frame buffer.
     pub fn blit(&self) {
+        // SAFETY: We copy the pixels from our heap-allocated backbuffer (with length matching the active screen dimensions)
+        // to the mapped graphics framebuffer virtual address space `self.lfb_virt`.
         unsafe {
             let dest = self.lfb_virt as *mut u32;
             let back = self.backbuffer.lock();
@@ -174,39 +180,60 @@ impl GraphicsConsole {
         self.cursor_y = 0;
     }
 
-    /// Draw a character glyph onto the backbuffer at character coordinates (col, row).
-    pub fn draw_char_at(&self, col: usize, row: usize, c: u8) {
-        if col >= 128 || row >= 48 {
-            return;
-        }
-
+    /// Draw a character glyph onto the backbuffer at arbitrary pixel coordinates (x, y).
+    pub fn draw_char(&self, x: usize, y: usize, c: u8, fg_color: Color, bg_color: Color) {
         let font_data = include_bytes!("font_8x16.bin");
         let char_offset = (c as usize) * 16;
         let mut back = self.gpu.backbuffer.lock();
+        let width = self.gpu.width as usize;
+        let height = self.gpu.height as usize;
 
         for y_offset in 0..16 {
+            let pixel_y = y + y_offset;
+            if pixel_y >= height {
+                continue;
+            }
             let row_byte = font_data[char_offset + y_offset];
-            let pixel_y = row * 16 + y_offset;
 
             for x_offset in 0..8 {
-                let pixel_x = col * 8 + x_offset;
+                let pixel_x = x + x_offset;
+                if pixel_x >= width {
+                    continue;
+                }
                 let bit = (row_byte >> (7 - x_offset)) & 1;
-                let color = if bit == 1 {
-                    self.fg_color
-                } else {
-                    self.bg_color
-                };
-
-                let index = pixel_y * 1024 + pixel_x;
-                back[index] = color.to_argb32();
+                let color = if bit == 1 { fg_color } else { bg_color };
+                let index = pixel_y * width + pixel_x;
+                if index < back.len() {
+                    back[index] = color.to_argb32();
+                }
             }
         }
+    }
+
+    /// Render a string at arbitrary pixel coordinates (x, y).
+    pub fn draw_string(&self, x: usize, y: usize, text: &str, fg_color: Color, bg_color: Color) {
+        let mut curr_x = x;
+        for &byte in text.as_bytes() {
+            self.draw_char(curr_x, y, byte, fg_color, bg_color);
+            curr_x += 8;
+        }
+    }
+
+    /// Draw a character glyph onto the backbuffer at character coordinates (col, row).
+    pub fn draw_char_at(&self, col: usize, row: usize, c: u8) {
+        let cols = self.gpu.width as usize / 8;
+        let rows = self.gpu.height as usize / 16;
+        if col >= cols || row >= rows {
+            return;
+        }
+        self.draw_char(col * 8, row * 16, c, self.fg_color, self.bg_color);
     }
 
     /// Advance cursor and handle scrolling.
     pub fn newline(&mut self) {
         self.cursor_x = 0;
-        if self.cursor_y < 47 {
+        let rows = self.gpu.height as usize / 16;
+        if self.cursor_y < rows - 1 {
             self.cursor_y += 1;
         } else {
             self.scroll_up();
@@ -216,14 +243,20 @@ impl GraphicsConsole {
     /// Scroll console up by 1 line (16 pixels).
     pub fn scroll_up(&mut self) {
         let mut back = self.gpu.backbuffer.lock();
-        let lines_to_copy = 768 - 16;
+        let width = self.gpu.width as usize;
+        let height = self.gpu.height as usize;
+        let lines_to_copy = height - 16;
+        // SAFETY: We copy the pixels within the bounds of the backbuffer size (width * height).
+        // The pointer additions and copy are fully checked against the pointer boundaries and bounds.
         unsafe {
             let ptr = back.as_mut_ptr();
-            core::ptr::copy(ptr.add(1024 * 16), ptr, 1024 * lines_to_copy);
+            core::ptr::copy(ptr.add(width * 16), ptr, width * lines_to_copy);
 
             let bg_val = self.bg_color.to_argb32();
-            for i in (1024 * lines_to_copy)..(1024 * 768) {
-                *ptr.add(i) = bg_val;
+            for i in (width * lines_to_copy)..(width * height) {
+                if i < back.len() {
+                    *ptr.add(i) = bg_val;
+                }
             }
         }
     }
@@ -329,6 +362,7 @@ impl GraphicsConsole {
 
     /// Write a character byte, parsing ANSI escapes.
     pub fn write_char(&mut self, c: u8) {
+        let cols = self.gpu.width as usize / 8;
         match self.ansi_state.clone() {
             AnsiState::Normal => {
                 if c == b'\x1b' {
@@ -339,11 +373,11 @@ impl GraphicsConsole {
                     self.cursor_x = 0;
                 } else if c == b'\t' {
                     let next_tab = (self.cursor_x + 8) & !7;
-                    while self.cursor_x < next_tab && self.cursor_x < 128 {
+                    while self.cursor_x < next_tab && self.cursor_x < cols {
                         self.draw_char_at(self.cursor_x, self.cursor_y, b' ');
                         self.cursor_x += 1;
                     }
-                    if self.cursor_x >= 128 {
+                    if self.cursor_x >= cols {
                         self.newline();
                     }
                 } else if c == 0x08 || c == 0x7F {
@@ -354,7 +388,7 @@ impl GraphicsConsole {
                 } else {
                     self.draw_char_at(self.cursor_x, self.cursor_y, c);
                     self.cursor_x += 1;
-                    if self.cursor_x >= 128 {
+                    if self.cursor_x >= cols {
                         self.newline();
                     }
                 }
@@ -473,6 +507,10 @@ impl core::fmt::Write for GraphicsConsole {
 /// The globally active graphics console, if initialized.
 pub static GRAPHICS_CONSOLE: Mutex<Option<GraphicsConsole>> = Mutex::new(None);
 
+/// Global flag to disable mirroring standard kprint/serial outputs to the graphics console.
+pub static DISABLE_CONSOLE_MIRROR: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Probes the PCI bus for Bochs graphics adapter, switches video modes,
 /// renders boot splash, and registers the GPU driver.
 pub fn init() {
@@ -488,12 +526,27 @@ pub fn init() {
 
     let bar0 = crate::drivers::bus::pci::read_config(dev.bus, dev.device, dev.function, 0x10);
     let lfb_phys = (bar0 & 0xFFFFFFF0) as u64;
-    let lfb_virt = lfb_phys + crate::memory::r#virtual::phys_mem_offset();
 
     let width = 1024;
     let height = 768;
     let bpp = 32;
     let size = (width as u64) * (height as u64) * 4;
+
+    // Map the physical framebuffer memory range (BAR 0) into the higher-half virtual address space.
+    let lfb_virt = 0xffff_c000_0000_0000u64;
+    let page_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+    let num_pages = (size + 4095) / 4096;
+    for i in 0..num_pages {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(lfb_virt + i * 4096));
+        let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(lfb_phys + i * 4096));
+        // SAFETY: We map the hardware framebuffer BAR0 memory range (which is mapped to a physical address
+        // by the PCI host controller) into a dedicated higher-half kernel virtual address space with
+        // caching disabled (NO_CACHE) to ensure immediate write visibility.
+        unsafe {
+            crate::memory::r#virtual::map_page(page, frame, page_flags)
+                .expect("Failed to map physical framebuffer page");
+        }
+    }
 
     // Configure video mode: 1024x768x32
     write_vbe(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);

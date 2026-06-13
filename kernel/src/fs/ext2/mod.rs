@@ -14,7 +14,10 @@ pub mod dir;
 pub mod file;
 pub mod types;
 
-pub use types::{Ext2RawInode, GroupDescriptor, Superblock};
+pub use types::{
+    Ext2RawInode, Ext4Extent, Ext4ExtentHeader, Ext4ExtentIdx, GroupDescriptor, JournalHeader,
+    JournalSuperblock, Superblock,
+};
 
 /// Helper to count free bits (zeros) in a bitmap buffer.
 pub(crate) fn count_free_bits(bitmap: &[u8], total_count: u32) -> u32 {
@@ -415,6 +418,38 @@ impl Ext2FileSystem {
             root_node: Mutex::new(None),
         });
 
+        // Parse JBD2 Journal if HAS_JOURNAL feature is set
+        if (sb.s_feature_compat & 0x0004) != 0 {
+            kprintln!("[ext4] Superblock has journal feature compat flag.");
+            let journal_ino = 8;
+            let journal_inode = fs.get_ext2_inode(journal_ino)?;
+            let phys_block = journal_inode.resolve_block(0)?;
+            if phys_block == 0 {
+                return Err("Journal inode block 0 is not mapped");
+            }
+            let mut jsb_buf = ::alloc::vec![0u8; block_size as usize];
+            read_blocks(&*device, phys_block as u64, &mut jsb_buf, block_size)?;
+            // SAFETY: jsb_buf is allocated with size block_size, which is at least 1024 bytes, matching JBD2 superblock layout.
+            let jsb =
+                unsafe { core::ptr::read_unaligned(jsb_buf.as_ptr() as *const JournalSuperblock) };
+            let magic = u32::from_be(jsb.s_header.h_magic);
+            if magic != 0xC03B3998 {
+                return Err("Invalid JBD2 journal superblock magic");
+            }
+            let j_blocksize = u32::from_be(jsb.s_blocksize);
+            let j_start = u32::from_be(jsb.s_start);
+            kprintln!(
+                "[ext4] JBD2 Journal Superblock magic verified. Block Size: {}, Start Block: {}",
+                j_blocksize,
+                j_start
+            );
+            if j_start != 0 {
+                kprintln!("[ext4] WARNING: Journal has active transactions (start block {}). Mounting anyway (clean state default).", j_start);
+            } else {
+                kprintln!("[ext4] Journal is clean.");
+            }
+        }
+
         // Parse root directory (Inode 2)
         let root = fs.get_inode(2)?;
         *fs.root_node.lock() = Some(root);
@@ -422,8 +457,8 @@ impl Ext2FileSystem {
         Ok(fs)
     }
 
-    /// Retrieve an inode by its number.
-    pub fn get_inode(self: &Arc<Self>, ino: u32) -> Result<Arc<dyn InodeOps>, &'static str> {
+    /// Retrieve raw ext2 inode wrapper.
+    pub fn get_ext2_inode(self: &Arc<Self>, ino: u32) -> Result<Ext2Inode, &'static str> {
         if ino == 0 {
             return Err("Invalid inode number 0");
         }
@@ -482,12 +517,18 @@ impl Ext2FileSystem {
         inode.mtime = raw_inode.i_mtime as u64;
         inode.ctime = raw_inode.i_ctime as u64;
 
-        Ok(Arc::new(Ext2Inode {
+        Ok(Ext2Inode {
             fs: self.clone(),
             ino,
             raw: Mutex::new(raw_inode),
             vfs_inode: Mutex::new(inode),
-        }))
+        })
+    }
+
+    /// Retrieve an inode by its number.
+    pub fn get_inode(self: &Arc<Self>, ino: u32) -> Result<Arc<dyn InodeOps>, &'static str> {
+        let ext2_inode = self.get_ext2_inode(ino)?;
+        Ok(Arc::new(ext2_inode))
     }
 
     /// Write superblock back to the block device.

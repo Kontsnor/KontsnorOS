@@ -140,6 +140,18 @@ pub fn interface_count() -> usize {
     INTERFACES.lock().as_ref().map(|v| v.len()).unwrap_or(0)
 }
 
+/// Get the MAC address of a registered network interface by name.
+pub fn get_mac_address(name: &str) -> Option<[u8; 6]> {
+    if let Some(ref interfaces) = *INTERFACES.lock() {
+        for iface in interfaces {
+            if iface.name == name {
+                return Some(iface.mac_addr);
+            }
+        }
+    }
+    None
+}
+
 /// Find a registered interface by IP.
 pub fn find_interface_by_ip(ip: Ipv4Addr) -> Option<(Ipv4Addr, [u8; 6])> {
     if let Some(ref interfaces) = *INTERFACES.lock() {

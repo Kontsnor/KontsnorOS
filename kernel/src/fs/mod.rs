@@ -19,6 +19,7 @@
 //! ```
 
 use crate::kprintln;
+pub mod cgroupfs;
 pub mod devfs;
 pub mod epoll;
 pub mod eventfd;
@@ -29,7 +30,9 @@ pub mod path;
 pub mod pipe;
 pub mod procfs;
 pub mod pty;
+pub mod securityfs;
 pub mod signalfd;
+pub mod sysfs;
 pub mod timerfd;
 pub mod tmpfs;
 pub mod tty;
@@ -41,6 +44,21 @@ pub fn init() {
     devfs::init();
     tmpfs::init();
     procfs::init();
+
+    // Mount sysfs at /sys
+    let sysfs = sysfs::create_sysfs();
+    vfs::mount(alloc::string::String::from("/sys"), sysfs);
+
+    // Mount cgroup2 at /sys/fs/cgroup
+    let cgroupfs = cgroupfs::create_cgroupfs();
+    vfs::mount(alloc::string::String::from("/sys/fs/cgroup"), cgroupfs);
+
+    // Mount securityfs at /sys/kernel/security
+    let securityfs = securityfs::create_securityfs();
+    vfs::mount(
+        alloc::string::String::from("/sys/kernel/security"),
+        securityfs,
+    );
 
     // Create the RAM disk pre-populated with our ext2 filesystem
     let ramdisk = crate::drivers::ramdisk::create_ext2_ramdisk();

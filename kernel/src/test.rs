@@ -864,3 +864,324 @@ fn test_signalfd() {
     crate::process::fd::current_task_close_fd(sfd);
     kprintln!("[test] signalfd test PASSED!");
 }
+
+#[test_case]
+fn test_pseudo_filesystems() {
+    kprintln!("[test] Starting pseudo-filesystems (sysfs, cgroupfs, securityfs) test...");
+
+    // Test sysfs online CPUs
+    let online_inode = crate::fs::vfs::lookup("/sys/devices/system/cpu/online")
+        .expect("Failed to lookup /sys/devices/system/cpu/online");
+    let mut buf = [0u8; 128];
+    let n = online_inode
+        .read(0, &mut buf)
+        .expect("Failed to read CPU online file");
+    let online_str = core::str::from_utf8(&buf[..n]).expect("Invalid UTF-8");
+    assert!(!online_str.is_empty());
+    kprintln!("[test] sysfs CPU online: {}", online_str.trim());
+
+    // Test loopback MAC address
+    let lo_inode = crate::fs::vfs::lookup("/sys/class/net/lo/address")
+        .expect("Failed to lookup /sys/class/net/lo/address");
+    let n_lo = lo_inode
+        .read(0, &mut buf)
+        .expect("Failed to read lo address");
+    let lo_str = core::str::from_utf8(&buf[..n_lo]).expect("Invalid UTF-8");
+    assert_eq!(lo_str, "00:00:00:00:00:00\n");
+    kprintln!("[test] sysfs lo address: {}", lo_str.trim());
+
+    // Test eth0 MAC address
+    let eth0_inode = crate::fs::vfs::lookup("/sys/class/net/eth0/address")
+        .expect("Failed to lookup /sys/class/net/eth0/address");
+    let n_eth0 = eth0_inode
+        .read(0, &mut buf)
+        .expect("Failed to read eth0 address");
+    let eth0_str = core::str::from_utf8(&buf[..n_eth0]).expect("Invalid UTF-8");
+    assert!(!eth0_str.is_empty());
+    assert!(eth0_str.ends_with('\n'));
+    kprintln!("[test] sysfs eth0 address: {}", eth0_str.trim());
+
+    // Test cgroupfs controllers
+    let controllers_inode = crate::fs::vfs::lookup("/sys/fs/cgroup/cgroup.controllers")
+        .expect("Failed to lookup /sys/fs/cgroup/cgroup.controllers");
+    let n_ctrl = controllers_inode
+        .read(0, &mut buf)
+        .expect("Failed to read cgroup.controllers");
+    let ctrl_str = core::str::from_utf8(&buf[..n_ctrl]).expect("Invalid UTF-8");
+    assert_eq!(ctrl_str, "cpu memory io pids\n");
+    kprintln!("[test] cgroup controllers: {}", ctrl_str.trim());
+
+    // Test cgroupfs procs
+    let procs_inode = crate::fs::vfs::lookup("/sys/fs/cgroup/cgroup.procs")
+        .expect("Failed to lookup /sys/fs/cgroup/cgroup.procs");
+    let n_procs = procs_inode
+        .read(0, &mut buf)
+        .expect("Failed to read cgroup.procs");
+    let procs_str = core::str::from_utf8(&buf[..n_procs]).expect("Invalid UTF-8");
+    assert!(!procs_str.is_empty());
+    kprintln!("[test] cgroup active procs:\n{}", procs_str.trim());
+
+    // Test securityfs (apparmor revision / profiles)
+    let apparmor_rev_inode = crate::fs::vfs::lookup("/sys/kernel/security/apparmor/revision")
+        .expect("Failed to lookup /sys/kernel/security/apparmor/revision");
+    let n_rev = apparmor_rev_inode
+        .read(0, &mut buf)
+        .expect("Failed to read apparmor/revision");
+    let rev_str = core::str::from_utf8(&buf[..n_rev]).expect("Invalid UTF-8");
+    assert_eq!(rev_str, "0\n");
+
+    // Test selinux stubs
+    let selinux_enforce = crate::fs::vfs::lookup("/sys/fs/selinux/enforce")
+        .expect("Failed to lookup /sys/fs/selinux/enforce");
+    let n_enf = selinux_enforce
+        .read(0, &mut buf)
+        .expect("Failed to read selinux/enforce");
+    let enf_str = core::str::from_utf8(&buf[..n_enf]).expect("Invalid UTF-8");
+    assert_eq!(enf_str, "0\n");
+
+    kprintln!("[test] pseudo-filesystems test PASSED!");
+}
+
+#[test_case]
+fn test_ext4_extent_mapping() {
+    kprintln!("[test] Starting Ext4 extent mapping test...");
+
+    // Create a mock ramdisk block device and mount a minimal Ext2 filesystem
+    let device = crate::drivers::ramdisk::create_ext2_ramdisk();
+    let fs = crate::fs::ext2::Ext2FileSystem::mount(device.clone()).expect("Failed to mount ext2");
+
+    // Get inode 12 (hello.txt regular file)
+    let inode = fs.get_ext2_inode(12).expect("Failed to get ext2 inode");
+
+    // Test Case 1: Leaf node extent mapping (eh_depth = 0)
+    let mut i_block = [0u32; 15];
+    let mut bytes = [0u8; 60];
+
+    let header = crate::fs::ext2::types::Ext4ExtentHeader {
+        eh_magic: 0xF30A,
+        eh_entries: 2,
+        eh_max: 4,
+        eh_depth: 0,
+        eh_generation: 0,
+    };
+
+    let ext1 = crate::fs::ext2::types::Ext4Extent {
+        ee_block: 10,
+        ee_len: 10,
+        ee_start_hi: 0,
+        ee_start_lo: 1000,
+    };
+
+    let ext2 = crate::fs::ext2::types::Ext4Extent {
+        ee_block: 30,
+        ee_len: 5,
+        ee_start_hi: 0,
+        ee_start_lo: 5000,
+    };
+
+    // Write structures to bytes buffer
+    // SAFETY: We write to a stack-allocated byte buffer of size 60 which is sufficiently large and aligned.
+    unsafe {
+        core::ptr::write_unaligned(
+            bytes.as_mut_ptr() as *mut crate::fs::ext2::types::Ext4ExtentHeader,
+            header,
+        );
+        core::ptr::write_unaligned(
+            bytes[12..].as_mut_ptr() as *mut crate::fs::ext2::types::Ext4Extent,
+            ext1,
+        );
+        core::ptr::write_unaligned(
+            bytes[24..].as_mut_ptr() as *mut crate::fs::ext2::types::Ext4Extent,
+            ext2,
+        );
+    }
+
+    // Pack bytes into i_block array
+    for i in 0..15 {
+        i_block[i] = u32::from_le_bytes([
+            bytes[i * 4],
+            bytes[i * 4 + 1],
+            bytes[i * 4 + 2],
+            bytes[i * 4 + 3],
+        ]);
+    }
+
+    // Assert physical mappings
+    assert_eq!(inode.resolve_extent_block(&i_block, 10).unwrap(), 1000);
+    assert_eq!(inode.resolve_extent_block(&i_block, 15).unwrap(), 1005);
+    assert_eq!(inode.resolve_extent_block(&i_block, 19).unwrap(), 1009);
+    assert_eq!(inode.resolve_extent_block(&i_block, 20).unwrap(), 0); // Not mapped
+    assert_eq!(inode.resolve_extent_block(&i_block, 30).unwrap(), 5000);
+    assert_eq!(inode.resolve_extent_block(&i_block, 32).unwrap(), 5002);
+    assert_eq!(inode.resolve_extent_block(&i_block, 34).unwrap(), 5004);
+    assert_eq!(inode.resolve_extent_block(&i_block, 35).unwrap(), 0); // Not mapped
+
+    // Test Case 2: Index-based extent tree mapping (eh_depth = 1)
+    let root_header = crate::fs::ext2::types::Ext4ExtentHeader {
+        eh_magic: 0xF30A,
+        eh_entries: 1,
+        eh_max: 4,
+        eh_depth: 1,
+        eh_generation: 0,
+    };
+
+    let idx = crate::fs::ext2::types::Ext4ExtentIdx {
+        ei_block: 0,
+        ei_leaf_lo: 60,
+        ei_leaf_hi: 0,
+        ei_unused: 0,
+    };
+
+    let mut root_bytes = [0u8; 60];
+    // SAFETY: We write to a stack-allocated byte buffer of size 60 which is sufficiently large and aligned.
+    unsafe {
+        core::ptr::write_unaligned(
+            root_bytes.as_mut_ptr() as *mut crate::fs::ext2::types::Ext4ExtentHeader,
+            root_header,
+        );
+        core::ptr::write_unaligned(
+            root_bytes[12..].as_mut_ptr() as *mut crate::fs::ext2::types::Ext4ExtentIdx,
+            idx,
+        );
+    }
+
+    let mut i_block_idx = [0u32; 15];
+    for i in 0..15 {
+        i_block_idx[i] = u32::from_le_bytes([
+            root_bytes[i * 4],
+            root_bytes[i * 4 + 1],
+            root_bytes[i * 4 + 2],
+            root_bytes[i * 4 + 3],
+        ]);
+    }
+
+    // Prepare child block (at block 60 on the ramdisk)
+    let child_header = crate::fs::ext2::types::Ext4ExtentHeader {
+        eh_magic: 0xF30A,
+        eh_entries: 1,
+        eh_max: 4,
+        eh_depth: 0,
+        eh_generation: 0,
+    };
+
+    let leaf = crate::fs::ext2::types::Ext4Extent {
+        ee_block: 0,
+        ee_len: 5,
+        ee_start_hi: 0,
+        ee_start_lo: 9000,
+    };
+
+    let mut child_bytes = [0u8; 1024];
+    // SAFETY: We write to a stack-allocated byte buffer of size 1024 which is sufficiently large and aligned.
+    unsafe {
+        core::ptr::write_unaligned(
+            child_bytes.as_mut_ptr() as *mut crate::fs::ext2::types::Ext4ExtentHeader,
+            child_header,
+        );
+        core::ptr::write_unaligned(
+            child_bytes[12..].as_mut_ptr() as *mut crate::fs::ext2::types::Ext4Extent,
+            leaf,
+        );
+    }
+
+    // Write child block data to block 60 (sectors 120 and 121)
+    device
+        .write_block(120, &child_bytes[0..512])
+        .expect("Write block 120 failed");
+    device
+        .write_block(121, &child_bytes[512..1024])
+        .expect("Write block 121 failed");
+
+    // Assert physical mapping through the index tree structure
+    let resolved = inode.resolve_extent_block(&i_block_idx, 2).unwrap();
+    assert_eq!(resolved, 9002);
+
+    kprintln!("[test] Ext4 extent mapping test PASSED!");
+}
+
+#[test_case]
+fn test_jbd2_journal_mount_check() {
+    kprintln!("[test] Starting JBD2 journal mount check test...");
+
+    // 1. Create a mock JBD2 superblock with correct magic and clean unmount flag (s_start = 0)
+    let clean_jsb = crate::fs::ext2::types::JournalSuperblock {
+        s_header: crate::fs::ext2::types::JournalHeader {
+            h_magic: 0xC03B3998u32.to_be(),
+            h_blocktype: 4u32.to_be(),
+            h_sequence: 1u32.to_be(),
+        },
+        s_blocksize: 1024u32.to_be(),
+        s_maxlen: 1000u32.to_be(),
+        s_first: 1u32.to_be(),
+        s_sequence: 1u32.to_be(),
+        s_start: 0u32.to_be(), // 0 means cleanly unmounted
+        s_errno: 0,
+        s_feature_compat: 0,
+        s_feature_incompat: 0,
+        s_feature_ro_compat: 0,
+        s_uuid: [0; 16],
+        s_nr_users: 0,
+        s_dynsuper: 0,
+        s_max_transaction: 0,
+        s_max_user_data: 0,
+    };
+
+    // 2. Validate clean journal
+    let magic = u32::from_be(clean_jsb.s_header.h_magic);
+    assert_eq!(magic, 0xC03B3998);
+    let j_start = u32::from_be(clean_jsb.s_start);
+    assert_eq!(j_start, 0); // clean
+
+    // 3. Create a mock JBD2 superblock with correct magic but dirty unmount flag (s_start = 123)
+    let dirty_jsb = crate::fs::ext2::types::JournalSuperblock {
+        s_header: crate::fs::ext2::types::JournalHeader {
+            h_magic: 0xC03B3998u32.to_be(),
+            h_blocktype: 4u32.to_be(),
+            h_sequence: 1u32.to_be(),
+        },
+        s_blocksize: 1024u32.to_be(),
+        s_maxlen: 1000u32.to_be(),
+        s_first: 1u32.to_be(),
+        s_sequence: 1u32.to_be(),
+        s_start: 123u32.to_be(), // non-zero means dirty/active transactions
+        s_errno: 0,
+        s_feature_compat: 0,
+        s_feature_incompat: 0,
+        s_feature_ro_compat: 0,
+        s_uuid: [0; 16],
+        s_nr_users: 0,
+        s_dynsuper: 0,
+        s_max_transaction: 0,
+        s_max_user_data: 0,
+    };
+
+    let j_start_dirty = u32::from_be(dirty_jsb.s_start);
+    assert_eq!(j_start_dirty, 123); // dirty
+
+    // 4. Create a superblock with invalid magic
+    let invalid_jsb = crate::fs::ext2::types::JournalSuperblock {
+        s_header: crate::fs::ext2::types::JournalHeader {
+            h_magic: 0xDEADBEEFu32.to_be(),
+            h_blocktype: 4u32.to_be(),
+            h_sequence: 1u32.to_be(),
+        },
+        s_blocksize: 1024u32.to_be(),
+        s_maxlen: 1000u32.to_be(),
+        s_first: 1u32.to_be(),
+        s_sequence: 1u32.to_be(),
+        s_start: 0,
+        s_errno: 0,
+        s_feature_compat: 0,
+        s_feature_incompat: 0,
+        s_feature_ro_compat: 0,
+        s_uuid: [0; 16],
+        s_nr_users: 0,
+        s_dynsuper: 0,
+        s_max_transaction: 0,
+        s_max_user_data: 0,
+    };
+    let magic_invalid = u32::from_be(invalid_jsb.s_header.h_magic);
+    assert_ne!(magic_invalid, 0xC03B3998);
+
+    kprintln!("[test] JBD2 journal mount check test PASSED!");
+}

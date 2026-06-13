@@ -2,15 +2,114 @@
 
 use super::{read_blocks, write_blocks};
 use super::{Ext2Inode, Ext2RawInode};
+use super::{Ext4Extent, Ext4ExtentHeader, Ext4ExtentIdx};
 use crate::fs::inode::{FileType, InodeOps};
 
 impl Ext2Inode {
+    /// Resolve an Ext4 extent-mapped block.
+    pub fn resolve_extent_block(
+        &self,
+        i_block: &[u32; 15],
+        file_block: u32,
+    ) -> Result<u32, &'static str> {
+        let mut root_buf = [0u8; 60];
+        for i in 0..15 {
+            root_buf[i * 4..i * 4 + 4].copy_from_slice(&i_block[i].to_le_bytes());
+        }
+
+        let mut current_buf = root_buf.to_vec();
+
+        loop {
+            if current_buf.len() < 12 {
+                return Err("Extent buffer too small for header");
+            }
+            // SAFETY: Safe to read Ext4ExtentHeader from a valid aligned/unaligned buffer of sufficient size.
+            let header = unsafe {
+                core::ptr::read_unaligned(current_buf.as_ptr() as *const Ext4ExtentHeader)
+            };
+            if header.eh_magic != 0xF30A {
+                return Err("Invalid extent header magic");
+            }
+
+            let eh_entries = header.eh_entries as usize;
+            let eh_depth = header.eh_depth;
+
+            if eh_depth == 0 {
+                // Leaf node. Followed by leaf entries.
+                let entry_size = core::mem::size_of::<Ext4Extent>(); // 12 bytes
+                for i in 0..eh_entries {
+                    let offset = 12 + i * entry_size;
+                    if offset + entry_size > current_buf.len() {
+                        return Err("Extent entry out of bounds");
+                    }
+                    // SAFETY: Safe to read Ext4Extent from a valid aligned/unaligned buffer of sufficient size.
+                    let ext = unsafe {
+                        core::ptr::read_unaligned(
+                            current_buf[offset..].as_ptr() as *const Ext4Extent
+                        )
+                    };
+                    if file_block >= ext.ee_block && file_block < ext.ee_block + ext.ee_len as u32 {
+                        let phys_start =
+                            ((ext.ee_start_hi as u64) << 32) | (ext.ee_start_lo as u64);
+                        let phys_block = phys_start + (file_block - ext.ee_block) as u64;
+                        return Ok(phys_block as u32);
+                    }
+                }
+                return Ok(0); // Sparse block / hole
+            } else {
+                // Index node. Followed by index entries.
+                let entry_size = core::mem::size_of::<Ext4ExtentIdx>(); // 12 bytes
+                let mut best_idx: Option<Ext4ExtentIdx> = None;
+                for i in 0..eh_entries {
+                    let offset = 12 + i * entry_size;
+                    if offset + entry_size > current_buf.len() {
+                        return Err("Extent index entry out of bounds");
+                    }
+                    // SAFETY: Safe to read Ext4ExtentIdx from a valid aligned/unaligned buffer of sufficient size.
+                    let idx = unsafe {
+                        core::ptr::read_unaligned(
+                            current_buf[offset..].as_ptr() as *const Ext4ExtentIdx
+                        )
+                    };
+                    if idx.ei_block <= file_block {
+                        match best_idx {
+                            None => best_idx = Some(idx),
+                            Some(ref best) => {
+                                if idx.ei_block > best.ei_block {
+                                    best_idx = Some(idx);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(best) = best_idx {
+                    let child_block = ((best.ei_leaf_hi as u64) << 32) | (best.ei_leaf_lo as u64);
+                    let mut next_buf = alloc::vec![0u8; self.fs.block_size as usize];
+                    read_blocks(
+                        &*self.fs.device,
+                        child_block,
+                        &mut next_buf,
+                        self.fs.block_size,
+                    )?;
+                    current_buf = next_buf;
+                } else {
+                    return Ok(0); // Not found
+                }
+            }
+        }
+    }
+
     /// Resolve logical block number to physical disk block using a provided raw inode reference.
     pub fn resolve_block_with_raw(
         &self,
         raw: &Ext2RawInode,
         file_block: u32,
     ) -> Result<u32, &'static str> {
+        if (raw.i_flags & 0x80000) != 0 {
+            let i_block = raw.i_block;
+            return self.resolve_extent_block(&i_block, file_block);
+        }
         let i_block = raw.i_block;
 
         if file_block < 12 {
@@ -106,8 +205,21 @@ impl Ext2Inode {
         raw: &mut Ext2RawInode,
         file_block: u32,
     ) -> Result<u32, &'static str> {
+        if (raw.i_flags & 0x80000) != 0 {
+            let i_block = raw.i_block;
+            if let Ok(phys_block) = self.resolve_extent_block(&i_block, file_block) {
+                if phys_block != 0 {
+                    return Ok(phys_block);
+                }
+            }
+            return Err(
+                "Dynamic allocation of physical blocks for Ext4 extent files is unsupported",
+            );
+        }
+
         if file_block < 12 {
             let phys_block = raw.i_block[file_block as usize];
+
             if phys_block != 0 {
                 return Ok(phys_block);
             }

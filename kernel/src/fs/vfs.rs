@@ -13,9 +13,25 @@ use alloc::vec::Vec;
 use spin::RwLock;
 
 use super::inode::{FileType, InodeOps};
+use crate::drivers::traits::BlockDevice;
 
 /// The global VFS instance.
 static VFS: RwLock<Option<Vfs>> = RwLock::new(None);
+
+/// VFS drive map (global block devices registry).
+pub static BLOCK_DEVICES: RwLock<BTreeMap<String, Arc<dyn BlockDevice>>> =
+    RwLock::new(BTreeMap::new());
+
+/// Register a block device in the VFS drive map.
+pub fn register_block_device(name: String, device: Arc<dyn BlockDevice>) {
+    kprintln!("[vfs] Registered block device: {}", name);
+    BLOCK_DEVICES.write().insert(name, device);
+}
+
+/// Retrieve a block device by name from the VFS drive map.
+pub fn get_block_device(name: &str) -> Option<Arc<dyn BlockDevice>> {
+    BLOCK_DEVICES.read().get(name).cloned()
+}
 
 /// A registered filesystem type.
 pub struct FileSystemType {

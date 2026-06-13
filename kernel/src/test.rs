@@ -1185,3 +1185,102 @@ fn test_jbd2_journal_mount_check() {
 
     kprintln!("[test] JBD2 journal mount check test PASSED!");
 }
+
+#[test_case]
+fn test_ahci_controller_initialization() {
+    kprintln!("[test] Starting AHCI Controller Initialization test...");
+
+    // Allocate a mock register space on the heap (5000 bytes to fit 32 ports and control registers)
+    let mut mock_registers = alloc::vec![0u8; 5000];
+    let virt_base = mock_registers.as_mut_ptr() as u64;
+
+    // Set Ports Implemented (PI) to 0x0000_0005 (ports 0 and 2 are active/implemented)
+    let pi_offset = crate::drivers::block::ahci::HOST_PI as usize;
+    unsafe {
+        let pi_ptr = (virt_base + pi_offset as u64) as *mut u32;
+        pi_ptr.write_volatile(0x0000_0005);
+    }
+
+    // Call init_controller_at
+    let pi = unsafe { crate::drivers::block::ahci::test_helpers::init_controller_at(virt_base) };
+
+    // Verify Ports Implemented
+    assert_eq!(pi, 0x0000_0005);
+
+    // Verify GHC has AE (AHCI Enable = bit 31) and IE (Interrupt Enable = bit 1) set
+    let ghc_offset = crate::drivers::block::ahci::HOST_GHC as usize;
+    let ghc = unsafe { ((virt_base + ghc_offset as u64) as *const u32).read_volatile() };
+    assert_ne!(ghc & (1 << 31), 0);
+    assert_ne!(ghc & (1 << 1), 0);
+
+    kprintln!("[test] AHCI Controller Initialization test PASSED!");
+}
+
+#[test_case]
+fn test_ahci_port_connection() {
+    kprintln!("[test] Starting AHCI Port Connection test...");
+
+    // Allocate mock register space
+    let mut mock_registers = alloc::vec![0u8; 5000];
+    let virt_base = mock_registers.as_mut_ptr() as u64;
+
+    let port_idx = 2;
+    let port_base = 0x100 + port_idx * 0x80;
+
+    // Set SSTS of port 2 to 3 (device detected and PHY established)
+    unsafe {
+        let ssts_ptr = (virt_base
+            + port_base as u64
+            + crate::drivers::block::ahci::PORT_SSTS as u64) as *mut u32;
+        ssts_ptr.write_volatile(3);
+    }
+
+    // Mock physical addresses for command list and FIS
+    let cl_phys = 0x1000_2000;
+    let fis_phys = 0x3000_4000;
+
+    // Initialize port 2
+    unsafe {
+        crate::drivers::block::ahci::test_helpers::init_port_at(
+            virt_base, port_idx, cl_phys, fis_phys,
+        );
+    }
+
+    // Assert that the command list and FIS base addresses were written correctly
+    let clb = unsafe {
+        ((virt_base + port_base as u64 + crate::drivers::block::ahci::PORT_CLB as u64)
+            as *const u32)
+            .read_volatile()
+    };
+    let clbu = unsafe {
+        ((virt_base + port_base as u64 + crate::drivers::block::ahci::PORT_CLBU as u64)
+            as *const u32)
+            .read_volatile()
+    };
+    let fb = unsafe {
+        ((virt_base + port_base as u64 + crate::drivers::block::ahci::PORT_FB as u64) as *const u32)
+            .read_volatile()
+    };
+    let fbu = unsafe {
+        ((virt_base + port_base as u64 + crate::drivers::block::ahci::PORT_FBU as u64)
+            as *const u32)
+            .read_volatile()
+    };
+
+    let cl_phys_read = clb as u64 | ((clbu as u64) << 32);
+    let fis_phys_read = fb as u64 | ((fbu as u64) << 32);
+
+    assert_eq!(cl_phys_read, cl_phys);
+    assert_eq!(fis_phys_read, fis_phys);
+
+    // Assert that port 2 CMD register has FRE (0x10) and ST (0x01) bits set
+    let cmd = unsafe {
+        ((virt_base + port_base as u64 + crate::drivers::block::ahci::PORT_CMD as u64)
+            as *const u32)
+            .read_volatile()
+    };
+    assert_ne!(cmd & 0x0010, 0); // FRE set
+    assert_ne!(cmd & 0x0001, 0); // ST set
+
+    kprintln!("[test] AHCI Port Connection test PASSED!");
+}

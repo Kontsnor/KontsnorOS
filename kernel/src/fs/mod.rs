@@ -62,11 +62,16 @@ pub fn init() {
 
     // Create the RAM disk pre-populated with our ext2 filesystem
     let ramdisk = crate::drivers::ramdisk::create_ext2_ramdisk();
+    crate::fs::vfs::register_block_device(alloc::string::String::from("ramdisk"), ramdisk.clone());
 
     let mut mounted_ata = false;
 
     // Probe the physical ATA Primary Slave drive
     if let Some(ata_drive) = crate::drivers::block::ata::init_ata_drive() {
+        crate::fs::vfs::register_block_device(
+            alloc::string::String::from("ata0"),
+            ata_drive.clone(),
+        );
         let mut buf = [0u8; 512];
         if ata_drive.read_block(2, &mut buf).is_ok() {
             let magic = u16::from_le_bytes([buf[56], buf[57]]);
@@ -128,6 +133,12 @@ pub fn init() {
         } else {
             kprintln!("[fs] Failed to mount ext RAM disk.");
         }
+    }
+
+    // Probe and initialize SATA AHCI drives
+    let sata_drives = crate::drivers::block::ahci::init();
+    for (idx, drive) in sata_drives.into_iter().enumerate() {
+        crate::fs::vfs::register_block_device(alloc::format!("sata{}", idx), drive);
     }
 
     kprintln!("[fs] VFS initialized with devfs, tmpfs, procfs, ext.");

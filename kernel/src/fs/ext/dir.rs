@@ -1,13 +1,13 @@
-//! Directory operations for ext2 filesystems.
+//! Directory operations for ext filesystems.
 
 use super::{read_blocks, write_blocks};
-use super::{Ext2Inode, Ext2RawInode};
+use super::{ExtInode, ExtRawInode};
 use crate::fs::inode::{DirEntry, FileType, InodeOps};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-impl Ext2Inode {
+impl ExtInode {
     /// Add a directory entry to the parent.
     pub fn add_directory_entry(
         &self,
@@ -206,7 +206,7 @@ impl Ext2Inode {
         let is_dir = file_type == FileType::Directory;
         let child_ino = self.fs.allocate_inode(is_dir).ok()?;
 
-        let mut raw_child = Ext2RawInode {
+        let mut raw_child = ExtRawInode {
             i_mode: match file_type {
                 FileType::Directory => 0x4000 | 0o755,
                 FileType::Symlink => 0xA000 | 0o777,

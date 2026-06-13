@@ -1,6 +1,6 @@
-//! ext2 physical structures and disk layout types.
+//! ext physical structures and disk layout types.
 
-/// ext2 superblock structure (located at offset 1024).
+/// ext superblock structure (located at offset 1024).
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct Superblock {
@@ -58,7 +58,7 @@ pub struct GroupDescriptor {
 /// ext2 raw inode structure on disk (128 bytes).
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
-pub struct Ext2RawInode {
+pub struct ExtRawInode {
     pub i_mode: u16,
     pub i_uid: u16,
     pub i_size: u32,

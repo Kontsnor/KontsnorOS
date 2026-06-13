@@ -1,11 +1,11 @@
 //! Regular file read, write, and size manipulation (truncate) operations.
 
 use super::{read_blocks, write_blocks};
-use super::{Ext2Inode, Ext2RawInode};
 use super::{Ext4Extent, Ext4ExtentHeader, Ext4ExtentIdx};
+use super::{ExtInode, ExtRawInode};
 use crate::fs::inode::{FileType, InodeOps};
 
-impl Ext2Inode {
+impl ExtInode {
     /// Resolve an Ext4 extent-mapped block.
     pub fn resolve_extent_block(
         &self,
@@ -103,7 +103,7 @@ impl Ext2Inode {
     /// Resolve logical block number to physical disk block using a provided raw inode reference.
     pub fn resolve_block_with_raw(
         &self,
-        raw: &Ext2RawInode,
+        raw: &ExtRawInode,
         file_block: u32,
     ) -> Result<u32, &'static str> {
         if (raw.i_flags & 0x80000) != 0 {
@@ -202,7 +202,7 @@ impl Ext2Inode {
     /// Retrieve or dynamically allocate a physical disk block for a file block index.
     pub fn get_or_alloc_block(
         &self,
-        raw: &mut Ext2RawInode,
+        raw: &mut ExtRawInode,
         file_block: u32,
     ) -> Result<u32, &'static str> {
         if (raw.i_flags & 0x80000) != 0 {

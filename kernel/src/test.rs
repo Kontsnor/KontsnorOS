@@ -364,7 +364,7 @@ fn test_vfs_permissions() {
 #[test_case]
 fn test_shared_mapping_communication() {
     kprintln!("[test] Starting shared mapping communication test...");
-    // 1. Create and open file on ext2 via VFS directly
+    // 1. Create and open file on ext via VFS directly
     let disk_dir = crate::fs::vfs::lookup("/disk").expect("Failed to lookup /disk");
     let _ = disk_dir.unlink("shared_test.txt");
     let inode = disk_dir
@@ -449,7 +449,7 @@ fn test_shared_mapping_communication() {
 #[test_case]
 fn test_page_cache_isolation() {
     kprintln!("[test] Starting page cache isolation test...");
-    // 1. Create and open file on ext2 via VFS directly
+    // 1. Create and open file on ext via VFS directly
     let disk_dir = crate::fs::vfs::lookup("/disk").expect("Failed to lookup /disk");
     let _ = disk_dir.unlink("private_test.txt");
     let inode = disk_dir
@@ -510,7 +510,7 @@ fn test_page_cache_isolation() {
 #[test_case]
 fn test_dirty_page_flush() {
     kprintln!("[test] Starting dirty page flush test...");
-    // 1. Create and open file on ext2 via VFS directly
+    // 1. Create and open file on ext via VFS directly
     let disk_dir = crate::fs::vfs::lookup("/disk").expect("Failed to lookup /disk");
     kprintln!("[test] Looked up /disk");
     let _ = disk_dir.unlink("flush_test.txt");
@@ -946,18 +946,18 @@ fn test_pseudo_filesystems() {
 fn test_ext4_extent_mapping() {
     kprintln!("[test] Starting Ext4 extent mapping test...");
 
-    // Create a mock ramdisk block device and mount a minimal Ext2 filesystem
+    // Create a mock ramdisk block device and mount a minimal Ext filesystem
     let device = crate::drivers::ramdisk::create_ext2_ramdisk();
-    let fs = crate::fs::ext2::Ext2FileSystem::mount(device.clone()).expect("Failed to mount ext2");
+    let fs = crate::fs::ext::ExtFileSystem::mount(device.clone()).expect("Failed to mount ext");
 
     // Get inode 12 (hello.txt regular file)
-    let inode = fs.get_ext2_inode(12).expect("Failed to get ext2 inode");
+    let inode = fs.get_ext_inode(12).expect("Failed to get ext inode");
 
     // Test Case 1: Leaf node extent mapping (eh_depth = 0)
     let mut i_block = [0u32; 15];
     let mut bytes = [0u8; 60];
 
-    let header = crate::fs::ext2::types::Ext4ExtentHeader {
+    let header = crate::fs::ext::types::Ext4ExtentHeader {
         eh_magic: 0xF30A,
         eh_entries: 2,
         eh_max: 4,
@@ -965,14 +965,14 @@ fn test_ext4_extent_mapping() {
         eh_generation: 0,
     };
 
-    let ext1 = crate::fs::ext2::types::Ext4Extent {
+    let ext1 = crate::fs::ext::types::Ext4Extent {
         ee_block: 10,
         ee_len: 10,
         ee_start_hi: 0,
         ee_start_lo: 1000,
     };
 
-    let ext2 = crate::fs::ext2::types::Ext4Extent {
+    let ext2 = crate::fs::ext::types::Ext4Extent {
         ee_block: 30,
         ee_len: 5,
         ee_start_hi: 0,
@@ -983,15 +983,15 @@ fn test_ext4_extent_mapping() {
     // SAFETY: We write to a stack-allocated byte buffer of size 60 which is sufficiently large and aligned.
     unsafe {
         core::ptr::write_unaligned(
-            bytes.as_mut_ptr() as *mut crate::fs::ext2::types::Ext4ExtentHeader,
+            bytes.as_mut_ptr() as *mut crate::fs::ext::types::Ext4ExtentHeader,
             header,
         );
         core::ptr::write_unaligned(
-            bytes[12..].as_mut_ptr() as *mut crate::fs::ext2::types::Ext4Extent,
+            bytes[12..].as_mut_ptr() as *mut crate::fs::ext::types::Ext4Extent,
             ext1,
         );
         core::ptr::write_unaligned(
-            bytes[24..].as_mut_ptr() as *mut crate::fs::ext2::types::Ext4Extent,
+            bytes[24..].as_mut_ptr() as *mut crate::fs::ext::types::Ext4Extent,
             ext2,
         );
     }
@@ -1017,7 +1017,7 @@ fn test_ext4_extent_mapping() {
     assert_eq!(inode.resolve_extent_block(&i_block, 35).unwrap(), 0); // Not mapped
 
     // Test Case 2: Index-based extent tree mapping (eh_depth = 1)
-    let root_header = crate::fs::ext2::types::Ext4ExtentHeader {
+    let root_header = crate::fs::ext::types::Ext4ExtentHeader {
         eh_magic: 0xF30A,
         eh_entries: 1,
         eh_max: 4,
@@ -1025,7 +1025,7 @@ fn test_ext4_extent_mapping() {
         eh_generation: 0,
     };
 
-    let idx = crate::fs::ext2::types::Ext4ExtentIdx {
+    let idx = crate::fs::ext::types::Ext4ExtentIdx {
         ei_block: 0,
         ei_leaf_lo: 60,
         ei_leaf_hi: 0,
@@ -1036,11 +1036,11 @@ fn test_ext4_extent_mapping() {
     // SAFETY: We write to a stack-allocated byte buffer of size 60 which is sufficiently large and aligned.
     unsafe {
         core::ptr::write_unaligned(
-            root_bytes.as_mut_ptr() as *mut crate::fs::ext2::types::Ext4ExtentHeader,
+            root_bytes.as_mut_ptr() as *mut crate::fs::ext::types::Ext4ExtentHeader,
             root_header,
         );
         core::ptr::write_unaligned(
-            root_bytes[12..].as_mut_ptr() as *mut crate::fs::ext2::types::Ext4ExtentIdx,
+            root_bytes[12..].as_mut_ptr() as *mut crate::fs::ext::types::Ext4ExtentIdx,
             idx,
         );
     }
@@ -1056,7 +1056,7 @@ fn test_ext4_extent_mapping() {
     }
 
     // Prepare child block (at block 60 on the ramdisk)
-    let child_header = crate::fs::ext2::types::Ext4ExtentHeader {
+    let child_header = crate::fs::ext::types::Ext4ExtentHeader {
         eh_magic: 0xF30A,
         eh_entries: 1,
         eh_max: 4,
@@ -1064,7 +1064,7 @@ fn test_ext4_extent_mapping() {
         eh_generation: 0,
     };
 
-    let leaf = crate::fs::ext2::types::Ext4Extent {
+    let leaf = crate::fs::ext::types::Ext4Extent {
         ee_block: 0,
         ee_len: 5,
         ee_start_hi: 0,
@@ -1075,11 +1075,11 @@ fn test_ext4_extent_mapping() {
     // SAFETY: We write to a stack-allocated byte buffer of size 1024 which is sufficiently large and aligned.
     unsafe {
         core::ptr::write_unaligned(
-            child_bytes.as_mut_ptr() as *mut crate::fs::ext2::types::Ext4ExtentHeader,
+            child_bytes.as_mut_ptr() as *mut crate::fs::ext::types::Ext4ExtentHeader,
             child_header,
         );
         core::ptr::write_unaligned(
-            child_bytes[12..].as_mut_ptr() as *mut crate::fs::ext2::types::Ext4Extent,
+            child_bytes[12..].as_mut_ptr() as *mut crate::fs::ext::types::Ext4Extent,
             leaf,
         );
     }
@@ -1104,8 +1104,8 @@ fn test_jbd2_journal_mount_check() {
     kprintln!("[test] Starting JBD2 journal mount check test...");
 
     // 1. Create a mock JBD2 superblock with correct magic and clean unmount flag (s_start = 0)
-    let clean_jsb = crate::fs::ext2::types::JournalSuperblock {
-        s_header: crate::fs::ext2::types::JournalHeader {
+    let clean_jsb = crate::fs::ext::types::JournalSuperblock {
+        s_header: crate::fs::ext::types::JournalHeader {
             h_magic: 0xC03B3998u32.to_be(),
             h_blocktype: 4u32.to_be(),
             h_sequence: 1u32.to_be(),
@@ -1133,8 +1133,8 @@ fn test_jbd2_journal_mount_check() {
     assert_eq!(j_start, 0); // clean
 
     // 3. Create a mock JBD2 superblock with correct magic but dirty unmount flag (s_start = 123)
-    let dirty_jsb = crate::fs::ext2::types::JournalSuperblock {
-        s_header: crate::fs::ext2::types::JournalHeader {
+    let dirty_jsb = crate::fs::ext::types::JournalSuperblock {
+        s_header: crate::fs::ext::types::JournalHeader {
             h_magic: 0xC03B3998u32.to_be(),
             h_blocktype: 4u32.to_be(),
             h_sequence: 1u32.to_be(),
@@ -1159,8 +1159,8 @@ fn test_jbd2_journal_mount_check() {
     assert_eq!(j_start_dirty, 123); // dirty
 
     // 4. Create a superblock with invalid magic
-    let invalid_jsb = crate::fs::ext2::types::JournalSuperblock {
-        s_header: crate::fs::ext2::types::JournalHeader {
+    let invalid_jsb = crate::fs::ext::types::JournalSuperblock {
+        s_header: crate::fs::ext::types::JournalHeader {
             h_magic: 0xDEADBEEFu32.to_be(),
             h_blocktype: 4u32.to_be(),
             h_sequence: 1u32.to_be(),

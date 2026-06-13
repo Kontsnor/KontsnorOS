@@ -23,7 +23,7 @@ pub mod cgroupfs;
 pub mod devfs;
 pub mod epoll;
 pub mod eventfd;
-pub mod ext2;
+pub mod ext;
 pub mod file;
 pub mod inode;
 pub mod path;
@@ -109,26 +109,26 @@ pub fn init() {
         let cached_drive = alloc::sync::Arc::new(crate::drivers::block::cache::BlockCache::new(
             ata_drive, 2048,
         ));
-        if let Ok(ext2_fs) = ext2::Ext2FileSystem::mount(cached_drive) {
-            vfs::mount(alloc::string::String::from("/disk"), ext2_fs.clone());
-            vfs::mount(alloc::string::String::from("/"), ext2_fs);
-            kprintln!("[fs] Persistent ext2 ATA drive mounted at /disk and /.");
+        if let Ok(ext_fs) = ext::ExtFileSystem::mount(cached_drive) {
+            vfs::mount(alloc::string::String::from("/disk"), ext_fs.clone());
+            vfs::mount(alloc::string::String::from("/"), ext_fs);
+            kprintln!("[fs] Persistent ext ATA drive mounted at /disk and /.");
             mounted_ata = true;
         } else {
-            kprintln!("[fs] Failed to mount ext2 ATA drive. Falling back to RAM disk.");
+            kprintln!("[fs] Failed to mount ext ATA drive. Falling back to RAM disk.");
         }
     }
 
     if !mounted_ata {
-        // Mount it using the ext2 driver
-        if let Ok(ext2_fs) = ext2::Ext2FileSystem::mount(ramdisk) {
-            vfs::mount(alloc::string::String::from("/disk"), ext2_fs.clone());
-            vfs::mount(alloc::string::String::from("/"), ext2_fs);
-            kprintln!("[fs] Pre-populated ext2 RAM disk mounted at /disk and /.");
+        // Mount it using the ext driver
+        if let Ok(ext_fs) = ext::ExtFileSystem::mount(ramdisk) {
+            vfs::mount(alloc::string::String::from("/disk"), ext_fs.clone());
+            vfs::mount(alloc::string::String::from("/"), ext_fs);
+            kprintln!("[fs] Pre-populated ext RAM disk mounted at /disk and /.");
         } else {
-            kprintln!("[fs] Failed to mount ext2 RAM disk.");
+            kprintln!("[fs] Failed to mount ext RAM disk.");
         }
     }
 
-    kprintln!("[fs] VFS initialized with devfs, tmpfs, procfs, ext2.");
+    kprintln!("[fs] VFS initialized with devfs, tmpfs, procfs, ext.");
 }

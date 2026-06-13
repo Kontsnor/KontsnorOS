@@ -1,7 +1,7 @@
 //! Block and inode allocation/deallocation routines.
 
 use super::{read_blocks, write_blocks};
-use super::{Ext2FileSystem, Ext2RawInode, GroupDescriptor};
+use super::{ExtFileSystem, ExtRawInode, GroupDescriptor};
 
 /// Helper to count free bits (zeros) in a bitmap buffer.
 pub fn count_free_bits(bitmap: &[u8], total_count: u32) -> u32 {
@@ -18,7 +18,7 @@ pub fn count_free_bits(bitmap: &[u8], total_count: u32) -> u32 {
     count
 }
 
-impl Ext2FileSystem {
+impl ExtFileSystem {
     /// Allocate a block from the filesystem block bitmap.
     pub fn allocate_block(&self) -> Result<u32, &'static str> {
         let mut sb = self.superblock.lock();
@@ -194,7 +194,7 @@ impl Ext2FileSystem {
     }
 
     /// Write the modified raw inode back to the disk.
-    pub fn write_inode(&self, ino: u32, raw_inode: &Ext2RawInode) -> Result<(), &'static str> {
+    pub fn write_inode(&self, ino: u32, raw_inode: &ExtRawInode) -> Result<(), &'static str> {
         let group = (ino - 1) / self.inodes_per_group;
         let index = (ino - 1) % self.inodes_per_group;
 
@@ -220,7 +220,7 @@ impl Ext2FileSystem {
         )?;
 
         let dst_ptr = block_buf[offset_in_block..].as_mut_ptr();
-        let src_ptr = raw_inode as *const Ext2RawInode as *const u8;
+        let src_ptr = raw_inode as *const ExtRawInode as *const u8;
         unsafe {
             core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, self.inode_size as usize);
         }
@@ -254,7 +254,7 @@ impl Ext2FileSystem {
         )?;
 
         let mut raw_inode = unsafe {
-            core::ptr::read_unaligned(block_buf[offset_in_block..].as_ptr() as *const Ext2RawInode)
+            core::ptr::read_unaligned(block_buf[offset_in_block..].as_ptr() as *const ExtRawInode)
         };
 
         if raw_inode.i_links_count > 0 {
@@ -330,7 +330,7 @@ impl Ext2FileSystem {
             self.deallocate_inode(ino, is_dir)?;
         } else {
             let dst_ptr = block_buf[offset_in_block..].as_mut_ptr();
-            let src_ptr = &raw_inode as *const Ext2RawInode as *const u8;
+            let src_ptr = &raw_inode as *const ExtRawInode as *const u8;
             unsafe {
                 core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, self.inode_size as usize);
             }

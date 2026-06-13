@@ -1,4 +1,4 @@
-//! ext2 writable filesystem driver for KontsnorOS.
+//! ext writable filesystem driver for KontsnorOS.
 
 use crate::drivers::traits::BlockDevice;
 use crate::fs::inode::{DirEntry, FilePermissions, FileType, Inode, InodeOps};
@@ -15,7 +15,7 @@ pub mod file;
 pub mod types;
 
 pub use types::{
-    Ext2RawInode, Ext4Extent, Ext4ExtentHeader, Ext4ExtentIdx, GroupDescriptor, JournalHeader,
+    Ext4Extent, Ext4ExtentHeader, Ext4ExtentIdx, ExtRawInode, GroupDescriptor, JournalHeader,
     JournalSuperblock, Superblock,
 };
 
@@ -64,8 +64,8 @@ pub(crate) fn write_blocks(
         .map_err(|_| "Block device write error")
 }
 
-/// ext2 FileSystem implementation.
-pub struct Ext2FileSystem {
+/// ext FileSystem implementation.
+pub struct ExtFileSystem {
     pub(crate) device: Arc<dyn BlockDevice>,
     pub(crate) block_size: u32,
     pub(crate) inodes_per_block: u32,
@@ -76,8 +76,8 @@ pub struct Ext2FileSystem {
     pub(crate) root_node: Mutex<Option<Arc<dyn InodeOps>>>,
 }
 
-impl Ext2FileSystem {
-    /// Mount an ext2 volume on a block device.
+impl ExtFileSystem {
+    /// Mount an ext volume on a block device.
     pub fn mount(device: Arc<dyn BlockDevice>) -> Result<Arc<Self>, &'static str> {
         let mut sb_buf = [0u8; 1024];
 
@@ -97,20 +97,20 @@ impl Ext2FileSystem {
         let s_inodes_per_group = sb.s_inodes_per_group;
 
         if s_magic != 0xEF53 {
-            return Err("Invalid ext2 superblock magic");
+            return Err("Invalid ext superblock magic");
         }
 
         // Validate metadata parameters
         if s_log_block_size > 10 || s_inode_size == 0 || s_inodes_per_group == 0 {
-            return Err("Malformed ext2 superblock fields");
+            return Err("Malformed ext superblock fields");
         }
 
         if sb.s_inodes_count == 0 || sb.s_blocks_count == 0 {
-            return Err("Malformed ext2 superblock: inodes or blocks count is zero");
+            return Err("Malformed ext superblock: inodes or blocks count is zero");
         }
 
         if sb.s_inodes_count > sb.s_inodes_per_group {
-            return Err("Multi-group ext2 filesystems are not supported");
+            return Err("Multi-group ext filesystems are not supported");
         }
 
         let block_size = 1024 << s_log_block_size;
@@ -119,7 +119,7 @@ impl Ext2FileSystem {
         let inodes_per_block = block_size / inode_size as u32;
 
         kprintln!(
-            "[ext2] Volume detected. s_magic: {:#x}, Block Size: {}, Inode Size: {}",
+            "[ext] Volume detected. s_magic: {:#x}, Block Size: {}, Inode Size: {}",
             s_magic,
             block_size,
             inode_size
@@ -160,7 +160,7 @@ impl Ext2FileSystem {
 
         let mut block_bitmap_changed = false;
         if block_bitmap.iter().all(|&x| x == 0) {
-            kprintln!("[ext2] Block bitmap is all zeros, healing...");
+            kprintln!("[ext] Block bitmap is all zeros, healing...");
             block_bitmap[0] = 0xFF;
             block_bitmap[1] = 0xFF;
             block_bitmap[2] = 0xFF;
@@ -177,7 +177,7 @@ impl Ext2FileSystem {
 
         let mut inode_bitmap_changed = false;
         if inode_bitmap.iter().all(|&x| x == 0) {
-            kprintln!("[ext2] Inode bitmap is all zeros, healing...");
+            kprintln!("[ext] Inode bitmap is all zeros, healing...");
             inode_bitmap[0] = 0xFF;
             inode_bitmap[1] = 0x7F; // 15 inodes total
             write_blocks(
@@ -272,10 +272,10 @@ impl Ext2FileSystem {
                 block_cache_idx = logical_block;
             }
 
-            // SAFETY: block_cache_buf has size block_size, offset_in_block is within bounds, and raw inode layout matches Ext2RawInode structure.
+            // SAFETY: block_cache_buf has size block_size, offset_in_block is within bounds, and raw inode layout matches ExtRawInode structure.
             let raw_inode = unsafe {
                 core::ptr::read_unaligned(
-                    block_cache_buf[offset_in_block..].as_ptr() as *const Ext2RawInode
+                    block_cache_buf[offset_in_block..].as_ptr() as *const ExtRawInode
                 )
             };
 
@@ -352,7 +352,7 @@ impl Ext2FileSystem {
         }
 
         if mismatch {
-            kprintln!("[ext2] Integrity mismatch found. Self-healing filesystem metadata...");
+            kprintln!("[ext] Integrity mismatch found. Self-healing filesystem metadata...");
 
             write_blocks(
                 &*device,
@@ -401,7 +401,7 @@ impl Ext2FileSystem {
             }
             write_blocks(&*device, gdt_block, &gdt_buf, block_size)?;
         } else {
-            kprintln!("[ext2] Filesystem consistency check succeeded. No corruption detected.");
+            kprintln!("[ext] Filesystem consistency check succeeded. No corruption detected.");
         }
 
         let mut group_descriptors = Vec::new();
@@ -422,7 +422,7 @@ impl Ext2FileSystem {
         if (sb.s_feature_compat & 0x0004) != 0 {
             kprintln!("[ext4] Superblock has journal feature compat flag.");
             let journal_ino = 8;
-            let journal_inode = fs.get_ext2_inode(journal_ino)?;
+            let journal_inode = fs.get_ext_inode(journal_ino)?;
             let phys_block = journal_inode.resolve_block(0)?;
             if phys_block == 0 {
                 return Err("Journal inode block 0 is not mapped");
@@ -457,8 +457,8 @@ impl Ext2FileSystem {
         Ok(fs)
     }
 
-    /// Retrieve raw ext2 inode wrapper.
-    pub fn get_ext2_inode(self: &Arc<Self>, ino: u32) -> Result<Ext2Inode, &'static str> {
+    /// Retrieve raw ext inode wrapper.
+    pub fn get_ext_inode(self: &Arc<Self>, ino: u32) -> Result<ExtInode, &'static str> {
         if ino == 0 {
             return Err("Invalid inode number 0");
         }
@@ -487,9 +487,9 @@ impl Ext2FileSystem {
             self.block_size,
         )?;
 
-        // SAFETY: block_buf is allocated with size block_size, offset_in_block is within bounds, and layout matches Ext2RawInode.
+        // SAFETY: block_buf is allocated with size block_size, offset_in_block is within bounds, and layout matches ExtRawInode.
         let raw_inode = unsafe {
-            core::ptr::read_unaligned(block_buf[offset_in_block..].as_ptr() as *const Ext2RawInode)
+            core::ptr::read_unaligned(block_buf[offset_in_block..].as_ptr() as *const ExtRawInode)
         };
 
         let i_mode = raw_inode.i_mode;
@@ -517,7 +517,7 @@ impl Ext2FileSystem {
         inode.mtime = raw_inode.i_mtime as u64;
         inode.ctime = raw_inode.i_ctime as u64;
 
-        Ok(Ext2Inode {
+        Ok(ExtInode {
             fs: self.clone(),
             ino,
             raw: Mutex::new(raw_inode),
@@ -527,8 +527,8 @@ impl Ext2FileSystem {
 
     /// Retrieve an inode by its number.
     pub fn get_inode(self: &Arc<Self>, ino: u32) -> Result<Arc<dyn InodeOps>, &'static str> {
-        let ext2_inode = self.get_ext2_inode(ino)?;
-        Ok(Arc::new(ext2_inode))
+        let ext_inode = self.get_ext_inode(ino)?;
+        Ok(Arc::new(ext_inode))
     }
 
     /// Write superblock back to the block device.
@@ -579,15 +579,15 @@ impl Ext2FileSystem {
     }
 }
 
-/// ext2 Inode wrapper implementing InodeOps.
-pub struct Ext2Inode {
-    pub(crate) fs: Arc<Ext2FileSystem>,
+/// ext Inode wrapper implementing InodeOps.
+pub struct ExtInode {
+    pub(crate) fs: Arc<ExtFileSystem>,
     pub(crate) ino: u32,
-    pub(crate) raw: Mutex<Ext2RawInode>,
+    pub(crate) raw: Mutex<ExtRawInode>,
     pub(crate) vfs_inode: Mutex<Inode>,
 }
 
-impl InodeOps for Ext2Inode {
+impl InodeOps for ExtInode {
     fn inode(&self) -> &Inode {
         // SAFETY: The reference to Inode is protected by Mutex but the caller requires a lifetime matched reference.
         // We cast the reference to a raw pointer to satisfy the signature.
@@ -647,13 +647,13 @@ impl InodeOps for Ext2Inode {
     }
 }
 
-impl FileSystem for Ext2FileSystem {
+impl FileSystem for ExtFileSystem {
     fn root(&self) -> Option<Arc<dyn InodeOps>> {
         self.root_node.lock().clone()
     }
 
     fn name(&self) -> &str {
-        "ext2"
+        "ext"
     }
 
     fn statfs(&self) -> FsStats {

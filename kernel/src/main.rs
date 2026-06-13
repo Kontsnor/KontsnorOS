@@ -151,8 +151,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     fs::init();
     kprintln!("[boot] VFS initialized.");
 
-    // Verify ext2 RAM disk file retrieval
-    kprintln!("[boot] Testing ext2 RAM disk file retrieval...");
+    // Verify ext RAM disk file retrieval
+    kprintln!("[boot] Testing ext RAM disk file retrieval...");
     if let Some(inode) = fs::vfs::lookup("/disk/hello.txt") {
         let size = inode.inode().size as usize;
         let mut buf = alloc::vec![0u8; size];
@@ -160,20 +160,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             Ok(bytes_read) => {
                 if let Ok(content_str) = core::str::from_utf8(&buf[0..bytes_read]) {
                     kprintln!(
-                        "[ext2] Successfully read /disk/hello.txt ({} bytes): \"{}\"",
+                        "[ext] Successfully read /disk/hello.txt ({} bytes): \"{}\"",
                         bytes_read,
                         content_str
                     );
                 } else {
-                    kprintln!("[ext2] Read file but content is not valid UTF-8.");
+                    kprintln!("[ext] Read file but content is not valid UTF-8.");
                 }
             }
             Err(e) => {
-                kprintln!("[ext2] Failed to read /disk/hello.txt: error {}", e);
+                kprintln!("[ext] Failed to read /disk/hello.txt: error {}", e);
             }
         }
     } else {
-        kprintln!("[ext2] File /disk/hello.txt not found on mounted ext2 disk!");
+        kprintln!("[ext] File /disk/hello.txt not found on mounted ext disk!");
     }
 
     kprintln!("[boot] Initializing process subsystem...");
@@ -220,7 +220,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         *crate::fs::pty::ACTIVE_PTY_MASTER.lock() = Some(master.clone());
         crate::fs::pty::start_pty_io_loop();
 
-        // Spawn Ring 3 user init from ext2 RAM disk as PID 1
+        // Spawn Ring 3 user init from ext RAM disk as PID 1
         let init_path = "/sbin/init";
         kprintln!("[boot] Spawning Ring 3 → Ring 3 init: {}...", init_path);
         if let Some(inode) = fs::vfs::lookup(init_path) {
@@ -260,7 +260,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 }
             }
         } else {
-            kprintln!("[boot] {} not found on mounted ext2 disk!", init_path);
+            kprintln!("[boot] {} not found on mounted ext disk!", init_path);
         }
 
         // Spawn freestanding network test binary

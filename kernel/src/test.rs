@@ -731,3 +731,136 @@ fn test_userspace_wrfsbase() {
 
     kprintln!("[test] WRFSBASE verification test PASSED!");
 }
+
+#[test_case]
+fn test_eventfd() {
+    kprintln!("[test] Starting eventfd test...");
+    let fd = crate::fs::eventfd::sys_eventfd2(10, 0);
+    assert!(fd >= 0);
+    let fd = fd as i32;
+
+    let inode = crate::process::fd::current_task_read_fd(fd).unwrap();
+    let events = inode.poll(crate::fs::inode::POLLIN | crate::fs::inode::POLLOUT);
+    assert_eq!(events & crate::fs::inode::POLLIN, crate::fs::inode::POLLIN);
+    assert_eq!(
+        events & crate::fs::inode::POLLOUT,
+        crate::fs::inode::POLLOUT
+    );
+
+    let mut buf = [0u8; 8];
+    let n = inode.read(0, &mut buf).unwrap();
+    assert_eq!(n, 8);
+    let val = u64::from_ne_bytes(buf);
+    assert_eq!(val, 10);
+
+    let events2 = inode.poll(crate::fs::inode::POLLIN | crate::fs::inode::POLLOUT);
+    assert_eq!(events2 & crate::fs::inode::POLLIN, 0);
+    assert_eq!(
+        events2 & crate::fs::inode::POLLOUT,
+        crate::fs::inode::POLLOUT
+    );
+
+    let write_buf = 5u64.to_ne_bytes();
+    let n_write = inode.write(0, &write_buf).unwrap();
+    assert_eq!(n_write, 8);
+
+    let events3 = inode.poll(crate::fs::inode::POLLIN);
+    assert_eq!(events3 & crate::fs::inode::POLLIN, crate::fs::inode::POLLIN);
+
+    let mut buf2 = [0u8; 8];
+    let n2 = inode.read(0, &mut buf2).unwrap();
+    assert_eq!(n2, 8);
+    let val2 = u64::from_ne_bytes(buf2);
+    assert_eq!(val2, 5);
+
+    crate::process::fd::current_task_close_fd(fd);
+    kprintln!("[test] eventfd test PASSED!");
+}
+
+#[test_case]
+fn test_timerfd() {
+    kprintln!("[test] Starting timerfd test...");
+    let epfd = crate::fs::epoll::sys_epoll_create1(0);
+    assert!(epfd >= 0);
+    let epfd = epfd as i32;
+
+    let tfd = crate::fs::timerfd::sys_timerfd_create(0, 0);
+    assert!(tfd >= 0);
+    let tfd = tfd as i32;
+
+    let mut ev = crate::fs::epoll::EpollEvent {
+        events: crate::fs::inode::POLLIN,
+        data: 999,
+    };
+    let res = crate::fs::epoll::sys_epoll_ctl(epfd, 1, tfd, &mut ev);
+    assert_eq!(res, 0);
+
+    let new_value = crate::fs::timerfd::Itimerspec {
+        it_interval: crate::fs::timerfd::Timespec::default(),
+        it_value: crate::fs::timerfd::Timespec {
+            tv_sec: 0,
+            tv_nsec: 10_000_000,
+        },
+    };
+    let res = crate::fs::timerfd::sys_timerfd_settime(tfd, 0, &new_value, core::ptr::null_mut());
+    assert_eq!(res, 0);
+
+    let mut ready_evs = [crate::fs::epoll::EpollEvent::default(); 1];
+    let n = crate::fs::epoll::sys_epoll_wait(epfd, ready_evs.as_mut_ptr(), 1, 100);
+    assert_eq!(n, 1);
+    let ev_data = ready_evs[0].data;
+    let ev_events = ready_evs[0].events;
+    assert_eq!(ev_data, 999);
+    assert_eq!(
+        ev_events & crate::fs::inode::POLLIN,
+        crate::fs::inode::POLLIN
+    );
+
+    let mut buf = [0u8; 8];
+    let inode = crate::process::fd::current_task_read_fd(tfd).unwrap();
+    let n_read = inode.read(0, &mut buf).unwrap();
+    assert_eq!(n_read, 8);
+    let count = u64::from_ne_bytes(buf);
+    assert_eq!(count, 1);
+
+    crate::process::fd::current_task_close_fd(tfd);
+    crate::process::fd::current_task_close_fd(epfd);
+    kprintln!("[test] timerfd test PASSED!");
+}
+
+#[test_case]
+fn test_signalfd() {
+    kprintln!("[test] Starting signalfd test...");
+    let mask = 1u64 << (10 - 1);
+    let sfd = crate::fs::signalfd::sys_signalfd4(-1, &mask, 8, 0);
+    assert!(sfd >= 0);
+    let sfd = sfd as i32;
+
+    let pid = crate::process::scheduler::current_pid().unwrap();
+    crate::syscall::signal::deliver_signal(pid, 10);
+
+    let inode = crate::process::fd::current_task_read_fd(sfd).unwrap();
+    let events = inode.poll(crate::fs::inode::POLLIN);
+    assert_eq!(events & crate::fs::inode::POLLIN, crate::fs::inode::POLLIN);
+
+    let mut siginfo = crate::fs::signalfd::SignalFdSiginfo::default();
+    let ptr = &mut siginfo as *mut crate::fs::signalfd::SignalFdSiginfo as *mut u8;
+    let slice = unsafe {
+        core::slice::from_raw_parts_mut(
+            ptr,
+            core::mem::size_of::<crate::fs::signalfd::SignalFdSiginfo>(),
+        )
+    };
+    let n = inode.read(0, slice).unwrap();
+    assert_eq!(
+        n,
+        core::mem::size_of::<crate::fs::signalfd::SignalFdSiginfo>()
+    );
+    assert_eq!(siginfo.ssi_signo, 10);
+
+    let task_arc = crate::process::scheduler::get_task_arc(pid).unwrap();
+    task_arc.lock().pending_signals &= !mask;
+
+    crate::process::fd::current_task_close_fd(sfd);
+    kprintln!("[test] signalfd test PASSED!");
+}

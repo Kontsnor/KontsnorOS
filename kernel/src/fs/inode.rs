@@ -153,6 +153,11 @@ pub const MAY_EXEC: u16 = 0o100;
 pub const MAY_WRITE: u16 = 0o200;
 pub const MAY_READ: u16 = 0o400;
 
+pub const POLLIN: u32 = 0x0001;
+pub const POLLOUT: u32 = 0x0004;
+pub const POLLERR: u32 = 0x0008;
+pub const POLLHUP: u32 = 0x0010;
+
 /// Check permission logic.
 pub fn check_permission(inode: &Inode, mask: u16) -> Result<(), Errno> {
     let (euid, egid) = if let Some(pid) = crate::process::scheduler::current_pid() {
@@ -275,4 +280,45 @@ pub trait InodeOps: Send + Sync {
     fn ioctl(&self, _request: u64, _arg: u64) -> Result<u64, i32> {
         Err(-22) // EINVAL
     }
+
+    /// Poll for I/O readiness.
+    fn poll(&self, _events: u32) -> u32 {
+        0
+    }
+
+    /// Downcast helpers
+    fn as_epoll(&self) -> Option<&crate::fs::epoll::EpollInstance> {
+        None
+    }
+    fn as_timerfd(&self) -> Option<&crate::fs::timerfd::TimerFd> {
+        None
+    }
+    fn as_signalfd(&self) -> Option<&crate::fs::signalfd::SignalFd> {
+        None
+    }
+    fn as_eventfd(&self) -> Option<&crate::fs::eventfd::EventFd> {
+        None
+    }
+}
+
+/// Helper function to check if a given inode's open file description in the current task has O_NONBLOCK set.
+pub fn is_inode_nonblocking(inode: &dyn InodeOps) -> bool {
+    if let Some(pid) = crate::process::scheduler::current_pid() {
+        if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+            let task = task_arc.lock();
+            for slot in task.fd_table.iter() {
+                if let Some(desc) = slot {
+                    let p1 = inode as *const dyn InodeOps as *const u8;
+                    let p2 = desc.inode.as_ref() as *const dyn InodeOps as *const u8;
+                    if p1 == p2 {
+                        if (desc.flags.lock().0 & 0o4000) != 0 {
+                            // O_NONBLOCK = 0o4000
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }

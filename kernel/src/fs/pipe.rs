@@ -65,6 +65,7 @@ pub struct PipeState {
     buffer: Mutex<PipeBuffer>,
     readers: AtomicUsize,
     writers: AtomicUsize,
+    pub wait_queue: crate::sync::wait_queue::WaitQueue,
 }
 
 impl PipeState {
@@ -73,6 +74,7 @@ impl PipeState {
             buffer: Mutex::new(PipeBuffer::new()),
             readers: AtomicUsize::new(1),
             writers: AtomicUsize::new(1),
+            wait_queue: crate::sync::wait_queue::WaitQueue::new(),
         }
     }
 }
@@ -106,6 +108,8 @@ impl InodeOps for PipeReader {
                             break;
                         }
                     }
+                    drop(guard);
+                    self.state.wait_queue.wake_all();
                     return Ok(count);
                 }
             }
@@ -123,11 +127,23 @@ impl InodeOps for PipeReader {
     fn readdir(&self) -> Vec<DirEntry> {
         Vec::new()
     }
+
+    fn poll(&self, events: u32) -> u32 {
+        let mut revents = 0;
+        let buf = self.state.buffer.lock();
+        if (events & crate::fs::inode::POLLIN) != 0 {
+            if !buf.is_empty() || self.state.writers.load(Ordering::SeqCst) == 0 {
+                revents |= crate::fs::inode::POLLIN;
+            }
+        }
+        revents
+    }
 }
 
 impl Drop for PipeReader {
     fn drop(&mut self) {
         self.state.readers.fetch_sub(1, Ordering::SeqCst);
+        self.state.wait_queue.wake_all();
     }
 }
 
@@ -167,6 +183,8 @@ impl InodeOps for PipeWriter {
                             break;
                         }
                     }
+                    drop(guard);
+                    self.state.wait_queue.wake_all();
                     true
                 } else {
                     false
@@ -185,11 +203,26 @@ impl InodeOps for PipeWriter {
     fn readdir(&self) -> Vec<DirEntry> {
         Vec::new()
     }
+
+    fn poll(&self, events: u32) -> u32 {
+        let mut revents = 0;
+        let buf = self.state.buffer.lock();
+        if (events & crate::fs::inode::POLLOUT) != 0 {
+            if !buf.is_full() {
+                revents |= crate::fs::inode::POLLOUT;
+            }
+        }
+        if self.state.readers.load(Ordering::SeqCst) == 0 {
+            revents |= crate::fs::inode::POLLERR;
+        }
+        revents
+    }
 }
 
 impl Drop for PipeWriter {
     fn drop(&mut self) {
         self.state.writers.fetch_sub(1, Ordering::SeqCst);
+        self.state.wait_queue.wake_all();
     }
 }
 

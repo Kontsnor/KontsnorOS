@@ -20,6 +20,8 @@
 
 use crate::kprintln;
 pub mod devfs;
+pub mod epoll;
+pub mod eventfd;
 pub mod ext2;
 pub mod file;
 pub mod inode;
@@ -27,6 +29,8 @@ pub mod path;
 pub mod pipe;
 pub mod procfs;
 pub mod pty;
+pub mod signalfd;
+pub mod timerfd;
 pub mod tmpfs;
 pub mod tty;
 pub mod vfs;

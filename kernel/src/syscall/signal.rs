@@ -73,6 +73,7 @@ pub fn deliver_signal(pid: crate::process::pid::Pid, sig: i32) {
         }
         drop(task);
         scheduler::wake_task(pid);
+        crate::fs::epoll::wake_all_epolls();
     }
 }
 

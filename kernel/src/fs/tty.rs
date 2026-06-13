@@ -266,6 +266,24 @@ impl InodeOps for DevStdin {
     fn readdir(&self) -> Vec<DirEntry> {
         Vec::new()
     }
+
+    fn poll(&self, events: u32) -> u32 {
+        let mut revents = 0;
+        let termios = TTY_TERMIOS.lock();
+        let icanon = (termios.c_lflag & 0x00000002) != 0;
+        drop(termios);
+
+        let has_data = if icanon {
+            crate::drivers::keyboard::has_newline()
+        } else {
+            crate::drivers::keyboard::has_input()
+        };
+
+        if (events & crate::fs::inode::POLLIN) != 0 && has_data {
+            revents |= crate::fs::inode::POLLIN;
+        }
+        revents
+    }
 }
 
 // ── /dev/stdout ───────────────────────────────────────────────────────────────
@@ -290,6 +308,14 @@ impl InodeOps for DevStdout {
     fn readdir(&self) -> Vec<DirEntry> {
         Vec::new()
     }
+
+    fn poll(&self, events: u32) -> u32 {
+        let mut revents = 0;
+        if (events & crate::fs::inode::POLLOUT) != 0 {
+            revents |= crate::fs::inode::POLLOUT;
+        }
+        revents
+    }
 }
 
 // ── /dev/stderr ───────────────────────────────────────────────────────────────
@@ -313,6 +339,14 @@ impl InodeOps for DevStderr {
 
     fn readdir(&self) -> Vec<DirEntry> {
         Vec::new()
+    }
+
+    fn poll(&self, events: u32) -> u32 {
+        let mut revents = 0;
+        if (events & crate::fs::inode::POLLOUT) != 0 {
+            revents |= crate::fs::inode::POLLOUT;
+        }
+        revents
     }
 }
 
@@ -351,6 +385,13 @@ impl InodeOps for DevTty {
 
     fn readdir(&self) -> Vec<DirEntry> {
         Vec::new()
+    }
+
+    fn poll(&self, events: u32) -> u32 {
+        let stdin = DevStdin {
+            inode: Inode::new(10, FileType::CharDevice),
+        };
+        stdin.poll(events) | (events & crate::fs::inode::POLLOUT)
     }
 }
 

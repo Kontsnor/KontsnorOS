@@ -343,6 +343,10 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     // Update scheduler tick counter
     crate::process::scheduler::tick();
 
+    // Check sleep timeouts and active timerfds
+    crate::fs::timerfd::check_timers();
+    crate::fs::epoll::check_sleep_timeouts();
+
     // Acknowledge the timer interrupt to the Local APIC
     super::apic::lapic_eoi();
 

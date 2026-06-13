@@ -50,6 +50,13 @@ pub enum SyscallNumber {
     Getgid = 104,
     Setuid = 105,
     Setgid = 106,
+    EpollWait = 232,
+    EpollCtl = 233,
+    TimerFdCreate = 283,
+    TimerFdSetTime = 286,
+    SignalFd4 = 289,
+    EventFd2 = 290,
+    EpollCreate1 = 291,
 }
 
 /// Result type for syscalls.
@@ -507,6 +514,28 @@ pub fn dispatch(
             arg3 as usize,
         ),
         269 => fs::sys_faccessat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as i32),
+        232 => fs::sys_epoll_wait(
+            arg0 as i32,
+            arg1 as *mut crate::fs::epoll::EpollEvent,
+            arg2 as i32,
+            arg3 as i32,
+        ),
+        233 => fs::sys_epoll_ctl(
+            arg0 as i32,
+            arg1 as i32,
+            arg2 as i32,
+            arg3 as *const crate::fs::epoll::EpollEvent,
+        ),
+        283 => fs::sys_timerfd_create(arg0 as i32, arg1 as i32),
+        286 => fs::sys_timerfd_settime(
+            arg0 as i32,
+            arg1 as i32,
+            arg2 as *const crate::fs::timerfd::Itimerspec,
+            arg3 as *mut crate::fs::timerfd::Itimerspec,
+        ),
+        289 => fs::sys_signalfd4(arg0 as i32, arg1 as *const u64, arg2 as usize, arg3 as i32),
+        290 => fs::sys_eventfd2(arg0 as u32, arg1 as i32),
+        291 => fs::sys_epoll_create1(arg0 as i32),
         // Memory
         9 => memory::sys_mmap(
             arg0,

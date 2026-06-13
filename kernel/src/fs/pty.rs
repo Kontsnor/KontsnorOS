@@ -26,6 +26,7 @@ pub struct PtyShared {
     pub winsize: Mutex<Winsize>,
     /// Foreground process group ID (for job control signal delivery).
     pub foreground_pgid: Mutex<u64>,
+    pub wait_queue: crate::sync::wait_queue::WaitQueue,
 }
 
 /// The PTY master device node.
@@ -134,7 +135,21 @@ impl InodeOps for PtyMaster {
             }
         }
 
+        self.shared.wait_queue.wake_all();
         Ok(data.len())
+    }
+
+    fn poll(&self, events: u32) -> u32 {
+        let mut revents = 0;
+        if (events & crate::fs::inode::POLLIN) != 0 {
+            if !self.shared.master_read_queue.lock().is_empty() {
+                revents |= crate::fs::inode::POLLIN;
+            }
+        }
+        if (events & crate::fs::inode::POLLOUT) != 0 {
+            revents |= crate::fs::inode::POLLOUT;
+        }
+        revents
     }
 
     fn ioctl(&self, request: u64, arg: u64) -> Result<u64, i32> {
@@ -228,7 +243,22 @@ impl InodeOps for PtySlave {
         for &byte in data {
             master_read.push_back(byte);
         }
+        drop(master_read);
+        self.shared.wait_queue.wake_all();
         Ok(data.len())
+    }
+
+    fn poll(&self, events: u32) -> u32 {
+        let mut revents = 0;
+        if (events & crate::fs::inode::POLLIN) != 0 {
+            if !self.shared.slave_read_queue.lock().is_empty() {
+                revents |= crate::fs::inode::POLLIN;
+            }
+        }
+        if (events & crate::fs::inode::POLLOUT) != 0 {
+            revents |= crate::fs::inode::POLLOUT;
+        }
+        revents
     }
 
     fn ioctl(&self, request: u64, arg: u64) -> Result<u64, i32> {
@@ -381,6 +411,7 @@ pub fn allocate_new_pty() -> Result<Arc<dyn InodeOps>, i32> {
             ws_ypixel: 0,
         }),
         foreground_pgid: Mutex::new(0),
+        wait_queue: crate::sync::wait_queue::WaitQueue::new(),
     });
 
     let master = Arc::new(PtyMaster {

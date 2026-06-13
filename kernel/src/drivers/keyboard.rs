@@ -68,6 +68,10 @@ impl RingBuffer {
 /// Global keyboard input ring buffer.
 static KEYBOARD_BUFFER: TicketLock<RingBuffer> = TicketLock::new(RingBuffer::new());
 
+/// Global stdin wait queue.
+pub static STDIN_WAIT_QUEUE: crate::sync::wait_queue::WaitQueue =
+    crate::sync::wait_queue::WaitQueue::new();
+
 /// Whether the Shift key is currently pressed.
 static SHIFT_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -162,6 +166,7 @@ fn scan_to_ascii(scancode: u8) -> Option<u8> {
 pub fn push_scancode(scancode: u8) {
     if let Some(ascii) = scan_to_ascii(scancode) {
         KEYBOARD_BUFFER.lock().push(ascii);
+        STDIN_WAIT_QUEUE.wake_all();
     }
 }
 
@@ -169,6 +174,7 @@ pub fn push_scancode(scancode: u8) {
 /// Used to route input from alternative devices like the serial port.
 pub fn push_char(byte: u8) {
     KEYBOARD_BUFFER.lock().push(byte);
+    STDIN_WAIT_QUEUE.wake_all();
 }
 
 /// Non-blocking read of one ASCII character from the keyboard buffer.

@@ -204,6 +204,45 @@ impl InodeOps for SocketInode {
             Err(-22) // EINVAL
         }
     }
+
+    fn poll(&self, events: u32) -> u32 {
+        let mut revents = 0;
+        let sock = self.socket.lock();
+        if (events & crate::fs::inode::POLLIN) != 0 {
+            if sock.sock_type == 1 {
+                // SOCK_STREAM (TCP)
+                if sock.tcp_state == crate::net::tcp::TcpState::Listen {
+                    if !sock.tcp_backlog.is_empty() {
+                        revents |= crate::fs::inode::POLLIN;
+                    }
+                } else {
+                    if !sock.tcp_recv_buf.is_empty()
+                        || sock.tcp_state == crate::net::tcp::TcpState::CloseWait
+                        || sock.tcp_state == crate::net::tcp::TcpState::Closed
+                    {
+                        revents |= crate::fs::inode::POLLIN;
+                    }
+                }
+            } else if sock.sock_type == 2 {
+                // SOCK_DGRAM (UDP)
+                if !sock.udp_recv_queue.is_empty() {
+                    revents |= crate::fs::inode::POLLIN;
+                }
+            }
+        }
+        if (events & crate::fs::inode::POLLOUT) != 0 {
+            if sock.sock_type == 1 {
+                // SOCK_STREAM (TCP)
+                if sock.tcp_state == crate::net::tcp::TcpState::Established {
+                    revents |= crate::fs::inode::POLLOUT;
+                }
+            } else if sock.sock_type == 2 {
+                // SOCK_DGRAM (UDP) - always ready to write
+                revents |= crate::fs::inode::POLLOUT;
+            }
+        }
+        revents
+    }
 }
 
 impl Drop for SocketInode {

@@ -261,6 +261,7 @@ pub unsafe extern "C" fn enter_user_mode(
     _user_data_selector: u64,
 ) -> ! {
     core::arch::naked_asm!(
+        "cli", // Disable interrupts during transition
         // Switch CR3 to user page table (passed in rdx)
         "mov cr3, rdx",
         // Build the iretq stack frame:

@@ -24,4 +24,5 @@ busybox
 
 # User space binaries
 tools/init
+tcc-build/
 

@@ -749,3 +749,89 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, _timeout: i32) -> SyscallResult {
 
     ready as SyscallResult
 }
+
+/// `chmod(pathname, mode)` — Change file permissions.
+pub fn sys_chmod(pathname: *const u8, mode: u32) -> SyscallResult {
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+    if crate::syscall::DEBUG_SYSCALLS {
+        kprintln!("[syscall] chmod(\"{}\", mode={:#o})", resolved_path, mode);
+    }
+
+    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved_path, true) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    // Check ownership before changing permissions (only owner or root can change)
+    let current_uid = if let Some(pid) = crate::process::scheduler::current_pid() {
+        if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+            let task = task_arc.lock();
+            (task.euid, task.uid)
+        } else {
+            (0, 0)
+        }
+    } else {
+        (0, 0)
+    };
+
+    let inode_uid = inode_ops.inode().uid;
+    if current_uid.0 != 0 && current_uid.0 != inode_uid && current_uid.1 != inode_uid {
+        return Errno::EPERM.into();
+    }
+
+    match inode_ops.set_permissions(mode as u16) {
+        Ok(_) => 0,
+        Err(e) => {
+            if e < 0 {
+                e as SyscallResult
+            } else {
+                -e as SyscallResult
+            }
+        }
+    }
+}
+
+/// `fchmod(fd, mode)` — Change permissions of an open file descriptor.
+pub fn sys_fchmod(fd: i32, mode: u32) -> SyscallResult {
+    if crate::syscall::DEBUG_SYSCALLS {
+        kprintln!("[syscall] fchmod(fd={}, mode={:#o})", fd, mode);
+    }
+
+    let inode_ops = match proc_fd::current_task_read_fd(fd) {
+        Some(i) => i,
+        None => return Errno::EBADF.into(),
+    };
+
+    // Check ownership
+    let current_uid = if let Some(pid) = crate::process::scheduler::current_pid() {
+        if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+            let task = task_arc.lock();
+            (task.euid, task.uid)
+        } else {
+            (0, 0)
+        }
+    } else {
+        (0, 0)
+    };
+
+    let inode_uid = inode_ops.inode().uid;
+    if current_uid.0 != 0 && current_uid.0 != inode_uid && current_uid.1 != inode_uid {
+        return Errno::EPERM.into();
+    }
+
+    match inode_ops.set_permissions(mode as u16) {
+        Ok(_) => 0,
+        Err(e) => {
+            if e < 0 {
+                e as SyscallResult
+            } else {
+                -e as SyscallResult
+            }
+        }
+    }
+}

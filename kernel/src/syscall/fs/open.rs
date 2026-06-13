@@ -101,7 +101,10 @@ pub fn sys_open(pathname: *const u8, flags: i32, _mode: u32) -> SyscallResult {
                     }
 
                     match parent_inode.create(name, crate::fs::inode::FileType::Regular) {
-                        Some(new_i) => new_i,
+                        Some(new_i) => {
+                            let _ = new_i.set_permissions((_mode & 0x0FFF) as u16);
+                            new_i
+                        }
                         None => return Errno::EACCES.into(),
                     }
                 } else {

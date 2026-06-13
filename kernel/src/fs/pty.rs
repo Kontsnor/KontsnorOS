@@ -449,6 +449,10 @@ fn pty_flusher_thread() {
                         }
                         console.gpu.blit();
                     }
+                    // Mirror output to the serial port
+                    for &byte in &buf[..n] {
+                        crate::arch::x86_64::serial::write_byte(byte);
+                    }
                 }
                 _ => {}
             }

@@ -499,6 +499,8 @@ pub fn dispatch(
         87 => fs::sys_unlink(arg0 as *const u8),
         88 => fs::sys_symlink(arg0 as *const u8, arg1 as *const u8),
         89 => fs::sys_readlink(arg0 as *const u8, arg1 as *mut u8, arg2 as usize),
+        90 => fs::sys_chmod(arg0 as *const u8, arg1 as u32),
+        91 => fs::sys_fchmod(arg0 as i32, arg1 as u32),
         217 => fs::sys_getdents64(arg0 as i32, arg1 as *mut u8, arg2 as usize),
         257 => fs::sys_openat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as u32),
         262 => fs::sys_newfstatat(

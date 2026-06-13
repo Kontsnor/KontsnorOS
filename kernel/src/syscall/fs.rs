@@ -9,9 +9,10 @@ pub use io::{
     sys_write, sys_writev, IoVec,
 };
 pub use meta::{
-    sys_access, sys_chdir, sys_faccessat, sys_fstat, sys_getcwd, sys_getdents64, sys_link,
-    sys_lstat, sys_mkdir, sys_newfstatat, sys_poll, sys_readlink, sys_readlinkat, sys_rename,
-    sys_rmdir, sys_stat, sys_symlink, sys_symlinkat, sys_unlink, LinuxStat,
+    sys_access, sys_chdir, sys_chmod, sys_faccessat, sys_fchmod, sys_fstat, sys_getcwd,
+    sys_getdents64, sys_link, sys_lstat, sys_mkdir, sys_newfstatat, sys_poll, sys_readlink,
+    sys_readlinkat, sys_rename, sys_rmdir, sys_stat, sys_symlink, sys_symlinkat, sys_unlink,
+    LinuxStat,
 };
 pub use open::{sys_close, sys_open, sys_openat};
 

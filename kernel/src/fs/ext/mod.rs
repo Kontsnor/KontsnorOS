@@ -618,6 +618,27 @@ impl InodeOps for ExtInode {
         self.write_file(offset, data)
     }
 
+    fn set_permissions(&self, mode: u16) -> Result<(), i32> {
+        let mut vfs = self.vfs_inode.lock();
+        let mut raw = self.raw.lock();
+        let new_mode = (raw.i_mode & 0xF000) | (mode & 0x0FFF);
+        raw.i_mode = new_mode;
+        vfs.permissions.mode = new_mode;
+        self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?; // -EIO
+        Ok(())
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) -> Result<(), i32> {
+        let mut vfs = self.vfs_inode.lock();
+        let mut raw = self.raw.lock();
+        raw.i_uid = uid as u16;
+        raw.i_gid = gid as u16;
+        vfs.uid = uid;
+        vfs.gid = gid;
+        self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?; // -EIO
+        Ok(())
+    }
+
     fn create(&self, name: &str, file_type: FileType) -> Option<Arc<dyn InodeOps>> {
         self.create_dir_entry(name, file_type)
     }

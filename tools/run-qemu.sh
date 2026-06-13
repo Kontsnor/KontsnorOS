@@ -60,7 +60,7 @@ qemu-system-x86_64 \
     -drive format=raw,file="$DISK_IMG",index=1,media=disk \
     -serial stdio \
     -display none \
-    -m 256M \
+    -m 2G \
     -cpu qemu64,+fsgsbase \
     -no-reboot \
     -no-shutdown \

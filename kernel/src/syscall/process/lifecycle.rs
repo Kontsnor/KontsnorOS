@@ -556,7 +556,12 @@ pub fn sys_execve(
             }
             drop(fd_table);
 
-            let old = task.address_space.lock().page_table_root;
+            let old = {
+                let mut addr_space = task.address_space.lock();
+                let old_pt = addr_space.page_table_root;
+                addr_space.page_table_root = 0; // Prevent drop() from double-freeing
+                old_pt
+            };
             task.address_space = Arc::new(spin::Mutex::new(crate::process::task::AddressSpace {
                 page_table_root: new_page_table,
                 brk: initial_brk,

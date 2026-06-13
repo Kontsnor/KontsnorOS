@@ -159,7 +159,8 @@ pub fn flush_all_for_inode_inner(inode: &dyn InodeOps) -> Result<(), Errno> {
         if let Some(task_arc) = task_opt {
             x86_64::instructions::interrupts::without_interrupts(|| {
                 let mut task = task_arc.lock();
-                for region in &task.mmap_regions {
+                let addr_space = task.address_space.lock();
+                for region in &addr_space.mmap_regions {
                     if region.is_shared && region.inode_ino == ino {
                         let start_page = region.start & !4095;
                         let end_page = (region.start + region.len as u64 - 1) & !4095;
@@ -168,9 +169,10 @@ pub fn flush_all_for_inode_inner(inode: &dyn InodeOps) -> Result<(), Errno> {
                             let file_offset = region.offset + page_offset_in_mapping;
 
                             unsafe {
-                                if let Some(pte) =
-                                    get_page_table_entry(task.page_table_root, VirtAddr::new(vaddr))
-                                {
+                                if let Some(pte) = get_page_table_entry(
+                                    addr_space.page_table_root,
+                                    VirtAddr::new(vaddr),
+                                ) {
                                     let mut flags = pte.flags();
                                     if flags.contains(PageTableFlags::DIRTY) {
                                         flags.remove(PageTableFlags::DIRTY);

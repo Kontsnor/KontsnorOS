@@ -5,8 +5,8 @@ pub mod meta;
 pub mod open;
 
 pub use io::{
-    sys_dup, sys_dup2, sys_fcntl, sys_fsync, sys_lseek, sys_pipe, sys_pread64, sys_read, sys_write,
-    sys_writev, IoVec,
+    sys_dup, sys_dup2, sys_fcntl, sys_flock, sys_fsync, sys_lseek, sys_pipe, sys_pread64, sys_read,
+    sys_write, sys_writev, IoVec,
 };
 pub use meta::{
     sys_access, sys_chdir, sys_faccessat, sys_fstat, sys_getcwd, sys_getdents64, sys_link,

@@ -222,7 +222,9 @@ impl Scheduler {
             let mut task = task_arc.lock();
             task.state = TaskState::Zombie;
             task.exit_code = Some(exit_code);
-            task.fd_table.clear();
+            if alloc::sync::Arc::strong_count(&task.fd_table) == 1 {
+                task.fd_table.lock().entries.clear();
+            }
             parent_pid = Some(task.parent_pid);
         }
         drop(tasks); // Drop TASKS read lock before calling wake_task to keep correct order

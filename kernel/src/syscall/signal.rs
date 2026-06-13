@@ -134,15 +134,16 @@ pub fn sys_rt_sigaction(
         None => return Errno::ESRCH.into(),
     };
     let mut task = task_arc.lock();
+    let mut sigactions = task.sigactions.lock();
 
     if !oldact.is_null() {
         unsafe {
-            core::ptr::write(oldact, task.sigactions[(signum - 1) as usize]);
+            core::ptr::write(oldact, sigactions[(signum - 1) as usize]);
         }
     }
     if !act.is_null() {
         unsafe {
-            task.sigactions[(signum - 1) as usize] = core::ptr::read(act);
+            sigactions[(signum - 1) as usize] = core::ptr::read(act);
         }
     }
     0
@@ -286,7 +287,7 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
 
         task.pending_signals &= !(1 << (active_sig - 1));
 
-        let action = task.sigactions[(active_sig - 1) as usize];
+        let action = task.sigactions.lock()[(active_sig - 1) as usize];
         let old_mask = task.blocked_signals;
 
         if (action.sa_flags & 0x40000000) == 0 {

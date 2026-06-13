@@ -280,8 +280,9 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                 None => return Errno::ESRCH.into(),
             };
             let mut task = task_arc.lock();
+            let mut fd_table = task.fd_table.lock();
 
-            let file_desc = match task.fd_table.get(fd as usize) {
+            let file_desc = match fd_table.entries.get(fd as usize) {
                 Some(Some(desc)) => desc.clone(),
                 _ => return Errno::EBADF.into(),
             };
@@ -289,16 +290,16 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             *file_desc.ref_count.lock() += 1;
 
             let mut new_fd = start_fd;
-            while (new_fd as usize) < task.fd_table.len()
-                && task.fd_table[new_fd as usize].is_some()
+            while (new_fd as usize) < fd_table.entries.len()
+                && fd_table.entries[new_fd as usize].is_some()
             {
                 new_fd += 1;
             }
 
-            if (new_fd as usize) >= task.fd_table.len() {
-                task.fd_table.resize(new_fd as usize + 1, None);
+            if (new_fd as usize) >= fd_table.entries.len() {
+                fd_table.entries.resize(new_fd as usize + 1, None);
             }
-            task.fd_table[new_fd as usize] = Some(file_desc);
+            fd_table.entries[new_fd as usize] = Some(file_desc);
 
             kprintln!(
                 "[syscall] fcntl(fd={}, F_DUPFD, arg={}) -> {}",
@@ -324,7 +325,8 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             };
             if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
                 let task = task_arc.lock();
-                if let Some(Some(desc)) = task.fd_table.get(fd as usize) {
+                let fd_table = task.fd_table.lock();
+                if let Some(Some(desc)) = fd_table.entries.get(fd as usize) {
                     return desc.flags.lock().0 as i64;
                 }
             }
@@ -338,7 +340,8 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             };
             if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
                 let mut task = task_arc.lock();
-                if let Some(Some(desc)) = task.fd_table.get_mut(fd as usize) {
+                let mut fd_table = task.fd_table.lock();
+                if let Some(Some(desc)) = fd_table.entries.get_mut(fd as usize) {
                     let allowed_flags = OpenFlags::O_APPEND | OpenFlags::O_NONBLOCK;
                     let mut flags = desc.flags.lock();
                     let old_val = flags.0;
@@ -347,6 +350,17 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                 }
             }
             Errno::EBADF.into()
+        }
+        5 | 6 | 7 | 36 | 37 | 38 => {
+            // F_GETLK (5), F_SETLK (6), F_SETLKW (7), F_OFD_GETLK (36), F_OFD_SETLK (37), F_OFD_SETLKW (38)
+            // Mock successful POSIX file lock acquisition to satisfy Cargo database locking.
+            kprintln!(
+                "[syscall] fcntl(fd={}, cmd={} (lock command), arg={}) -> stub success",
+                fd,
+                cmd,
+                arg
+            );
+            0 // Success
         }
         _ => {
             kprintln!(
@@ -450,4 +464,14 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: i32) -> SyscallResult {
         total_written += ret;
     }
     total_written
+}
+
+/// `flock(fd, operation)` — Apply or remove an advisory lock on an open file.
+pub fn sys_flock(fd: i32, operation: i32) -> SyscallResult {
+    kprintln!(
+        "[syscall] flock(fd={}, operation={}) -> stub success",
+        fd,
+        operation
+    );
+    0
 }

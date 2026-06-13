@@ -141,5 +141,11 @@ pub fn init() {
         crate::fs::vfs::register_block_device(alloc::format!("sata{}", idx), drive);
     }
 
+    // Probe and initialize NVMe drives
+    let nvme_drives = crate::drivers::block::nvme::init();
+    for (idx, drive) in nvme_drives.into_iter().enumerate() {
+        crate::fs::vfs::register_block_device(alloc::format!("nvme{}", idx), drive);
+    }
+
     kprintln!("[fs] VFS initialized with devfs, tmpfs, procfs, ext.");
 }

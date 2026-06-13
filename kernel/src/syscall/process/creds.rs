@@ -7,7 +7,13 @@ use crate::process::scheduler;
 /// `getpid()` — Get the process ID of the calling process.
 pub fn sys_getpid() -> SyscallResult {
     match scheduler::current_pid() {
-        Some(pid) => pid.as_u64() as SyscallResult,
+        Some(pid) => {
+            if let Some(task_arc) = scheduler::get_task_arc(pid) {
+                task_arc.lock().tgid.as_u64() as SyscallResult
+            } else {
+                pid.as_u64() as SyscallResult
+            }
+        }
         None => 0,
     }
 }
@@ -196,5 +202,8 @@ pub fn sys_setsid() -> SyscallResult {
 
 /// `gettid()` — Get thread ID (alias to getpid).
 pub fn sys_gettid() -> SyscallResult {
-    sys_getpid()
+    match scheduler::current_pid() {
+        Some(pid) => pid.as_u64() as SyscallResult,
+        None => 0,
+    }
 }

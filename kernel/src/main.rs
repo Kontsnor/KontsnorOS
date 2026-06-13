@@ -244,15 +244,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                         crate::fs::vfs::lookup("/dev/pts/0").expect("Failed to lookup PTY slave");
                     if let Some(task_arc) = process::scheduler::get_task_arc(pid) {
                         let mut task = task_arc.lock();
-                        task.fd_table.clear();
+                        let mut fd_table = task.fd_table.lock();
+                        fd_table.entries.clear();
                         let slave_desc =
                             alloc::sync::Arc::new(crate::fs::file::FileDescription::new(
                                 slave,
                                 crate::fs::file::OpenFlags(crate::fs::file::OpenFlags::O_RDWR),
                             ));
-                        task.fd_table.push(Some(slave_desc.clone())); // fd 0
-                        task.fd_table.push(Some(slave_desc.clone())); // fd 1
-                        task.fd_table.push(Some(slave_desc.clone())); // fd 2
+                        fd_table.entries.push(Some(slave_desc.clone())); // fd 0
+                        fd_table.entries.push(Some(slave_desc.clone())); // fd 1
+                        fd_table.entries.push(Some(slave_desc.clone())); // fd 2
                     }
                 }
                 Err(e) => {

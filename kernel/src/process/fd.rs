@@ -14,7 +14,8 @@ pub fn get_fd_offset(fd: i32) -> Option<u64> {
     let current_pid = scheduler::current_pid()?;
     let task_arc = scheduler::get_task_arc(current_pid)?;
     let task = task_arc.lock();
-    let file_desc = task.fd_table.get(fd_idx)?.as_ref()?;
+    let fd_table = task.fd_table.lock();
+    let file_desc = fd_table.entries.get(fd_idx)?.as_ref()?;
     let offset = *file_desc.offset.lock();
     Some(offset)
 }
@@ -28,7 +29,8 @@ pub fn set_fd_offset(fd: i32, offset: u64) -> Option<()> {
     let current_pid = scheduler::current_pid()?;
     let task_arc = scheduler::get_task_arc(current_pid)?;
     let task = task_arc.lock();
-    let file_desc = task.fd_table.get(fd_idx)?.as_ref()?;
+    let fd_table = task.fd_table.lock();
+    let file_desc = fd_table.entries.get(fd_idx)?.as_ref()?;
     *file_desc.offset.lock() = offset;
     Some(())
 }
@@ -43,7 +45,9 @@ pub fn current_task_read_fd(fd: i32) -> Option<Arc<dyn InodeOps>> {
     let current_pid = scheduler::current_pid()?;
     let task_arc = scheduler::get_task_arc(current_pid)?;
     let task = task_arc.lock();
-    task.fd_table
+    let fd_table = task.fd_table.lock();
+    fd_table
+        .entries
         .get(fd_idx)?
         .as_ref()
         .map(|desc| desc.inode.clone())
@@ -59,7 +63,8 @@ pub fn current_task_get_file_desc(fd: i32) -> Option<Arc<FileDescription>> {
     let current_pid = scheduler::current_pid()?;
     let task_arc = scheduler::get_task_arc(current_pid)?;
     let task = task_arc.lock();
-    task.fd_table.get(fd_idx)?.as_ref().cloned()
+    let fd_table = task.fd_table.lock();
+    fd_table.entries.get(fd_idx)?.as_ref().cloned()
 }
 
 /// Allocate the next free file descriptor slot in the current task's fd_table
@@ -73,10 +78,11 @@ pub fn current_task_alloc_fd_with_flags(inode: Arc<dyn InodeOps>, flags: OpenFla
     let current_pid = scheduler::current_pid()?;
     let task_arc = scheduler::get_task_arc(current_pid)?;
     let mut task = task_arc.lock();
+    let mut fd_table = task.fd_table.lock();
     let file_desc = Arc::new(FileDescription::new(inode, flags));
 
     // Find first free slot (first None entry)
-    for (i, slot) in task.fd_table.iter_mut().enumerate() {
+    for (i, slot) in fd_table.entries.iter_mut().enumerate() {
         if slot.is_none() {
             *slot = Some(file_desc);
             return Some(i as i32);
@@ -84,9 +90,9 @@ pub fn current_task_alloc_fd_with_flags(inode: Arc<dyn InodeOps>, flags: OpenFla
     }
 
     // No free slot found — extend the table (up to a hard limit of 1024)
-    if task.fd_table.len() < 1024 {
-        task.fd_table.push(Some(file_desc));
-        Some((task.fd_table.len() - 1) as i32)
+    if fd_table.entries.len() < 1024 {
+        fd_table.entries.push(Some(file_desc));
+        Some((fd_table.entries.len() - 1) as i32)
     } else {
         None // EMFILE
     }
@@ -107,13 +113,15 @@ pub fn current_task_close_fd(fd: i32) -> bool {
         None => return false,
     };
     let mut task = task_arc.lock();
+    let mut fd_table = task.fd_table.lock();
 
-    let desc = if let Some(slot) = task.fd_table.get_mut(fd_idx) {
+    let desc = if let Some(slot) = fd_table.entries.get_mut(fd_idx) {
         slot.take()
     } else {
         None
     };
 
+    drop(fd_table);
     drop(task); // Drop the task lock before dropping the desc (which might trigger Drop calling flush_all_for_inode)
 
     if let Some(desc) = desc {
@@ -136,12 +144,13 @@ pub fn current_task_dup_fd(fd: i32) -> Option<i32> {
     let current_pid = scheduler::current_pid()?;
     let task_arc = scheduler::get_task_arc(current_pid)?;
     let mut task = task_arc.lock();
+    let mut fd_table = task.fd_table.lock();
 
-    let file_desc = task.fd_table.get(fd_idx)?.as_ref().cloned()?;
+    let file_desc = fd_table.entries.get(fd_idx)?.as_ref().cloned()?;
     *file_desc.ref_count.lock() += 1;
 
     // Find first free slot (first None entry)
-    for (i, slot) in task.fd_table.iter_mut().enumerate() {
+    for (i, slot) in fd_table.entries.iter_mut().enumerate() {
         if slot.is_none() {
             *slot = Some(file_desc);
             return Some(i as i32);
@@ -149,9 +158,9 @@ pub fn current_task_dup_fd(fd: i32) -> Option<i32> {
     }
 
     // No free slot found — extend the table (up to a hard limit of 1024)
-    if task.fd_table.len() < 1024 {
-        task.fd_table.push(Some(file_desc));
-        Some((task.fd_table.len() - 1) as i32)
+    if fd_table.entries.len() < 1024 {
+        fd_table.entries.push(Some(file_desc));
+        Some((fd_table.entries.len() - 1) as i32)
     } else {
         None
     }
@@ -167,7 +176,8 @@ pub fn current_task_dup2_fd(oldfd: i32, newfd: i32) -> Option<i32> {
 
     if oldfd == newfd {
         let task = task_arc.lock();
-        if task.fd_table.get(oldfd as usize)?.as_ref().is_some() {
+        let fd_table = task.fd_table.lock();
+        if fd_table.entries.get(oldfd as usize)?.as_ref().is_some() {
             return Some(newfd);
         } else {
             return None;
@@ -175,23 +185,24 @@ pub fn current_task_dup2_fd(oldfd: i32, newfd: i32) -> Option<i32> {
     }
 
     let mut task = task_arc.lock();
-    let file_desc = task.fd_table.get(oldfd as usize)?.as_ref().cloned()?;
+    let mut fd_table = task.fd_table.lock();
+    let file_desc = fd_table.entries.get(oldfd as usize)?.as_ref().cloned()?;
     *file_desc.ref_count.lock() += 1;
 
     // Ensure fd_table is large enough to contain newfd
     let newfd_idx = newfd as usize;
-    if newfd_idx >= task.fd_table.len() {
-        task.fd_table.resize(newfd_idx + 1, None);
+    if newfd_idx >= fd_table.entries.len() {
+        fd_table.entries.resize(newfd_idx + 1, None);
     }
 
     // If newfd was already open, decrement its ref count
-    if let Some(ref old_desc) = task.fd_table[newfd_idx] {
+    if let Some(ref old_desc) = fd_table.entries[newfd_idx] {
         let mut rc = old_desc.ref_count.lock();
         if *rc > 0 {
             *rc -= 1;
         }
     }
 
-    task.fd_table[newfd_idx] = Some(file_desc);
+    fd_table.entries[newfd_idx] = Some(file_desc);
     Some(newfd)
 }

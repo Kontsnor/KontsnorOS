@@ -1,5 +1,8 @@
 //! Process lifecycle and scheduler/memory control system calls.
 
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
 use super::super::{Errno, SyscallResult};
 use super::creds::calculate_exec_creds;
 use crate::kprintln;
@@ -27,7 +30,8 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
     let (parent_cr3, mmap_regions) = match scheduler::get_task_arc(current_pid) {
         Some(task_arc) => {
             let task = task_arc.lock();
-            (task.page_table_root, task.mmap_regions.clone())
+            let addr_space = task.address_space.lock();
+            (addr_space.page_table_root, addr_space.mmap_regions.clone())
         }
         None => return Errno::ESRCH.into(),
     };
@@ -52,18 +56,35 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
     {
         if let Some(parent_task_arc) = scheduler::get_task_arc(current_pid) {
             let parent_task = parent_task_arc.lock();
-            child_task.fd_table = parent_task.fd_table.clone();
-            for slot in &child_task.fd_table {
+
+            // Copy file descriptors (fork does not share FdTable)
+            let parent_fds = parent_task.fd_table.lock();
+            let mut child_fds = child_task.fd_table.lock();
+            child_fds.entries = parent_fds.entries.clone();
+            for slot in &child_fds.entries {
                 if let Some(ref file_desc) = slot {
                     *file_desc.ref_count.lock() += 1;
                 }
             }
-            child_task.sigactions = parent_task.sigactions.clone();
+            drop(child_fds);
+            drop(parent_fds);
+
+            // Copy address space metrics (fork does not share AddressSpace)
+            let parent_vm = parent_task.address_space.lock();
+            let mut child_vm = child_task.address_space.lock();
+            child_vm.brk = parent_vm.brk;
+            child_vm.mmap_bump = parent_vm.mmap_bump;
+            child_vm.mmap_regions = parent_vm.mmap_regions.clone();
+            drop(child_vm);
+            drop(parent_vm);
+
+            // Clone sigactions Array into a new Mutex
+            let parent_sigs = parent_task.sigactions.lock();
+            child_task.sigactions = Arc::new(spin::Mutex::new(*parent_sigs));
+            drop(parent_sigs);
+
             child_task.blocked_signals = parent_task.blocked_signals;
-            child_task.brk = parent_task.brk;
             child_task.cwd = parent_task.cwd.clone();
-            child_task.mmap_bump = parent_task.mmap_bump;
-            child_task.mmap_regions = parent_task.mmap_regions.clone();
             child_task.uid = parent_task.uid;
             child_task.gid = parent_task.gid;
             child_task.euid = parent_task.euid;
@@ -500,12 +521,14 @@ pub fn sys_execve(
             task.euid = new_euid;
             task.egid = new_egid;
 
-            for action in task.sigactions.iter_mut() {
+            let mut sigs = task.sigactions.lock();
+            for action in sigs.iter_mut() {
                 if action.sa_handler != 1 {
                     // If not SIG_IGN
                     *action = crate::process::task::SigAction::default();
                 }
             }
+            drop(sigs);
             task.pending_signals = 0;
             let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
             unsafe {
@@ -514,7 +537,8 @@ pub fn sys_execve(
                 }
             }
             // Close O_CLOEXEC file descriptors
-            for slot in task.fd_table.iter_mut() {
+            let mut fd_table = task.fd_table.lock();
+            for slot in fd_table.entries.iter_mut() {
                 let mut close = false;
                 if let Some(ref fd) = slot {
                     if fd.flags.lock().0 & crate::fs::file::OpenFlags::O_CLOEXEC != 0 {
@@ -530,12 +554,16 @@ pub fn sys_execve(
                     }
                 }
             }
+            drop(fd_table);
 
-            let old = task.page_table_root;
-            task.page_table_root = new_page_table;
-            task.brk = initial_brk; // Dynamically calculated start of heap
+            let old = task.address_space.lock().page_table_root;
+            task.address_space = Arc::new(spin::Mutex::new(crate::process::task::AddressSpace {
+                page_table_root: new_page_table,
+                brk: initial_brk,
+                mmap_bump: 0x0000_5000_0000_0000u64,
+                mmap_regions: Vec::new(),
+            }));
             task.context.fs_base = 0; // Clear TLS base for new process
-            task.mmap_regions.clear();
             old
         } else {
             0
@@ -684,7 +712,8 @@ pub fn sys_brk(addr: u64) -> SyscallResult {
     let (current_brk, page_table_root) = {
         if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
             let task = task_arc.lock();
-            (task.brk, task.page_table_root)
+            let addr_space = task.address_space.lock();
+            (addr_space.brk, addr_space.page_table_root)
         } else {
             return Errno::ESRCH.into();
         }
@@ -738,7 +767,8 @@ pub fn sys_brk(addr: u64) -> SyscallResult {
     // Update the task's brk
     {
         if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
-            task_arc.lock().brk = new_brk;
+            let task = task_arc.lock();
+            task.address_space.lock().brk = new_brk;
         }
     }
 
@@ -803,19 +833,30 @@ pub fn sys_clone(
         None => return Errno::ESRCH.into(),
     };
 
-    let (parent_cr3, mmap_regions) = match scheduler::get_task_arc(current_pid) {
-        Some(task_arc) => {
-            let task = task_arc.lock();
-            (task.page_table_root, task.mmap_regions.clone())
-        }
-        None => return Errno::ESRCH.into(),
-    };
+    let (parent_cr3, mmap_regions, parent_brk, parent_mmap_bump) =
+        match scheduler::get_task_arc(current_pid) {
+            Some(task_arc) => {
+                let task = task_arc.lock();
+                let addr_space = task.address_space.lock();
+                (
+                    addr_space.page_table_root,
+                    addr_space.mmap_regions.clone(),
+                    addr_space.brk,
+                    addr_space.mmap_bump,
+                )
+            }
+            None => return Errno::ESRCH.into(),
+        };
 
-    let child_page_table =
+    let child_page_table = if flags & 0x00000100 != 0 {
+        // CLONE_VM: share page tables
+        parent_cr3
+    } else {
         match crate::memory::r#virtual::clone_parent_page_table(parent_cr3, &mmap_regions) {
             Ok(pt) => pt,
             Err(_) => return Errno::ENOMEM.into(),
-        };
+        }
+    };
 
     let child_pid = pid::allocate();
     let mut child_task = Task::new(
@@ -827,18 +868,52 @@ pub fn sys_clone(
     {
         if let Some(parent_task_arc) = scheduler::get_task_arc(current_pid) {
             let parent_task = parent_task_arc.lock();
-            child_task.fd_table = parent_task.fd_table.clone();
-            for slot in &child_task.fd_table {
-                if let Some(ref file_desc) = slot {
-                    *file_desc.ref_count.lock() += 1;
+
+            // CLONE_FILES
+            if flags & 0x00000400 != 0 {
+                child_task.fd_table = parent_task.fd_table.clone();
+            } else {
+                let parent_fds = parent_task.fd_table.lock();
+                let mut child_fds = child_task.fd_table.lock();
+                child_fds.entries = parent_fds.entries.clone();
+                for slot in &child_fds.entries {
+                    if let Some(ref file_desc) = slot {
+                        *file_desc.ref_count.lock() += 1;
+                    }
                 }
             }
-            child_task.sigactions = parent_task.sigactions.clone();
+
+            // CLONE_VM
+            if flags & 0x00000100 != 0 {
+                child_task.address_space = parent_task.address_space.clone();
+            } else {
+                let mut child_vm = child_task.address_space.lock();
+                child_vm.brk = parent_brk;
+                child_vm.mmap_bump = parent_mmap_bump;
+                child_vm.mmap_regions = mmap_regions.clone();
+            }
+
+            // CLONE_SIGHAND
+            if flags & 0x00000800 != 0 {
+                child_task.sigactions = parent_task.sigactions.clone();
+            } else {
+                let parent_sigs = parent_task.sigactions.lock();
+                child_task.sigactions = Arc::new(spin::Mutex::new(*parent_sigs));
+            }
+
+            // CLONE_THREAD
+            if flags & 0x00010000 != 0 {
+                child_task.tgid = parent_task.tgid;
+            } else {
+                child_task.tgid = child_pid;
+            }
+
             child_task.blocked_signals = parent_task.blocked_signals;
-            child_task.brk = parent_task.brk;
             child_task.cwd = parent_task.cwd.clone();
-            child_task.mmap_bump = parent_task.mmap_bump;
-            child_task.mmap_regions = parent_task.mmap_regions.clone();
+            child_task.uid = parent_task.uid;
+            child_task.gid = parent_task.gid;
+            child_task.euid = parent_task.euid;
+            child_task.egid = parent_task.egid;
         } else {
             return Errno::ESRCH.into();
         }

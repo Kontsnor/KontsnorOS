@@ -78,9 +78,10 @@ pub fn sys_mmap(
             None => return Errno::ESRCH.into(),
         };
         let mut task = task_arc.lock();
+        let mut addr_space = task.address_space.lock();
 
         let resolved = if addr == 0 {
-            let current_bump = task.mmap_bump;
+            let current_bump = addr_space.mmap_bump;
             let next_bump = match current_bump.checked_add(aligned_len as u64) {
                 Some(b) => b,
                 None => return Errno::EINVAL.into(),
@@ -88,7 +89,7 @@ pub fn sys_mmap(
             if next_bump > 0x0000_7FFF_FFFF_FFFF {
                 return Errno::EINVAL.into();
             }
-            task.mmap_bump = next_bump;
+            addr_space.mmap_bump = next_bump;
             current_bump
         } else {
             let aligned_addr = match addr.checked_add(4095) {
@@ -105,7 +106,7 @@ pub fn sys_mmap(
             aligned_addr
         };
 
-        (resolved, task.page_table_root)
+        (resolved, addr_space.page_table_root)
     };
 
     // Map pages in the resolved range
@@ -204,14 +205,17 @@ pub fn sys_mmap(
             None => return Errno::ESRCH.into(),
         };
         let mut task = task_arc.lock();
+        let mut addr_space = task.address_space.lock();
         if let Some(ref desc) = file_desc {
-            task.mmap_regions.push(crate::process::task::MappedRegion {
-                start: resolved_addr,
-                len: aligned_len,
-                inode_ino: desc.inode.inode().ino,
-                offset: offset as u64,
-                is_shared,
-            });
+            addr_space
+                .mmap_regions
+                .push(crate::process::task::MappedRegion {
+                    start: resolved_addr,
+                    len: aligned_len,
+                    inode_ino: desc.inode.inode().ino,
+                    offset: offset as u64,
+                    is_shared,
+                });
         }
     }
 
@@ -240,7 +244,11 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
         Some(t) => t,
         None => return Errno::ESRCH.into(),
     };
-    let page_table_root = task_arc.lock().page_table_root;
+    let page_table_root = {
+        let task = task_arc.lock();
+        let pt_root = task.address_space.lock().page_table_root;
+        pt_root
+    };
 
     let aligned_len = match length.checked_add(4095) {
         Some(len) => len & !4095,
@@ -271,11 +279,12 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
     // unmap and remove/shrink task.mmap_regions
     {
         let mut task = task_arc.lock();
+        let mut addr_space = task.address_space.lock();
         let mut new_regions = alloc::vec::Vec::new();
         let unmap_start = addr;
         let unmap_end = addr + aligned_len as u64;
 
-        for r in task.mmap_regions.iter() {
+        for r in addr_space.mmap_regions.iter() {
             let r_start = r.start;
             let r_end = r.start + r.len as u64;
 
@@ -303,7 +312,7 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
                 }
             }
         }
-        task.mmap_regions = new_regions;
+        addr_space.mmap_regions = new_regions;
     }
 
     if unmapped_count > 0 {
@@ -343,7 +352,11 @@ pub fn sys_mprotect(addr: u64, length: usize, prot: i32) -> SyscallResult {
         Some(t) => t,
         None => return Errno::ESRCH.into(),
     };
-    let page_table_root = task_arc.lock().page_table_root;
+    let page_table_root = {
+        let task = task_arc.lock();
+        let pt_root = task.address_space.lock().page_table_root;
+        pt_root
+    };
 
     let aligned_len = match length.checked_add(4095) {
         Some(len) => len & !4095,

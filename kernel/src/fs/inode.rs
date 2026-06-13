@@ -306,7 +306,8 @@ pub fn is_inode_nonblocking(inode: &dyn InodeOps) -> bool {
     if let Some(pid) = crate::process::scheduler::current_pid() {
         if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
             let task = task_arc.lock();
-            for slot in task.fd_table.iter() {
+            let fd_table = task.fd_table.lock();
+            for slot in fd_table.entries.iter() {
                 if let Some(desc) = slot {
                     let p1 = inode as *const dyn InodeOps as *const u8;
                     let p2 = desc.inode.as_ref() as *const dyn InodeOps as *const u8;

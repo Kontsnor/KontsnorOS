@@ -209,7 +209,7 @@ pub fn spawn_user_process_with_pid(name: alloc::string::String, elf_data: &[u8],
 
     // Create new process TCB
     let mut task = Task::new(pid, name, page_table_root);
-    task.brk = initial_brk;
+    task.address_space.lock().brk = initial_brk;
 
     // Allocate kernel stack (32 KiB)
     let kernel_stack_layout = alloc::alloc::Layout::from_size_align(32768, 16).unwrap();

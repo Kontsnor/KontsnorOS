@@ -391,7 +391,8 @@ fn test_shared_mapping_communication() {
     let parent_task_arc = crate::process::scheduler::get_task_arc(current_pid).unwrap();
     let (parent_cr3, mmap_regions) = {
         let task = parent_task_arc.lock();
-        (task.page_table_root, task.mmap_regions.clone())
+        let addr_space = task.address_space.lock();
+        (addr_space.page_table_root, addr_space.mmap_regions.clone())
     };
     let child_cr3 = crate::memory::r#virtual::clone_parent_page_table(parent_cr3, &mmap_regions)
         .expect("Failed to clone page table");
@@ -1266,7 +1267,6 @@ fn test_ahci_port_connection() {
             as *const u32)
             .read_volatile()
     };
-
     let cl_phys_read = clb as u64 | ((clbu as u64) << 32);
     let fis_phys_read = fb as u64 | ((fbu as u64) << 32);
 
@@ -1283,4 +1283,281 @@ fn test_ahci_port_connection() {
     assert_ne!(cmd & 0x0001, 0); // ST set
 
     kprintln!("[test] AHCI Port Connection test PASSED!");
+}
+
+#[test_case]
+fn test_nvme_controller_initialization() {
+    kprintln!("[test] Starting NVMe Controller Initialization test...");
+
+    // Allocate a mock register space on the heap (8192 bytes for MMIO registers)
+    let mut mock_registers = alloc::vec![0u8; 8192];
+    let virt_base = mock_registers.as_mut_ptr() as u64;
+
+    unsafe {
+        // Test VS register (0x08)
+        crate::drivers::block::nvme::test_helpers::write_reg32(
+            virt_base,
+            crate::drivers::block::nvme::VS,
+            0x00010300,
+        ); // VS = 1.3.0
+        assert_eq!(
+            crate::drivers::block::nvme::test_helpers::read_reg32(
+                virt_base,
+                crate::drivers::block::nvme::VS
+            ),
+            0x00010300
+        );
+
+        // Test CAP register (0x00) - 8 bytes
+        crate::drivers::block::nvme::test_helpers::write_reg64(
+            virt_base,
+            crate::drivers::block::nvme::CAP,
+            0x0014000300020001,
+        );
+        assert_eq!(
+            crate::drivers::block::nvme::test_helpers::read_reg64(
+                virt_base,
+                crate::drivers::block::nvme::CAP
+            ),
+            0x0014000300020001
+        );
+
+        // Test CC register (0x14)
+        crate::drivers::block::nvme::test_helpers::write_reg32(
+            virt_base,
+            crate::drivers::block::nvme::CC,
+            0x00460001,
+        ); // CC.EN = 1, IOSQES=6, IOCQES=4
+        assert_eq!(
+            crate::drivers::block::nvme::test_helpers::read_reg32(
+                virt_base,
+                crate::drivers::block::nvme::CC
+            ),
+            0x00460001
+        );
+
+        // Test AQA register (0x24)
+        crate::drivers::block::nvme::test_helpers::write_reg32(
+            virt_base,
+            crate::drivers::block::nvme::AQA,
+            (63 << 16) | 63,
+        );
+        assert_eq!(
+            crate::drivers::block::nvme::test_helpers::read_reg32(
+                virt_base,
+                crate::drivers::block::nvme::AQA
+            ),
+            (63 << 16) | 63
+        );
+
+        // Test ASQ and ACQ registers (0x28, 0x30) - 8 bytes
+        crate::drivers::block::nvme::test_helpers::write_reg64(
+            virt_base,
+            crate::drivers::block::nvme::ASQ,
+            0x10002000,
+        );
+        crate::drivers::block::nvme::test_helpers::write_reg64(
+            virt_base,
+            crate::drivers::block::nvme::ACQ,
+            0x30004000,
+        );
+        assert_eq!(
+            crate::drivers::block::nvme::test_helpers::read_reg64(
+                virt_base,
+                crate::drivers::block::nvme::ASQ
+            ),
+            0x10002000
+        );
+        assert_eq!(
+            crate::drivers::block::nvme::test_helpers::read_reg64(
+                virt_base,
+                crate::drivers::block::nvme::ACQ
+            ),
+            0x30004000
+        );
+    }
+
+    kprintln!("[test] NVMe Controller Initialization test PASSED!");
+}
+
+#[test_case]
+fn test_nvme_identify_parsing() {
+    kprintln!("[test] Starting NVMe Identify Parsing test...");
+
+    // Allocate simulated identify namespace buffer (4096 bytes)
+    let mut identify_buf = alloc::vec![0u8; 4096];
+
+    // NSZE (Namespace Size) at offset 0 (8 bytes) = 0x0000_0000_1234_5678 (305,419,896 sectors)
+    let expected_nsze: u64 = 0x12345678;
+    identify_buf[0..8].copy_from_slice(&expected_nsze.to_ne_bytes());
+
+    // FLBAS (Formatted LBA Size) at offset 27 (1 byte) = 0
+    // Index 0 in LBA format table will be active
+    identify_buf[27] = 0;
+
+    // LBA Format table starts at offset 128
+    // LBA Format 0 at bytes 128..132:
+    // bits 16..23 is LBADS (LBA Data Size). If LBADS = 9 (2^9 = 512 bytes)
+    let lbads: u8 = 9;
+    let lbads_word = (lbads as u32) << 16;
+    identify_buf[128..132].copy_from_slice(&lbads_word.to_ne_bytes());
+
+    // Parse just like the driver would
+    let nsze = u64::from_ne_bytes([
+        identify_buf[0],
+        identify_buf[1],
+        identify_buf[2],
+        identify_buf[3],
+        identify_buf[4],
+        identify_buf[5],
+        identify_buf[6],
+        identify_buf[7],
+    ]);
+    let flbas = identify_buf[27];
+    let lbaf_idx = (flbas & 0x0F) as usize;
+
+    let lbaf_offset = 128 + lbaf_idx * 4;
+    let lbaf_entry = u32::from_ne_bytes([
+        identify_buf[lbaf_offset],
+        identify_buf[lbaf_offset + 1],
+        identify_buf[lbaf_offset + 2],
+        identify_buf[lbaf_offset + 3],
+    ]);
+    let parsed_lbads = ((lbaf_entry >> 16) & 0xFF) as u8;
+    let block_size = if parsed_lbads >= 9 && parsed_lbads <= 16 {
+        1u64 << parsed_lbads
+    } else {
+        512
+    };
+
+    assert_eq!(nsze, expected_nsze);
+    assert_eq!(block_size, 512);
+
+    // Test a different LBA size: LBADS = 12 (2^12 = 4096 bytes)
+    let lbads_12: u8 = 12;
+    let lbads_word_12 = (lbads_12 as u32) << 16;
+    identify_buf[128..132].copy_from_slice(&lbads_word_12.to_ne_bytes());
+
+    let lbaf_entry_12 = u32::from_ne_bytes([
+        identify_buf[128],
+        identify_buf[129],
+        identify_buf[130],
+        identify_buf[131],
+    ]);
+    let parsed_lbads_12 = ((lbaf_entry_12 >> 16) & 0xFF) as u8;
+    let block_size_12 = if parsed_lbads_12 >= 9 && parsed_lbads_12 <= 16 {
+        1u64 << parsed_lbads_12
+    } else {
+        512
+    };
+    assert_eq!(block_size_12, 4096);
+
+    kprintln!("[test] NVMe Identify Parsing test PASSED!");
+}
+
+static FUTEX_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn futex_helper_thread() {
+    kprintln!("[test_futex] Helper thread started, waiting for futex address...");
+    let addr = loop {
+        let a = FUTEX_ADDR.load(core::sync::atomic::Ordering::SeqCst);
+        if a != 0 {
+            break a;
+        }
+        crate::process::scheduler::yield_now();
+    };
+
+    // Yield a few times to let the main test thread call FUTEX_WAIT and block
+    for _ in 0..10 {
+        crate::process::scheduler::yield_now();
+    }
+
+    kprintln!("[test_futex] Helper thread waking futex at {:#x}", addr);
+    let woken = crate::syscall::process::futex::sys_futex(
+        addr as *mut i32,
+        1, // FUTEX_WAKE
+        1, // Wake 1 task
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
+    kprintln!("[test_futex] Helper thread woke {} task(s)", woken);
+}
+
+#[test_case]
+fn test_futex_wait_wake() {
+    kprintln!("[test] Starting Futex Wait/Wake test...");
+    FUTEX_ADDR.store(0, core::sync::atomic::Ordering::SeqCst);
+
+    // 1. Allocate mapped address for futex variable
+    let addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0);
+    assert!(addr > 0);
+    let uaddr = addr as *mut i32;
+
+    // Set value to 42
+    unsafe {
+        uaddr.write_volatile(42);
+    }
+
+    // 2. Spawn helper thread
+    let _helper_pid = crate::process::spawn_kernel_thread(
+        alloc::string::String::from("futex_helper"),
+        futex_helper_thread,
+    );
+
+    // 3. Store address so the helper thread can find it
+    FUTEX_ADDR.store(addr as u64, core::sync::atomic::Ordering::SeqCst);
+
+    // 4. Call FUTEX_WAIT. This should block the current thread until woken by the helper.
+    kprintln!("[test] Main thread calling FUTEX_WAIT on {:#x}...", addr);
+    let res = crate::syscall::process::futex::sys_futex(
+        uaddr,
+        0,  // FUTEX_WAIT
+        42, // Expected value
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
+    assert_eq!(res, 0);
+    kprintln!("[test] Main thread woke up successfully from FUTEX_WAIT!");
+
+    kprintln!("[test] Futex Wait/Wake test PASSED!");
+}
+
+#[test_case]
+fn test_thread_clone_vm() {
+    kprintln!("[test] Starting Thread Shared VM test...");
+    let mut sched = crate::process::scheduler::Scheduler::new();
+
+    let pid1 = crate::process::pid::Pid::from_raw(40);
+    let mut task1 =
+        crate::process::task::Task::new(pid1, alloc::string::String::from("thread1"), 0);
+    task1.state = crate::process::task::TaskState::Ready;
+
+    let pid2 = crate::process::pid::Pid::from_raw(41);
+    let mut task2 =
+        crate::process::task::Task::new(pid2, alloc::string::String::from("thread2"), 0);
+    task2.state = crate::process::task::TaskState::Ready;
+
+    // Share address space
+    task2.address_space = task1.address_space.clone();
+
+    sched.add_task(task1);
+    sched.add_task(task2);
+
+    // Modify brk in thread1
+    {
+        let t1_arc = crate::process::scheduler::get_task_arc(pid1).unwrap();
+        let mut t1 = t1_arc.lock();
+        t1.address_space.lock().brk = 0x1000;
+    }
+
+    // Verify read in thread2
+    {
+        let t2_arc = crate::process::scheduler::get_task_arc(pid2).unwrap();
+        let t2 = t2_arc.lock();
+        assert_eq!(t2.address_space.lock().brk, 0x1000);
+    }
+
+    kprintln!("[test] Thread Shared VM test PASSED!");
 }

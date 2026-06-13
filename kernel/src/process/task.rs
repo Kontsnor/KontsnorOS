@@ -76,19 +76,34 @@ pub struct SigAction {
     pub sa_mask: u64,
 }
 
-/// Represents a memory-mapped file region in the process virtual memory.
 #[derive(Clone, Debug)]
 pub struct MappedRegion {
-    /// Start virtual address.
     pub start: u64,
-    /// Size of the region in bytes.
     pub len: usize,
-    /// Backing file inode number.
     pub inode_ino: u64,
-    /// Offset within the file.
     pub offset: u64,
-    /// Whether the mapping is shared (MAP_SHARED).
     pub is_shared: bool,
+}
+
+pub struct AddressSpace {
+    pub page_table_root: u64,
+    pub brk: u64,
+    pub mmap_bump: u64,
+    pub mmap_regions: Vec<MappedRegion>,
+}
+
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        if self.page_table_root != 0
+            && self.page_table_root != crate::memory::r#virtual::kernel_pml4_phys()
+        {
+            let _ = crate::memory::r#virtual::free_user_page_table(self.page_table_root);
+        }
+    }
+}
+
+pub struct FdTable {
+    pub entries: Vec<Option<Arc<FileDescription>>>,
 }
 
 /// A Task Control Block (TCB).
@@ -115,8 +130,8 @@ pub struct Task {
     /// Saved CPU context for context switching.
     pub context: CpuContext,
 
-    /// Physical address of this task's page table root (CR3 value).
-    pub page_table_root: u64,
+    /// Physical address of this task's page table root (CR3 value) and mapping info.
+    pub address_space: Arc<spin::Mutex<AddressSpace>>,
 
     /// Base address of the kernel stack for this task.
     pub kernel_stack_base: u64,
@@ -133,26 +148,17 @@ pub struct Task {
     /// Process group ID (POSIX job control).
     pub pgid: u64,
 
+    /// Thread group ID (Process ID).
+    pub tgid: Pid,
+
     /// CPU time consumed (in timer ticks).
     pub cpu_ticks: u64,
 
     /// Open file descriptor table.
-    ///
-    /// Index corresponds to the file descriptor number (fd 0 = stdin, 1 = stdout, 2 = stderr).
-    /// Pre-populated with standard I/O TTY devices for Ring 3 tasks.
-    pub fd_table: Vec<Option<Arc<FileDescription>>>,
-
-    /// Current program break — top of the user-space heap (used by `brk()`).
-    pub brk: u64,
+    pub fd_table: Arc<spin::Mutex<FdTable>>,
 
     /// Current working directory (always an absolute normalized path).
     pub cwd: String,
-
-    /// Current mmap bump allocator pointer.
-    pub mmap_bump: u64,
-
-    /// Memory mapped file regions.
-    pub mmap_regions: Vec<MappedRegion>,
 
     /// Pending signals mask.
     pub pending_signals: u64,
@@ -161,7 +167,7 @@ pub struct Task {
     pub blocked_signals: u64,
 
     /// Registered signal actions.
-    pub sigactions: [SigAction; 64],
+    pub sigactions: Arc<spin::Mutex<[SigAction; 64]>>,
 
     /// Wait queue for child process state changes (e.g. wait4).
     pub child_wait_queue: Arc<crate::sync::wait_queue::WaitQueue>,
@@ -184,16 +190,16 @@ impl Task {
     pub fn new(pid: Pid, name: String, page_table_root: u64) -> Self {
         // Pre-populate the standard I/O file descriptors for every task.
         // Kernel threads won't use these but they don't hurt.
-        let mut fd_table: Vec<Option<Arc<FileDescription>>> = Vec::new();
-        fd_table.push(Some(Arc::new(FileDescription::new(
+        let mut entries: Vec<Option<Arc<FileDescription>>> = Vec::new();
+        entries.push(Some(Arc::new(FileDescription::new(
             crate::fs::tty::make_stdin(),
             OpenFlags(OpenFlags::O_RDONLY),
         )))); // fd 0: stdin
-        fd_table.push(Some(Arc::new(FileDescription::new(
+        entries.push(Some(Arc::new(FileDescription::new(
             crate::fs::tty::make_stdout(),
             OpenFlags(OpenFlags::O_WRONLY),
         )))); // fd 1: stdout
-        fd_table.push(Some(Arc::new(FileDescription::new(
+        entries.push(Some(Arc::new(FileDescription::new(
             crate::fs::tty::make_stderr(),
             OpenFlags(OpenFlags::O_WRONLY),
         )))); // fd 2: stderr
@@ -204,27 +210,32 @@ impl Task {
             state: TaskState::Ready,
             priority: Priority::default(),
             context: CpuContext::default(),
-            page_table_root,
+            address_space: Arc::new(spin::Mutex::new(AddressSpace {
+                page_table_root,
+                brk: 0,
+                mmap_bump: 0x0000_5000_0000_0000u64,
+                mmap_regions: Vec::new(),
+            })),
             kernel_stack_base: 0,
             kernel_stack_size: 0,
             exit_code: None,
             parent_pid: Pid::IDLE,
             cpu_ticks: 0,
-            fd_table,
-            brk: 0,
+            fd_table: Arc::new(spin::Mutex::new(FdTable { entries })),
             cwd: String::from("/"),
-            mmap_bump: 0x0000_5000_0000_0000u64,
-            mmap_regions: Vec::new(),
             pending_signals: 0,
             blocked_signals: 0,
-            sigactions: [SigAction {
-                sa_handler: 0,
-                sa_flags: 0,
-                sa_restorer: 0,
-                sa_mask: 0,
-            }; 64],
+            sigactions: Arc::new(spin::Mutex::new(
+                [SigAction {
+                    sa_handler: 0,
+                    sa_flags: 0,
+                    sa_restorer: 0,
+                    sa_mask: 0,
+                }; 64],
+            )),
             child_wait_queue: Arc::new(crate::sync::wait_queue::WaitQueue::new()),
             pgid: pid.as_u64(),
+            tgid: pid,
             in_queue: false,
             uid: 0,
             gid: 0,
@@ -263,13 +274,6 @@ impl Drop for Task {
             unsafe {
                 alloc::alloc::dealloc(self.kernel_stack_base as *mut u8, layout);
             }
-        }
-
-        // Free the page table root and all mapping tables (if it's a user address space)
-        if self.page_table_root != 0
-            && self.page_table_root != crate::memory::r#virtual::kernel_pml4_phys()
-        {
-            let _ = crate::memory::r#virtual::free_user_page_table(self.page_table_root);
         }
     }
 }

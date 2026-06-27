@@ -48,19 +48,18 @@ pub fn deliver_signal(pid: crate::process::pid::Pid, sig: i32) {
     }
 
     if let Some(task_arc) = scheduler::get_task_arc(pid) {
-        // Scan current_cpus to find which core (if any) is running the target task
-        // We lock SCHEDULER briefly only to scan current_cpus
         let mut target_core = None;
-        let sched_lock = scheduler::SCHEDULER.lock();
-        if let Some(ref sched) = *sched_lock {
-            for core_id in 0..32 {
-                if sched.current_cpus[core_id] == Some(pid) {
-                    target_core = Some(core_id);
-                    break;
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let sched_lock = scheduler::SCHEDULER.lock();
+            if let Some(ref sched) = *sched_lock {
+                for core_id in 0..32 {
+                    if sched.current_cpus[core_id] == Some(pid) {
+                        target_core = Some(core_id);
+                        break;
+                    }
                 }
             }
-        }
-        drop(sched_lock);
+        });
 
         let mut task = task_arc.lock();
         task.pending_signals |= 1 << (sig - 1);
@@ -84,10 +83,83 @@ pub fn sys_kill(pid: i32, sig: i32) -> SyscallResult {
     if sig < 0 || sig > 64 {
         return Errno::EINVAL.into();
     }
-    if pid <= 0 {
-        return Errno::ENOSYS.into(); // We don't support process groups/broadcast yet
+
+    if sig == 0 {
+        if pid > 0 {
+            use crate::process::scheduler;
+            let target_pid = Pid::from_raw(pid as u64);
+            if scheduler::get_task_arc(target_pid).is_some() {
+                return 0;
+            } else {
+                return Errno::ESRCH.into();
+            }
+        } else if pid == 0 {
+            return 0;
+        } else if pid < -1 {
+            let target_pgid = (-pid) as u64;
+            use crate::process::scheduler;
+            let tasks = scheduler::TASKS.read();
+            let exists = tasks.iter().any(|t| {
+                if let Some(task_arc) = t {
+                    task_arc.lock().pgid == target_pgid
+                } else {
+                    false
+                }
+            });
+            if exists {
+                return 0;
+            } else {
+                return Errno::ESRCH.into();
+            }
+        } else {
+            // pid == -1
+            return 0;
+        }
     }
-    deliver_signal(Pid::from_raw(pid as u64), sig);
+
+    if pid > 0 {
+        use crate::process::scheduler;
+        let target_pid = Pid::from_raw(pid as u64);
+        if scheduler::get_task_arc(target_pid).is_some() {
+            deliver_signal(target_pid, sig);
+        } else {
+            return Errno::ESRCH.into();
+        }
+    } else if pid == 0 {
+        let caller_pgid = {
+            use crate::process::scheduler;
+            if let Some(curr_pid) = scheduler::current_pid() {
+                if let Some(task_arc) = scheduler::get_task_arc(curr_pid) {
+                    task_arc.lock().pgid
+                } else {
+                    1
+                }
+            } else {
+                1
+            }
+        };
+        crate::fs::pty::deliver_signal_to_pgrp(caller_pgid, sig);
+    } else if pid < -1 {
+        let target_pgid = (-pid) as u64;
+        crate::fs::pty::deliver_signal_to_pgrp(target_pgid, sig);
+    } else {
+        // pid == -1: broadcast to all processes except init
+        use crate::process::scheduler;
+        let tasks = scheduler::TASKS.read();
+        let mut pids = alloc::vec::Vec::new();
+        for task_opt in tasks.iter() {
+            if let Some(task_arc) = task_opt {
+                let task = task_arc.lock();
+                if task.pid.as_u64() > 1 {
+                    pids.push(task.pid);
+                }
+            }
+        }
+        drop(tasks);
+        for target_pid in pids {
+            deliver_signal(target_pid, sig);
+        }
+    }
     0
 }
 
@@ -255,7 +327,7 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
         None => return,
     };
 
-    let (sig, action, old_mask) = {
+    let (sig, action, old_mask, sigaltstack) = {
         let task_arc = match scheduler::get_task_arc(current_pid) {
             Some(t) => t,
             None => return,
@@ -305,7 +377,7 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
             }
         }
 
-        (active_sig, action, old_mask)
+        (active_sig, action, old_mask, task.sigaltstack)
     };
 
     if action.sa_handler == 1 {
@@ -322,7 +394,24 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
         );
         scheduler::exit_current_thread(sig | 128);
     } else {
-        let user_sp = unsafe { (*regs).rsp };
+        let original_user_sp = unsafe { (*regs).rsp };
+        let mut user_sp = original_user_sp;
+
+        const SA_ONSTACK: u64 = 0x08000000;
+        const SS_DISABLE: i32 = 2;
+        if (action.sa_flags & SA_ONSTACK) != 0 {
+            if let Some(ref alt) = sigaltstack {
+                if (alt.ss_flags & SS_DISABLE) == 0 {
+                    // Check if we are already executing on the alternate stack
+                    if !(original_user_sp >= alt.ss_sp
+                        && original_user_sp < alt.ss_sp + alt.ss_size)
+                    {
+                        user_sp = alt.ss_sp + alt.ss_size;
+                    }
+                }
+            }
+        }
+
         let new_user_sp = (user_sp - core::mem::size_of::<SignalFrame>() as u64) & !0xF;
 
         if !crate::syscall::fs::validate_user_ptr(
@@ -340,7 +429,7 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
             rax: unsafe { (*regs).rax },
             rbx: unsafe { (*regs).rbx },
             rbp: unsafe { (*regs).rbp },
-            rsp: user_sp,
+            rsp: original_user_sp,
             rdi: unsafe { (*regs).rdi },
             rsi: unsafe { (*regs).rsi },
             rdx: unsafe { (*regs).rdx },

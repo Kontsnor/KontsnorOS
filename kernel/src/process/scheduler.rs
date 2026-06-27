@@ -103,18 +103,19 @@ impl Scheduler {
                 let idx = current_pid.as_u64() as usize;
                 let tasks = TASKS.read();
                 if let Some(Some(task_arc)) = tasks.get(idx) {
-                    let mut task = task_arc.lock();
-                    task.cpu_ticks += 1;
-                    if task.cpu_ticks % TIME_QUANTUM == 0 {
-                        // Demote the task if it's not already at the lowest priority
-                        if task.priority < Priority::Idle {
-                            task.priority = match task.priority {
-                                Priority::RealTime => Priority::High,
-                                Priority::High => Priority::Normal,
-                                Priority::Normal => Priority::Low,
-                                Priority::Low => Priority::Idle,
-                                Priority::Idle => Priority::Idle,
-                            };
+                    if let Some(mut task) = task_arc.try_lock() {
+                        task.cpu_ticks += 1;
+                        if task.cpu_ticks % TIME_QUANTUM == 0 {
+                            // Demote the task if it's not already at the lowest priority
+                            if task.priority < Priority::Idle {
+                                task.priority = match task.priority {
+                                    Priority::RealTime => Priority::High,
+                                    Priority::High => Priority::Normal,
+                                    Priority::Normal => Priority::Low,
+                                    Priority::Low => Priority::Idle,
+                                    Priority::Idle => Priority::Idle,
+                                };
+                            }
                         }
                     }
                 }
@@ -125,13 +126,24 @@ impl Scheduler {
     /// Boost all tasks to the highest non-realtime priority.
     fn boost_priorities(&mut self) {
         let tasks = TASKS.read();
-        for task_opt in tasks.iter() {
+        for (idx, task_opt) in tasks.iter().enumerate() {
             if let Some(task_arc) = task_opt {
-                let mut task = task_arc.lock();
-                if task.priority > Priority::High
-                    && (task.state == TaskState::Ready || task.state == TaskState::Running)
-                {
-                    task.priority = Priority::High;
+                let pid = Pid::from_raw(idx as u64);
+                if Some(pid) == self.current_pid() {
+                    if let Some(mut task) = task_arc.try_lock() {
+                        if task.priority > Priority::High
+                            && (task.state == TaskState::Ready || task.state == TaskState::Running)
+                        {
+                            task.priority = Priority::High;
+                        }
+                    }
+                } else {
+                    let mut task = task_arc.lock();
+                    if task.priority > Priority::High
+                        && (task.state == TaskState::Ready || task.state == TaskState::Running)
+                    {
+                        task.priority = Priority::High;
+                    }
                 }
             }
         }
@@ -141,19 +153,37 @@ impl Scheduler {
             queue.clear();
         }
 
-        for task_opt in tasks.iter() {
+        for (idx, task_opt) in tasks.iter().enumerate() {
             if let Some(task_arc) = task_opt {
-                task_arc.lock().in_queue = false;
+                let pid = Pid::from_raw(idx as u64);
+                if Some(pid) == self.current_pid() {
+                    if let Some(mut task) = task_arc.try_lock() {
+                        task.in_queue = false;
+                    }
+                } else {
+                    task_arc.lock().in_queue = false;
+                }
             }
         }
 
-        for task_opt in tasks.iter() {
+        for (idx, task_opt) in tasks.iter().enumerate() {
             if let Some(task_arc) = task_opt {
-                let mut task = task_arc.lock();
-                if task.state == TaskState::Ready {
-                    let priority = task.priority as usize;
-                    self.queues[priority].push_back(task.pid);
-                    task.in_queue = true;
+                let pid = Pid::from_raw(idx as u64);
+                if Some(pid) == self.current_pid() {
+                    if let Some(mut task) = task_arc.try_lock() {
+                        if task.state == TaskState::Ready {
+                            let priority = task.priority as usize;
+                            self.queues[priority].push_back(task.pid);
+                            task.in_queue = true;
+                        }
+                    }
+                } else {
+                    let mut task = task_arc.lock();
+                    if task.state == TaskState::Ready {
+                        let priority = task.priority as usize;
+                        self.queues[priority].push_back(task.pid);
+                        task.in_queue = true;
+                    }
                 }
             }
         }
@@ -217,6 +247,7 @@ impl Scheduler {
 
         let idx = pid.as_u64() as usize;
         let mut parent_pid = None;
+        let mut clear_ctid = None;
         let tasks = TASKS.read();
         if let Some(Some(task_arc)) = tasks.get(idx) {
             let mut task = task_arc.lock();
@@ -226,8 +257,19 @@ impl Scheduler {
                 task.fd_table.lock().entries.clear();
             }
             parent_pid = Some(task.parent_pid);
+            clear_ctid = task.clear_child_tid;
         }
         drop(tasks); // Drop TASKS read lock before calling wake_task to keep correct order
+
+        if let Some(ctid) = clear_ctid {
+            if crate::syscall::validation::validate_user_ptr_write(ctid as *mut u8, 4).is_ok() {
+                // SAFETY: Verification ensures pointer is valid in user address space and is writable.
+                unsafe {
+                    (ctid as *mut u32).write_volatile(0);
+                }
+            }
+            crate::syscall::process::futex::futex_wake_locked(ctid, 1, 0xffffffff, self);
+        }
 
         if let Some(parent) = parent_pid {
             // Wake the parent task if it was blocked waiting
@@ -298,12 +340,13 @@ impl Scheduler {
         let task_arc = Arc::new(spin::Mutex::new(task));
         task_arc.lock().in_queue = true;
 
-        let mut tasks = TASKS.write();
-        while tasks.len() <= idx {
-            tasks.push(None);
-        }
-        tasks[idx] = Some(task_arc);
-        drop(tasks);
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut tasks = TASKS.write();
+            while tasks.len() <= idx {
+                tasks.push(None);
+            }
+            tasks[idx] = Some(task_arc);
+        });
 
         self.queues[priority].push_back(pid);
     }
@@ -368,17 +411,19 @@ pub fn add_task(task: Task) {
     let task_arc = Arc::new(spin::Mutex::new(task));
     task_arc.lock().in_queue = true;
 
-    let mut tasks = TASKS.write();
-    while tasks.len() <= idx {
-        tasks.push(None);
-    }
-    tasks[idx] = Some(task_arc);
-    drop(tasks);
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut tasks = TASKS.write();
+        while tasks.len() <= idx {
+            tasks.push(None);
+        }
+        tasks[idx] = Some(task_arc);
+        drop(tasks);
 
-    if let Some(ref mut scheduler) = *SCHEDULER.lock() {
-        scheduler.queues[priority].push_back(pid);
-        kprintln!("[scheduler] Added task: PID {} ({})", pid, name);
-    }
+        if let Some(ref mut scheduler) = *SCHEDULER.lock() {
+            scheduler.queues[priority].push_back(pid);
+            kprintln!("[scheduler] Added task: PID {} ({})", pid, name);
+        }
+    });
 }
 
 /// Called on each timer tick.
@@ -444,6 +489,7 @@ pub fn schedule() {
                 // No other ready tasks; keep running current if it's still runnable
                 let current_idx = current_pid.as_u64() as usize;
                 let tasks = TASKS.read();
+
                 if let Some(Some(current_task_arc)) = tasks.get(current_idx) {
                     let current_task = current_task_arc.lock();
                     if current_task.state == TaskState::Running
@@ -522,6 +568,9 @@ pub fn schedule() {
 
         // Drop lock before switching to prevent deadlock
         drop(sched_lock);
+
+        let from_pid = current_pid;
+        let to_pid = next_pid;
 
         // Perform raw context switch directly
         unsafe {

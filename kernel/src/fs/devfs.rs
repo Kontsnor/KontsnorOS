@@ -133,6 +133,29 @@ impl InodeOps for DevPtmxDummy {
     }
 }
 
+/// `/dev/random` and `/dev/urandom` — reads return random bytes from the kernel CSPRNG.
+struct DevRandom {
+    inode: Inode,
+}
+
+impl InodeOps for DevRandom {
+    fn inode(&self) -> &Inode {
+        &self.inode
+    }
+
+    fn read(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
+        if crate::crypto::prng::fill_bytes(buf) {
+            Ok(buf.len())
+        } else {
+            Err(-11) // EAGAIN
+        }
+    }
+
+    fn write(&self, _offset: u64, data: &[u8]) -> Result<usize, i32> {
+        Ok(data.len()) // Mock seed write, just accept it
+    }
+}
+
 /// Initialize devfs and register standard device nodes.
 pub fn init() {
     let mut entries = BTreeMap::new();
@@ -149,6 +172,20 @@ pub fn init() {
         String::from("zero"),
         Arc::new(DevZero {
             inode: Inode::new(3, FileType::CharDevice),
+        }) as Arc<dyn InodeOps>,
+    );
+
+    entries.insert(
+        String::from("random"),
+        Arc::new(DevRandom {
+            inode: Inode::new(16, FileType::CharDevice),
+        }) as Arc<dyn InodeOps>,
+    );
+
+    entries.insert(
+        String::from("urandom"),
+        Arc::new(DevRandom {
+            inode: Inode::new(17, FileType::CharDevice),
         }) as Arc<dyn InodeOps>,
     );
 

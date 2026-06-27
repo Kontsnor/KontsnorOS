@@ -12,7 +12,8 @@ pub use creds::{
 pub use futex::sys_futex;
 pub use info::{
     sys_clock_gettime, sys_getrandom, sys_getrlimit, sys_gettimeofday, sys_nanosleep,
-    sys_prlimit64, sys_setrlimit, sys_sigaltstack, sys_sysinfo, sys_tgkill, sys_times, sys_uname,
+    sys_prlimit64, sys_sched_getaffinity, sys_setrlimit, sys_sigaltstack, sys_sysinfo, sys_tgkill,
+    sys_times, sys_uname,
 };
 pub use lifecycle::{
     sys_arch_prctl, sys_brk, sys_clone, sys_execve, sys_exit, sys_exit_group, sys_fork, sys_prctl,

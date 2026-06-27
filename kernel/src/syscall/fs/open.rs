@@ -114,7 +114,11 @@ pub fn sys_open(pathname: *const u8, flags: i32, _mode: u32) -> SyscallResult {
         }
     };
 
-    match proc_fd::current_task_alloc_fd_with_flags(inode, crate::fs::file::OpenFlags(flags_u32)) {
+    match proc_fd::current_task_alloc_fd_with_flags_and_path(
+        inode,
+        crate::fs::file::OpenFlags(flags_u32),
+        Some(resolved_path),
+    ) {
         Some(fd) => fd as SyscallResult,
         None => Errno::EMFILE.into(),
     }
@@ -145,6 +149,18 @@ pub fn sys_close(fd: i32) -> SyscallResult {
     if fd < 0 {
         return Errno::EBADF.into();
     }
+
+    // Retrieve PID and Inode number prior to close to clean up fcntl locks
+    let lock_cleanup_info = if let Some(desc) = proc_fd::current_task_get_file_desc(fd) {
+        let current_pid = crate::process::scheduler::current_pid()
+            .map(|p| p.as_u64())
+            .unwrap_or(0);
+        let ino = desc.inode.inode().ino;
+        Some((current_pid, ino))
+    } else {
+        None
+    };
+
     let is_pipe = proc_fd::current_task_read_fd(fd)
         .map(|i| i.inode().file_type == crate::fs::inode::FileType::Pipe)
         .unwrap_or(false);
@@ -155,6 +171,9 @@ pub fn sys_close(fd: i32) -> SyscallResult {
         crate::kprintln!("[syscall pid={}] sys_close on pipe fd {}", pid_str, fd);
     }
     if proc_fd::current_task_close_fd(fd) {
+        if let Some((pid, ino)) = lock_cleanup_info {
+            crate::syscall::fs::io::release_fcntl_locks_for_pid_and_ino(pid, ino);
+        }
         0
     } else {
         Errno::EBADF.into()

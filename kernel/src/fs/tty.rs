@@ -43,6 +43,9 @@ pub static TTY_TERMIOS: Mutex<Termios> = Mutex::new(Termios {
     c_cc: [0; 19],
 });
 
+/// Global active TTY foreground process group ID.
+pub static TTY_FOREGROUND_PGID: Mutex<u64> = Mutex::new(1);
+
 // ── /dev/stdin ────────────────────────────────────────────────────────────────
 
 /// Global lock to serialize reads from `/dev/stdin`.
@@ -87,10 +90,8 @@ impl InodeOps for DevStdin {
 
                     // If ISIG is enabled and Ctrl+C is typed, deliver SIGINT immediately!
                     if isig && byte == 0x03 {
-                        if let Some(current_pid) = crate::process::scheduler::current_pid() {
-                            crate::syscall::signal::deliver_signal(current_pid, 2);
-                            // SIGINT = 2
-                        }
+                        let pgid = *TTY_FOREGROUND_PGID.lock();
+                        crate::fs::pty::deliver_signal_to_pgrp(pgid, 2); // SIGINT = 2
                         interrupted = Some(-4); // EINTR
                     }
 
@@ -244,8 +245,9 @@ impl InodeOps for DevStdin {
                 ) {
                     return Err(-14); // EFAULT
                 }
+                let pgid = *TTY_FOREGROUND_PGID.lock() as i32;
                 unsafe {
-                    core::ptr::write(arg as *mut i32, 1);
+                    core::ptr::write(arg as *mut i32, pgid);
                 }
                 Ok(0)
             }
@@ -257,6 +259,8 @@ impl InodeOps for DevStdin {
                 ) {
                     return Err(-14); // EFAULT
                 }
+                let pgid = unsafe { core::ptr::read(arg as *const i32) } as u64;
+                *TTY_FOREGROUND_PGID.lock() = pgid;
                 Ok(0)
             }
             _ => Err(-22), // EINVAL
@@ -305,6 +309,13 @@ impl InodeOps for DevStdout {
         Ok(data.len())
     }
 
+    fn ioctl(&self, request: u64, arg: u64) -> Result<u64, i32> {
+        let stdin = DevStdin {
+            inode: Inode::new(10, FileType::CharDevice),
+        };
+        stdin.ioctl(request, arg)
+    }
+
     fn readdir(&self) -> Vec<DirEntry> {
         Vec::new()
     }
@@ -335,6 +346,13 @@ impl InodeOps for DevStderr {
             crate::arch::x86_64::serial::write_byte(byte);
         }
         Ok(data.len())
+    }
+
+    fn ioctl(&self, request: u64, arg: u64) -> Result<u64, i32> {
+        let stdin = DevStdin {
+            inode: Inode::new(10, FileType::CharDevice),
+        };
+        stdin.ioctl(request, arg)
     }
 
     fn readdir(&self) -> Vec<DirEntry> {

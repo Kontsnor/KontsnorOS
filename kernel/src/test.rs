@@ -386,6 +386,13 @@ fn test_shared_mapping_communication() {
     let addr1 = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x01, fd, 0); // PROT_READ|WRITE, MAP_SHARED
     assert!(addr1 > 0);
 
+    // Write magic value in parent mapping (this faults in the lazy mapping)
+    let ptr = addr1 as *mut u64;
+    unsafe {
+        ptr.write_volatile(0xDEADBEEF12345678);
+    }
+    kprintln!("[test] Wrote magic value to virtual ptr {:#x}", addr1);
+
     // 4. Simulate fork by cloning page table
     let current_pid = crate::process::scheduler::current_pid().unwrap();
     let parent_task_arc = crate::process::scheduler::get_task_arc(current_pid).unwrap();
@@ -407,13 +414,6 @@ fn test_shared_mapping_communication() {
     let phys_parent = pte_parent.addr().as_u64();
     let phys_child = pte_child.addr().as_u64();
     assert_eq!(phys_parent, phys_child);
-
-    // Write magic value in parent mapping
-    let ptr = addr1 as *mut u64;
-    unsafe {
-        ptr.write_volatile(0xDEADBEEF12345678);
-    }
-    kprintln!("[test] Wrote magic value to virtual ptr {:#x}", addr1);
 
     // Read magic value from virtual mapping directly
     let direct_val = unsafe { ptr.read_volatile() };
@@ -1560,4 +1560,525 @@ fn test_thread_clone_vm() {
     }
 
     kprintln!("[test] Thread Shared VM test PASSED!");
+}
+
+static STRESS_FUTEX_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static STRESS_THREADS_ACTIVE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static STRESS_THREAD_ID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn stress_helper_thread() {
+    let id = STRESS_THREAD_ID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let addr = loop {
+        let a = STRESS_FUTEX_ADDR.load(core::sync::atomic::Ordering::SeqCst);
+        if a != 0 {
+            break a;
+        }
+        crate::process::scheduler::yield_now();
+    };
+
+    let uaddr = addr as *mut i32;
+
+    for step in 0..100 {
+        // Yield sometimes to cause scheduling pressure
+        if step % 5 == 0 {
+            crate::process::scheduler::yield_now();
+        }
+
+        // Print to standard output (competing for serial output lock)
+        kprintln!(
+            "[stress] Core {} - Thread {} step {}",
+            crate::arch::x86_64::smp::current_lapic_id(),
+            id,
+            step
+        );
+
+        if id % 2 == 0 {
+            // Even threads call FUTEX_WAIT if value is still 0 (which it might be)
+            unsafe {
+                let current_val = uaddr.read_volatile();
+                if current_val == 0 {
+                    let _ = crate::syscall::process::futex::sys_futex(
+                        uaddr,
+                        0, // FUTEX_WAIT
+                        0, // Expected value
+                        0,
+                        core::ptr::null_mut(),
+                        0,
+                    );
+                } else {
+                    // Reset value and wake other threads
+                    uaddr.write_volatile(0);
+                    let _ = crate::syscall::process::futex::sys_futex(
+                        uaddr,
+                        1, // FUTEX_WAKE
+                        1, // Wake 1
+                        0,
+                        core::ptr::null_mut(),
+                        0,
+                    );
+                }
+            }
+        } else {
+            // Odd threads set value to 1 and wake others
+            unsafe {
+                uaddr.write_volatile(1);
+                let _ = crate::syscall::process::futex::sys_futex(
+                    uaddr,
+                    1, // FUTEX_WAKE
+                    1, // Wake 1
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
+            }
+        }
+    }
+
+    kprintln!("[stress] Thread {} finished.", id);
+    STRESS_THREADS_ACTIVE.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+}
+
+#[test_case]
+fn test_multicore_deadlock_stress() {
+    kprintln!("[test] Starting Multi-Core Deadlock Stress Test...");
+    STRESS_FUTEX_ADDR.store(0, core::sync::atomic::Ordering::SeqCst);
+    STRESS_THREAD_ID.store(0, core::sync::atomic::Ordering::SeqCst);
+
+    let thread_count = 8;
+    STRESS_THREADS_ACTIVE.store(thread_count, core::sync::atomic::Ordering::SeqCst);
+
+    // 1. Allocate shared futex page
+    let addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0);
+    assert!(addr > 0);
+    let uaddr = addr as *mut i32;
+    unsafe {
+        uaddr.write_volatile(0);
+    }
+
+    // 2. Spawn helper threads
+    for _ in 0..thread_count {
+        crate::process::spawn_kernel_thread(
+            alloc::string::String::from("stress_thread"),
+            stress_helper_thread,
+        );
+    }
+
+    // 3. Enable threads to proceed
+    STRESS_FUTEX_ADDR.store(addr as u64, core::sync::atomic::Ordering::SeqCst);
+
+    // 4. Wait for all threads to finish while yielding and printing
+    let mut main_step = 0;
+    while STRESS_THREADS_ACTIVE.load(core::sync::atomic::Ordering::SeqCst) > 0 {
+        main_step += 1;
+        if main_step % 20 == 0 {
+            kprintln!(
+                "[stress] Main thread monitoring (remaining: {})...",
+                STRESS_THREADS_ACTIVE.load(core::sync::atomic::Ordering::SeqCst)
+            );
+        }
+        // Force the futex wake sometimes from the main thread
+        unsafe {
+            uaddr.write_volatile(1);
+            let _ = crate::syscall::process::futex::sys_futex(
+                uaddr,
+                1, // FUTEX_WAKE
+                8, // Wake all
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
+        }
+        crate::process::scheduler::yield_now();
+    }
+
+    // Clean up
+    crate::syscall::memory::sys_munmap(addr as u64, 4096);
+    kprintln!("[test] Multi-Core Deadlock Stress Test PASSED!");
+}
+
+#[test_case]
+fn test_sys_mremap() {
+    kprintln!("[test] Starting sys_mremap verification test...");
+
+    // 1. Create a private anonymous mapping of 1 page (4 KiB)
+    let addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64; // PROT_READ|WRITE, MAP_PRIVATE|ANON
+    assert!(addr > 0);
+
+    // Write some data to the page
+    let ptr = addr as *mut u64;
+    unsafe {
+        ptr.write_volatile(0x123456789ABCDEF0);
+    }
+
+    // 2. Grow the mapping in-place (from 4 KiB to 8 KiB)
+    let grew_addr = crate::syscall::memory::sys_mremap(addr, 4096, 8192, 0, 0) as u64;
+    assert_eq!(grew_addr, addr); // Should grow in-place as nothing is next to it
+
+    // Verify original data is preserved
+    let val = unsafe { ptr.read_volatile() };
+    assert_eq!(val, 0x123456789ABCDEF0);
+
+    // Verify new page is accessible (write to it)
+    let ptr2 = (addr + 4096) as *mut u64;
+    unsafe {
+        ptr2.write_volatile(0xDEADC0DECAFEBABE);
+    }
+    let val2 = unsafe { ptr2.read_volatile() };
+    assert_eq!(val2, 0xDEADC0DECAFEBABE);
+
+    // 3. Move the mapping using MREMAP_MAYMOVE (force move by allocating at a different address)
+    // First, let's allocate a dummy block right after our grew block to block in-place growth,
+    // then mremap with new size 16 KiB.
+    let dummy = crate::syscall::memory::sys_mmap(addr + 8192, 4096, 3, 0x22, -1, 0) as u64;
+    assert_eq!(dummy, addr + 8192);
+
+    let moved_addr = crate::syscall::memory::sys_mremap(addr, 8192, 16384, 1, 0) as u64; // MREMAP_MAYMOVE = 1
+    assert!(moved_addr > 0);
+    assert_ne!(moved_addr, addr); // Must have moved because of dummy mapping
+
+    // Verify original data is preserved at the new address
+    let moved_ptr = moved_addr as *mut u64;
+    let val_moved = unsafe { moved_ptr.read_volatile() };
+    assert_eq!(val_moved, 0x123456789ABCDEF0);
+
+    let moved_ptr2 = (moved_addr + 4096) as *mut u64;
+    let val_moved2 = unsafe { moved_ptr2.read_volatile() };
+    assert_eq!(val_moved2, 0xDEADC0DECAFEBABE);
+
+    // 4. Shrink the mapping (from 16 KiB to 4 KiB)
+    let shrunk_addr = crate::syscall::memory::sys_mremap(moved_addr, 16384, 4096, 0, 0) as u64;
+    assert_eq!(shrunk_addr, moved_addr);
+
+    // Original data should still be there
+    let val_shrunk = unsafe { moved_ptr.read_volatile() };
+    assert_eq!(val_shrunk, 0x123456789ABCDEF0);
+
+    // Clean up
+    crate::syscall::memory::sys_munmap(shrunk_addr, 4096);
+    crate::syscall::memory::sys_munmap(dummy, 4096);
+
+    kprintln!("[test] sys_mremap verification test PASSED!");
+}
+
+static mut BITSET_FUTEX_ADDR: u64 = 0;
+static BITSET_WOKE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn futex_bitset_helper_thread() {
+    let uaddr = unsafe { BITSET_FUTEX_ADDR as *mut i32 };
+    kprintln!("[test] Helper thread waiting on futex with bitset 0x1...");
+    let res = crate::syscall::process::sys_futex(
+        uaddr,
+        9, // FUTEX_WAIT_BITSET
+        0, // Expected val
+        0,
+        core::ptr::null_mut(),
+        1, // Bitset = 0x1
+    );
+    assert_eq!(res, 0);
+    kprintln!("[test] Helper thread woke up!");
+    BITSET_WOKE.store(true, core::sync::atomic::Ordering::SeqCst);
+}
+
+#[test_case]
+fn test_futex_bitset_and_cleartid() {
+    kprintln!("[test] Starting futex bitset and CLONE_CHILD_CLEARTID verification test...");
+
+    // 1. FUTEX_WAIT_BITSET and FUTEX_WAKE_BITSET test
+    BITSET_WOKE.store(false, core::sync::atomic::Ordering::SeqCst);
+    let addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    assert!(addr > 0);
+    let uaddr = addr as *mut i32;
+    unsafe {
+        uaddr.write_volatile(0);
+        BITSET_FUTEX_ADDR = addr;
+    }
+
+    crate::process::spawn_kernel_thread(
+        alloc::string::String::from("futex_bitset_helper"),
+        futex_bitset_helper_thread,
+    );
+
+    // Let the helper thread start and wait
+    for _ in 0..10 {
+        crate::process::scheduler::yield_now();
+    }
+
+    // Try to wake with a non-matching bitset 0x2 (should wake 0 threads)
+    let woken = crate::syscall::process::sys_futex(
+        uaddr,
+        10, // FUTEX_WAKE_BITSET
+        1,  // Wake 1
+        0,
+        core::ptr::null_mut(),
+        2, // Bitset = 0x2
+    );
+    assert_eq!(woken, 0);
+    assert_eq!(
+        BITSET_WOKE.load(core::sync::atomic::Ordering::SeqCst),
+        false
+    );
+
+    // Wake with matching bitset 0x1 (should wake 1 thread)
+    let woken2 = crate::syscall::process::sys_futex(
+        uaddr,
+        10, // FUTEX_WAKE_BITSET
+        1,  // Wake 1
+        0,
+        core::ptr::null_mut(),
+        1, // Bitset = 0x1
+    );
+    assert_eq!(woken2, 1);
+
+    // Yield to let the helper thread finish
+    for _ in 0..10 {
+        crate::process::scheduler::yield_now();
+    }
+    assert_eq!(BITSET_WOKE.load(core::sync::atomic::Ordering::SeqCst), true);
+
+    // 2. CLONE_CHILD_CLEARTID test
+    // Create a mock task and exit it, checking that clear_child_tid clears user memory and wakes
+    let pid_child = crate::process::pid::allocate();
+    let mut task_child =
+        crate::process::task::Task::new(pid_child, alloc::string::String::from("mock_child"), 0);
+
+    // Set up clear_child_tid pointing to our uaddr
+    unsafe {
+        uaddr.write_volatile(999);
+    }
+    task_child.clear_child_tid = Some(addr);
+    task_child.state = crate::process::task::TaskState::Ready;
+
+    // We need to wait on this address
+    // Let's spawn a helper thread that waits on uaddr (expected val 0)
+    // Wait, first the helper thread waits using FUTEX_WAIT on uaddr (which is 0 once cleared)
+    // Let's set uaddr to 999. The helper thread will wait with expected val 999.
+    // When the child task exits, it writes 0 to uaddr and wakes futex.
+    struct JoinWaiter {
+        woke: core::sync::atomic::AtomicBool,
+    }
+    static JOIN_WOKE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    fn join_waiter_thread() {
+        let uaddr = unsafe { BITSET_FUTEX_ADDR as *mut i32 };
+        kprintln!("[test] Join waiter thread waiting on TID clear...");
+        let res = crate::syscall::process::sys_futex(
+            uaddr,
+            0,   // FUTEX_WAIT
+            999, // Expected val before exit
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
+        // Wait, if it returns EAGAIN (because it was already cleared before wait), or returns 0 (normal wake), it's fine.
+        kprintln!("[test] Join waiter thread woke! res={}", res);
+        JOIN_WOKE.store(true, core::sync::atomic::Ordering::SeqCst);
+    }
+
+    JOIN_WOKE.store(false, core::sync::atomic::Ordering::SeqCst);
+    crate::process::spawn_kernel_thread(
+        alloc::string::String::from("join_waiter"),
+        join_waiter_thread,
+    );
+
+    // Let helper start
+    for _ in 0..10 {
+        crate::process::scheduler::yield_now();
+    }
+
+    // Now exit the mock child task via the scheduler
+    let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
+    let sched = sched_lock.as_mut().unwrap();
+
+    // Add child task to scheduler so it exists in TASKS
+    sched.add_task(task_child);
+
+    // Exit it
+    sched.exit_task(pid_child, 0);
+    drop(sched_lock);
+
+    // Yield to let join_waiter run
+    for _ in 0..20 {
+        crate::process::scheduler::yield_now();
+    }
+
+    // Verify uaddr was cleared to 0
+    let val_after = unsafe { uaddr.read_volatile() };
+    assert_eq!(val_after, 0);
+
+    // Verify join waiter was woken
+    assert_eq!(JOIN_WOKE.load(core::sync::atomic::Ordering::SeqCst), true);
+
+    // Clean up
+    crate::syscall::memory::sys_munmap(addr, 4096);
+    kprintln!("[test] futex bitset and CLONE_CHILD_CLEARTID verification test PASSED!");
+}
+
+#[test_case]
+fn test_phase2_features() {
+    kprintln!("[test] Starting Phase 2 features verification...");
+
+    // --- 1. /dev/urandom & /dev/random ---
+    kprintln!("[test] 1. Looking up /dev/urandom");
+    let urandom = crate::fs::vfs::lookup("/dev/urandom").expect("/dev/urandom missing");
+    let mut rand_buf1 = [0u8; 16];
+    let mut rand_buf2 = [0u8; 16];
+    kprintln!("[test] 1. Reading /dev/urandom 1");
+    let r1 = urandom
+        .read(0, &mut rand_buf1)
+        .expect("read /dev/urandom failed");
+    kprintln!("[test] 1. Reading /dev/urandom 2");
+    let r2 = urandom
+        .read(0, &mut rand_buf2)
+        .expect("read /dev/urandom failed");
+    assert_eq!(r1, 16);
+    assert_eq!(r2, 16);
+    // Highly unlikely that two random buffers of 16 bytes are identical or all zero
+    assert_ne!(rand_buf1, rand_buf2);
+    assert_ne!(rand_buf1, [0u8; 16]);
+
+    kprintln!("[test] 1. Looking up /dev/random");
+    let random = crate::fs::vfs::lookup("/dev/random").expect("/dev/random missing");
+    kprintln!("[test] 1. Reading /dev/random");
+    let r3 = random
+        .read(0, &mut rand_buf1)
+        .expect("read /dev/random failed");
+    assert_eq!(r3, 16);
+
+    // --- 2. /proc/self/fd ---
+    kprintln!("[test] 2. Looking up /proc/self/fd");
+    let fd_dir = crate::fs::vfs::lookup("/proc/self/fd").expect("/proc/self/fd missing");
+    kprintln!("[test] 2. Reading directory /proc/self/fd");
+    let entries = fd_dir.readdir();
+    // Must contain stdin (0), stdout (1), stderr (2)
+    let mut has_stdin = false;
+    let mut has_stdout = false;
+    let mut has_stderr = false;
+    for entry in &entries {
+        if entry.name == "0" {
+            has_stdin = true;
+        }
+        if entry.name == "1" {
+            has_stdout = true;
+        }
+        if entry.name == "2" {
+            has_stderr = true;
+        }
+    }
+    assert!(has_stdin);
+    assert!(has_stdout);
+    assert!(has_stderr);
+
+    // Read link value
+    kprintln!("[test] 2. Looking up /proc/self/fd/0");
+    let fd0_link =
+        crate::fs::vfs::lookup_follow("/proc/self/fd/0", false).expect("/proc/self/fd/0 missing");
+    kprintln!("[test] 2. Reading /proc/self/fd/0");
+    let mut link_buf = [0u8; 64];
+    let link_len = fd0_link
+        .read(0, &mut link_buf)
+        .expect("readlink /proc/self/fd/0 failed");
+    let link_str = core::str::from_utf8(&link_buf[..link_len]).unwrap();
+    assert_eq!(link_str, "/dev/stdin");
+
+    // --- 3. Clocks ---
+    kprintln!("[test] 3. Starting Clock tests");
+    let mut ts_mono1 = [0u8; 16];
+    let mut ts_mono2 = [0u8; 16];
+    let ret1 = crate::syscall::process::sys_clock_gettime(1, ts_mono1.as_mut_ptr()); // CLOCK_MONOTONIC
+    assert_eq!(ret1, 0);
+    // Yield a bit
+    for _ in 0..10 {
+        crate::process::scheduler::yield_now();
+    }
+    let ret2 = crate::syscall::process::sys_clock_gettime(1, ts_mono2.as_mut_ptr());
+    assert_eq!(ret2, 0);
+
+    // SAFETY: ts_mono1 and ts_mono2 are properly written 16 bytes.
+    let sec1 = unsafe { *(ts_mono1.as_ptr() as *const i64) };
+    let nsec1 = unsafe { *(ts_mono1.as_ptr().add(8) as *const i64) };
+    let sec2 = unsafe { *(ts_mono2.as_ptr() as *const i64) };
+    let nsec2 = unsafe { *(ts_mono2.as_ptr().add(8) as *const i64) };
+    let t1 = sec1 * 1_000_000_000 + nsec1;
+    let t2 = sec2 * 1_000_000_000 + nsec2;
+    assert!(t2 >= t1);
+
+    // --- 4. File Advisory Locking (flock & fcntl) ---
+    let tmp_dir = crate::fs::vfs::lookup("/tmp").unwrap();
+    let _ = tmp_dir.unlink("lock_test.txt");
+    let file = tmp_dir
+        .create("lock_test.txt", crate::fs::inode::FileType::Regular)
+        .unwrap();
+
+    // Write some bytes so fcntl range locking works on offset
+    let dummy_data = [0u8; 100];
+    file.write(0, &dummy_data).unwrap();
+
+    let fd1 = crate::process::fd::current_task_alloc_fd(file.clone()).unwrap();
+    let fd2 = crate::process::fd::current_task_alloc_fd(file.clone()).unwrap();
+
+    // Try flock LOCK_EX on fd1
+    let r_lock1 = crate::syscall::fs::sys_flock(fd1, 2); // LOCK_EX
+    assert_eq!(r_lock1, 0);
+
+    // Try flock LOCK_EX | LOCK_NB on fd2 -> should fail with EAGAIN (-11)
+    let r_lock2 = crate::syscall::fs::sys_flock(fd2, 2 | 4); // LOCK_EX | LOCK_NB
+    assert_eq!(r_lock2, -11); // -EAGAIN
+
+    // Try flock LOCK_UN on fd1
+    let r_unlock = crate::syscall::fs::sys_flock(fd1, 8); // LOCK_UN
+    assert_eq!(r_unlock, 0);
+
+    // Try flock LOCK_EX on fd2 now -> should succeed
+    let r_lock3 = crate::syscall::fs::sys_flock(fd2, 2); // LOCK_EX
+    assert_eq!(r_lock3, 0);
+
+    // Cleanup fd2 lock
+    crate::syscall::fs::sys_flock(fd2, 8);
+
+    // Test fcntl range locking
+    use crate::syscall::fs::io::Flock;
+    let mut fl1 = Flock {
+        l_type: 1,   // F_WRLCK
+        l_whence: 0, // SEEK_SET
+        l_start: 10,
+        l_len: 20,
+        l_pid: 0,
+    };
+    // Acquire wrlock on range [10, 30) using fd1 (owner Flock because cmd is F_OFD_SETLK)
+    let r_fc1 = crate::syscall::fs::sys_fcntl(fd1, 37, &mut fl1 as *mut Flock as u64); // F_OFD_SETLK
+    assert_eq!(r_fc1, 0);
+
+    // Try acquire wrlock on overlapping range [20, 40) using fd2 -> should fail with EAGAIN (-11)
+    let mut fl2 = Flock {
+        l_type: 1, // F_WRLCK
+        l_whence: 0,
+        l_start: 20,
+        l_len: 20,
+        l_pid: 0,
+    };
+    let r_fc2 = crate::syscall::fs::sys_fcntl(fd2, 37, &mut fl2 as *mut Flock as u64); // F_OFD_SETLK
+    assert_eq!(r_fc2, -11); // -EAGAIN
+
+    // Unlock on [10, 30)
+    let mut fl_un = Flock {
+        l_type: 2, // F_UNLCK
+        l_whence: 0,
+        l_start: 10,
+        l_len: 20,
+        l_pid: 0,
+    };
+    let r_fc_un = crate::syscall::fs::sys_fcntl(fd1, 37, &mut fl_un as *mut Flock as u64);
+    assert_eq!(r_fc_un, 0);
+
+    // Try acquire on fd2 again -> should succeed
+    let r_fc3 = crate::syscall::fs::sys_fcntl(fd2, 37, &mut fl2 as *mut Flock as u64);
+    assert_eq!(r_fc3, 0);
+
+    // Close fds
+    crate::process::fd::current_task_close_fd(fd1);
+    crate::process::fd::current_task_close_fd(fd2);
+    let _ = tmp_dir.unlink("lock_test.txt");
+
+    kprintln!("[test] Phase 2 features verification test PASSED!");
 }

@@ -65,16 +65,23 @@ pub struct FileDescription {
     pub flags: Mutex<OpenFlags>,
     /// Reference count (how many fds point here).
     pub ref_count: Mutex<u32>,
+    /// The path used to open this file.
+    pub path: Option<alloc::string::String>,
 }
 
 impl FileDescription {
     /// Create a new file description.
-    pub fn new(inode: Arc<dyn InodeOps>, flags: OpenFlags) -> Self {
+    pub fn new(
+        inode: Arc<dyn InodeOps>,
+        flags: OpenFlags,
+        path: Option<alloc::string::String>,
+    ) -> Self {
         Self {
             inode,
             offset: Mutex::new(0),
             flags: Mutex::new(flags),
             ref_count: Mutex::new(1),
+            path,
         }
     }
 
@@ -151,6 +158,9 @@ impl Drop for FileDescription {
         if self.inode.inode().file_type == crate::fs::inode::FileType::Regular {
             let _ = crate::memory::page_cache::flush_all_for_inode(&self.inode);
         }
+        let fd_desc_ptr = self as *mut FileDescription as usize;
+        let ino = self.inode.inode().ino;
+        crate::syscall::fs::io::release_flock_locks(fd_desc_ptr, ino);
     }
 }
 

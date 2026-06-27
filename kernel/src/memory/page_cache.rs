@@ -1,10 +1,10 @@
 //! Page Cache subsystem for mapping and caching file inodes in virtual memory.
 
 use crate::fs::inode::InodeOps;
+use crate::sync::spinlock::TicketLock;
 use crate::syscall::Errno;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use spin::Mutex;
 use x86_64::structures::paging::{PageTable, PageTableFlags};
 use x86_64::VirtAddr;
 
@@ -18,7 +18,8 @@ pub struct PageCacheEntry {
 }
 
 /// Global Page Cache mapping (inode_number, file_offset_aligned_to_4096) to a PageCacheEntry.
-pub static PAGE_CACHE: Mutex<BTreeMap<(u64, u64), PageCacheEntry>> = Mutex::new(BTreeMap::new());
+pub static PAGE_CACHE: TicketLock<BTreeMap<(u64, u64), PageCacheEntry>> =
+    TicketLock::new(BTreeMap::new());
 
 /// Walk the page table of a task to get a mutable reference to the target page table entry.
 ///
@@ -75,13 +76,25 @@ pub fn get_or_create_page_inner(inode: &dyn InodeOps, offset: u64) -> Result<u64
     let ino = inode.inode().ino;
     let aligned_offset = offset & !4095;
 
-    let mut cache = PAGE_CACHE.lock();
-    if let Some(entry) = cache.get(&(ino, aligned_offset)) {
-        return Ok(entry.phys_addr);
+    // 1. Quick check under lock
+    {
+        let cache = PAGE_CACHE.lock();
+        if let Some(entry) = cache.get(&(ino, aligned_offset)) {
+            return Ok(entry.phys_addr);
+        }
     }
 
-    // Allocate a physical frame
+    // 2. Allocate and read WITHOUT holding the lock
+    crate::kprintln!(
+        "[page_cache] allocating frame for ino={}, offset={:#x}",
+        ino,
+        aligned_offset
+    );
     let phys = crate::memory::physical::allocate_frame().ok_or(Errno::ENOMEM)?;
+    crate::kprintln!(
+        "[page_cache] allocated frame: phys={:#x}, calling read_direct",
+        phys
+    );
 
     // Read 4096 bytes from the inode at aligned_offset using read_direct
     let phys_offset = phys + crate::memory::r#virtual::phys_mem_offset();
@@ -90,17 +103,50 @@ pub fn get_or_create_page_inner(inode: &dyn InodeOps, offset: u64) -> Result<u64
 
     let mut total_read = 0;
     while total_read < 4096 {
+        crate::kprintln!(
+            "[page_cache] read_direct offset={:#x}, remaining={}",
+            aligned_offset + total_read as u64,
+            4096 - total_read
+        );
         match inode.read_direct(
             aligned_offset + total_read as u64,
             &mut dest_slice[total_read..],
         ) {
-            Ok(0) => break,
-            Ok(n) => total_read += n,
-            Err(_) => {
+            Ok(0) => {
+                crate::kprintln!("[page_cache] read_direct returned EOF");
+                break;
+            }
+            Ok(n) => {
+                crate::kprintln!("[page_cache] read_direct read {} bytes", n);
+                total_read += n;
+            }
+            Err(e) => {
+                crate::kprintln!("[page_cache] read_direct error: {}", e);
                 crate::memory::physical::deallocate_frame(phys);
                 return Err(Errno::EIO);
             }
         }
+    }
+    crate::kprintln!(
+        "[page_cache] read_direct finished, total_read={}",
+        total_read
+    );
+
+    // 3. Re-acquire lock and insert/check
+    crate::kprintln!("[page_cache] acquiring lock for insert");
+    let mut cache = PAGE_CACHE.lock();
+    crate::kprintln!("[page_cache] acquired lock for insert");
+    if let Some(entry) = cache.get(&(ino, aligned_offset)) {
+        // Someone else allocated and read it in the meantime!
+        // Deallocate our frame and return the existing one.
+        let phys_addr = entry.phys_addr;
+        drop(cache);
+        crate::memory::physical::deallocate_frame(phys);
+        crate::kprintln!(
+            "[page_cache] already present in cache: phys={:#x}",
+            phys_addr
+        );
+        return Ok(phys_addr);
     }
 
     cache.insert(
@@ -110,6 +156,7 @@ pub fn get_or_create_page_inner(inode: &dyn InodeOps, offset: u64) -> Result<u64
             dirty: false,
         },
     );
+    crate::kprintln!("[page_cache] inserted into cache: phys={:#x}", phys);
 
     Ok(phys)
 }
@@ -124,21 +171,40 @@ pub fn flush_page_inner(inode: &dyn InodeOps, offset: u64) -> Result<(), Errno> 
     let ino = inode.inode().ino;
     let aligned_offset = offset & !4095;
 
-    let mut cache = PAGE_CACHE.lock();
-    if let Some(entry) = cache.get_mut(&(ino, aligned_offset)) {
-        if entry.dirty {
-            let phys = entry.phys_addr;
-            let phys_offset = phys + crate::memory::r#virtual::phys_mem_offset();
-            let src_slice = unsafe { core::slice::from_raw_parts(phys_offset as *const u8, 4096) };
-
-            let size = inode.inode().size;
-            if size > aligned_offset {
-                let write_len = core::cmp::min(4096, (size - aligned_offset) as usize);
-                inode
-                    .write_direct(aligned_offset, &src_slice[..write_len])
-                    .map_err(|_| Errno::EIO)?;
+    // 1. Check if dirty and copy page info under lock
+    let phys_to_write = {
+        let cache = PAGE_CACHE.lock();
+        if let Some(entry) = cache.get(&(ino, aligned_offset)) {
+            if entry.dirty {
+                Some(entry.phys_addr)
+            } else {
+                None
             }
-            entry.dirty = false;
+        } else {
+            None
+        }
+    };
+
+    // 2. Perform write without lock
+    if let Some(phys) = phys_to_write {
+        let phys_offset = phys + crate::memory::r#virtual::phys_mem_offset();
+        let src_slice = unsafe { core::slice::from_raw_parts(phys_offset as *const u8, 4096) };
+
+        let size = inode.inode().size;
+        if size > aligned_offset {
+            let write_len = core::cmp::min(4096, (size - aligned_offset) as usize);
+            inode
+                .write_direct(aligned_offset, &src_slice[..write_len])
+                .map_err(|_| Errno::EIO)?;
+        }
+
+        // 3. Clear dirty flag under lock
+        let mut cache = PAGE_CACHE.lock();
+        if let Some(entry) = cache.get_mut(&(ino, aligned_offset)) {
+            // Only clear dirty if the physical page hasn't changed (it shouldn't have)
+            if entry.phys_addr == phys {
+                entry.dirty = false;
+            }
         }
     }
     Ok(())
@@ -161,7 +227,8 @@ pub fn flush_all_for_inode_inner(inode: &dyn InodeOps) -> Result<(), Errno> {
                 let mut task = task_arc.lock();
                 let addr_space = task.address_space.lock();
                 for region in &addr_space.mmap_regions {
-                    if region.is_shared && region.inode_ino == ino {
+                    if region.is_shared && region.inode.as_ref().map(|i| i.inode().ino) == Some(ino)
+                    {
                         let start_page = region.start & !4095;
                         let end_page = (region.start + region.len as u64 - 1) & !4095;
                         for vaddr in (start_page..=end_page).step_by(4096) {

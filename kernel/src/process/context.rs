@@ -297,6 +297,11 @@ pub unsafe extern "C" fn enter_user_mode(
     );
 }
 
+#[no_mangle]
+pub extern "C" fn fork_child_return_debug() {
+    crate::kprintln!("[debug] Entering fork_child_return in child task!");
+}
+
 /// Naked assembly return path for fork'ed child processes.
 ///
 /// When the scheduler switches to a newly forked child, it enters here.
@@ -306,6 +311,7 @@ pub unsafe extern "C" fn enter_user_mode(
 #[unsafe(naked)]
 pub unsafe extern "C" fn fork_child_return() -> ! {
     core::arch::naked_asm!(
+        "call fork_child_return_debug",
         "pop rax",      // Pop and discard the parent's rax
         "xor rax, rax", // rax = 0 (child process return value)
         "pop rdi",

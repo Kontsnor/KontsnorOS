@@ -11,6 +11,7 @@
 //!   [47:39]             [38:30]            [29:21]          [20:12]          [11:0]
 //! ```
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
@@ -23,10 +24,10 @@ use x86_64::{PhysAddr, VirtAddr};
 ///
 /// All physical memory is mapped starting at this virtual address,
 /// allowing the kernel to access any physical address by adding this offset.
-static PHYS_MEM_OFFSET: Mutex<Option<u64>> = Mutex::new(None);
+static PHYS_MEM_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 /// The kernel's active PML4 page table root physical address.
-static KERNEL_PML4_PHYS: Mutex<Option<u64>> = Mutex::new(None);
+static KERNEL_PML4_PHYS: AtomicU64 = AtomicU64::new(0);
 
 /// Initialize the virtual memory manager.
 ///
@@ -37,23 +38,81 @@ pub fn init(phys_mem_offset: u64) {
     if pml4_index < 256 {
         panic!("Physical memory mapping offset {:#x} resides in lower half of PML4 (index {}), overlapping user space!", phys_mem_offset, pml4_index);
     }
-    *PHYS_MEM_OFFSET.lock() = Some(phys_mem_offset);
+    PHYS_MEM_OFFSET.store(phys_mem_offset, Ordering::SeqCst);
     let (level_4_table_frame, _) = Cr3::read();
-    *KERNEL_PML4_PHYS.lock() = Some(level_4_table_frame.start_address().as_u64());
+    KERNEL_PML4_PHYS.store(
+        level_4_table_frame.start_address().as_u64(),
+        Ordering::SeqCst,
+    );
 }
 
 /// Get the physical memory offset.
 pub fn phys_mem_offset() -> u64 {
-    PHYS_MEM_OFFSET
-        .lock()
-        .expect("Virtual memory not initialized")
+    let val = PHYS_MEM_OFFSET.load(Ordering::SeqCst);
+    if val == 0 {
+        panic!("Virtual memory not initialized");
+    }
+    val
 }
 
 /// Get the kernel PML4 physical address.
 pub fn kernel_pml4_phys() -> u64 {
-    KERNEL_PML4_PHYS
-        .lock()
-        .expect("Virtual memory not initialized")
+    let val = KERNEL_PML4_PHYS.load(Ordering::SeqCst);
+    if val == 0 {
+        panic!("Virtual memory not initialized");
+    }
+    val
+}
+
+/// Dump page table entries for debugging.
+pub fn debug_dump_mapping(vaddr: u64) {
+    let (pml4_frame, _) = Cr3::read();
+    let pml4_phys = pml4_frame.start_address().as_u64();
+    let pml4_virt = VirtAddr::new(pml4_phys + phys_mem_offset());
+    let pml4: &PageTable = unsafe { &*pml4_virt.as_ptr() };
+
+    let addr = VirtAddr::new(vaddr);
+    let p4 = addr.p4_index();
+    let p3 = addr.p3_index();
+    let p2 = addr.p2_index();
+    let p1 = addr.p1_index();
+
+    crate::kprintln!("[debug_map] Vaddr: {:#x} CR3: {:#x}", vaddr, pml4_phys);
+    let pml4_entry = &pml4[p4];
+    crate::kprintln!("  PML4[{:?}] entry: {:?}", p4, pml4_entry);
+    if pml4_entry.is_unused() {
+        return;
+    }
+
+    if let Ok(pdpt_frame) = pml4_entry.frame() {
+        let pdpt_phys = pdpt_frame.start_address().as_u64();
+        let pdpt_virt = VirtAddr::new(pdpt_phys + phys_mem_offset());
+        let pdpt: &PageTable = unsafe { &*pdpt_virt.as_ptr() };
+        let pdpt_entry = &pdpt[p3];
+        crate::kprintln!("  PDPT[{:?}] entry: {:?}", p3, pdpt_entry);
+        if pdpt_entry.is_unused() {
+            return;
+        }
+
+        if let Ok(pd_frame) = pdpt_entry.frame() {
+            let pd_phys = pd_frame.start_address().as_u64();
+            let pd_virt = VirtAddr::new(pd_phys + phys_mem_offset());
+            let pd: &PageTable = unsafe { &*pd_virt.as_ptr() };
+            let pd_entry = &pd[p2];
+            crate::kprintln!("  PD[{:?}] entry: {:?}", p2, pd_entry);
+            if pd_entry.is_unused() {
+                return;
+            }
+
+            if let Ok(pt_frame) = pd_entry.frame() {
+                let pt_phys = pt_frame.start_address().as_u64();
+                let pt_virt = VirtAddr::new(pt_phys + phys_mem_offset());
+                let pt: &PageTable = unsafe { &*pt_virt.as_ptr() };
+                let pt_entry = &pt[p1];
+                crate::kprintln!("  PT[{:?}] entry: {:?}", p1, pt_entry);
+            }
+        }
+    }
 }
 
 /// Create an `OffsetPageTable` from the active page table.
@@ -331,9 +390,65 @@ pub unsafe fn map_user_page_no_shootdown(
             .map_to(page, frame, flags, &mut frame_alloc)
             .map_err(|_| "Failed to map user page")?
             .flush();
+
+        ensure_directory_permissions(pml4_phys, page.start_address());
     }
 
     Ok(())
+}
+
+/// Ensure that the intermediate page table directories (PML4, PDPT, PD) for the given virtual address
+/// have USER_ACCESSIBLE and WRITABLE flags set.
+pub unsafe fn ensure_directory_permissions(pml4_phys: u64, addr: VirtAddr) {
+    let pml4_virt = VirtAddr::new(pml4_phys + phys_mem_offset());
+    let pml4: &mut PageTable = unsafe { &mut *pml4_virt.as_mut_ptr() };
+
+    let p4_idx = addr.p4_index();
+    let p3_idx = addr.p3_index();
+    let p2_idx = addr.p2_index();
+
+    let pml4_entry = &mut pml4[p4_idx];
+    if !pml4_entry.is_unused() {
+        let mut flags = pml4_entry.flags();
+        if !flags.contains(PageTableFlags::WRITABLE)
+            || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+        {
+            flags |= PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+            pml4_entry.set_addr(pml4_entry.addr(), flags);
+        }
+        if let Ok(pdpt_frame) = pml4_entry.frame() {
+            let pdpt_phys = pdpt_frame.start_address().as_u64();
+            let pdpt_virt = VirtAddr::new(pdpt_phys + phys_mem_offset());
+            let pdpt: &mut PageTable = unsafe { &mut *pdpt_virt.as_mut_ptr() };
+
+            let pdpt_entry = &mut pdpt[p3_idx];
+            if !pdpt_entry.is_unused() {
+                let mut flags = pdpt_entry.flags();
+                if !flags.contains(PageTableFlags::WRITABLE)
+                    || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+                {
+                    flags |= PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+                    pdpt_entry.set_addr(pdpt_entry.addr(), flags);
+                }
+                if let Ok(pd_frame) = pdpt_entry.frame() {
+                    let pd_phys = pd_frame.start_address().as_u64();
+                    let pd_virt = VirtAddr::new(pd_phys + phys_mem_offset());
+                    let pd: &mut PageTable = unsafe { &mut *pd_virt.as_mut_ptr() };
+
+                    let pd_entry = &mut pd[p2_idx];
+                    if !pd_entry.is_unused() {
+                        let mut flags = pd_entry.flags();
+                        if !flags.contains(PageTableFlags::WRITABLE)
+                            || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+                        {
+                            flags |= PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+                            pd_entry.set_addr(pd_entry.addr(), flags);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Translate a virtual address to a physical address.

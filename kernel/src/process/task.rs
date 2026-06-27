@@ -76,13 +76,38 @@ pub struct SigAction {
     pub sa_mask: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MappedRegion {
     pub start: u64,
     pub len: usize,
-    pub inode_ino: u64,
+    pub inode: Option<Arc<dyn crate::fs::inode::InodeOps>>,
     pub offset: u64,
     pub is_shared: bool,
+    pub prot: i32,
+    pub pathname: Option<alloc::string::String>,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StackT {
+    pub ss_sp: u64,
+    pub ss_flags: i32,
+    pub _pad: i32,
+    pub ss_size: u64,
+}
+
+impl core::fmt::Debug for MappedRegion {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MappedRegion")
+            .field("start", &self.start)
+            .field("len", &self.len)
+            .field("inode_ino", &self.inode.as_ref().map(|i| i.inode().ino))
+            .field("offset", &self.offset)
+            .field("is_shared", &self.is_shared)
+            .field("prot", &self.prot)
+            .field("pathname", &self.pathname)
+            .finish()
+    }
 }
 
 pub struct AddressSpace {
@@ -183,6 +208,10 @@ pub struct Task {
     pub euid: u32,
     /// Effective Group ID
     pub egid: u32,
+    /// Registered user-space address to be cleared when thread exits (CLONE_CHILD_CLEARTID)
+    pub clear_child_tid: Option<u64>,
+    /// Alternate signal stack.
+    pub sigaltstack: Option<StackT>,
 }
 
 impl Task {
@@ -194,14 +223,17 @@ impl Task {
         entries.push(Some(Arc::new(FileDescription::new(
             crate::fs::tty::make_stdin(),
             OpenFlags(OpenFlags::O_RDONLY),
+            Some(alloc::string::String::from("/dev/stdin")),
         )))); // fd 0: stdin
         entries.push(Some(Arc::new(FileDescription::new(
             crate::fs::tty::make_stdout(),
             OpenFlags(OpenFlags::O_WRONLY),
+            Some(alloc::string::String::from("/dev/stdout")),
         )))); // fd 1: stdout
         entries.push(Some(Arc::new(FileDescription::new(
             crate::fs::tty::make_stderr(),
             OpenFlags(OpenFlags::O_WRONLY),
+            Some(alloc::string::String::from("/dev/stderr")),
         )))); // fd 2: stderr
 
         Self {
@@ -241,6 +273,8 @@ impl Task {
             gid: 0,
             euid: 0,
             egid: 0,
+            clear_child_tid: None,
+            sigaltstack: None,
         }
     }
 
@@ -271,9 +305,13 @@ impl Drop for Task {
         // Free the kernel stack if allocated
         if self.kernel_stack_base != 0 && self.kernel_stack_size != 0 {
             let layout = alloc::alloc::Layout::from_size_align(self.kernel_stack_size, 16).unwrap();
+            // SAFETY: kernel_stack_base and kernel_stack_size were allocated using exactly the same layout in clone/fork.
             unsafe {
                 alloc::alloc::dealloc(self.kernel_stack_base as *mut u8, layout);
             }
         }
+        // Release advisory fcntl locks
+        let pid_val = self.pid.as_u64();
+        crate::syscall::fs::io::release_fcntl_locks(pid_val);
     }
 }

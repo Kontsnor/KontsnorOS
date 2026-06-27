@@ -67,7 +67,8 @@ pub fn spawn_user_process(name: alloc::string::String, elf_data: &[u8]) -> Pid {
 
 /// Spawn a new Ring 3 user process from ELF data with a specific PID.
 pub fn spawn_user_process_with_pid(name: alloc::string::String, elf_data: &[u8], pid: Pid) -> Pid {
-    let elf_info = elf::parse_elf(elf_data).expect("Failed to parse user process ELF");
+    let elf_info =
+        elf::parse_elf(elf_data, elf_data.len()).expect("Failed to parse user process ELF");
 
     // Create new user PML4 page table (clones kernel mappings)
     let page_table_root = crate::memory::r#virtual::create_user_page_table()
@@ -286,28 +287,18 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
 
 /// Block a task.
 pub fn block_task(pid: Pid) {
-    let idx = pid.as_u64() as usize;
-    let tasks = TASKS.read();
-    if let Some(Some(task_arc)) = tasks.get(idx) {
-        task_arc.lock().state = TaskState::Blocked;
-    }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(ref mut scheduler) = *SCHEDULER.lock() {
+            scheduler.block_task(pid);
+        }
+    });
 }
 
 /// Wake up a blocked task.
 pub fn wake_task(pid: Pid) {
-    let idx = pid.as_u64() as usize;
-    let tasks = TASKS.read();
-    if let Some(Some(task_arc)) = tasks.get(idx) {
-        let mut task = task_arc.lock();
-        if task.state == TaskState::Blocked {
-            task.state = TaskState::Ready;
-            if !task.in_queue {
-                if let Some(ref mut scheduler) = *SCHEDULER.lock() {
-                    let priority = task.priority as usize;
-                    scheduler.queues[priority].push_back(pid);
-                    task.in_queue = true;
-                }
-            }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(ref mut scheduler) = *SCHEDULER.lock() {
+            scheduler.wake_task(pid);
         }
-    }
+    });
 }

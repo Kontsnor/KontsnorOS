@@ -27,8 +27,8 @@ if [ ! -f "$TCC_BIN" ]; then
     )
 fi
 
-echo "Creating 64MB blank disk image..."
-dd if=/dev/zero of="$DISK_IMG" bs=1M count=64
+echo "Creating 1.5GB blank disk image..."
+dd if=/dev/zero of="$DISK_IMG" bs=1M count=1536
 
 echo "Formatting disk.img with ext2 (4096 byte blocks)..."
 mkfs.ext2 -b 4096 -F "$DISK_IMG"
@@ -106,6 +106,40 @@ int main() {
 }
 EOF
 
+echo "Compiling dynamic hello binary..."
+musl-gcc -o /tmp/hello_dyn /tmp/hello.c
+
+echo "Compiling stubs library..."
+cat << 'EOF' > /tmp/stubs.c
+#include <string.h>
+#include <stddef.h>
+
+struct {
+    unsigned int __cpu_vendor;
+    unsigned int __cpu_type;
+    unsigned int __cpu_subtype;
+    unsigned int __cpu_features[8];
+} __cpu_model = {0};
+
+void __cpu_indicator_init(void) {
+}
+
+void *__memset_chk(void *dest, int c, size_t len, size_t destlen) {
+    return memset(dest, c, len);
+}
+
+int _dl_find_object(void *address, void *result) {
+    return -1;
+}
+EOF
+musl-gcc -shared -fPIC -o /tmp/libstubs.so /tmp/stubs.c
+
+echo "mkdir /lib" >> "$CMD_FILE"
+echo "write /usr/lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1" >> "$CMD_FILE"
+echo "write /usr/lib/x86_64-linux-musl/libc.so /lib/libc.so" >> "$CMD_FILE"
+echo "write /tmp/hello_dyn /bin/hello_dyn" >> "$CMD_FILE"
+echo "write /tmp/libstubs.so /lib/libstubs.so" >> "$CMD_FILE"
+
 echo "write /tmp/hello.c /hello.c" >> "$CMD_FILE"
 echo "write $PROJECT_DIR/tools/sh.c /sh.c" >> "$CMD_FILE"
 
@@ -122,10 +156,87 @@ echo "Writing /hello.txt..."
 echo "Hello from the ext2 disk on KontsnorOS!" > /tmp/hello.txt
 echo "write /tmp/hello.txt /hello.txt" >> "$CMD_FILE"
 
+# Copy Rust Toolchain
+RUST_TOOLCHAIN_DIR="/home/kontsnor/.rustup/toolchains/nightly-x86_64-unknown-linux-musl"
+if [ -d "$RUST_TOOLCHAIN_DIR" ]; then
+    echo "Staging Rust toolchain binaries and libraries..."
+    echo "mkdir /lib/rustlib" >> "$CMD_FILE"
+    echo "mkdir /lib/rustlib/x86_64-unknown-linux-musl" >> "$CMD_FILE"
+    echo "mkdir /lib/rustlib/x86_64-unknown-linux-musl/lib" >> "$CMD_FILE"
+    
+    echo "write $RUST_TOOLCHAIN_DIR/bin/rustc /bin/rustc" >> "$CMD_FILE"
+    echo "write $RUST_TOOLCHAIN_DIR/bin/cargo /bin/cargo" >> "$CMD_FILE"
+    
+    # Copy librustc_driver shared library
+    find "$RUST_TOOLCHAIN_DIR/lib" -maxdepth 1 -name "librustc_driver-*.so" | while read -r filepath; do
+        filename=$(basename "$filepath")
+        echo "write $filepath /lib/$filename" >> "$CMD_FILE"
+    done
+    
+    # Compile a musl-compatible libgcc_s.so.1 stub library
+    cat << 'EOF' > /tmp/libgcc_s.c
+void _Unwind_Backtrace() {}
+void _Unwind_DeleteException() {}
+void _Unwind_FindEnclosingFunction() {}
+void _Unwind_GetCFA() {}
+void _Unwind_GetDataRelBase() {}
+void _Unwind_GetIP() {}
+void _Unwind_GetIPInfo() {}
+void _Unwind_GetLanguageSpecificData() {}
+void _Unwind_GetRegionStart() {}
+void _Unwind_GetTextRelBase() {}
+void _Unwind_RaiseException() {}
+void _Unwind_Resume() {}
+void _Unwind_Resume_or_Rethrow() {}
+void _Unwind_SetGR() {}
+void _Unwind_SetIP() {}
+EOF
+    musl-gcc -shared -fPIC -o /tmp/libgcc_s.so.1 /tmp/libgcc_s.c
+    echo "write /tmp/libgcc_s.so.1 /lib/libgcc_s.so.1" >> "$CMD_FILE"
+    
+    # Copy target stdlib files
+    find "$RUST_TOOLCHAIN_DIR/lib/rustlib/x86_64-unknown-linux-musl/lib" -type f | while read -r filepath; do
+        filename=$(basename "$filepath")
+        echo "write $filepath /lib/rustlib/x86_64-unknown-linux-musl/lib/$filename" >> "$CMD_FILE"
+    done
+else
+    echo "WARNING: Rust toolchain dir $RUST_TOOLCHAIN_DIR not found!"
+fi
+
+# Stage KontsnorOS kernel source code
+echo "Staging KontsnorOS kernel source code..."
+echo "mkdir /src" >> "$CMD_FILE"
+echo "mkdir /src/KontsnorOS" >> "$CMD_FILE"
+
+# Pre-create all subdirectories under kernel and driver-sdk
+find "$PROJECT_DIR/kernel" "$PROJECT_DIR/driver-sdk" -type d | while read -r dirpath; do
+    relpath="${dirpath#$PROJECT_DIR/}"
+    echo "mkdir /src/KontsnorOS/$relpath" >> "$CMD_FILE"
+done
+
+# Copy Cargo.toml, Cargo.lock, rust-toolchain.toml
+echo "write $PROJECT_DIR/Cargo.toml /src/KontsnorOS/Cargo.toml" >> "$CMD_FILE"
+if [ -f "$PROJECT_DIR/Cargo.lock" ]; then
+    echo "write $PROJECT_DIR/Cargo.lock /src/KontsnorOS/Cargo.lock" >> "$CMD_FILE"
+fi
+if [ -f "$PROJECT_DIR/rust-toolchain.toml" ]; then
+    echo "write $PROJECT_DIR/rust-toolchain.toml /src/KontsnorOS/rust-toolchain.toml" >> "$CMD_FILE"
+fi
+
+# Copy all source files under kernel and driver-sdk
+find "$PROJECT_DIR/kernel" "$PROJECT_DIR/driver-sdk" -type f | while read -r filepath; do
+    relpath="${filepath#$PROJECT_DIR/}"
+    echo "write $filepath /src/KontsnorOS/$relpath" >> "$CMD_FILE"
+done
+
+# Write hello.rs
+echo 'fn main() { println!("Hello World from native Rust compiled binary on KontsnorOS!"); }' > /tmp/hello.rs
+echo "write /tmp/hello.rs /hello.rs" >> "$CMD_FILE"
+
 # Execute debugfs
 debugfs -w "$DISK_IMG" -f "$CMD_FILE" >/dev/null
 
-rm -f "$CMD_FILE" /tmp/hello.c /tmp/install-busybox.sh /tmp/hello.txt
+rm -f "$CMD_FILE" /tmp/hello.c /tmp/install-busybox.sh /tmp/hello.txt /tmp/hello_dyn /tmp/hello.rs /tmp/stubs.c /tmp/libstubs.so /tmp/libgcc_s.c /tmp/libgcc_s.so.1
 
 echo "Done! disk.img is ready."
 

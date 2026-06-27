@@ -75,11 +75,20 @@ pub fn current_task_alloc_fd(inode: Arc<dyn InodeOps>) -> Option<i32> {
 
 /// Allocate the next free file descriptor slot with specified flags.
 pub fn current_task_alloc_fd_with_flags(inode: Arc<dyn InodeOps>, flags: OpenFlags) -> Option<i32> {
+    current_task_alloc_fd_with_flags_and_path(inode, flags, None)
+}
+
+/// Allocate the next free file descriptor slot with specified flags and open path.
+pub fn current_task_alloc_fd_with_flags_and_path(
+    inode: Arc<dyn InodeOps>,
+    flags: OpenFlags,
+    path: Option<alloc::string::String>,
+) -> Option<i32> {
     let current_pid = scheduler::current_pid()?;
     let task_arc = scheduler::get_task_arc(current_pid)?;
     let mut task = task_arc.lock();
     let mut fd_table = task.fd_table.lock();
-    let file_desc = Arc::new(FileDescription::new(inode, flags));
+    let file_desc = Arc::new(FileDescription::new(inode, flags, path));
 
     // Find first free slot (first None entry)
     for (i, slot) in fd_table.entries.iter_mut().enumerate() {

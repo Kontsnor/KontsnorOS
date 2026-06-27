@@ -26,19 +26,21 @@ impl WaitQueue {
             None => return,
         };
 
-        // F-09: Acquire SCHEDULER lock first to close the missed wakeup TOCTOU window
-        let mut sched_lock = scheduler::SCHEDULER.lock();
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            // F-09: Acquire SCHEDULER lock first to close the missed wakeup TOCTOU window
+            let mut sched_lock = scheduler::SCHEDULER.lock();
 
-        // Add the current task to the wait queue under both locks
-        self.pids.lock().push_back(current_pid);
+            // Add the current task to the wait queue under both locks
+            self.pids.lock().push_back(current_pid);
 
-        // Mark the task as Blocked
-        if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
-            task_arc.lock().state = TaskState::Blocked;
-        }
+            // Mark the task as Blocked
+            if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+                task_arc.lock().state = TaskState::Blocked;
+            }
 
-        // Release the scheduler lock before rescheduling
-        drop(sched_lock);
+            // Release the scheduler lock before rescheduling
+            drop(sched_lock);
+        });
 
         // Yield CPU control to execute other tasks
         scheduler::schedule();
@@ -50,7 +52,7 @@ impl WaitQueue {
 
     /// Wake up all tasks currently sleeping on this wait queue.
     pub fn wake_all(&self) {
-        {
+        x86_64::instructions::interrupts::without_interrupts(|| {
             let mut sched_lock = scheduler::SCHEDULER.lock();
             if let Some(ref mut sched) = *sched_lock {
                 let mut pids = self.pids.lock();
@@ -58,7 +60,7 @@ impl WaitQueue {
                     sched.wake_task(pid);
                 }
             }
-        }
+        });
         crate::fs::epoll::wake_all_epolls();
     }
 

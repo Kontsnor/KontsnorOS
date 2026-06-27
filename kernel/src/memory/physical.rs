@@ -17,9 +17,9 @@ use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use super::PAGE_SIZE;
 use core::sync::atomic::{AtomicU8, Ordering};
 
-/// Maximum supported physical memory: 4 GiB initially.
-/// This gives us 1M frames, requiring a 128 KiB bitmap.
-const MAX_FRAMES: usize = 1024 * 1024;
+/// Maximum supported physical memory: 16 GiB.
+/// This gives us 4M frames, requiring a 512 KiB bitmap.
+const MAX_FRAMES: usize = 4 * 1024 * 1024;
 
 /// Bitmap size in bytes.
 const BITMAP_SIZE: usize = MAX_FRAMES / 8;
@@ -44,19 +44,23 @@ pub fn increment_ref(phys_addr: u64) {
 pub fn decrement_ref(phys_addr: u64) -> u8 {
     let index = (phys_addr / PAGE_SIZE as u64) as usize;
     if index < MAX_FRAMES {
-        let old = FRAME_REFS[index].load(Ordering::SeqCst);
-        if old == 0 {
-            return 0;
+        let mut old = FRAME_REFS[index].load(Ordering::SeqCst);
+        loop {
+            if old == 0 {
+                return 0;
+            }
+            match FRAME_REFS[index].compare_exchange(
+                old,
+                old - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return old - 1,
+                Err(actual) => old = actual,
+            }
         }
-        let old = FRAME_REFS[index].fetch_sub(1, Ordering::SeqCst);
-        if old > 0 {
-            old - 1
-        } else {
-            0
-        }
-    } else {
-        0
     }
+    0
 }
 
 /// The global physical frame allocator.
@@ -279,12 +283,24 @@ pub fn allocate_frame() -> Option<u64> {
 pub fn deallocate_frame(phys_addr: u64) {
     let frame_index = (phys_addr / PAGE_SIZE as u64) as usize;
     if frame_index < MAX_FRAMES {
-        let old = FRAME_REFS[frame_index].load(Ordering::SeqCst);
-        if old == 0 {
-            return;
+        let mut old = FRAME_REFS[frame_index].load(Ordering::SeqCst);
+        let mut new_val;
+        loop {
+            if old == 0 {
+                return;
+            }
+            new_val = old - 1;
+            match FRAME_REFS[frame_index].compare_exchange(
+                old,
+                new_val,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => old = actual,
+            }
         }
-        let old = FRAME_REFS[frame_index].fetch_sub(1, Ordering::SeqCst);
-        if old > 1 {
+        if new_val > 0 {
             // Still referenced by other page tables. Do not reclaim yet!
             return;
         }

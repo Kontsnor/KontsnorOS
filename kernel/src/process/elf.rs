@@ -226,7 +226,7 @@ impl From<u32> for SegmentFlags {
 /// Validate and parse an ELF64 binary.
 ///
 /// Returns the entry point and loadable segments on success.
-pub fn parse_elf(data: &[u8]) -> Result<ElfInfo, ElfError> {
+pub fn parse_elf(data: &[u8], total_file_size: usize) -> Result<ElfInfo, ElfError> {
     // Check minimum size for ELF header
     if data.len() < core::mem::size_of::<Elf64Header>() {
         return Err(ElfError::FileTooSmall);
@@ -292,7 +292,7 @@ pub fn parse_elf(data: &[u8]) -> Result<ElfInfo, ElfError> {
                 let mem_size = phdr.p_memsz;
 
                 // Validate segment fits in the file
-                if (file_offset + file_size) as usize > data.len() {
+                if (file_offset + file_size) as usize > total_file_size {
                     return Err(ElfError::InvalidSegment);
                 }
 

@@ -13,7 +13,7 @@ pub mod process;
 pub mod signal;
 pub mod validation;
 
-pub const DEBUG_SYSCALLS: bool = false;
+pub const DEBUG_SYSCALLS: bool = true;
 
 /// Syscall numbers for KontsnorOS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +30,7 @@ pub enum SyscallNumber {
     Mprotect = 10,
     Munmap = 11,
     Brk = 12,
+    Mremap = 25,
     Getpid = 39,
     Fork = 57,
     Execve = 59,
@@ -57,6 +58,7 @@ pub enum SyscallNumber {
     SignalFd4 = 289,
     EventFd2 = 290,
     EpollCreate1 = 291,
+    SchedGetAffinity = 204,
 }
 
 /// Result type for syscalls.
@@ -539,6 +541,10 @@ pub fn dispatch(
         289 => fs::sys_signalfd4(arg0 as i32, arg1 as *const u64, arg2 as usize, arg3 as i32),
         290 => fs::sys_eventfd2(arg0 as u32, arg1 as i32),
         291 => fs::sys_epoll_create1(arg0 as i32),
+        137 => fs::sys_statfs(arg0 as *const u8, arg1 as *mut fs::LinuxStatfs),
+        138 => fs::sys_fstatfs(arg0 as i32, arg1 as *mut fs::LinuxStatfs),
+        293 => fs::sys_pipe2(arg0 as *mut i32, arg1 as i32),
+        319 => fs::sys_memfd_create(arg0 as *const u8, arg1 as u32),
         // Memory
         9 => memory::sys_mmap(
             arg0,
@@ -551,6 +557,8 @@ pub fn dispatch(
         10 => memory::sys_mprotect(arg0, arg1 as usize, arg2 as i32),
         11 => memory::sys_munmap(arg0, arg1 as usize),
         12 => memory::sys_brk(arg0),
+        25 => memory::sys_mremap(arg0, arg1 as usize, arg2 as usize, arg3 as i32, arg4),
+        28 => memory::sys_madvise(arg0, arg1 as usize, arg2 as i32),
         // Process
         13 => signal::sys_rt_sigaction(
             arg0 as i32,
@@ -585,7 +593,7 @@ pub fn dispatch(
         110 => process::sys_getppid(),
         112 => process::sys_setsid(),
         121 => process::sys_getpgid(arg0 as i32),
-        131 => process::sys_sigaltstack(arg0 as *const u8, arg1 as *mut u8),
+        131 => process::sys_sigaltstack(arg0 as *const u8, arg1 as *mut u8, unsafe { (*regs).rsp }),
         157 => process::sys_prctl(arg0 as i32, arg1, arg2, arg3, arg4),
         158 => process::sys_arch_prctl(arg0 as i32, arg1),
         186 => process::sys_gettid(),
@@ -599,6 +607,7 @@ pub fn dispatch(
         ),
         218 => process::sys_set_tid_address(arg0 as *mut i32),
         228 => process::sys_clock_gettime(arg0 as i32, arg1 as *mut u8),
+        204 => process::sys_sched_getaffinity(arg0 as i32, arg1 as usize, arg2 as *mut u8),
         231 => process::sys_exit_group(arg0 as i32),
         234 => process::sys_tgkill(arg0 as i32, arg1 as i32, arg2 as i32),
         302 => process::sys_prlimit64(arg0 as i32, arg1 as i32, arg2 as *const u8, arg3 as *mut u8),

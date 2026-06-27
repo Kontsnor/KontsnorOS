@@ -835,3 +835,132 @@ pub fn sys_fchmod(fd: i32, mode: u32) -> SyscallResult {
         }
     }
 }
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LinuxStatfs {
+    pub f_type: i64,       /* Type of filesystem */
+    pub f_bsize: i64,      /* Optimal transfer block size */
+    pub f_blocks: u64,     /* Total data blocks in filesystem */
+    pub f_bfree: u64,      /* Free blocks in filesystem */
+    pub f_bavail: u64,     /* Free blocks available to unprivileged user */
+    pub f_files: u64,      /* Total file nodes in filesystem */
+    pub f_ffree: u64,      /* Free file nodes in filesystem */
+    pub f_fsid: [i32; 2],  /* Filesystem ID */
+    pub f_namelen: i64,    /* Maximum length of filenames */
+    pub f_frsize: i64,     /* Fragment size */
+    pub f_flags: i64,      /* Mount flags of filesystem */
+    pub f_spare: [i64; 4], /* Padding bytes reserved for future use */
+}
+
+fn fs_stats_to_linux_statfs(stats: &crate::fs::vfs::FsStats, fs_name: &str) -> LinuxStatfs {
+    let f_type = match fs_name {
+        "ext" | "ext2" => 0xEF53,
+        "tmpfs" => 0x01021994,
+        "procfs" => 0x9fa0,
+        "devfs" => 0x1373,
+        _ => 0,
+    };
+    LinuxStatfs {
+        f_type,
+        f_bsize: stats.block_size as i64,
+        f_blocks: stats.total_blocks,
+        f_bfree: stats.free_blocks,
+        f_bavail: stats.free_blocks,
+        f_files: stats.total_inodes,
+        f_ffree: stats.free_inodes,
+        f_fsid: [0, 0],
+        f_namelen: stats.max_name_len as i64,
+        f_frsize: stats.block_size as i64,
+        f_flags: 0,
+        f_spare: [0; 4],
+    }
+}
+
+/// `statfs(path, buf)` — Get filesystem statistics.
+pub fn sys_statfs(path_ptr: *const u8, buf: *mut LinuxStatfs) -> SyscallResult {
+    if path_ptr.is_null() || buf.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if !validate_user_ptr(path_ptr, 1)
+        || !validate_user_ptr(buf as *const u8, core::mem::size_of::<LinuxStatfs>())
+    {
+        return Errno::EFAULT.into();
+    }
+
+    let path_str = unsafe {
+        match crate::syscall::validation::copy_string_from_user_pub(path_ptr) {
+            Some(s) => s,
+            None => return Errno::EFAULT.into(),
+        }
+    };
+
+    let abs_path = crate::fs::vfs::resolve_relative_path(&path_str);
+    let (fs, _) = match crate::fs::vfs::resolve_mount(&abs_path) {
+        Some(res) => res,
+        None => return Errno::ENOENT.into(),
+    };
+
+    let stats = fs.statfs();
+    let linux_stats = fs_stats_to_linux_statfs(&stats, fs.name());
+
+    unsafe {
+        buf.write(linux_stats);
+    }
+    0
+}
+
+/// `fstatfs(fd, buf)` — Get filesystem statistics.
+pub fn sys_fstatfs(fd: i32, buf: *mut LinuxStatfs) -> SyscallResult {
+    if buf.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if !validate_user_ptr(buf as *const u8, core::mem::size_of::<LinuxStatfs>()) {
+        return Errno::EFAULT.into();
+    }
+
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+
+    // If there is a path associated, resolve its filesystem
+    let (stats, fs_name) = if let Some(ref path_str) = file_desc.path {
+        let abs_path = crate::fs::vfs::resolve_relative_path(path_str);
+        if let Some((fs, _)) = crate::fs::vfs::resolve_mount(&abs_path) {
+            (fs.statfs(), alloc::string::String::from(fs.name()))
+        } else {
+            // Fallback to synthetic
+            (
+                crate::fs::vfs::FsStats {
+                    total_blocks: 1024 * 1024,
+                    free_blocks: 512 * 1024,
+                    total_inodes: 1024 * 1024,
+                    free_inodes: 512 * 1024,
+                    block_size: 4096,
+                    max_name_len: 255,
+                },
+                alloc::string::String::from("virtual"),
+            )
+        }
+    } else {
+        // Fallback to synthetic
+        (
+            crate::fs::vfs::FsStats {
+                total_blocks: 1024 * 1024,
+                free_blocks: 512 * 1024,
+                total_inodes: 1024 * 1024,
+                free_inodes: 512 * 1024,
+                block_size: 4096,
+                max_name_len: 255,
+            },
+            alloc::string::String::from("virtual"),
+        )
+    };
+
+    let linux_stats = fs_stats_to_linux_statfs(&stats, &fs_name);
+    unsafe {
+        buf.write(linux_stats);
+    }
+    0
+}

@@ -4,6 +4,7 @@ use crate::drivers::traits::BlockDevice;
 use crate::fs::inode::{DirEntry, FilePermissions, FileType, Inode, InodeOps};
 use crate::fs::vfs::{FileSystem, FsStats};
 use crate::kprintln;
+use crate::sync::spinlock::TicketLock;
 use ::alloc::string::String;
 use ::alloc::sync::Arc;
 use ::alloc::vec::Vec;
@@ -71,9 +72,9 @@ pub struct ExtFileSystem {
     pub(crate) inodes_per_block: u32,
     pub(crate) inodes_per_group: u32,
     pub(crate) inode_size: u16,
-    pub(crate) superblock: Mutex<Superblock>,
-    pub(crate) group_descriptors: Mutex<Vec<GroupDescriptor>>,
-    pub(crate) root_node: Mutex<Option<Arc<dyn InodeOps>>>,
+    pub(crate) superblock: TicketLock<Superblock>,
+    pub(crate) group_descriptors: TicketLock<Vec<GroupDescriptor>>,
+    pub(crate) root_node: TicketLock<Option<Arc<dyn InodeOps>>>,
 }
 
 impl ExtFileSystem {
@@ -109,9 +110,12 @@ impl ExtFileSystem {
             return Err("Malformed ext superblock: inodes or blocks count is zero");
         }
 
-        if sb.s_inodes_count > sb.s_inodes_per_group {
-            return Err("Multi-group ext filesystems are not supported");
-        }
+        let blocks_per_group = sb.s_blocks_per_group;
+        let num_groups = core::cmp::max(
+            1,
+            ((sb.s_blocks_count - sb.s_first_data_block + blocks_per_group - 1) / blocks_per_group)
+                as usize,
+        );
 
         let block_size = 1024 << s_log_block_size;
         let inode_size = s_inode_size;
@@ -127,252 +131,170 @@ impl ExtFileSystem {
 
         // Read Group Descriptor Table
         let gdt_block = if block_size == 1024 { 2 } else { 1 };
-        let mut gdt_buf = ::alloc::vec![0u8; block_size as usize];
-        read_blocks(&*device, gdt_block, &mut gdt_buf, block_size)?;
+        let gd_size = core::mem::size_of::<GroupDescriptor>();
+        let gdt_size = num_groups * gd_size;
+        let gdt_blocks = (gdt_size + block_size as usize - 1) / block_size as usize;
+        let mut gds = Vec::with_capacity(num_groups);
 
-        // SAFETY: gdt_buf contains at least 32 bytes read from the block device, which is valid for GroupDescriptor.
-        let mut gd =
-            unsafe { core::ptr::read_unaligned(gdt_buf.as_ptr() as *const GroupDescriptor) };
-
-        // Validate GDT offsets are within filesystem bounds
-        if gd.bg_block_bitmap >= sb.s_blocks_count
-            || gd.bg_inode_bitmap >= sb.s_blocks_count
-            || gd.bg_inode_table >= sb.s_blocks_count
-        {
-            return Err("Metadata blocks exceed filesystem blocks count");
-        }
-
-        // Self-healing bitmaps check on mount
-        let mut block_bitmap = ::alloc::vec![0u8; block_size as usize];
-        read_blocks(
-            &*device,
-            gd.bg_block_bitmap as u64,
-            &mut block_bitmap,
-            block_size,
-        )?;
-        let mut inode_bitmap = ::alloc::vec![0u8; block_size as usize];
-        read_blocks(
-            &*device,
-            gd.bg_inode_bitmap as u64,
-            &mut inode_bitmap,
-            block_size,
-        )?;
-
-        let mut block_bitmap_changed = false;
-        if block_bitmap.iter().all(|&x| x == 0) {
-            kprintln!("[ext] Block bitmap is all zeros, healing...");
-            block_bitmap[0] = 0xFF;
-            block_bitmap[1] = 0xFF;
-            block_bitmap[2] = 0xFF;
-            block_bitmap[3] = 0xFF;
-            block_bitmap[4] = 0x03; // 34 blocks total
-            write_blocks(
+        let mut gdt_buf = ::alloc::vec![0u8; gdt_blocks * block_size as usize];
+        for b in 0..gdt_blocks {
+            let offset = b * block_size as usize;
+            read_blocks(
                 &*device,
-                gd.bg_block_bitmap as u64,
-                &block_bitmap,
+                (gdt_block + b) as u64,
+                &mut gdt_buf[offset..(offset + block_size as usize)],
                 block_size,
             )?;
-            block_bitmap_changed = true;
         }
 
-        let mut inode_bitmap_changed = false;
-        if inode_bitmap.iter().all(|&x| x == 0) {
-            kprintln!("[ext] Inode bitmap is all zeros, healing...");
-            inode_bitmap[0] = 0xFF;
-            inode_bitmap[1] = 0x7F; // 15 inodes total
-            write_blocks(
-                &*device,
-                gd.bg_inode_bitmap as u64,
-                &inode_bitmap,
-                block_size,
-            )?;
-            inode_bitmap_changed = true;
-        }
-
-        if block_bitmap_changed || inode_bitmap_changed {
-            let free_b = count_free_bits(&block_bitmap, sb.s_blocks_count);
-            let free_i = count_free_bits(&inode_bitmap, sb.s_inodes_count);
-            sb.s_free_blocks_count = free_b;
-            sb.s_free_inodes_count = free_i;
-            gd.bg_free_blocks_count = free_b as u16;
-            gd.bg_free_inodes_count = free_i as u16;
-
-            // Write superblock back
-            let sb_ptr = &sb as *const Superblock as *const u8;
-            let mut sb_buf_write = [0u8; 1024];
-            // SAFETY: sb is stack-allocated, and sb_buf_write is 1024 bytes, copy is within bounds.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    sb_ptr,
-                    sb_buf_write.as_mut_ptr(),
-                    core::mem::size_of::<Superblock>(),
-                );
-            }
-            device
-                .write_block(2, &sb_buf_write[0..512])
-                .map_err(|_| "Error writing superblock low")?;
-            device
-                .write_block(3, &sb_buf_write[512..1024])
-                .map_err(|_| "Error writing superblock high")?;
-
-            // Write gd back
-            let gd_size = core::mem::size_of::<GroupDescriptor>();
-            let src_ptr = &gd as *const GroupDescriptor as *const u8;
-            // SAFETY: gd is stack-allocated, and gdt_buf has size equal to block_size which is at least gd_size.
-            unsafe {
-                core::ptr::copy_nonoverlapping(src_ptr, gdt_buf.as_mut_ptr(), gd_size);
-            }
-            write_blocks(&*device, gdt_block, &gdt_buf, block_size)?;
-        }
-
-        // --- Consistency Check and Self-Healing (FSCK) ---
-        let mut calc_block_bitmap = ::alloc::vec![0u8; block_size as usize];
-        let mut calc_inode_bitmap = ::alloc::vec![0u8; block_size as usize];
-
-        // 1. Mark reserved metadata blocks as allocated
-        let it_blocks = match (s_inodes_per_group as u64).checked_mul(s_inode_size as u64) {
-            Some(prod) => ((prod + block_size as u64 - 1) / block_size as u64) as u32,
-            None => return Err("Overflow in metadata size calculation"),
-        };
-        let reserved_blocks_count = match (gd.bg_inode_table as u32).checked_add(it_blocks) {
-            Some(count) => count,
-            None => return Err("Overflow in reserved blocks count calculation"),
-        };
-        if reserved_blocks_count > sb.s_blocks_count {
-            return Err("Reserved metadata block count exceeds total block count");
-        }
-        for b in 0..reserved_blocks_count {
-            let byte = (b / 8) as usize;
-            let bit = b % 8;
-            if byte < calc_block_bitmap.len() {
-                calc_block_bitmap[byte] |= 1 << bit;
-            }
-        }
-
-        // 2. Mark reserved inodes (1 to 10) as allocated
-        for i in 0..10 {
-            let byte = (i / 8) as usize;
-            let bit = i % 8;
-            calc_inode_bitmap[byte] |= 1 << bit;
-        }
-
-        // 3. Scan all inodes from 2 to sb.s_inodes_count
-        let table_block = gd.bg_inode_table as u64;
-        let mut block_cache_idx = 0u64;
-        let mut block_cache_buf = ::alloc::vec![0u8; block_size as usize];
-
-        for ino in 2..=sb.s_inodes_count {
-            let index = (ino - 1) % s_inodes_per_group;
-            let inode_offset_in_table = (index * s_inode_size as u32) as u64;
-            let logical_block = table_block + (inode_offset_in_table / block_size as u64);
-            let offset_in_block = (inode_offset_in_table % block_size as u64) as usize;
-
-            if block_cache_idx != logical_block {
-                read_blocks(&*device, logical_block, &mut block_cache_buf, block_size)?;
-                block_cache_idx = logical_block;
-            }
-
-            // SAFETY: block_cache_buf has size block_size, offset_in_block is within bounds, and raw inode layout matches ExtRawInode structure.
-            let raw_inode = unsafe {
-                core::ptr::read_unaligned(
-                    block_cache_buf[offset_in_block..].as_ptr() as *const ExtRawInode
-                )
+        for i in 0..num_groups {
+            let gd_offset = i * gd_size;
+            // SAFETY: gdt_buf contains at least gd_offset + gd_size bytes read from the block device, which is valid for GroupDescriptor.
+            let gd = unsafe {
+                core::ptr::read_unaligned(gdt_buf[gd_offset..].as_ptr() as *const GroupDescriptor)
             };
 
-            if raw_inode.i_links_count > 0 {
-                // Mark inode as allocated
-                let i_idx = ino - 1;
-                let byte = (i_idx / 8) as usize;
-                let bit = i_idx % 8;
-                if byte < calc_inode_bitmap.len() {
-                    calc_inode_bitmap[byte] |= 1 << bit;
-                }
-
-                // Trace block pointers
-                for file_block in 0..12 {
-                    let block_num = raw_inode.i_block[file_block];
-                    if block_num != 0 && block_num < sb.s_blocks_count {
-                        let byte = (block_num / 8) as usize;
-                        let bit = block_num % 8;
-                        if byte < calc_block_bitmap.len() {
-                            calc_block_bitmap[byte] |= 1 << bit;
-                        }
-                    }
-                }
-
-                let sib = raw_inode.i_block[12];
-                if sib != 0 && sib < sb.s_blocks_count {
-                    // Mark indirect block as allocated
-                    let sib_byte = (sib / 8) as usize;
-                    let sib_bit = sib % 8;
-                    if sib_byte < calc_block_bitmap.len() {
-                        calc_block_bitmap[sib_byte] |= 1 << sib_bit;
-                    }
-
-                    // Read indirect block and trace its pointers
-                    let mut ind_buf = ::alloc::vec![0u8; block_size as usize];
-                    if read_blocks(&*device, sib as u64, &mut ind_buf, block_size).is_ok() {
-                        let refs_per_block = block_size / 4;
-                        for r in 0..refs_per_block {
-                            let ptr_offset = (r * 4) as usize;
-                            let phys_block = u32::from_le_bytes([
-                                ind_buf[ptr_offset],
-                                ind_buf[ptr_offset + 1],
-                                ind_buf[ptr_offset + 2],
-                                ind_buf[ptr_offset + 3],
-                            ]);
-                            if phys_block != 0 && phys_block < sb.s_blocks_count {
-                                let byte = (phys_block / 8) as usize;
-                                let bit = phys_block % 8;
-                                if byte < calc_block_bitmap.len() {
-                                    calc_block_bitmap[byte] |= 1 << bit;
-                                }
-                            }
-                        }
-                    }
-                }
+            // Validate GDT offsets are within filesystem bounds
+            if gd.bg_block_bitmap >= sb.s_blocks_count
+                || gd.bg_inode_bitmap >= sb.s_blocks_count
+                || gd.bg_inode_table >= sb.s_blocks_count
+            {
+                return Err("Metadata blocks exceed filesystem blocks count");
             }
+            gds.push(gd);
         }
 
-        // 4. Compare bitmaps and self-heal if necessary
-        let mut mismatch = false;
-        for i in 0..block_size as usize {
-            if block_bitmap[i] != calc_block_bitmap[i] {
-                mismatch = true;
-                break;
-            }
-        }
-        if !mismatch {
-            for i in 0..block_size as usize {
-                if inode_bitmap[i] != calc_inode_bitmap[i] {
-                    mismatch = true;
-                    break;
-                }
-            }
-        }
-
-        if mismatch {
-            kprintln!("[ext] Integrity mismatch found. Self-healing filesystem metadata...");
-
-            write_blocks(
+        // --- Self-healing bitmaps check on mount ---
+        let mut bitmap_healed = false;
+        for g in 0..num_groups {
+            let gd = &mut gds[g];
+            let mut block_bitmap = ::alloc::vec![0u8; block_size as usize];
+            read_blocks(
                 &*device,
                 gd.bg_block_bitmap as u64,
-                &calc_block_bitmap,
+                &mut block_bitmap,
                 block_size,
             )?;
-            write_blocks(
+            let mut inode_bitmap = ::alloc::vec![0u8; block_size as usize];
+            read_blocks(
                 &*device,
                 gd.bg_inode_bitmap as u64,
-                &calc_inode_bitmap,
+                &mut inode_bitmap,
                 block_size,
             )?;
 
-            let free_b = count_free_bits(&calc_block_bitmap, sb.s_blocks_count);
-            let free_i = count_free_bits(&calc_inode_bitmap, sb.s_inodes_count);
-            sb.s_free_blocks_count = free_b;
-            sb.s_free_inodes_count = free_i;
-            gd.bg_free_blocks_count = free_b as u16;
-            gd.bg_free_inodes_count = free_i as u16;
+            let mut block_bitmap_changed = false;
+            if block_bitmap.iter().all(|&x| x == 0) {
+                kprintln!(
+                    "[ext] Block bitmap for group {} is all zeros, healing...",
+                    g
+                );
+                // Mark metadata blocks for this group as allocated in the bitmap
+                let it_blocks = match (s_inodes_per_group as u64).checked_mul(s_inode_size as u64) {
+                    Some(prod) => ((prod + block_size as u64 - 1) / block_size as u64) as u32,
+                    None => return Err("Overflow in metadata size calculation"),
+                };
+                let start_block = (g as u32) * blocks_per_group + sb.s_first_data_block;
+                let end_block =
+                    core::cmp::min(gd.bg_inode_table as u32 + it_blocks, sb.s_blocks_count);
+                for b in start_block..end_block {
+                    let local_b = b - start_block;
+                    let byte = (local_b / 8) as usize;
+                    let bit = local_b % 8;
+                    if byte < block_bitmap.len() {
+                        block_bitmap[byte] |= 1 << bit;
+                    }
+                }
+
+                // Initialize padding bits for block bitmap
+                let group_blocks = if g == num_groups - 1 {
+                    sb.s_blocks_count - sb.s_first_data_block - (g as u32) * blocks_per_group
+                } else {
+                    blocks_per_group
+                };
+                for b in group_blocks..((block_size * 8) as u32) {
+                    let byte = (b / 8) as usize;
+                    let bit = b % 8;
+                    if byte < block_bitmap.len() {
+                        block_bitmap[byte] |= 1 << bit;
+                    }
+                }
+
+                write_blocks(
+                    &*device,
+                    gd.bg_block_bitmap as u64,
+                    &block_bitmap,
+                    block_size,
+                )?;
+                block_bitmap_changed = true;
+            }
+
+            let mut inode_bitmap_changed = false;
+            if inode_bitmap.iter().all(|&x| x == 0) {
+                kprintln!(
+                    "[ext] Inode bitmap for group {} is all zeros, healing...",
+                    g
+                );
+                let start_ino = if g == 0 { 10 } else { 0 }; // reserve first 10 inodes in group 0
+                for i in 0..start_ino {
+                    let byte = (i / 8) as usize;
+                    let bit = i % 8;
+                    if byte < inode_bitmap.len() {
+                        inode_bitmap[byte] |= 1 << bit;
+                    }
+                }
+
+                // Initialize padding bits for inode bitmap
+                let group_inodes = if g == num_groups - 1 {
+                    sb.s_inodes_count - (g as u32) * s_inodes_per_group
+                } else {
+                    s_inodes_per_group
+                };
+                for i in group_inodes..((block_size * 8) as u32) {
+                    let byte = (i / 8) as usize;
+                    let bit = i % 8;
+                    if byte < inode_bitmap.len() {
+                        inode_bitmap[byte] |= 1 << bit;
+                    }
+                }
+
+                write_blocks(
+                    &*device,
+                    gd.bg_inode_bitmap as u64,
+                    &inode_bitmap,
+                    block_size,
+                )?;
+                inode_bitmap_changed = true;
+            }
+
+            if block_bitmap_changed || inode_bitmap_changed {
+                let group_blocks = if g == num_groups - 1 {
+                    sb.s_blocks_count - sb.s_first_data_block - (g as u32) * blocks_per_group
+                } else {
+                    blocks_per_group
+                };
+                let group_inodes = if g == num_groups - 1 {
+                    sb.s_inodes_count - (g as u32) * s_inodes_per_group
+                } else {
+                    s_inodes_per_group
+                };
+                let free_b = count_free_bits(&block_bitmap, group_blocks);
+                let free_i = count_free_bits(&inode_bitmap, group_inodes);
+                gd.bg_free_blocks_count = free_b as u16;
+                gd.bg_free_inodes_count = free_i as u16;
+                bitmap_healed = true;
+            }
+        }
+
+        if bitmap_healed {
+            let mut total_free_blocks = 0u32;
+            let mut total_free_inodes = 0u32;
+            for g in 0..num_groups {
+                total_free_blocks += gds[g].bg_free_blocks_count as u32;
+                total_free_inodes += gds[g].bg_free_inodes_count as u32;
+            }
+            sb.s_free_blocks_count = total_free_blocks;
+            sb.s_free_inodes_count = total_free_inodes;
 
             // Write superblock back
             let sb_ptr = &sb as *const Superblock as *const u8;
@@ -393,19 +315,372 @@ impl ExtFileSystem {
                 .map_err(|_| "Error writing superblock high")?;
 
             // Write gd back
-            let gd_size = core::mem::size_of::<GroupDescriptor>();
-            let src_ptr = &gd as *const GroupDescriptor as *const u8;
-            // SAFETY: gd is stack-allocated, and gdt_buf has size equal to block_size which is at least gd_size.
-            unsafe {
-                core::ptr::copy_nonoverlapping(src_ptr, gdt_buf.as_mut_ptr(), gd_size);
+            let mut gdt_buf_write = ::alloc::vec![0u8; gdt_blocks * block_size as usize];
+            for g in 0..num_groups {
+                let gd_offset = g * gd_size;
+                let src_ptr = &gds[g] as *const GroupDescriptor as *const u8;
+                // SAFETY: source is &gds[g], destination is inside gdt_buf_write, copy size is gd_size.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src_ptr,
+                        gdt_buf_write.as_mut_ptr().add(gd_offset),
+                        gd_size,
+                    );
+                }
             }
-            write_blocks(&*device, gdt_block, &gdt_buf, block_size)?;
+            for b in 0..gdt_blocks {
+                let offset = b * block_size as usize;
+                write_blocks(
+                    &*device,
+                    (gdt_block + b) as u64,
+                    &gdt_buf_write[offset..(offset + block_size as usize)],
+                    block_size,
+                )?;
+            }
+        }
+
+        // --- Consistency Check and Self-Healing (FSCK) ---
+        let mut calc_block_bitmaps =
+            ::alloc::vec![::alloc::vec![0u8; block_size as usize]; num_groups];
+        let mut calc_inode_bitmaps =
+            ::alloc::vec![::alloc::vec![0u8; block_size as usize]; num_groups];
+
+        let it_blocks = match (s_inodes_per_group as u64).checked_mul(s_inode_size as u64) {
+            Some(prod) => ((prod + block_size as u64 - 1) / block_size as u64) as u32,
+            None => return Err("Overflow in metadata size calculation"),
+        };
+
+        // 1. Mark reserved metadata blocks as allocated
+        for g in 0..num_groups {
+            let start_block = (g as u32) * blocks_per_group + sb.s_first_data_block;
+            let end_block =
+                core::cmp::min(gds[g].bg_inode_table as u32 + it_blocks, sb.s_blocks_count);
+            for b in start_block..end_block {
+                let local_b = b - start_block;
+                let byte = (local_b / 8) as usize;
+                let bit = local_b % 8;
+                if byte < calc_block_bitmaps[g].len() {
+                    calc_block_bitmaps[g][byte] |= 1 << bit;
+                }
+            }
+        }
+
+        // 2. Mark reserved inodes (1 to 10) in group 0 as allocated
+        for i in 0..10 {
+            let byte = (i / 8) as usize;
+            let bit = i % 8;
+            calc_inode_bitmaps[0][byte] |= 1 << bit;
+        }
+
+        // 3. Scan all inodes from 2 to sb.s_inodes_count
+        let mut block_cache_idx = 0u64;
+        let mut block_cache_buf = ::alloc::vec![0u8; block_size as usize];
+
+        for ino in 2..=sb.s_inodes_count {
+            let group = ((ino - 1) / s_inodes_per_group) as usize;
+            let index = (ino - 1) % s_inodes_per_group;
+            if group >= num_groups {
+                break;
+            }
+            let table_block = gds[group].bg_inode_table as u64;
+            let inode_offset_in_table = (index * s_inode_size as u32) as u64;
+            let logical_block = table_block + (inode_offset_in_table / block_size as u64);
+            let offset_in_block = (inode_offset_in_table % block_size as u64) as usize;
+
+            if block_cache_idx != logical_block {
+                read_blocks(&*device, logical_block, &mut block_cache_buf, block_size)?;
+                block_cache_idx = logical_block;
+            }
+
+            // SAFETY: block_cache_buf has size block_size, offset_in_block is within bounds, and raw inode layout matches ExtRawInode structure.
+            let raw_inode = unsafe {
+                core::ptr::read_unaligned(
+                    block_cache_buf[offset_in_block..].as_ptr() as *const ExtRawInode
+                )
+            };
+
+            if raw_inode.i_links_count > 0 {
+                // Mark inode as allocated
+                let i_idx = (ino - 1) % s_inodes_per_group;
+                let byte = (i_idx / 8) as usize;
+                let bit = i_idx % 8;
+                if byte < calc_inode_bitmaps[group].len() {
+                    calc_inode_bitmaps[group][byte] |= 1 << bit;
+                }
+
+                // Trace block pointers
+                for file_block in 0..12 {
+                    let block_num = raw_inode.i_block[file_block];
+                    if block_num != 0 && block_num < sb.s_blocks_count {
+                        let b_group =
+                            ((block_num - sb.s_first_data_block) / blocks_per_group) as usize;
+                        let local_b = (block_num - sb.s_first_data_block) % blocks_per_group;
+                        let byte = (local_b / 8) as usize;
+                        let bit = local_b % 8;
+                        if b_group < num_groups && byte < calc_block_bitmaps[b_group].len() {
+                            calc_block_bitmaps[b_group][byte] |= 1 << bit;
+                        }
+                    }
+                }
+
+                let sib = raw_inode.i_block[12];
+                if sib != 0 && sib < sb.s_blocks_count {
+                    // Mark indirect block as allocated
+                    let sib_group = ((sib - sb.s_first_data_block) / blocks_per_group) as usize;
+                    let sib_local = (sib - sb.s_first_data_block) % blocks_per_group;
+                    let sib_byte = (sib_local / 8) as usize;
+                    let sib_bit = sib_local % 8;
+                    if sib_group < num_groups && sib_byte < calc_block_bitmaps[sib_group].len() {
+                        calc_block_bitmaps[sib_group][sib_byte] |= 1 << sib_bit;
+                    }
+
+                    // Read indirect block and trace its pointers
+                    let mut ind_buf = ::alloc::vec![0u8; block_size as usize];
+                    if read_blocks(&*device, sib as u64, &mut ind_buf, block_size).is_ok() {
+                        let refs_per_block = block_size / 4;
+                        for r in 0..refs_per_block {
+                            let ptr_offset = (r * 4) as usize;
+                            let phys_block = u32::from_le_bytes([
+                                ind_buf[ptr_offset],
+                                ind_buf[ptr_offset + 1],
+                                ind_buf[ptr_offset + 2],
+                                ind_buf[ptr_offset + 3],
+                            ]);
+                            if phys_block != 0 && phys_block < sb.s_blocks_count {
+                                let b_group = ((phys_block - sb.s_first_data_block)
+                                    / blocks_per_group)
+                                    as usize;
+                                let local_b =
+                                    (phys_block - sb.s_first_data_block) % blocks_per_group;
+                                let byte = (local_b / 8) as usize;
+                                let bit = local_b % 8;
+                                if b_group < num_groups && byte < calc_block_bitmaps[b_group].len()
+                                {
+                                    calc_block_bitmaps[b_group][byte] |= 1 << bit;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let dib = raw_inode.i_block[13];
+                if dib != 0 && dib < sb.s_blocks_count {
+                    // Mark double indirect block as allocated
+                    let dib_group = ((dib - sb.s_first_data_block) / blocks_per_group) as usize;
+                    let dib_local = (dib - sb.s_first_data_block) % blocks_per_group;
+                    let dib_byte = (dib_local / 8) as usize;
+                    let dib_bit = dib_local % 8;
+                    if dib_group < num_groups && dib_byte < calc_block_bitmaps[dib_group].len() {
+                        calc_block_bitmaps[dib_group][dib_byte] |= 1 << dib_bit;
+                    }
+
+                    // Read double indirect block and trace its single indirect blocks
+                    let mut dib_buf = ::alloc::vec![0u8; block_size as usize];
+                    if read_blocks(&*device, dib as u64, &mut dib_buf, block_size).is_ok() {
+                        let refs_per_block = block_size / 4;
+                        for i in 0..refs_per_block {
+                            let ptr_offset = (i * 4) as usize;
+                            let sib = u32::from_le_bytes([
+                                dib_buf[ptr_offset],
+                                dib_buf[ptr_offset + 1],
+                                dib_buf[ptr_offset + 2],
+                                dib_buf[ptr_offset + 3],
+                            ]);
+                            if sib != 0 && sib < sb.s_blocks_count {
+                                // Mark indirect block as allocated
+                                let sib_group =
+                                    ((sib - sb.s_first_data_block) / blocks_per_group) as usize;
+                                let sib_local = (sib - sb.s_first_data_block) % blocks_per_group;
+                                let sib_byte = (sib_local / 8) as usize;
+                                let sib_bit = sib_local % 8;
+                                if sib_group < num_groups
+                                    && sib_byte < calc_block_bitmaps[sib_group].len()
+                                {
+                                    calc_block_bitmaps[sib_group][sib_byte] |= 1 << sib_bit;
+                                }
+
+                                // Read indirect block and trace its pointers
+                                let mut ind_buf = ::alloc::vec![0u8; block_size as usize];
+                                if read_blocks(&*device, sib as u64, &mut ind_buf, block_size)
+                                    .is_ok()
+                                {
+                                    for r in 0..refs_per_block {
+                                        let ptr_offset2 = (r * 4) as usize;
+                                        let phys_block = u32::from_le_bytes([
+                                            ind_buf[ptr_offset2],
+                                            ind_buf[ptr_offset2 + 1],
+                                            ind_buf[ptr_offset2 + 2],
+                                            ind_buf[ptr_offset2 + 3],
+                                        ]);
+                                        if phys_block != 0 && phys_block < sb.s_blocks_count {
+                                            let b_group = ((phys_block - sb.s_first_data_block)
+                                                / blocks_per_group)
+                                                as usize;
+                                            let local_b = (phys_block - sb.s_first_data_block)
+                                                % blocks_per_group;
+                                            let byte = (local_b / 8) as usize;
+                                            let bit = local_b % 8;
+                                            if b_group < num_groups
+                                                && byte < calc_block_bitmaps[b_group].len()
+                                            {
+                                                calc_block_bitmaps[b_group][byte] |= 1 << bit;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Initialize padding bits for calculated bitmaps
+        for g in 0..num_groups {
+            let group_blocks = if g == num_groups - 1 {
+                sb.s_blocks_count - sb.s_first_data_block - (g as u32) * blocks_per_group
+            } else {
+                blocks_per_group
+            };
+            for b in group_blocks..((block_size * 8) as u32) {
+                let byte = (b / 8) as usize;
+                let bit = b % 8;
+                if byte < calc_block_bitmaps[g].len() {
+                    calc_block_bitmaps[g][byte] |= 1 << bit;
+                }
+            }
+
+            let group_inodes = if g == num_groups - 1 {
+                sb.s_inodes_count - (g as u32) * s_inodes_per_group
+            } else {
+                s_inodes_per_group
+            };
+            for i in group_inodes..((block_size * 8) as u32) {
+                let byte = (i / 8) as usize;
+                let bit = i % 8;
+                if byte < calc_inode_bitmaps[g].len() {
+                    calc_inode_bitmaps[g][byte] |= 1 << bit;
+                }
+            }
+        }
+
+        // 4. Compare bitmaps and self-heal if necessary
+        let mut mismatch = false;
+        for g in 0..num_groups {
+            let gd = &gds[g];
+            let mut block_bitmap = ::alloc::vec![0u8; block_size as usize];
+            read_blocks(
+                &*device,
+                gd.bg_block_bitmap as u64,
+                &mut block_bitmap,
+                block_size,
+            )?;
+            if block_bitmap != calc_block_bitmaps[g] {
+                mismatch = true;
+                break;
+            }
+
+            let mut inode_bitmap = ::alloc::vec![0u8; block_size as usize];
+            read_blocks(
+                &*device,
+                gd.bg_inode_bitmap as u64,
+                &mut inode_bitmap,
+                block_size,
+            )?;
+            if inode_bitmap != calc_inode_bitmaps[g] {
+                mismatch = true;
+                break;
+            }
+        }
+
+        if mismatch {
+            kprintln!("[ext] Integrity mismatch found. Self-healing filesystem metadata...");
+
+            let mut total_free_blocks = 0u32;
+            let mut total_free_inodes = 0u32;
+
+            for g in 0..num_groups {
+                let gd = &mut gds[g];
+                write_blocks(
+                    &*device,
+                    gd.bg_block_bitmap as u64,
+                    &calc_block_bitmaps[g],
+                    block_size,
+                )?;
+                write_blocks(
+                    &*device,
+                    gd.bg_inode_bitmap as u64,
+                    &calc_inode_bitmaps[g],
+                    block_size,
+                )?;
+
+                let group_blocks = if g == num_groups - 1 {
+                    sb.s_blocks_count - sb.s_first_data_block - (g as u32) * blocks_per_group
+                } else {
+                    blocks_per_group
+                };
+                let group_inodes = if g == num_groups - 1 {
+                    sb.s_inodes_count - (g as u32) * s_inodes_per_group
+                } else {
+                    s_inodes_per_group
+                };
+
+                let free_b = count_free_bits(&calc_block_bitmaps[g], group_blocks);
+                let free_i = count_free_bits(&calc_inode_bitmaps[g], group_inodes);
+                gd.bg_free_blocks_count = free_b as u16;
+                gd.bg_free_inodes_count = free_i as u16;
+
+                total_free_blocks += free_b;
+                total_free_inodes += free_i;
+            }
+
+            sb.s_free_blocks_count = total_free_blocks;
+            sb.s_free_inodes_count = total_free_inodes;
+
+            // Write superblock back
+            let sb_ptr = &sb as *const Superblock as *const u8;
+            let mut sb_buf_write = [0u8; 1024];
+            // SAFETY: sb is stack-allocated, sb_buf_write is 1024 bytes, copy is within bounds.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    sb_ptr,
+                    sb_buf_write.as_mut_ptr(),
+                    core::mem::size_of::<Superblock>(),
+                );
+            }
+            device
+                .write_block(2, &sb_buf_write[0..512])
+                .map_err(|_| "Error writing superblock low")?;
+            device
+                .write_block(3, &sb_buf_write[512..1024])
+                .map_err(|_| "Error writing superblock high")?;
+
+            // Write gd back
+            let mut gdt_buf_write = ::alloc::vec![0u8; gdt_blocks * block_size as usize];
+            for g in 0..num_groups {
+                let gd_offset = g * gd_size;
+                let src_ptr = &gds[g] as *const GroupDescriptor as *const u8;
+                // SAFETY: source is &gds[g], destination is inside gdt_buf_write, copy size is gd_size.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src_ptr,
+                        gdt_buf_write.as_mut_ptr().add(gd_offset),
+                        gd_size,
+                    );
+                }
+            }
+            for b in 0..gdt_blocks {
+                let offset = b * block_size as usize;
+                write_blocks(
+                    &*device,
+                    (gdt_block + b) as u64,
+                    &gdt_buf_write[offset..(offset + block_size as usize)],
+                    block_size,
+                )?;
+            }
         } else {
             kprintln!("[ext] Filesystem consistency check succeeded. No corruption detected.");
         }
-
-        let mut group_descriptors = Vec::new();
-        group_descriptors.push(gd);
 
         let fs = Arc::new(Self {
             device: device.clone(),
@@ -413,9 +688,9 @@ impl ExtFileSystem {
             inodes_per_block,
             inodes_per_group,
             inode_size,
-            superblock: Mutex::new(sb),
-            group_descriptors: Mutex::new(group_descriptors),
-            root_node: Mutex::new(None),
+            superblock: TicketLock::new(sb),
+            group_descriptors: TicketLock::new(gds),
+            root_node: TicketLock::new(None),
         });
 
         // Parse JBD2 Journal if HAS_JOURNAL feature is set
@@ -520,8 +795,8 @@ impl ExtFileSystem {
         Ok(ExtInode {
             fs: self.clone(),
             ino,
-            raw: Mutex::new(raw_inode),
-            vfs_inode: Mutex::new(inode),
+            raw: TicketLock::new(raw_inode),
+            vfs_inode: TicketLock::new(inode),
         })
     }
 
@@ -558,23 +833,29 @@ impl ExtFileSystem {
         let block_size = self.block_size;
         let gdt_block = if block_size == 1024 { 2 } else { 1 };
 
-        let mut gdt_buf = ::alloc::vec![0u8; block_size as usize];
         let gd_size = core::mem::size_of::<GroupDescriptor>();
+        let gdt_size = gds.len() * gd_size;
+        let gdt_blocks = (gdt_size + block_size as usize - 1) / block_size as usize;
+
+        let mut gdt_buf = ::alloc::vec![0u8; gdt_blocks * block_size as usize];
         for (i, gd) in gds.iter().enumerate() {
             let offset = i * gd_size;
-            if offset + gd_size <= block_size as usize {
-                let src_ptr = gd as *const GroupDescriptor as *const u8;
-                // SAFETY: gd is valid for reading, gdt_buf is block_size bytes, copy is within bounds.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        src_ptr,
-                        gdt_buf.as_mut_ptr().add(offset),
-                        gd_size,
-                    );
-                }
+            let src_ptr = gd as *const GroupDescriptor as *const u8;
+            // SAFETY: gd is valid for reading, offset + gd_size is within gdt_buf bounds since gdt_buf size is gdt_blocks * block_size.
+            unsafe {
+                core::ptr::copy_nonoverlapping(src_ptr, gdt_buf.as_mut_ptr().add(offset), gd_size);
             }
         }
-        write_blocks(&*self.device, gdt_block, &gdt_buf, block_size)?;
+
+        for b in 0..gdt_blocks {
+            let offset = b * block_size as usize;
+            write_blocks(
+                &*self.device,
+                (gdt_block + b) as u64,
+                &gdt_buf[offset..(offset + block_size as usize)],
+                block_size,
+            )?;
+        }
         Ok(())
     }
 }
@@ -583,8 +864,8 @@ impl ExtFileSystem {
 pub struct ExtInode {
     pub(crate) fs: Arc<ExtFileSystem>,
     pub(crate) ino: u32,
-    pub(crate) raw: Mutex<ExtRawInode>,
-    pub(crate) vfs_inode: Mutex<Inode>,
+    pub(crate) raw: TicketLock<ExtRawInode>,
+    pub(crate) vfs_inode: TicketLock<Inode>,
 }
 
 impl InodeOps for ExtInode {

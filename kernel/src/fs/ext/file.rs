@@ -12,6 +12,11 @@ impl ExtInode {
         i_block: &[u32; 15],
         file_block: u32,
     ) -> Result<u32, &'static str> {
+        crate::kprintln!(
+            "[resolve_extent_block] ino={}, file_block={}",
+            self.ino,
+            file_block
+        );
         let mut root_buf = [0u8; 60];
         for i in 0..15 {
             root_buf[i * 4..i * 4 + 4].copy_from_slice(&i_block[i].to_le_bytes());
@@ -20,6 +25,10 @@ impl ExtInode {
         let mut current_buf = root_buf.to_vec();
 
         loop {
+            crate::kprintln!(
+                "[resolve_extent_block] loop offset, buf len={}",
+                current_buf.len()
+            );
             if current_buf.len() < 12 {
                 return Err("Extent buffer too small for header");
             }
@@ -27,12 +36,22 @@ impl ExtInode {
             let header = unsafe {
                 core::ptr::read_unaligned(current_buf.as_ptr() as *const Ext4ExtentHeader)
             };
-            if header.eh_magic != 0xF30A {
+            let eh_magic = header.eh_magic;
+            let eh_depth = header.eh_depth;
+            let eh_entries = header.eh_entries;
+            crate::kprintln!(
+                "[resolve_extent_block] magic={:#x}, depth={}, entries={}, bytes=[{:02x}, {:02x}, {:02x}, {:02x}, {:02x}, {:02x}, {:02x}, {:02x}]",
+                eh_magic,
+                eh_depth,
+                eh_entries,
+                current_buf[0], current_buf[1], current_buf[2], current_buf[3],
+                current_buf[4], current_buf[5], current_buf[6], current_buf[7]
+            );
+            if eh_magic != 0xF30A {
                 return Err("Invalid extent header magic");
             }
 
-            let eh_entries = header.eh_entries as usize;
-            let eh_depth = header.eh_depth;
+            let eh_entries = eh_entries as usize;
 
             if eh_depth == 0 {
                 // Leaf node. Followed by leaf entries.
@@ -85,6 +104,13 @@ impl ExtInode {
 
                 if let Some(best) = best_idx {
                     let child_block = ((best.ei_leaf_hi as u64) << 32) | (best.ei_leaf_lo as u64);
+                    let best_ei_block = best.ei_block;
+                    crate::kprintln!(
+                        "[resolve_extent_block] depth={}, ei_block={}, child_block={}",
+                        eh_depth,
+                        best_ei_block,
+                        child_block
+                    );
                     let mut next_buf = alloc::vec![0u8; self.fs.block_size as usize];
                     read_blocks(
                         &*self.fs.device,

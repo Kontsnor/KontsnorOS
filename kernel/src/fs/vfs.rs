@@ -57,7 +57,14 @@ pub trait FileSystem: Send + Sync {
 
     /// Get filesystem statistics.
     fn statfs(&self) -> FsStats {
-        FsStats::default()
+        FsStats {
+            total_blocks: 1024 * 1024, // 4GB with 4KB block size
+            free_blocks: 512 * 1024,
+            total_inodes: 1024 * 1024,
+            free_inodes: 512 * 1024,
+            block_size: 4096,
+            max_name_len: 255,
+        }
     }
 }
 
@@ -288,6 +295,11 @@ pub fn lookup(path: &str) -> Option<Arc<dyn InodeOps>> {
 /// Lookup an inode by path, optionally following symlinks.
 pub fn lookup_follow(path: &str, follow_last: bool) -> Option<Arc<dyn InodeOps>> {
     VFS.read().as_ref()?.lookup_follow(path, follow_last)
+}
+
+/// Find the filesystem that handles the given path.
+pub fn resolve_mount(path: &str) -> Option<(Arc<dyn FileSystem>, String)> {
+    VFS.read().as_ref()?.resolve_mount(path)
 }
 
 /// Register a filesystem type.

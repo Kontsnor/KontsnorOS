@@ -101,8 +101,19 @@ pub fn current_lapic_id() -> u8 {
 /// This function must not be called from interrupt/exception context as it
 /// can produce a deadlock if another core is also waiting for a TLB shootdown ACK.
 pub fn shootdown_tlb() {
-    let cpu_count = get_cpu_count();
-    if cpu_count > 1 {
+    let mut target_count = 0;
+    {
+        let manager = CPU_MANAGER.lock();
+        for i in 0..manager.count {
+            if let Some(ref cpu) = manager.cpus[i] {
+                if cpu.started && !cpu.is_bsp {
+                    target_count += 1;
+                }
+            }
+        }
+    }
+
+    if target_count > 0 {
         // F-08: Ensure we are not in an interrupt context under SMP
         debug_assert!(
             x86_64::instructions::interrupts::are_enabled(),
@@ -110,8 +121,6 @@ pub fn shootdown_tlb() {
         );
 
         let _lock = TLB_SHOOTDOWN_LOCK.lock();
-
-        let target_count = cpu_count - 1;
         TLB_SHOOTDOWN_ACKS.store(target_count as u32, Ordering::SeqCst);
 
         super::apic::broadcast_ipi_all_excluding_self(36);

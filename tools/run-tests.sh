@@ -31,6 +31,7 @@ qemu-system-x86_64 \
     -serial stdio \
     -display none \
     -m 256M \
+    -smp 4 \
     -cpu qemu64,+fsgsbase \
     -no-reboot
 QEMU_STATUS=$?

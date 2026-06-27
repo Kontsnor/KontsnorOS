@@ -170,6 +170,16 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) {
+    let active_gs = unsafe { x86_64::registers::model_specific::Msr::new(0xC0000101).read() };
+    let swap_needed = (stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3)
+        || (active_gs < 0xFFFF800000000000);
+    if swap_needed {
+        // SAFETY: Swap to kernel GS base if entering from user space or if user GS is active
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        }
+    }
+
     kprintln!("[EXCEPTION] General Protection Fault");
     kprintln!("  Error Code: {:#x}", error_code);
     kprintln!("{:#?}", stack_frame);
@@ -183,6 +193,16 @@ extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) -> ! {
+    let active_gs = unsafe { x86_64::registers::model_specific::Msr::new(0xC0000101).read() };
+    let swap_needed = (stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3)
+        || (active_gs < 0xFFFF800000000000);
+    if swap_needed {
+        // SAFETY: Swap to kernel GS base if entering from user space or if user GS is active
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        }
+    }
+
     kprintln!("[EXCEPTION] DOUBLE FAULT");
     kprintln!("  Error Code: {}", error_code);
     kprintln!("{:#?}", stack_frame);
@@ -193,16 +213,44 @@ extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
+    let active_gs = unsafe { x86_64::registers::model_specific::Msr::new(0xC0000101).read() };
+    let swap_needed = (stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3)
+        || (active_gs < 0xFFFF800000000000);
+    if swap_needed {
+        // SAFETY: Swap to kernel GS base if entering from user space or if user GS is active
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        }
+    }
+
+    page_fault_handler_inner(stack_frame, error_code);
+
+    if swap_needed {
+        // SAFETY: Swap back to user GS base before returning
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        }
+    }
+}
+
+fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFaultErrorCode) {
     use x86_64::registers::control::{Cr2, Cr3};
-    use x86_64::structures::paging::{PageTable, PageTableFlags};
+    use x86_64::structures::paging::{Page, PageTable, PageTableFlags, PhysFrame, Size4KiB};
     use x86_64::{PhysAddr, VirtAddr};
 
     let fault_addr = Cr2::read().unwrap();
+    let is_user = stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3;
 
     // Check if the fault was caused by a write operation
     if error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE) {
         let (pml4_frame, _) = Cr3::read();
         let pml4_phys = pml4_frame.start_address().as_u64();
+
+        // Upgrade intermediate directory flags to WRITABLE | USER_ACCESSIBLE
+        unsafe {
+            crate::memory::r#virtual::ensure_directory_permissions(pml4_phys, fault_addr);
+        }
+
         let phys_mem_offset = crate::memory::r#virtual::phys_mem_offset();
 
         let pml4_virt = VirtAddr::new(pml4_phys + phys_mem_offset);
@@ -313,6 +361,12 @@ extern "x86-interrupt" fn page_fault_handler(
                                                 }
                                             }
                                         }
+                                    } else if flags.contains(PageTableFlags::WRITABLE) {
+                                        // Leaf page is already writable, meaning the write fault occurred because
+                                        // one of the intermediate directory entries was read-only. We have already
+                                        // upgraded them, so the fault is now resolved.
+                                        x86_64::instructions::tlb::flush(fault_addr);
+                                        return;
                                     }
                                 }
                             }
@@ -323,10 +377,156 @@ extern "x86-interrupt" fn page_fault_handler(
         }
     }
 
+    if !error_code.contains(x86_64::structures::idt::PageFaultErrorCode::PROTECTION_VIOLATION) {
+        let resolved = crate::process::scheduler::current_pid()
+            .and_then(|pid| crate::process::scheduler::get_task_arc(pid))
+            .and_then(|task_arc| {
+                let fault_vaddr = fault_addr.as_u64();
+                let task_guard = if !is_user {
+                    task_arc.try_lock()
+                } else {
+                    Some(task_arc.lock())
+                };
+                let (region, page_table_root) = {
+                    let task = task_guard?;
+                    let addr_space = task.address_space.lock();
+
+                    // Find if fault_vaddr falls inside any mapped region
+                    let region_opt = addr_space
+                        .mmap_regions
+                        .iter()
+                        .find(|region| {
+                            fault_vaddr >= region.start
+                                && fault_vaddr < region.start + region.len as u64
+                        })
+                        .cloned();
+                    let pt_root = addr_space.page_table_root;
+                    region_opt.map(|r| (r, pt_root))
+                }?;
+
+                let page_vaddr = fault_vaddr & !4095;
+                let page_offset = page_vaddr - region.start;
+
+                let prot = region.prot;
+                let mut page_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+                if (prot & 2) != 0 {
+                    // PROT_WRITE
+                    page_flags |= PageTableFlags::WRITABLE;
+                }
+                if (prot & 4) == 0 {
+                    // NOT PROT_EXEC
+                    page_flags |= PageTableFlags::NO_EXECUTE;
+                }
+
+                let is_shared = region.is_shared;
+
+                let (phys, do_cow) = match region.inode {
+                    Some(ref inode) => {
+                        let file_offset = region.offset + page_offset;
+                        // File-backed page cache lookup
+                        match crate::memory::page_cache::get_or_create_page(inode, file_offset) {
+                            Ok(p) => {
+                                let cow = !is_shared && (prot & 2) != 0;
+                                (p, cow)
+                            }
+                            Err(_) => {
+                                return Some(Err((-5, page_vaddr))); // EIO
+                            }
+                        }
+                    }
+                    None => {
+                        // Anonymous page frame allocation
+                        match crate::memory::physical::allocate_frame() {
+                            Some(p) => {
+                                // Zero-fill the anonymous frame
+                                let dest =
+                                    (p + crate::memory::r#virtual::phys_mem_offset()) as *mut u8;
+                                unsafe {
+                                    core::ptr::write_bytes(dest, 0, 4096);
+                                }
+                                (p, false)
+                            }
+                            None => {
+                                return Some(Err((-12, page_vaddr))); // ENOMEM
+                            }
+                        }
+                    }
+                };
+
+                let actual_flags = if do_cow {
+                    let mut flags = page_flags;
+                    flags.remove(PageTableFlags::WRITABLE);
+                    flags.insert(PageTableFlags::BIT_9);
+                    flags
+                } else {
+                    page_flags
+                };
+
+                let page = Page::<Size4KiB>::containing_address(VirtAddr::new(page_vaddr));
+                let frame = PhysFrame::containing_address(PhysAddr::new(phys));
+
+                unsafe {
+                    if region.inode.is_some() {
+                        crate::memory::physical::increment_ref(phys);
+                    }
+
+                    if let Ok(old_phys) = crate::memory::r#virtual::unmap_user_page_no_shootdown(
+                        page_table_root,
+                        page,
+                    ) {
+                        crate::memory::physical::deallocate_frame(old_phys);
+                    }
+
+                    crate::memory::r#virtual::ensure_directory_permissions(
+                        page_table_root,
+                        VirtAddr::new(page_vaddr),
+                    );
+
+                    if let Err(e) = crate::memory::r#virtual::map_user_page_no_shootdown(
+                        page_table_root,
+                        page,
+                        frame,
+                        actual_flags,
+                    ) {
+                        if region.inode.is_some() {
+                            crate::memory::physical::decrement_ref(phys);
+                        } else {
+                            crate::memory::physical::deallocate_frame(phys);
+                        }
+                        return Some(Err((-12, page_vaddr)));
+                    }
+                }
+
+                x86_64::instructions::tlb::flush(VirtAddr::new(page_vaddr));
+                Some(Ok(()))
+            });
+
+        if let Some(res) = resolved {
+            match res {
+                Ok(()) => return, // Page fault resolved successfully!
+                Err((errno, page_vaddr)) => {
+                    crate::kprintln!(
+                        "[demand_page] Error resolving page fault at vaddr {:#x}: errno {}",
+                        page_vaddr,
+                        errno
+                    );
+                }
+            }
+        }
+    }
+
     kprintln!("[EXCEPTION] Unhandled Page Fault");
-    kprintln!("  Accessed Address: {:?}", fault_addr);
-    kprintln!("  Error Code: {:?}", error_code);
-    kprintln!("{:#?}", stack_frame);
+    kprintln!("  Accessed Address: {:#x}", fault_addr.as_u64());
+    kprintln!("  Error Code bits: {:#x}", error_code.bits());
+    kprintln!(
+        "  RIP: {:#x}, CS: {:#x}, RFLAGS: {:#x}, RSP: {:#x}, SS: {:#x}",
+        stack_frame.instruction_pointer.as_u64(),
+        stack_frame.code_segment.0,
+        stack_frame.cpu_flags,
+        stack_frame.stack_pointer.as_u64(),
+        stack_frame.stack_segment.0
+    );
+    crate::memory::r#virtual::debug_dump_mapping(fault_addr.as_u64());
     panic!("Unhandled page fault — system cannot recover");
 }
 
@@ -337,8 +537,19 @@ extern "x86-interrupt" fn page_fault_handler(
 /// Timer tick counter for basic timekeeping.
 static TIMER_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    TIMER_TICKS.fetch_add(1, core::sync::atomic::Ordering::Release);
+extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
+    let swap_needed = stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3;
+    if swap_needed {
+        // SAFETY: Swap to kernel GS base if entering from user space
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        }
+    }
+
+    let ticks = TIMER_TICKS.fetch_add(1, core::sync::atomic::Ordering::Release) + 1;
+    if ticks % 500 == 0 {
+        crate::kprintln!("[timer] Tick {}", ticks);
+    }
 
     // Update scheduler tick counter
     crate::process::scheduler::tick();
@@ -352,9 +563,24 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
 
     // Trigger rescheduling to enable preemption
     crate::process::scheduler::schedule();
+
+    if swap_needed {
+        // SAFETY: Swap back to user GS base before returning
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        }
+    }
 }
 
-extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn keyboard_interrupt_handler(stack_frame: InterruptStackFrame) {
+    let swap_needed = stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3;
+    if swap_needed {
+        // SAFETY: Swap to kernel GS base if entering from user space
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        }
+    }
+
     use x86_64::instructions::port::Port;
 
     // Read the scancode from the keyboard data port
@@ -367,15 +593,37 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 
     // SAFETY: Acknowledge the keyboard interrupt to the Local APIC.
     super::apic::lapic_eoi();
+
+    if swap_needed {
+        // SAFETY: Swap back to user GS base before returning
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        }
+    }
 }
 
 extern "x86-interrupt" fn spurious_interrupt_handler(_stack_frame: InterruptStackFrame) {
     // Spurious interrupts do not require an EOI.
 }
 
-extern "x86-interrupt" fn ipi_reschedule_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn ipi_reschedule_handler(stack_frame: InterruptStackFrame) {
+    let swap_needed = stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3;
+    if swap_needed {
+        // SAFETY: Swap to kernel GS base if entering from user space
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        }
+    }
+
     super::apic::lapic_eoi();
     crate::process::scheduler::schedule();
+
+    if swap_needed {
+        // SAFETY: Swap back to user GS base before returning
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        }
+    }
 }
 
 extern "x86-interrupt" fn ipi_halt_handler(_stack_frame: InterruptStackFrame) {
@@ -385,18 +633,48 @@ extern "x86-interrupt" fn ipi_halt_handler(_stack_frame: InterruptStackFrame) {
     }
 }
 
-extern "x86-interrupt" fn ipi_tlb_shootdown_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn ipi_tlb_shootdown_handler(stack_frame: InterruptStackFrame) {
+    let swap_needed = stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3;
+    if swap_needed {
+        // SAFETY: Swap to kernel GS base if entering from user space
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        }
+    }
+
     super::apic::lapic_eoi();
     x86_64::instructions::tlb::flush_all();
     crate::arch::x86_64::smp::tlb_shootdown_ack();
+
+    if swap_needed {
+        // SAFETY: Swap back to user GS base before returning
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        }
+    }
 }
 
-extern "x86-interrupt" fn network_interrupt_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn network_interrupt_handler(stack_frame: InterruptStackFrame) {
+    let swap_needed = stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3;
+    if swap_needed {
+        // SAFETY: Swap to kernel GS base if entering from user space
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        }
+    }
+
     // Call e1000 poll handler if initialized
     crate::drivers::net::e1000::handle_interrupt();
 
     // Acknowledge interrupt to Local APIC
     super::apic::lapic_eoi();
+
+    if swap_needed {
+        // SAFETY: Swap back to user GS base before returning
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        }
+    }
 }
 
 /// Returns the number of timer ticks since boot.

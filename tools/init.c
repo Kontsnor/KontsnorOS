@@ -142,7 +142,7 @@ void _start() {
 
             char *argv_bash[] = { "/bin/bash", NULL };
             char *argv_sh[] = { "/bin/sh", NULL };
-            char *envp[] = { NULL };
+            char *envp[] = { "LD_PRELOAD=/lib/libstubs.so", NULL };
 
             // Try execve("/bin/bash")
             syscall3(59, (long)"/bin/bash", (long)argv_bash, (long)envp);

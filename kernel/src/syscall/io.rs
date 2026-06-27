@@ -8,6 +8,12 @@ use crate::process::fd as proc_fd;
 /// This is the catch-all for device-specific operations that don't
 /// fit into the standard read/write model.
 pub fn sys_ioctl(fd: i32, request: u64, arg: u64) -> SyscallResult {
+    crate::kprintln!(
+        "[syscall] ioctl(fd={}, request={:#x}, arg={:#x})",
+        fd,
+        request,
+        arg
+    );
     if fd < 0 {
         return Errno::EBADF.into();
     }

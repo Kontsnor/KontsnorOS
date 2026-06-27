@@ -357,30 +357,18 @@ pub fn deliver_signal_to_pgrp(pgid: u64, sig: i32) {
         return;
     }
     let tasks = scheduler::TASKS.read();
-    let mut pids_to_wake = alloc::vec::Vec::new();
-    let curr_pid = scheduler::current_pid();
+    let mut pids = alloc::vec::Vec::new();
     for task_opt in tasks.iter() {
         if let Some(task_arc) = task_opt {
-            let mut task = task_arc.lock();
+            let task = task_arc.lock();
             if task.pgid == pgid {
-                task.pending_signals |= 1 << (sig - 1);
-                if Some(task.pid) == curr_pid {
-                    let pending_unblocked = task.pending_signals & !task.blocked_signals;
-                    let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
-                    unsafe {
-                        if apic_id < 32 {
-                            crate::syscall::CPU_SCRATCHES[apic_id].signals_pending =
-                                if pending_unblocked != 0 { 1 } else { 0 };
-                        }
-                    }
-                }
-                pids_to_wake.push(task.pid);
+                pids.push(task.pid);
             }
         }
     }
     drop(tasks);
-    for pid in pids_to_wake {
-        scheduler::wake_task(pid);
+    for pid in pids {
+        crate::syscall::signal::deliver_signal(pid, sig);
     }
 }
 
@@ -441,14 +429,16 @@ fn pty_flusher_thread() {
         if let Some(master) = master_opt {
             match master.read(0, &mut buf) {
                 Ok(n) if n > 0 => {
-                    if let Some(ref mut console) =
-                        *crate::drivers::gpu::bochs::GRAPHICS_CONSOLE.lock()
-                    {
-                        for &byte in &buf[..n] {
-                            console.write_char(byte);
+                    x86_64::instructions::interrupts::without_interrupts(|| {
+                        if let Some(ref mut console) =
+                            *crate::drivers::gpu::bochs::GRAPHICS_CONSOLE.lock()
+                        {
+                            for &byte in &buf[..n] {
+                                console.write_char(byte);
+                            }
+                            console.gpu.blit();
                         }
-                        console.gpu.blit();
-                    }
+                    });
                     // Mirror output to the serial port
                     for &byte in &buf[..n] {
                         crate::arch::x86_64::serial::write_byte(byte);
@@ -465,6 +455,7 @@ fn pty_router_thread() {
     loop {
         // Poll serial input for QEMU stdio
         if let Some(ch) = crate::arch::x86_64::serial::try_read_byte() {
+            crate::kprintln!("[pty_router] serial byte: '{}' ({:#x})", ch as char, ch);
             let mut byte = ch;
             if byte == b'\r' {
                 byte = b'\n';

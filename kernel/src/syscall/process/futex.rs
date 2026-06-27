@@ -6,7 +6,42 @@ use crate::sync::spinlock::TicketLock;
 use crate::syscall::{Errno, SyscallResult};
 use alloc::collections::{BTreeMap, VecDeque};
 
-static FUTEX_QUEUES: TicketLock<BTreeMap<u64, VecDeque<Pid>>> = TicketLock::new(BTreeMap::new());
+#[derive(Debug, Clone, Copy)]
+struct FutexWaiter {
+    pid: Pid,
+    bitset: u32,
+}
+
+static FUTEX_QUEUES: TicketLock<BTreeMap<u64, VecDeque<FutexWaiter>>> =
+    TicketLock::new(BTreeMap::new());
+
+/// Wake futex waiters from the scheduler/kernel without re-locking SCHEDULER.
+pub fn futex_wake_locked(
+    uaddr: u64,
+    val: i32,
+    bitset: u32,
+    sched: &mut crate::process::scheduler::Scheduler,
+) -> i32 {
+    let mut queues = FUTEX_QUEUES.lock();
+    let mut woken = 0;
+
+    if let Some(queue) = queues.get_mut(&uaddr) {
+        let mut i = 0;
+        while woken < val && i < queue.len() {
+            if (queue[i].bitset & bitset) != 0 {
+                let waiter = queue.remove(i).unwrap();
+                sched.wake_task(waiter.pid);
+                woken += 1;
+            } else {
+                i += 1;
+            }
+        }
+        if queue.is_empty() {
+            queues.remove(&uaddr);
+        }
+    }
+    woken
+}
 
 /// `futex(uaddr, op, val, timeout, uaddr2, val3)`
 pub fn sys_futex(
@@ -15,7 +50,7 @@ pub fn sys_futex(
     val: i32,
     _timeout: u64,
     _uaddr2: *mut i32,
-    _val3: i32,
+    val3: i32,
 ) -> SyscallResult {
     if uaddr.is_null() {
         return Errno::EINVAL.into();
@@ -31,8 +66,18 @@ pub fn sys_futex(
     let cmd = op & 127;
 
     match cmd {
-        0 => {
-            // FUTEX_WAIT
+        0 | 9 => {
+            // FUTEX_WAIT or FUTEX_WAIT_BITSET
+            let bitset = if cmd == 9 {
+                let b = val3 as u32;
+                if b == 0 {
+                    return Errno::EINVAL.into();
+                }
+                b
+            } else {
+                0xffffffff
+            };
+
             let current_pid = match scheduler::current_pid() {
                 Some(p) => p,
                 None => return Errno::ESRCH.into(),
@@ -50,7 +95,10 @@ pub fn sys_futex(
             queues
                 .entry(uaddr as u64)
                 .or_insert_with(VecDeque::new)
-                .push_back(current_pid);
+                .push_back(FutexWaiter {
+                    pid: current_pid,
+                    bitset,
+                });
 
             crate::process::lifecycle::block_task(current_pid);
             drop(queues);
@@ -58,16 +106,30 @@ pub fn sys_futex(
             scheduler::yield_now();
             0
         }
-        1 => {
-            // FUTEX_WAKE
+        1 | 10 => {
+            // FUTEX_WAKE or FUTEX_WAKE_BITSET
+            let bitset = if cmd == 10 {
+                let b = val3 as u32;
+                if b == 0 {
+                    return Errno::EINVAL.into();
+                }
+                b
+            } else {
+                0xffffffff
+            };
+
             let mut queues = FUTEX_QUEUES.lock();
             let mut woken = 0;
 
             if let Some(queue) = queues.get_mut(&(uaddr as u64)) {
-                while woken < val && !queue.is_empty() {
-                    if let Some(pid) = queue.pop_front() {
-                        crate::process::lifecycle::wake_task(pid);
+                let mut i = 0;
+                while woken < val && i < queue.len() {
+                    if (queue[i].bitset & bitset) != 0 {
+                        let waiter = queue.remove(i).unwrap();
+                        crate::process::lifecycle::wake_task(waiter.pid);
                         woken += 1;
+                    } else {
+                        i += 1;
                     }
                 }
                 if queue.is_empty() {

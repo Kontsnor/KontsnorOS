@@ -28,7 +28,22 @@ impl ExtFileSystem {
             return Err("No free blocks");
         }
 
-        let gd = &mut gds[0];
+        let blocks_per_group = sb.s_blocks_per_group;
+        let mut group_idx = None;
+        for (idx, gd) in gds.iter().enumerate() {
+            if gd.bg_free_blocks_count > 0 {
+                group_idx = Some(idx);
+                break;
+            }
+        }
+        let g = group_idx.ok_or("No free blocks found in group descriptors")?;
+        let group_blocks = if g == gds.len() - 1 {
+            sb.s_blocks_count - sb.s_first_data_block - (g as u32) * blocks_per_group
+        } else {
+            blocks_per_group
+        };
+
+        let gd = &mut gds[g];
         let mut bitmap = alloc::vec![0u8; self.block_size as usize];
         read_blocks(
             &*self.device,
@@ -37,7 +52,7 @@ impl ExtFileSystem {
             self.block_size,
         )?;
 
-        for i in 0..sb.s_blocks_count {
+        for i in 0..group_blocks {
             let byte = (i / 8) as usize;
             let bit = i % 8;
             if (bitmap[byte] & (1 << bit)) == 0 {
@@ -49,6 +64,8 @@ impl ExtFileSystem {
                     self.block_size,
                 )?;
 
+                let block_num = (g as u32) * blocks_per_group + sb.s_first_data_block + i;
+
                 sb.s_free_blocks_count -= 1;
                 gd.bg_free_blocks_count -= 1;
 
@@ -58,9 +75,9 @@ impl ExtFileSystem {
 
                 // Zero out the newly allocated block
                 let zero_buf = alloc::vec![0u8; self.block_size as usize];
-                write_blocks(&*self.device, i as u64, &zero_buf, self.block_size)?;
+                write_blocks(&*self.device, block_num as u64, &zero_buf, self.block_size)?;
 
-                return Ok(i);
+                return Ok(block_num);
             }
         }
         Err("No free blocks found in bitmap")
@@ -74,7 +91,14 @@ impl ExtFileSystem {
         let mut sb = self.superblock.lock();
         let mut gds = self.group_descriptors.lock();
 
-        let gd = &mut gds[0];
+        let blocks_per_group = sb.s_blocks_per_group;
+        let g = ((block_num - sb.s_first_data_block) / blocks_per_group) as usize;
+        let i = (block_num - sb.s_first_data_block) % blocks_per_group;
+
+        if g >= gds.len() {
+            return Err("Block number out of filesystem bounds");
+        }
+        let gd = &mut gds[g];
         let mut bitmap = alloc::vec![0u8; self.block_size as usize];
         read_blocks(
             &*self.device,
@@ -83,8 +107,8 @@ impl ExtFileSystem {
             self.block_size,
         )?;
 
-        let byte = (block_num / 8) as usize;
-        let bit = block_num % 8;
+        let byte = (i / 8) as usize;
+        let bit = i % 8;
         if (bitmap[byte] & (1 << bit)) != 0 {
             bitmap[byte] &= !(1 << bit);
             write_blocks(
@@ -113,7 +137,22 @@ impl ExtFileSystem {
             return Err("No free inodes");
         }
 
-        let gd = &mut gds[0];
+        let inodes_per_group = self.inodes_per_group;
+        let mut group_idx = None;
+        for (idx, gd) in gds.iter().enumerate() {
+            if gd.bg_free_inodes_count > 0 {
+                group_idx = Some(idx);
+                break;
+            }
+        }
+        let g = group_idx.ok_or("No free inodes found in group descriptors")?;
+        let group_inodes = if g == gds.len() - 1 {
+            sb.s_inodes_count - (g as u32) * inodes_per_group
+        } else {
+            inodes_per_group
+        };
+
+        let gd = &mut gds[g];
         let mut bitmap = alloc::vec![0u8; self.block_size as usize];
         read_blocks(
             &*self.device,
@@ -122,7 +161,7 @@ impl ExtFileSystem {
             self.block_size,
         )?;
 
-        for i in 0..sb.s_inodes_count {
+        for i in 0..group_inodes {
             let byte = (i / 8) as usize;
             let bit = i % 8;
             if (bitmap[byte] & (1 << bit)) == 0 {
@@ -144,7 +183,7 @@ impl ExtFileSystem {
                 drop(gds);
                 self.write_group_descriptors()?;
 
-                let ino = i + 1;
+                let ino = (g as u32) * inodes_per_group + i + 1;
                 return Ok(ino);
             }
         }
@@ -159,7 +198,14 @@ impl ExtFileSystem {
         let mut sb = self.superblock.lock();
         let mut gds = self.group_descriptors.lock();
 
-        let gd = &mut gds[0];
+        let inodes_per_group = self.inodes_per_group;
+        let g = ((ino - 1) / inodes_per_group) as usize;
+        let i = (ino - 1) % inodes_per_group;
+
+        if g >= gds.len() {
+            return Err("Inode number out of filesystem bounds");
+        }
+        let gd = &mut gds[g];
         let mut bitmap = alloc::vec![0u8; self.block_size as usize];
         read_blocks(
             &*self.device,
@@ -168,7 +214,6 @@ impl ExtFileSystem {
             self.block_size,
         )?;
 
-        let i = ino - 1;
         let byte = (i / 8) as usize;
         let bit = i % 8;
         if (bitmap[byte] & (1 << bit)) != 0 {

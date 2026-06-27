@@ -83,12 +83,14 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
             child_task.sigactions = Arc::new(spin::Mutex::new(*parent_sigs));
             drop(parent_sigs);
 
+            child_task.sigaltstack = parent_task.sigaltstack;
             child_task.blocked_signals = parent_task.blocked_signals;
             child_task.cwd = parent_task.cwd.clone();
             child_task.uid = parent_task.uid;
             child_task.gid = parent_task.gid;
             child_task.euid = parent_task.euid;
             child_task.egid = parent_task.egid;
+            child_task.pgid = parent_task.pgid;
         } else {
             return Errno::ESRCH.into();
         }
@@ -99,6 +101,9 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
     // Allocate a 32 KiB kernel stack for the child
     let layout = alloc::alloc::Layout::from_size_align(32768, 16).unwrap();
     let kstack_base = unsafe { alloc::alloc::alloc(layout) } as u64;
+    if kstack_base == 0 {
+        return Errno::ENOMEM.into();
+    }
     child_task.kernel_stack_base = kstack_base;
     child_task.kernel_stack_size = 32768;
 
@@ -143,8 +148,10 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
 fn map_elf_segments(
     new_page_table: u64,
     segments: &[crate::process::elf::LoadSegment],
-    elf_buf: &[u8],
+    inode: &alloc::sync::Arc<dyn crate::fs::inode::InodeOps>,
     bias: u64,
+    mmap_regions: &mut alloc::vec::Vec<crate::process::task::MappedRegion>,
+    pathname: Option<&str>,
 ) -> Result<u64, Errno> {
     use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
     use x86_64::{PhysAddr, VirtAddr};
@@ -160,6 +167,33 @@ fn map_elf_segments(
         if end > max_vaddr {
             max_vaddr = end;
         }
+
+        let aligned_len = ((segment.mem_size + 4095) & !4095) as usize;
+        let mut prot = 0;
+        if segment.flags.read {
+            prot |= 1;
+        }
+        if segment.flags.write {
+            prot |= 2;
+        }
+        if segment.flags.execute {
+            prot |= 4;
+        }
+
+        let page_start = vaddr & !4095;
+        let page_offset = segment.file_offset & !4095;
+        let page_end = (vaddr + segment.mem_size + 4095) & !4095;
+        let page_len = (page_end - page_start) as usize;
+
+        mmap_regions.push(crate::process::task::MappedRegion {
+            start: page_start,
+            len: page_len,
+            inode: Some(inode.clone()),
+            offset: page_offset,
+            is_shared: false,
+            prot,
+            pathname: pathname.map(|p| alloc::string::String::from(p)),
+        });
 
         let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
         let end_page =
@@ -219,10 +253,14 @@ fn map_elf_segments(
                     4096 - seg_offset_in_page,
                     segment.file_size - page_offset_in_seg,
                 );
-                let src_start = (segment.file_offset + page_offset_in_seg) as usize;
+                let src_offset = segment.file_offset + page_offset_in_seg;
                 let dst_start = seg_offset_in_page as usize;
-                dest_slice[dst_start..dst_start + copy_len as usize]
-                    .copy_from_slice(&elf_buf[src_start..src_start + copy_len as usize]);
+
+                let dst_slice_buf = &mut dest_slice[dst_start..dst_start + copy_len as usize];
+                match inode.read(src_offset, dst_slice_buf) {
+                    Ok(_) => {}
+                    Err(_) => return Err(Errno::EIO),
+                }
             }
         }
     }
@@ -277,13 +315,14 @@ pub fn sys_execve(
         return e as SyscallResult;
     }
 
-    // Read the ELF binary
+    // Read the ELF binary header (first 64KB)
     let file_size = inode.inode().size as usize;
     if file_size == 0 {
         return Errno::ENOEXEC.into();
     }
 
-    let mut elf_buf = alloc::vec![0u8; file_size];
+    let header_read_size = core::cmp::min(file_size, 65536);
+    let mut elf_buf = alloc::vec![0u8; header_read_size];
     match inode.read(0, &mut elf_buf) {
         Ok(_) => {}
         Err(e) => return e as SyscallResult,
@@ -292,6 +331,8 @@ pub fn sys_execve(
     let mut path = path;
     let mut argv = argv;
     let mut loop_count = 0;
+    let mut active_inode = inode.clone();
+    let mut elf_total_size = file_size;
 
     while elf_buf.starts_with(b"#!") {
         loop_count += 1;
@@ -371,17 +412,20 @@ pub fn sys_execve(
         if interp_size == 0 {
             return Errno::ENOEXEC.into();
         }
-        let mut new_buf = alloc::vec![0u8; interp_size];
+        let interp_header_size = core::cmp::min(interp_size, 65536);
+        let mut new_buf = alloc::vec![0u8; interp_header_size];
         match interp_inode.read(0, &mut new_buf) {
             Ok(_) => {
                 elf_buf = new_buf;
             }
             Err(e) => return e as SyscallResult,
         }
+        active_inode = interp_inode;
+        elf_total_size = interp_size;
     }
 
     // Parse the ELF
-    let elf_info = match crate::process::elf::parse_elf(&elf_buf) {
+    let elf_info = match crate::process::elf::parse_elf(&elf_buf, elf_total_size) {
         Ok(e) => e,
         Err(_) => return Errno::ENOEXEC.into(),
     };
@@ -395,7 +439,16 @@ pub fn sys_execve(
     use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
     use x86_64::{PhysAddr, VirtAddr};
 
-    let main_max_vaddr = match map_elf_segments(new_page_table, &elf_info.segments, &elf_buf, 0) {
+    let mut exec_mmap_regions = alloc::vec::Vec::new();
+
+    let main_max_vaddr = match map_elf_segments(
+        new_page_table,
+        &elf_info.segments,
+        &active_inode,
+        0,
+        &mut exec_mmap_regions,
+        Some(&path),
+    ) {
         Ok(addr) => addr,
         Err(e) => return e as SyscallResult,
     };
@@ -423,13 +476,14 @@ pub fn sys_execve(
         if interp_size == 0 {
             return Errno::ENOEXEC.into();
         }
-        let mut interp_elf_buf = alloc::vec![0u8; interp_size];
+        let interp_header_size = core::cmp::min(interp_size, 65536);
+        let mut interp_elf_buf = alloc::vec![0u8; interp_header_size];
         match interp_inode.read(0, &mut interp_elf_buf) {
             Ok(_) => {}
             Err(e) => return e as SyscallResult,
         }
 
-        let interp_info = match crate::process::elf::parse_elf(&interp_elf_buf) {
+        let interp_info = match crate::process::elf::parse_elf(&interp_elf_buf, interp_size) {
             Ok(e) => e,
             Err(_) => return Errno::ENOEXEC.into(),
         };
@@ -438,8 +492,10 @@ pub fn sys_execve(
         match map_elf_segments(
             new_page_table,
             &interp_info.segments,
-            &interp_elf_buf,
+            &interp_inode,
             interpreter_base,
+            &mut exec_mmap_regions,
+            elf_info.interpreter.as_deref(),
         ) {
             Ok(_) => {}
             Err(e) => return e as SyscallResult,
@@ -483,6 +539,17 @@ pub fn sys_execve(
         }
     }
 
+    // Register stack in mmap_regions
+    exec_mmap_regions.push(crate::process::task::MappedRegion {
+        start: stack_bottom,
+        len: stack_size as usize,
+        inode: None,
+        offset: 0,
+        is_shared: false,
+        prot: 3, // PROT_READ | PROT_WRITE
+        pathname: Some(alloc::string::String::from("[stack]")),
+    });
+
     // Construct System V ABI compliant stack
     let user_sp = match crate::process::elf::construct_user_stack(
         &argv,
@@ -497,8 +564,6 @@ pub fn sys_execve(
         Ok(sp) => sp,
         Err(e) => return e.into(),
     };
-
-    let entry = elf_info.entry_point;
 
     // Reset signal state and update page table root for execve
     let old_page_table = {
@@ -556,6 +621,8 @@ pub fn sys_execve(
             }
             drop(fd_table);
 
+            task.name = path.clone();
+            task.sigaltstack = None; // Reset alternate signal stack on execve
             let old = {
                 let mut addr_space = task.address_space.lock();
                 let old_pt = addr_space.page_table_root;
@@ -566,7 +633,7 @@ pub fn sys_execve(
                 page_table_root: new_page_table,
                 brk: initial_brk,
                 mmap_bump: 0x0000_5000_0000_0000u64,
-                mmap_regions: Vec::new(),
+                mmap_regions: exec_mmap_regions,
             }));
             task.context.fs_base = 0; // Clear TLS base for new process
             old
@@ -617,7 +684,48 @@ pub fn sys_exit(status: i32) -> SyscallResult {
 
 /// `exit_group(status)` — Terminate all threads in the thread group.
 pub fn sys_exit_group(status: i32) -> SyscallResult {
-    sys_exit(status)
+    kprintln!("[syscall] exit_group(status={})", status);
+
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+
+    let tgid = if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+        task_arc.lock().tgid
+    } else {
+        return Errno::ESRCH.into();
+    };
+
+    // Get all other tasks sharing the same tgid
+    let mut other_pids = alloc::vec::Vec::new();
+    {
+        let tasks = scheduler::TASKS.read();
+        for slot in tasks.iter() {
+            if let Some(task_arc) = slot {
+                let task = task_arc.lock();
+                if task.tgid == tgid && task.pid != current_pid {
+                    other_pids.push(task.pid);
+                }
+            }
+        }
+    }
+
+    // Disable interrupts before scheduler manipulation
+    x86_64::instructions::interrupts::disable();
+
+    if let Some(ref mut sched) = *scheduler::SCHEDULER.lock() {
+        for pid in other_pids {
+            sched.exit_task(pid, status);
+        }
+        sched.exit_task(current_pid, status);
+    }
+
+    scheduler::schedule();
+
+    loop {
+        x86_64::instructions::hlt();
+    }
 }
 
 /// `wait4(pid, wstatus, options, rusage)` — Wait for a child process.
@@ -672,10 +780,12 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
                 }
                 // Remove the zombie from the task list
                 let idx = child_pid.as_u64() as usize;
-                let mut tasks_write = scheduler::TASKS.write();
-                if let Some(slot) = tasks_write.get_mut(idx) {
-                    *slot = None;
-                }
+                x86_64::instructions::interrupts::without_interrupts(|| {
+                    let mut tasks_write = scheduler::TASKS.write();
+                    if let Some(slot) = tasks_write.get_mut(idx) {
+                        *slot = None;
+                    }
+                });
                 Some(Ok(child_pid.as_u64() as SyscallResult))
             } else if !has_children {
                 Some(Err(Errno::ECHILD))
@@ -796,6 +906,17 @@ pub fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
             task_arc.lock().context.fs_base = addr;
         }
         0
+    } else if code == 0x1003 {
+        // ARCH_GET_FS
+        if validate_user_ptr_write(addr as *mut u8, 8).is_err() {
+            return Errno::EFAULT.into();
+        }
+        let fs_base = x86_64::registers::model_specific::FsBase::read().as_u64();
+        // SAFETY: The pointer was validated with validate_user_ptr_write and is safe to write to.
+        unsafe {
+            *(addr as *mut u64) = fs_base;
+        }
+        0
     } else {
         Errno::EINVAL.into()
     }
@@ -870,6 +991,10 @@ pub fn sys_clone(
         child_page_table,
     );
 
+    if flags & 0x00200000 != 0 {
+        child_task.clear_child_tid = Some(child_tidptr as u64);
+    }
+
     {
         if let Some(parent_task_arc) = scheduler::get_task_arc(current_pid) {
             let parent_task = parent_task_arc.lock();
@@ -913,12 +1038,14 @@ pub fn sys_clone(
                 child_task.tgid = child_pid;
             }
 
+            child_task.sigaltstack = parent_task.sigaltstack;
             child_task.blocked_signals = parent_task.blocked_signals;
             child_task.cwd = parent_task.cwd.clone();
             child_task.uid = parent_task.uid;
             child_task.gid = parent_task.gid;
             child_task.euid = parent_task.euid;
             child_task.egid = parent_task.egid;
+            child_task.pgid = parent_task.pgid;
         } else {
             return Errno::ESRCH.into();
         }
@@ -928,6 +1055,9 @@ pub fn sys_clone(
 
     let layout = alloc::alloc::Layout::from_size_align(32768, 16).unwrap();
     let kstack_base = unsafe { alloc::alloc::alloc(layout) } as u64;
+    if kstack_base == 0 {
+        return Errno::ENOMEM.into();
+    }
     child_task.kernel_stack_base = kstack_base;
     child_task.kernel_stack_size = 32768;
 
@@ -981,5 +1111,9 @@ pub fn sys_clone(
 
     scheduler::add_task(child_task);
 
+    kprintln!(
+        "[syscall] clone() -> parent returns child PID {}",
+        child_pid
+    );
     child_pid.as_u64() as SyscallResult
 }

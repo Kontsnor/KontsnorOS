@@ -67,16 +67,30 @@ struct TimeZone {
     tz_dsttime: i32,
 }
 
+fn get_monotonic_ns() -> u64 {
+    let ticks = crate::arch::x86_64::interrupts::timer_ticks();
+    let current_count = crate::arch::x86_64::apic::get_lapic_timer_current() as u64;
+    let init_count = 10_000_000;
+    let sub_tick = if current_count <= init_count {
+        init_count - current_count
+    } else {
+        0
+    };
+    ticks * 10_000_000 + sub_tick
+}
+
 /// `gettimeofday(tv, tz)` — Return current time-of-day.
 pub fn sys_gettimeofday(tv: *mut u8, tz: *mut u8) -> SyscallResult {
     if !tv.is_null() {
         if validate_user_ptr_write(tv, core::mem::size_of::<TimeVal>()).is_err() {
             return Errno::EFAULT.into();
         }
+        let realtime_ns = 1782158506 * 1_000_000_000 + get_monotonic_ns();
         let t = TimeVal {
-            tv_sec: 0,
-            tv_usec: 0,
+            tv_sec: (realtime_ns / 1_000_000_000) as i64,
+            tv_usec: ((realtime_ns % 1_000_000_000) / 1000) as i64,
         };
+        // SAFETY: The pointer was validated with validate_user_ptr_write and is safe to write.
         unsafe {
             core::ptr::write(tv as *mut TimeVal, t);
         }
@@ -89,6 +103,7 @@ pub fn sys_gettimeofday(tv: *mut u8, tz: *mut u8) -> SyscallResult {
             tz_minuteswest: 0,
             tz_dsttime: 0,
         };
+        // SAFETY: The pointer was validated with validate_user_ptr_write and is safe to write.
         unsafe {
             core::ptr::write(tz as *mut TimeZone, z);
         }
@@ -104,17 +119,52 @@ struct TimeSpec {
 }
 
 /// `clock_gettime(clockid, tp)` — Return current clock value.
-pub fn sys_clock_gettime(_clockid: i32, tp: *mut u8) -> SyscallResult {
+pub fn sys_clock_gettime(clockid: i32, tp: *mut u8) -> SyscallResult {
     if tp.is_null() {
         return Errno::EFAULT.into();
     }
     if validate_user_ptr_write(tp, core::mem::size_of::<TimeSpec>()).is_err() {
         return Errno::EFAULT.into();
     }
-    let ts = TimeSpec {
-        tv_sec: 0,
-        tv_nsec: 0,
+
+    let ts = match clockid {
+        0 => {
+            // CLOCK_REALTIME
+            let realtime_ns = 1782158506 * 1_000_000_000 + get_monotonic_ns();
+            TimeSpec {
+                tv_sec: (realtime_ns / 1_000_000_000) as i64,
+                tv_nsec: (realtime_ns % 1_000_000_000) as i64,
+            }
+        }
+        1 => {
+            // CLOCK_MONOTONIC
+            let monotonic_ns = get_monotonic_ns();
+            TimeSpec {
+                tv_sec: (monotonic_ns / 1_000_000_000) as i64,
+                tv_nsec: (monotonic_ns % 1_000_000_000) as i64,
+            }
+        }
+        2 => {
+            // CLOCK_PROCESS_CPUTIME_ID
+            let cpu_ticks = if let Some(pid) = crate::process::scheduler::current_pid() {
+                if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+                    task_arc.lock().cpu_ticks
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            let cpu_ns = cpu_ticks * 10_000_000;
+            TimeSpec {
+                tv_sec: (cpu_ns / 1_000_000_000) as i64,
+                tv_nsec: (cpu_ns % 1_000_000_000) as i64,
+            }
+        }
+        _ => return Errno::EINVAL.into(),
     };
+
+    // SAFETY: The pointer was validated with validate_user_ptr_write and is safe to write.
     unsafe {
         core::ptr::write(tp as *mut TimeSpec, ts);
     }
@@ -279,11 +329,13 @@ pub fn sys_sysinfo(info: *mut u8) -> SyscallResult {
     if validate_user_ptr_write(info, core::mem::size_of::<SysInfo>()).is_err() {
         return Errno::EFAULT.into();
     }
+    let (total_frames, allocated_frames, free_frames) = crate::memory::physical::stats();
+    let uptime = (crate::arch::x86_64::interrupts::timer_ticks() / 18) as i64;
     let si = SysInfo {
-        uptime: 0,
+        uptime,
         loads: [0, 0, 0],
-        totalram: 128 * 1024 * 1024,
-        freeram: 64 * 1024 * 1024,
+        totalram: (total_frames * 4096) as u64,
+        freeram: (free_frames * 4096) as u64,
         sharedram: 0,
         bufferram: 0,
         totalswap: 0,
@@ -301,9 +353,95 @@ pub fn sys_sysinfo(info: *mut u8) -> SyscallResult {
     0
 }
 
-/// `sigaltstack(ss, old_ss)` — Set/get alternate signal stack (stub).
-pub fn sys_sigaltstack(_ss: *const u8, _old_ss: *mut u8) -> SyscallResult {
-    0
+/// `sigaltstack(ss, old_ss)` — Set/get alternate signal stack.
+pub fn sys_sigaltstack(ss_ptr: *const u8, old_ss_ptr: *mut u8, user_rsp: u64) -> SyscallResult {
+    use crate::process::scheduler;
+    use crate::process::task::StackT;
+
+    let current_pid = match scheduler::current_pid() {
+        Some(pid) => pid,
+        None => return Errno::ESRCH.into(),
+    };
+
+    let task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
+    };
+
+    let mut task = task_arc.lock();
+
+    // 1. If old_ss_ptr is not null, write the current alternate stack configuration
+    if !old_ss_ptr.is_null() {
+        if validate_user_ptr_write(old_ss_ptr, core::mem::size_of::<StackT>()).is_err() {
+            return Errno::EFAULT.into();
+        }
+
+        let mut flags = 0;
+        let mut sp = 0;
+        let mut size = 0;
+
+        if let Some(ref alt) = task.sigaltstack {
+            sp = alt.ss_sp;
+            size = alt.ss_size;
+            if user_rsp >= alt.ss_sp && user_rsp < alt.ss_sp + alt.ss_size {
+                flags |= 1; // SS_ONSTACK
+            }
+            flags |= alt.ss_flags & 2; // SS_DISABLE
+        } else {
+            flags = 2; // SS_DISABLE
+        }
+
+        let old_ss = StackT {
+            ss_sp: sp,
+            ss_flags: flags,
+            _pad: 0,
+            ss_size: size,
+        };
+
+        unsafe {
+            core::ptr::write(old_ss_ptr as *mut StackT, old_ss);
+        }
+    }
+
+    // 2. If ss_ptr is not null, update the alternate stack configuration
+    if !ss_ptr.is_null() {
+        if !validate_user_ptr(ss_ptr, core::mem::size_of::<StackT>()) {
+            return Errno::EFAULT.into();
+        }
+
+        let ss = unsafe { *(ss_ptr as *const StackT) };
+
+        // Check if we are currently executing on the alternate stack
+        if let Some(ref alt) = task.sigaltstack {
+            if user_rsp >= alt.ss_sp && user_rsp < alt.ss_sp + alt.ss_size {
+                return Errno::EPERM.into(); // Cannot change stack while executing on it
+            }
+        }
+
+        const SS_DISABLE: i32 = 2;
+        if (ss.ss_flags & !SS_DISABLE) != 0 {
+            return Errno::EINVAL.into(); // Invalid flags
+        }
+
+        if (ss.ss_flags & SS_DISABLE) != 0 {
+            // Disable alternate stack
+            task.sigaltstack = Some(StackT {
+                ss_sp: 0,
+                ss_flags: SS_DISABLE,
+                _pad: 0,
+                ss_size: 0,
+            });
+        } else {
+            // Enable/set alternate stack
+            // Check size (must be >= MINSIGSTKSZ, typically 2048)
+            if ss.ss_size < 2048 {
+                return Errno::ENOMEM.into();
+            }
+            task.sigaltstack = Some(ss);
+        }
+    }
+
+    0 // Success
 }
 
 /// `getrandom(buf, buflen, flags)` — Get random bytes.
@@ -325,10 +463,18 @@ pub fn sys_getrandom(buf: *mut u8, buflen: usize, _flags: u32) -> SyscallResult 
 pub fn sys_prlimit64(
     _pid: i32,
     resource: i32,
-    _new_limit: *const u8,
+    new_limit: *const u8,
     old_limit: *mut u8,
 ) -> SyscallResult {
+    if !new_limit.is_null() {
+        if !validate_user_ptr(new_limit, core::mem::size_of::<RLimit>()) {
+            return Errno::EFAULT.into();
+        }
+    }
     if !old_limit.is_null() {
+        if validate_user_ptr_write(old_limit, core::mem::size_of::<RLimit>()).is_err() {
+            return Errno::EFAULT.into();
+        }
         let ret = sys_getrlimit(resource, old_limit);
         if ret < 0 {
             return ret;
@@ -340,4 +486,36 @@ pub fn sys_prlimit64(
 /// `tgkill(tgid, tid, sig)` — Send signal to thread.
 pub fn sys_tgkill(_tgid: i32, tid: i32, sig: i32) -> SyscallResult {
     crate::syscall::signal::sys_kill(tid, sig)
+}
+
+/// `sched_getaffinity(pid, cpusetsize, mask)` — Get CPU affinity mask.
+pub fn sys_sched_getaffinity(_pid: i32, cpusetsize: usize, mask: *mut u8) -> SyscallResult {
+    if mask.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if cpusetsize < 8 {
+        return Errno::EINVAL.into();
+    }
+    if validate_user_ptr_write(mask, cpusetsize).is_err() {
+        return Errno::EFAULT.into();
+    }
+
+    // Zero out the whole mask first
+    // SAFETY: The pointer mask is validated with validate_user_ptr_write and has at least cpusetsize bytes.
+    unsafe {
+        core::ptr::write_bytes(mask, 0, cpusetsize);
+    }
+
+    let cpu_count = crate::arch::x86_64::smp::get_cpu_count();
+    let mut cpu_mask = 0u64;
+    for i in 0..cpu_count.min(64) {
+        cpu_mask |= 1 << i;
+    }
+
+    // SAFETY: The pointer mask was validated and has a size of at least 8 bytes.
+    unsafe {
+        *(mask as *mut u64) = cpu_mask;
+    }
+
+    8
 }

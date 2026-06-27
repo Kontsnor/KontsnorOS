@@ -39,6 +39,17 @@ impl FileSystem for TmpFs {
     fn name(&self) -> &str {
         "tmpfs"
     }
+
+    fn statfs(&self) -> super::vfs::FsStats {
+        super::vfs::FsStats {
+            total_blocks: 262144, // 1GB with 4KB block size
+            free_blocks: 200000,
+            total_inodes: 65536,
+            free_inodes: 60000,
+            block_size: 4096,
+            max_name_len: 255,
+        }
+    }
 }
 
 /// A tmpfs directory.
@@ -232,4 +243,12 @@ pub fn init() {
 
     let tmpfs = Arc::new(TmpFs { root });
     super::vfs::mount(String::from("/tmp"), tmpfs);
+}
+
+/// Create an anonymous TmpFsFile inode.
+pub fn create_memfd_inode() -> Arc<dyn InodeOps> {
+    Arc::new(TmpFsFile {
+        inode: RwLock::new(Inode::new(alloc_ino(), FileType::Regular)),
+        data: RwLock::new(Vec::new()),
+    })
 }

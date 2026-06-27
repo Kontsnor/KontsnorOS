@@ -2,9 +2,9 @@
 
 use crate::drivers::traits::{BlockDevice, DriverError, DriverInfo};
 use crate::kprintln;
+use crate::sync::spinlock::TicketLock;
 use alloc::string::String;
 use alloc::sync::Arc;
-use spin::Mutex;
 use x86_64::instructions::port::Port;
 
 #[repr(C, packed)]
@@ -27,7 +27,7 @@ unsafe impl Sync for AtaDriveInner {}
 /// ATA Primary Slave drive implementation.
 pub struct AtaDrive {
     info: DriverInfo,
-    inner: Mutex<AtaDriveInner>,
+    inner: TicketLock<AtaDriveInner>,
 }
 
 // SAFETY: AtaDrive implements safe multithreaded serialization.
@@ -43,11 +43,7 @@ impl AtaDrive {
             if (status & 0x80) == 0 && (status & 0x40) != 0 {
                 return Ok(());
             }
-            if i >= 100 && i % 1000 == 0 {
-                crate::process::scheduler::yield_now();
-            } else {
-                core::hint::spin_loop();
-            }
+            core::hint::spin_loop();
         }
         Err("ATA Drive timeout waiting for ready")
     }
@@ -60,11 +56,7 @@ impl AtaDrive {
             if (status & 0x80) == 0 && (status & 0x08) != 0 {
                 return Ok(());
             }
-            if i >= 100 && i % 1000 == 0 {
-                crate::process::scheduler::yield_now();
-            } else {
-                core::hint::spin_loop();
-            }
+            core::hint::spin_loop();
         }
         Err("ATA Drive timeout waiting for data request (DRQ)")
     }
@@ -299,11 +291,7 @@ impl AtaDrive {
                 break;
             }
 
-            if i >= 100 && i % 1000 == 0 {
-                crate::process::scheduler::yield_now();
-            } else {
-                core::hint::spin_loop();
-            }
+            core::hint::spin_loop();
         }
 
         // 9. Stop DMA engine
@@ -408,7 +396,7 @@ impl BlockDevice for AtaDrive {
     }
 
     fn block_count(&self) -> u64 {
-        131072 // 64 MB raw disk divided by 512 bytes per block = 131072 blocks
+        16777216 // Support disks up to 8 GB (16777216 blocks of 512 bytes)
     }
 
     fn flush(&self) -> Result<(), DriverError> {
@@ -513,7 +501,7 @@ pub fn init_ata_drive() -> Option<Arc<dyn BlockDevice>> {
         crate::drivers::register_driver(info.clone());
         Some(Arc::new(AtaDrive {
             info,
-            inner: Mutex::new(AtaDriveInner {
+            inner: TicketLock::new(AtaDriveInner {
                 dma_base,
                 prdt_phys,
                 prdt_virt,

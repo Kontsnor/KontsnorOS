@@ -250,6 +250,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                             alloc::sync::Arc::new(crate::fs::file::FileDescription::new(
                                 slave,
                                 crate::fs::file::OpenFlags(crate::fs::file::OpenFlags::O_RDWR),
+                                Some(alloc::string::String::from("/dev/pts/0")),
                             ));
                         fd_table.entries.push(Some(slave_desc.clone())); // fd 0
                         fd_table.entries.push(Some(slave_desc.clone())); // fd 1

@@ -217,6 +217,12 @@ pub fn init_lapic_timer() {
     }
 }
 
+/// Read the current Local APIC timer decrementer count.
+pub fn get_lapic_timer_current() -> u32 {
+    // SAFETY: Reading MMIO register via LAPIC base address is safe because LAPIC is mapped and active.
+    unsafe { lapic_read(LAPIC_REG_TIMER_CURRENT) }
+}
+
 /// Send an Inter-Processor Interrupt (IPI) to a specific target Local APIC.
 pub fn send_ipi(target_lapic_id: u8, vector: u8) {
     unsafe {

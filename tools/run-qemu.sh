@@ -15,6 +15,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # Parse arguments
 BUILD_TYPE="release"
 GDB_FLAG=""
+QEMU_ARGS=()
 
 for arg in "$@"; do
     case "$arg" in
@@ -25,6 +26,9 @@ for arg in "$@"; do
             GDB_FLAG="-s -S"
             echo "GDB server will listen on localhost:1234"
             echo "Connect with: gdb -ex 'target remote :1234'"
+            ;;
+        *)
+            QEMU_ARGS+=("$arg")
             ;;
     esac
 done
@@ -51,8 +55,8 @@ bootloader_linker build "$KERNEL_BIN" -o "$PROJECT_DIR" -s
 
 DISK_IMG="$PROJECT_DIR/disk.img"
 if [ ! -f "$DISK_IMG" ]; then
-    echo "Creating 10MB blank persistent hard drive image..."
-    dd if=/dev/zero of="$DISK_IMG" bs=1M count=10 2>/dev/null
+    echo "Creating 1.5GB blank persistent hard drive image..."
+    dd if=/dev/zero of="$DISK_IMG" bs=1M count=1536 2>/dev/null
 fi
 
 qemu-system-x86_64 \
@@ -60,9 +64,10 @@ qemu-system-x86_64 \
     -drive format=raw,file="$DISK_IMG",index=1,media=disk \
     -serial stdio \
     -display none \
-    -m 2G \
+    -m 8G \
+    -smp 4 \
     -cpu qemu64,+fsgsbase \
     -no-reboot \
     -no-shutdown \
     $GDB_FLAG \
-    "$@"
+    "${QEMU_ARGS[@]}"

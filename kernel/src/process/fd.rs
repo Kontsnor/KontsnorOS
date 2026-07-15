@@ -92,16 +92,26 @@ pub fn current_task_alloc_fd_with_flags_and_path(
 
     // Find first free slot (first None entry)
     for (i, slot) in fd_table.entries.iter_mut().enumerate() {
+        if i >= task.rlimit_nofile_cur as usize {
+            return None;
+        }
         if slot.is_none() {
             *slot = Some(file_desc);
+            if i >= fd_table.cloexec.len() {
+                fd_table.cloexec.resize(i + 1, false);
+            }
+            fd_table.cloexec[i] = (flags.0 & OpenFlags::O_CLOEXEC) != 0;
             return Some(i as i32);
         }
     }
 
-    // No free slot found — extend the table (up to a hard limit of 1024)
-    if fd_table.entries.len() < 1024 {
+    // No free slot found — extend the table up to rlimit_nofile_cur
+    let next_idx = fd_table.entries.len();
+    if next_idx < task.rlimit_nofile_cur as usize {
         fd_table.entries.push(Some(file_desc));
-        Some((fd_table.entries.len() - 1) as i32)
+        fd_table.cloexec.resize(next_idx + 1, false);
+        fd_table.cloexec[next_idx] = (flags.0 & OpenFlags::O_CLOEXEC) != 0;
+        Some(next_idx as i32)
     } else {
         None // EMFILE
     }
@@ -124,8 +134,11 @@ pub fn current_task_close_fd(fd: i32) -> bool {
     let mut task = task_arc.lock();
     let mut fd_table = task.fd_table.lock();
 
-    let desc = if let Some(slot) = fd_table.entries.get_mut(fd_idx) {
-        slot.take()
+    let desc = if fd_idx < fd_table.entries.len() && fd_table.entries[fd_idx].is_some() {
+        if fd_idx < fd_table.cloexec.len() {
+            fd_table.cloexec[fd_idx] = false;
+        }
+        fd_table.entries[fd_idx].take()
     } else {
         None
     };
@@ -160,16 +173,26 @@ pub fn current_task_dup_fd(fd: i32) -> Option<i32> {
 
     // Find first free slot (first None entry)
     for (i, slot) in fd_table.entries.iter_mut().enumerate() {
+        if i >= task.rlimit_nofile_cur as usize {
+            return None;
+        }
         if slot.is_none() {
             *slot = Some(file_desc);
+            if i >= fd_table.cloexec.len() {
+                fd_table.cloexec.resize(i + 1, false);
+            }
+            fd_table.cloexec[i] = false; // dup clears close-on-exec
             return Some(i as i32);
         }
     }
 
-    // No free slot found — extend the table (up to a hard limit of 1024)
-    if fd_table.entries.len() < 1024 {
+    // No free slot found — extend the table up to rlimit_nofile_cur
+    let next_idx = fd_table.entries.len();
+    if next_idx < task.rlimit_nofile_cur as usize {
         fd_table.entries.push(Some(file_desc));
-        Some((fd_table.entries.len() - 1) as i32)
+        fd_table.cloexec.resize(next_idx + 1, false);
+        fd_table.cloexec[next_idx] = false; // dup clears close-on-exec
+        Some(next_idx as i32)
     } else {
         None
     }
@@ -177,7 +200,7 @@ pub fn current_task_dup_fd(fd: i32) -> Option<i32> {
 
 /// Duplicate an existing file descriptor `oldfd` onto `newfd` in the current task's fd_table.
 pub fn current_task_dup2_fd(oldfd: i32, newfd: i32) -> Option<i32> {
-    if oldfd < 0 || newfd < 0 || newfd >= 1024 {
+    if oldfd < 0 || newfd < 0 {
         return None;
     }
     let current_pid = scheduler::current_pid()?;
@@ -185,6 +208,9 @@ pub fn current_task_dup2_fd(oldfd: i32, newfd: i32) -> Option<i32> {
 
     if oldfd == newfd {
         let task = task_arc.lock();
+        if newfd as u64 >= task.rlimit_nofile_cur {
+            return None;
+        }
         let fd_table = task.fd_table.lock();
         if fd_table.entries.get(oldfd as usize)?.as_ref().is_some() {
             return Some(newfd);
@@ -194,6 +220,9 @@ pub fn current_task_dup2_fd(oldfd: i32, newfd: i32) -> Option<i32> {
     }
 
     let mut task = task_arc.lock();
+    if newfd as u64 >= task.rlimit_nofile_cur {
+        return None;
+    }
     let mut fd_table = task.fd_table.lock();
     let file_desc = fd_table.entries.get(oldfd as usize)?.as_ref().cloned()?;
     *file_desc.ref_count.lock() += 1;
@@ -202,6 +231,9 @@ pub fn current_task_dup2_fd(oldfd: i32, newfd: i32) -> Option<i32> {
     let newfd_idx = newfd as usize;
     if newfd_idx >= fd_table.entries.len() {
         fd_table.entries.resize(newfd_idx + 1, None);
+    }
+    if newfd_idx >= fd_table.cloexec.len() {
+        fd_table.cloexec.resize(newfd_idx + 1, false);
     }
 
     // If newfd was already open, decrement its ref count
@@ -213,5 +245,6 @@ pub fn current_task_dup2_fd(oldfd: i32, newfd: i32) -> Option<i32> {
     }
 
     fd_table.entries[newfd_idx] = Some(file_desc);
+    fd_table.cloexec[newfd_idx] = false; // dup2 clears close-on-exec
     Some(newfd)
 }

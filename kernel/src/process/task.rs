@@ -129,6 +129,7 @@ impl Drop for AddressSpace {
 
 pub struct FdTable {
     pub entries: Vec<Option<Arc<FileDescription>>>,
+    pub cloexec: Vec<bool>,
 }
 
 /// A Task Control Block (TCB).
@@ -212,6 +213,14 @@ pub struct Task {
     pub clear_child_tid: Option<u64>,
     /// Alternate signal stack.
     pub sigaltstack: Option<StackT>,
+    /// Soft limit for open files (RLIMIT_NOFILE)
+    pub rlimit_nofile_cur: u64,
+    /// Hard limit for open files (RLIMIT_NOFILE)
+    pub rlimit_nofile_max: u64,
+    /// Process command line arguments
+    pub cmdline: Vec<String>,
+    /// File mode creation mask (umask)
+    pub umask: u32,
 }
 
 impl Task {
@@ -253,7 +262,10 @@ impl Task {
             exit_code: None,
             parent_pid: Pid::IDLE,
             cpu_ticks: 0,
-            fd_table: Arc::new(spin::Mutex::new(FdTable { entries })),
+            fd_table: Arc::new(spin::Mutex::new(FdTable {
+                entries,
+                cloexec: alloc::vec![false, false, false],
+            })),
             cwd: String::from("/"),
             pending_signals: 0,
             blocked_signals: 0,
@@ -275,6 +287,10 @@ impl Task {
             egid: 0,
             clear_child_tid: None,
             sigaltstack: None,
+            rlimit_nofile_cur: 1024,
+            rlimit_nofile_max: 4096,
+            cmdline: Vec::new(),
+            umask: 0o022,
         }
     }
 

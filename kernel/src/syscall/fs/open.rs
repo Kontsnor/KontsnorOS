@@ -100,9 +100,20 @@ pub fn sys_open(pathname: *const u8, flags: i32, _mode: u32) -> SyscallResult {
                         return e as SyscallResult;
                     }
 
+                    let umask = if let Some(pid) = crate::process::scheduler::current_pid() {
+                        if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+                            task_arc.lock().umask
+                        } else {
+                            0o022
+                        }
+                    } else {
+                        0o022
+                    };
+                    let file_mode = ((_mode & 0x0FFF) & !umask) as u16;
+
                     match parent_inode.create(name, crate::fs::inode::FileType::Regular) {
                         Some(new_i) => {
-                            let _ = new_i.set_permissions((_mode & 0x0FFF) as u16);
+                            let _ = new_i.set_permissions(file_mode);
                             new_i
                         }
                         None => return Errno::EACCES.into(),
@@ -177,5 +188,43 @@ pub fn sys_close(fd: i32) -> SyscallResult {
         0
     } else {
         Errno::EBADF.into()
+    }
+}
+
+/// `truncate(pathname, length)` — Truncate a file to a specified length.
+pub fn sys_truncate(pathname: *const u8, length: i64) -> SyscallResult {
+    if pathname.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if length < 0 {
+        return Errno::EINVAL.into();
+    }
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+    let inode = match crate::fs::vfs::lookup_follow(&resolved_path, true) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    let file_type = inode.inode().file_type;
+    if file_type == crate::fs::inode::FileType::Directory {
+        return Errno::EISDIR.into();
+    }
+    if file_type != crate::fs::inode::FileType::Regular {
+        return Errno::EINVAL.into();
+    }
+
+    // Check write permissions on the file
+    if let Err(e) = crate::fs::inode::check_permission(inode.inode(), crate::fs::inode::MAY_WRITE) {
+        return e as SyscallResult;
+    }
+
+    match inode.truncate(length as u64) {
+        Ok(()) => 0,
+        Err(e) => e as i64,
     }
 }

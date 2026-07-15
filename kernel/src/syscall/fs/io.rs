@@ -313,6 +313,13 @@ pub fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
             Ok(0) => break,
             Ok(n) => {
                 total_written += n;
+                if fd == 1 || fd == 2 {
+                    if let Ok(s) = core::str::from_utf8(&temp_buf[..n]) {
+                        crate::kprintln!("[fd {}] {}", fd, s);
+                    } else {
+                        crate::kprintln!("[fd {} raw] {:?}", fd, &temp_buf[..n]);
+                    }
+                }
                 if is_pipe {
                     crate::kprintln!(
                         "[syscall] sys_write on pipe fd {} returned {} bytes written",
@@ -477,6 +484,11 @@ pub fn sys_pipe2(pipefds: *mut i32, flags: i32) -> SyscallResult {
     // Create the pipe VFS endpoints
     let (reader, writer) = crate::fs::pipe::make_pipe();
 
+    if (flags & O_NONBLOCK) != 0 {
+        reader.set_nonblocking(true);
+        writer.set_nonblocking(true);
+    }
+
     // Allocate file descriptors
     let fd0 = match proc_fd::current_task_alloc_fd_with_flags_and_path(
         reader,
@@ -580,10 +592,6 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                 _ => return Errno::EBADF.into(),
             };
 
-            if cmd == 1030 {
-                file_desc.flags.lock().0 |= crate::fs::file::OpenFlags::O_CLOEXEC;
-            }
-
             *file_desc.ref_count.lock() += 1;
 
             let mut new_fd = start_fd;
@@ -596,7 +604,15 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             if (new_fd as usize) >= fd_table.entries.len() {
                 fd_table.entries.resize(new_fd as usize + 1, None);
             }
+            if (new_fd as usize) >= fd_table.cloexec.len() {
+                fd_table.cloexec.resize(new_fd as usize + 1, false);
+            }
             fd_table.entries[new_fd as usize] = Some(file_desc);
+            if cmd == 1030 {
+                fd_table.cloexec[new_fd as usize] = true;
+            } else {
+                fd_table.cloexec[new_fd as usize] = false;
+            }
 
             kprintln!(
                 "[syscall] fcntl(fd={}, cmd={}, arg={}) -> {}",
@@ -609,11 +625,41 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
         }
         1 => {
             // F_GETFD
-            0
+            let current_pid = match crate::process::scheduler::current_pid() {
+                Some(p) => p,
+                None => return Errno::ESRCH.into(),
+            };
+            if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+                let task = task_arc.lock();
+                let fd_table = task.fd_table.lock();
+                if (fd as usize) < fd_table.entries.len() && fd_table.entries[fd as usize].is_some()
+                {
+                    let is_cloexec =
+                        (fd as usize) < fd_table.cloexec.len() && fd_table.cloexec[fd as usize];
+                    return if is_cloexec { 1 } else { 0 };
+                }
+            }
+            Errno::EBADF.into()
         }
         2 => {
             // F_SETFD
-            0
+            let current_pid = match crate::process::scheduler::current_pid() {
+                Some(p) => p,
+                None => return Errno::ESRCH.into(),
+            };
+            if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+                let mut task = task_arc.lock();
+                let mut fd_table = task.fd_table.lock();
+                if (fd as usize) < fd_table.entries.len() && fd_table.entries[fd as usize].is_some()
+                {
+                    if (fd as usize) >= fd_table.cloexec.len() {
+                        fd_table.cloexec.resize(fd as usize + 1, false);
+                    }
+                    fd_table.cloexec[fd as usize] = (arg & 1) != 0;
+                    return 0;
+                }
+            }
+            Errno::EBADF.into()
         }
         3 => {
             // F_GETFL
@@ -643,6 +689,8 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                     let allowed_flags = OpenFlags::O_APPEND | OpenFlags::O_NONBLOCK;
                     let mut flags = desc.flags.lock();
                     let old_val = flags.0;
+                    let new_nonblock = (arg as u32 & OpenFlags::O_NONBLOCK) != 0;
+                    desc.inode.set_nonblocking(new_nonblock);
                     flags.0 = (old_val & !allowed_flags) | (arg as u32 & allowed_flags);
                     return 0;
                 }
@@ -978,5 +1026,73 @@ pub fn sys_flock(fd: i32, operation: i32) -> SyscallResult {
             });
             return 0;
         }
+    }
+}
+
+/// `readv(fd, iov, iovcnt)` — Read vector.
+pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: i32) -> SyscallResult {
+    if iov.is_null() || iovcnt <= 0 || iovcnt > 1024 {
+        return Errno::EINVAL.into();
+    }
+    if !validate_user_ptr(
+        iov as *const u8,
+        iovcnt as usize * core::mem::size_of::<IoVec>(),
+    ) {
+        return Errno::EFAULT.into();
+    }
+    let mut local_iov =
+        alloc::vec![IoVec { iov_base: core::ptr::null(), iov_len: 0 }; iovcnt as usize];
+    // SAFETY: The source pointer iov has been checked for nullity and validated using validate_user_ptr.
+    unsafe {
+        core::ptr::copy_nonoverlapping(iov, local_iov.as_mut_ptr(), iovcnt as usize);
+    }
+    let mut total_read = 0;
+    for io in local_iov {
+        if io.iov_len == 0 {
+            continue;
+        }
+        let ret = sys_read(fd, io.iov_base as *mut u8, io.iov_len);
+        if ret < 0 {
+            if total_read > 0 {
+                break;
+            }
+            return ret;
+        }
+        total_read += ret;
+        if ret < io.iov_len as i64 {
+            break;
+        }
+    }
+    total_read
+}
+
+/// `ftruncate(fd, length)` — Truncate a file to a specified length.
+pub fn sys_ftruncate(fd: i32, length: i64) -> SyscallResult {
+    if fd < 0 {
+        return Errno::EBADF.into();
+    }
+    if length < 0 {
+        return Errno::EINVAL.into();
+    }
+
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+
+    let flags = file_desc.flags.lock();
+    if !flags.is_writable() {
+        return Errno::EINVAL.into(); // In Linux, ftruncate returns EINVAL if fd is not open for writing.
+    }
+    drop(flags);
+
+    let file_type = file_desc.inode.inode().file_type;
+    if file_type != crate::fs::inode::FileType::Regular {
+        return Errno::EINVAL.into();
+    }
+
+    match file_desc.inode.truncate(length as u64) {
+        Ok(()) => 0,
+        Err(e) => e as i64,
     }
 }

@@ -40,6 +40,15 @@ impl<T> TicketLock<T> {
         }
     }
 
+    /// Retrieve the current tickets and holding CPU for debugging.
+    pub fn debug_info(&self) -> (u64, u64, u32) {
+        (
+            self.next_ticket.load(Ordering::Relaxed),
+            self.now_serving.load(Ordering::Relaxed),
+            self.holding_cpu.load(Ordering::Relaxed),
+        )
+    }
+
     /// Acquire the lock, returning a guard that releases it on drop.
     ///
     /// This will busy-wait until the lock is available. Interrupts

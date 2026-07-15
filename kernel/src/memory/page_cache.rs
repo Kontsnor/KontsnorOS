@@ -71,6 +71,8 @@ pub fn get_or_create_page(inode: &Arc<dyn InodeOps>, offset: u64) -> Result<u64,
     get_or_create_page_inner(&**inode, offset)
 }
 
+const DEBUG_PAGE_CACHE: bool = false;
+
 /// Helper function implementing page cache retrieval using raw `&dyn InodeOps`.
 pub fn get_or_create_page_inner(inode: &dyn InodeOps, offset: u64) -> Result<u64, Errno> {
     let ino = inode.inode().ino;
@@ -85,16 +87,20 @@ pub fn get_or_create_page_inner(inode: &dyn InodeOps, offset: u64) -> Result<u64
     }
 
     // 2. Allocate and read WITHOUT holding the lock
-    crate::kprintln!(
-        "[page_cache] allocating frame for ino={}, offset={:#x}",
-        ino,
-        aligned_offset
-    );
+    if DEBUG_PAGE_CACHE {
+        crate::kprintln!(
+            "[page_cache] allocating frame for ino={}, offset={:#x}",
+            ino,
+            aligned_offset
+        );
+    }
     let phys = crate::memory::physical::allocate_frame().ok_or(Errno::ENOMEM)?;
-    crate::kprintln!(
-        "[page_cache] allocated frame: phys={:#x}, calling read_direct",
-        phys
-    );
+    if DEBUG_PAGE_CACHE {
+        crate::kprintln!(
+            "[page_cache] allocated frame: phys={:#x}, calling read_direct",
+            phys
+        );
+    }
 
     // Read 4096 bytes from the inode at aligned_offset using read_direct
     let phys_offset = phys + crate::memory::r#virtual::phys_mem_offset();
@@ -103,49 +109,65 @@ pub fn get_or_create_page_inner(inode: &dyn InodeOps, offset: u64) -> Result<u64
 
     let mut total_read = 0;
     while total_read < 4096 {
-        crate::kprintln!(
-            "[page_cache] read_direct offset={:#x}, remaining={}",
-            aligned_offset + total_read as u64,
-            4096 - total_read
-        );
+        if DEBUG_PAGE_CACHE {
+            crate::kprintln!(
+                "[page_cache] read_direct offset={:#x}, remaining={}",
+                aligned_offset + total_read as u64,
+                4096 - total_read
+            );
+        }
         match inode.read_direct(
             aligned_offset + total_read as u64,
             &mut dest_slice[total_read..],
         ) {
             Ok(0) => {
-                crate::kprintln!("[page_cache] read_direct returned EOF");
+                if DEBUG_PAGE_CACHE {
+                    crate::kprintln!("[page_cache] read_direct returned EOF");
+                }
                 break;
             }
             Ok(n) => {
-                crate::kprintln!("[page_cache] read_direct read {} bytes", n);
+                if DEBUG_PAGE_CACHE {
+                    crate::kprintln!("[page_cache] read_direct read {} bytes", n);
+                }
                 total_read += n;
             }
             Err(e) => {
-                crate::kprintln!("[page_cache] read_direct error: {}", e);
+                if DEBUG_PAGE_CACHE {
+                    crate::kprintln!("[page_cache] read_direct error: {}", e);
+                }
                 crate::memory::physical::deallocate_frame(phys);
                 return Err(Errno::EIO);
             }
         }
     }
-    crate::kprintln!(
-        "[page_cache] read_direct finished, total_read={}",
-        total_read
-    );
+    if DEBUG_PAGE_CACHE {
+        crate::kprintln!(
+            "[page_cache] read_direct finished, total_read={}",
+            total_read
+        );
+    }
 
     // 3. Re-acquire lock and insert/check
-    crate::kprintln!("[page_cache] acquiring lock for insert");
+    if DEBUG_PAGE_CACHE {
+        crate::kprintln!("[page_cache] acquiring lock for insert");
+    }
     let mut cache = PAGE_CACHE.lock();
-    crate::kprintln!("[page_cache] acquired lock for insert");
+    if DEBUG_PAGE_CACHE {
+        crate::kprintln!("[page_cache] acquired lock for insert");
+    }
     if let Some(entry) = cache.get(&(ino, aligned_offset)) {
         // Someone else allocated and read it in the meantime!
         // Deallocate our frame and return the existing one.
         let phys_addr = entry.phys_addr;
         drop(cache);
         crate::memory::physical::deallocate_frame(phys);
-        crate::kprintln!(
-            "[page_cache] already present in cache: phys={:#x}",
-            phys_addr
-        );
+        if DEBUG_PAGE_CACHE {
+            crate::kprintln!(
+                "[page_cache] already present in cache: phys={:#x}",
+                phys_addr
+            );
+        }
         return Ok(phys_addr);
     }
 
@@ -156,7 +178,9 @@ pub fn get_or_create_page_inner(inode: &dyn InodeOps, offset: u64) -> Result<u64
             dirty: false,
         },
     );
-    crate::kprintln!("[page_cache] inserted into cache: phys={:#x}", phys);
+    if DEBUG_PAGE_CACHE {
+        crate::kprintln!("[page_cache] inserted into cache: phys={:#x}", phys);
+    }
 
     Ok(phys)
 }
@@ -218,50 +242,78 @@ pub fn flush_all_for_inode(inode: &Arc<dyn InodeOps>) -> Result<(), Errno> {
 /// Helper function implementing dirty page cache flushing for all pages of an inode using raw `&dyn InodeOps`.
 pub fn flush_all_for_inode_inner(inode: &dyn InodeOps) -> Result<(), Errno> {
     let ino = inode.inode().ino;
+    crate::kprintln!(
+        "[debug flush_all] scanning page tables of all tasks for ino={}",
+        ino
+    );
 
-    // First, scan page tables of all tasks to mark pages as dirty from shared mappings
-    let tasks = crate::process::scheduler::TASKS.read();
-    for task_opt in tasks.iter() {
-        if let Some(task_arc) = task_opt {
-            x86_64::instructions::interrupts::without_interrupts(|| {
-                let mut task = task_arc.lock();
-                let addr_space = task.address_space.lock();
-                for region in &addr_space.mmap_regions {
-                    if region.is_shared && region.inode.as_ref().map(|i| i.inode().ino) == Some(ino)
-                    {
-                        let start_page = region.start & !4095;
-                        let end_page = (region.start + region.len as u64 - 1) & !4095;
-                        for vaddr in (start_page..=end_page).step_by(4096) {
-                            let page_offset_in_mapping = vaddr - region.start;
-                            let file_offset = region.offset + page_offset_in_mapping;
+    // Collect Arc references to all active tasks under the read lock, then drop it immediately
+    // to prevent cross-thread read-write lock deadlocks if a task exits/forks concurrently.
+    let task_arcs: alloc::vec::Vec<(usize, Arc<spin::Mutex<crate::process::task::Task>>)> = {
+        let tasks = crate::process::scheduler::TASKS.read();
+        crate::kprintln!("[debug flush_all] TASKS locked, count={}", tasks.len());
+        tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, opt)| opt.as_ref().map(|arc| (idx, arc.clone())))
+            .collect()
+    };
 
-                            unsafe {
-                                if let Some(pte) = get_page_table_entry(
-                                    addr_space.page_table_root,
-                                    VirtAddr::new(vaddr),
-                                ) {
-                                    let mut flags = pte.flags();
-                                    if flags.contains(PageTableFlags::DIRTY) {
-                                        flags.remove(PageTableFlags::DIRTY);
-                                        pte.set_addr(pte.addr(), flags);
-                                        x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
+    crate::kprintln!(
+        "[debug flush_all] collected tasks, count={}",
+        task_arcs.len()
+    );
+    for (idx, task_arc) in task_arcs {
+        crate::kprintln!("[debug flush_all] locking task idx={}", idx);
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut task = task_arc.lock();
+            crate::kprintln!(
+                "[debug flush_all] task idx={} locked, locking addr_space",
+                idx
+            );
+            let addr_space = task.address_space.lock();
+            crate::kprintln!(
+                "[debug flush_all] addr_space idx={} locked, checking regions",
+                idx
+            );
+            for region in &addr_space.mmap_regions {
+                if region.is_shared && region.inode.as_ref().map(|i| i.inode().ino) == Some(ino) {
+                    let start_page = region.start & !4095;
+                    let end_page = (region.start + region.len as u64 - 1) & !4095;
+                    for vaddr in (start_page..=end_page).step_by(4096) {
+                        let page_offset_in_mapping = vaddr - region.start;
+                        let file_offset = region.offset + page_offset_in_mapping;
 
-                                        // Mark dirty in cache
-                                        let aligned_file_offset = file_offset & !4095;
-                                        let mut cache = PAGE_CACHE.lock();
-                                        if let Some(entry) =
-                                            cache.get_mut(&(ino, aligned_file_offset))
-                                        {
-                                            entry.dirty = true;
-                                        }
+                        unsafe {
+                            if let Some(pte) = get_page_table_entry(
+                                addr_space.page_table_root,
+                                VirtAddr::new(vaddr),
+                            ) {
+                                let mut flags = pte.flags();
+                                if flags.contains(PageTableFlags::DIRTY) {
+                                    flags.remove(PageTableFlags::DIRTY);
+                                    pte.set_addr(pte.addr(), flags);
+                                    x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
+
+                                    // Mark dirty in cache
+                                    let aligned_file_offset = file_offset & !4095;
+                                    let mut cache = PAGE_CACHE.lock();
+                                    if let Some(entry) = cache.get_mut(&(ino, aligned_file_offset))
+                                    {
+                                        entry.dirty = true;
                                     }
                                 }
                             }
                         }
                     }
                 }
-            });
-        }
+            }
+            crate::kprintln!(
+                "[debug flush_all] finished checking regions for idx={}",
+                idx
+            );
+        });
+        crate::kprintln!("[debug flush_all] task idx={} unlocked", idx);
     }
 
     let mut offsets = alloc::vec::Vec::new();

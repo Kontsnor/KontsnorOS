@@ -225,6 +225,7 @@ pub fn sys_times(buf: *mut u8) -> SyscallResult {
 
 /// `rlimit` struct used by `getrlimit`.
 #[repr(C)]
+#[derive(Clone, Copy, Debug)]
 struct RLimit {
     rlim_cur: u64, // soft limit
     rlim_max: u64, // hard limit
@@ -270,10 +271,22 @@ pub fn sys_getrlimit(resource: i32, rlim: *mut u8) -> SyscallResult {
             rlim_cur: RLIM_INFINITY,
             rlim_max: RLIM_INFINITY,
         }, // RLIMIT_NPROC
-        7 => RLimit {
-            rlim_cur: 1024,
-            rlim_max: 4096,
-        }, // RLIMIT_NOFILE
+        7 => {
+            let (cur, max) = if let Some(pid) = crate::process::scheduler::current_pid() {
+                if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+                    let task = task_arc.lock();
+                    (task.rlimit_nofile_cur, task.rlimit_nofile_max)
+                } else {
+                    (1024, 4096)
+                }
+            } else {
+                (1024, 4096)
+            };
+            RLimit {
+                rlim_cur: cur,
+                rlim_max: max,
+            }
+        } // RLIMIT_NOFILE
         8 => RLimit {
             rlim_cur: RLIM_INFINITY,
             rlim_max: RLIM_INFINITY,
@@ -297,8 +310,34 @@ pub fn sys_getrlimit(resource: i32, rlim: *mut u8) -> SyscallResult {
     0
 }
 
-/// `setrlimit(resource, rlim)` — Set resource limits (stub).
-pub fn sys_setrlimit(_resource: i32, _rlim: *const u8) -> SyscallResult {
+/// `setrlimit(resource, rlim)` — Set resource limits.
+pub fn sys_setrlimit(resource: i32, rlim: *const u8) -> SyscallResult {
+    if rlim.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if !validate_user_ptr(rlim, core::mem::size_of::<RLimit>()) {
+        return Errno::EFAULT.into();
+    }
+    // SAFETY: The pointer has been checked for nullity and validated using validate_user_ptr for the size of RLimit.
+    let limit = unsafe { *(rlim as *const RLimit) };
+
+    if resource == 7 {
+        // RLIMIT_NOFILE
+        let current_pid = match crate::process::scheduler::current_pid() {
+            Some(pid) => pid,
+            None => return Errno::ESRCH.into(),
+        };
+        let task_arc = match crate::process::scheduler::get_task_arc(current_pid) {
+            Some(arc) => arc,
+            None => return Errno::ESRCH.into(),
+        };
+        let mut task = task_arc.lock();
+        if limit.rlim_cur > limit.rlim_max {
+            return Errno::EINVAL.into();
+        }
+        task.rlimit_nofile_cur = limit.rlim_cur;
+        task.rlimit_nofile_max = limit.rlim_max;
+    }
     0
 }
 
@@ -466,25 +505,113 @@ pub fn sys_prlimit64(
     new_limit: *const u8,
     old_limit: *mut u8,
 ) -> SyscallResult {
-    if !new_limit.is_null() {
-        if !validate_user_ptr(new_limit, core::mem::size_of::<RLimit>()) {
-            return Errno::EFAULT.into();
+    let target_pid = if _pid == 0 {
+        match crate::process::scheduler::current_pid() {
+            Some(p) => p,
+            None => return Errno::ESRCH.into(),
         }
-    }
+    } else {
+        crate::process::pid::Pid::from_raw(_pid as u64)
+    };
+
     if !old_limit.is_null() {
         if validate_user_ptr_write(old_limit, core::mem::size_of::<RLimit>()).is_err() {
             return Errno::EFAULT.into();
         }
-        let ret = sys_getrlimit(resource, old_limit);
-        if ret < 0 {
-            return ret;
+        let limit = match resource {
+            7 => {
+                if let Some(task_arc) = crate::process::scheduler::get_task_arc(target_pid) {
+                    let task = task_arc.lock();
+                    RLimit {
+                        rlim_cur: task.rlimit_nofile_cur,
+                        rlim_max: task.rlimit_nofile_max,
+                    }
+                } else {
+                    return Errno::ESRCH.into();
+                }
+            }
+            0 => RLimit {
+                rlim_cur: RLIM_INFINITY,
+                rlim_max: RLIM_INFINITY,
+            }, // RLIMIT_CPU
+            1 => RLimit {
+                rlim_cur: RLIM_INFINITY,
+                rlim_max: RLIM_INFINITY,
+            }, // RLIMIT_FSIZE
+            2 => RLimit {
+                rlim_cur: RLIM_INFINITY,
+                rlim_max: RLIM_INFINITY,
+            }, // RLIMIT_DATA
+            3 => RLimit {
+                rlim_cur: 8 * 1024 * 1024,
+                rlim_max: RLIM_INFINITY,
+            }, // RLIMIT_STACK
+            4 => RLimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            }, // RLIMIT_CORE
+            5 => RLimit {
+                rlim_cur: RLIM_INFINITY,
+                rlim_max: RLIM_INFINITY,
+            }, // RLIMIT_RSS
+            6 => RLimit {
+                rlim_cur: RLIM_INFINITY,
+                rlim_max: RLIM_INFINITY,
+            }, // RLIMIT_NPROC
+            8 => RLimit {
+                rlim_cur: RLIM_INFINITY,
+                rlim_max: RLIM_INFINITY,
+            }, // RLIMIT_MEMLOCK
+            9 => RLimit {
+                rlim_cur: RLIM_INFINITY,
+                rlim_max: RLIM_INFINITY,
+            }, // RLIMIT_AS
+            10 => RLimit {
+                rlim_cur: RLIM_INFINITY,
+                rlim_max: RLIM_INFINITY,
+            }, // RLIMIT_LOCKS
+            _ => RLimit {
+                rlim_cur: RLIM_INFINITY,
+                rlim_max: RLIM_INFINITY,
+            },
+        };
+        // SAFETY: The pointer has been checked for nullity and validated using validate_user_ptr_write.
+        unsafe {
+            core::ptr::write(old_limit as *mut RLimit, limit);
         }
     }
+
+    if !new_limit.is_null() {
+        if !validate_user_ptr(new_limit, core::mem::size_of::<RLimit>()) {
+            return Errno::EFAULT.into();
+        }
+        // SAFETY: The pointer has been checked for nullity and validated using validate_user_ptr.
+        let limit = unsafe { *(new_limit as *const RLimit) };
+        if limit.rlim_cur > limit.rlim_max {
+            return Errno::EINVAL.into();
+        }
+        if resource == 7 {
+            // RLIMIT_NOFILE
+            if let Some(task_arc) = crate::process::scheduler::get_task_arc(target_pid) {
+                let mut task = task_arc.lock();
+                task.rlimit_nofile_cur = limit.rlim_cur;
+                task.rlimit_nofile_max = limit.rlim_max;
+            } else {
+                return Errno::ESRCH.into();
+            }
+        }
+    }
+
     0
 }
 
 /// `tgkill(tgid, tid, sig)` — Send signal to thread.
 pub fn sys_tgkill(_tgid: i32, tid: i32, sig: i32) -> SyscallResult {
+    crate::syscall::signal::sys_kill(tid, sig)
+}
+
+/// `tkill(tid, sig)` — Send signal to thread.
+pub fn sys_tkill(tid: i32, sig: i32) -> SyscallResult {
     crate::syscall::signal::sys_kill(tid, sig)
 }
 
@@ -518,4 +645,18 @@ pub fn sys_sched_getaffinity(_pid: i32, cpusetsize: usize, mask: *mut u8) -> Sys
     }
 
     8
+}
+
+/// `set_robust_list(head, len)` — Stub returning ENOSYS.
+pub fn sys_set_robust_list(_head: *const u8, _len: usize) -> SyscallResult {
+    Errno::ENOSYS.into()
+}
+
+/// `get_robust_list(pid, head_ptr, len_ptr)` — Stub returning ENOSYS.
+pub fn sys_get_robust_list(
+    _pid: i32,
+    _head_ptr: *mut *mut u8,
+    _len_ptr: *mut usize,
+) -> SyscallResult {
+    Errno::ENOSYS.into()
 }

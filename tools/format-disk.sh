@@ -51,6 +51,7 @@ mkdir /etc
 mkdir /tmp
 mkdir /var
 mkdir /usr
+mkdir /usr/bin
 mkdir /usr/include
 mkdir /usr/lib
 mkdir /usr/lib/tcc
@@ -113,6 +114,7 @@ echo "Compiling stubs library..."
 cat << 'EOF' > /tmp/stubs.c
 #include <string.h>
 #include <stddef.h>
+#include <unistd.h>
 
 struct {
     unsigned int __cpu_vendor;
@@ -122,13 +124,16 @@ struct {
 } __cpu_model = {0};
 
 void __cpu_indicator_init(void) {
+    write(2, "STUB: __cpu_indicator_init\n", 27);
 }
 
 void *__memset_chk(void *dest, int c, size_t len, size_t destlen) {
+    write(2, "STUB: __memset_chk\n", 19);
     return memset(dest, c, len);
 }
 
 int _dl_find_object(void *address, void *result) {
+    write(2, "STUB: _dl_find_object\n", 22);
     return -1;
 }
 EOF
@@ -156,6 +161,16 @@ echo "Writing /hello.txt..."
 echo "Hello from the ext2 disk on KontsnorOS!" > /tmp/hello.txt
 echo "write /tmp/hello.txt /hello.txt" >> "$CMD_FILE"
 
+echo "Writing /compile.sh..."
+cat << 'EOF' > /tmp/compile.sh
+#!/bin/sh
+echo "Compiling hello.rs..."
+/usr/bin/rustc -C linker-flavor=ld.lld -C linker=/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld /hello.rs -o /hello_rust
+echo "Compilation finished!"
+EOF
+chmod +x /tmp/compile.sh
+echo "write /tmp/compile.sh /compile.sh" >> "$CMD_FILE"
+
 # Copy Rust Toolchain
 RUST_TOOLCHAIN_DIR="/home/kontsnor/.rustup/toolchains/nightly-x86_64-unknown-linux-musl"
 if [ -d "$RUST_TOOLCHAIN_DIR" ]; then
@@ -163,9 +178,12 @@ if [ -d "$RUST_TOOLCHAIN_DIR" ]; then
     echo "mkdir /lib/rustlib" >> "$CMD_FILE"
     echo "mkdir /lib/rustlib/x86_64-unknown-linux-musl" >> "$CMD_FILE"
     echo "mkdir /lib/rustlib/x86_64-unknown-linux-musl/lib" >> "$CMD_FILE"
+    echo "mkdir /lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained" >> "$CMD_FILE"
+    echo "mkdir /lib/rustlib/x86_64-unknown-linux-musl/bin" >> "$CMD_FILE"
     
-    echo "write $RUST_TOOLCHAIN_DIR/bin/rustc /bin/rustc" >> "$CMD_FILE"
-    echo "write $RUST_TOOLCHAIN_DIR/bin/cargo /bin/cargo" >> "$CMD_FILE"
+    echo "write $RUST_TOOLCHAIN_DIR/bin/rustc /usr/bin/rustc" >> "$CMD_FILE"
+    echo "write $RUST_TOOLCHAIN_DIR/bin/cargo /usr/bin/cargo" >> "$CMD_FILE"
+    echo "write $RUST_TOOLCHAIN_DIR/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld /lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld" >> "$CMD_FILE"
     
     # Copy librustc_driver shared library
     find "$RUST_TOOLCHAIN_DIR/lib" -maxdepth 1 -name "librustc_driver-*.so" | while read -r filepath; do
@@ -175,29 +193,80 @@ if [ -d "$RUST_TOOLCHAIN_DIR" ]; then
     
     # Compile a musl-compatible libgcc_s.so.1 stub library
     cat << 'EOF' > /tmp/libgcc_s.c
-void _Unwind_Backtrace() {}
-void _Unwind_DeleteException() {}
-void _Unwind_FindEnclosingFunction() {}
-void _Unwind_GetCFA() {}
-void _Unwind_GetDataRelBase() {}
-void _Unwind_GetIP() {}
-void _Unwind_GetIPInfo() {}
-void _Unwind_GetLanguageSpecificData() {}
-void _Unwind_GetRegionStart() {}
-void _Unwind_GetTextRelBase() {}
-void _Unwind_RaiseException() {}
-void _Unwind_Resume() {}
-void _Unwind_Resume_or_Rethrow() {}
-void _Unwind_SetGR() {}
-void _Unwind_SetIP() {}
+#include <unistd.h>
+void _Unwind_Backtrace() { write(2, "STUB: _Unwind_Backtrace\n", 24); }
+void _Unwind_DeleteException() { write(2, "STUB: _Unwind_DeleteException\n", 30); }
+void _Unwind_FindEnclosingFunction() { write(2, "STUB: _Unwind_FindEnclosingFunction\n", 36); }
+void _Unwind_GetCFA() { write(2, "STUB: _Unwind_GetCFA\n", 21); }
+void _Unwind_GetDataRelBase() { write(2, "STUB: _Unwind_GetDataRelBase\n", 29); }
+void _Unwind_GetIP() { write(2, "STUB: _Unwind_GetIP\n", 20); }
+void _Unwind_GetIPInfo() { write(2, "STUB: _Unwind_GetIPInfo\n", 24); }
+void _Unwind_GetLanguageSpecificData() { write(2, "STUB: _Unwind_GetLanguageSpecificData\n", 38); }
+void _Unwind_GetRegionStart() { write(2, "STUB: _Unwind_GetRegionStart\n", 29); }
+void _Unwind_GetTextRelBase() { write(2, "STUB: _Unwind_GetTextRelBase\n", 29); }
+void _Unwind_RaiseException() { write(2, "STUB: _Unwind_RaiseException\n", 29); }
+void _Unwind_Resume() { write(2, "STUB: _Unwind_Resume\n", 21); }
+void _Unwind_Resume_or_Rethrow() { write(2, "STUB: _Unwind_Resume_or_Rethrow\n", 32); }
+void _Unwind_SetGR() { write(2, "STUB: _Unwind_SetGR\n", 20); }
+void _Unwind_SetIP() { write(2, "STUB: _Unwind_SetIP\n", 20); }
+void __register_frame_info() { write(2, "STUB: __register_frame_info\n", 28); }
+void __deregister_frame_info() { write(2, "STUB: __deregister_frame_info\n", 30); }
+int __popcountdi2(unsigned long long a) {
+    int count = 0;
+    while (a) {
+        count += (a & 1);
+        a >>= 1;
+    }
+    return count;
+}
 EOF
-    musl-gcc -shared -fPIC -o /tmp/libgcc_s.so.1 /tmp/libgcc_s.c
+
+    cat << 'EOF' > /tmp/version.map
+GCC_3.0 {
+  global:
+    _Unwind_DeleteException;
+    _Unwind_GetDataRelBase;
+    _Unwind_GetLanguageSpecificData;
+    _Unwind_GetRegionStart;
+    _Unwind_GetTextRelBase;
+    _Unwind_RaiseException;
+    _Unwind_Resume;
+    _Unwind_SetGR;
+    _Unwind_SetIP;
+    _Unwind_Backtrace;
+    _Unwind_FindEnclosingFunction;
+    _Unwind_GetCFA;
+    _Unwind_GetIP;
+    __register_frame_info;
+    __deregister_frame_info;
+  local:
+    *;
+};
+
+GCC_3.3 {
+  global:
+    _Unwind_Resume_or_Rethrow;
+} GCC_3.0;
+
+GCC_3.4 {
+  global:
+    __popcountdi2;
+} GCC_3.3;
+
+GCC_4.2.0 {
+  global:
+    _Unwind_GetIPInfo;
+} GCC_3.4;
+EOF
+
+    musl-gcc -shared -fPIC -o /tmp/libgcc_s.so.1 /tmp/libgcc_s.c -Wl,--version-script=/tmp/version.map
     echo "write /tmp/libgcc_s.so.1 /lib/libgcc_s.so.1" >> "$CMD_FILE"
     
     # Copy target stdlib files
-    find "$RUST_TOOLCHAIN_DIR/lib/rustlib/x86_64-unknown-linux-musl/lib" -type f | while read -r filepath; do
-        filename=$(basename "$filepath")
-        echo "write $filepath /lib/rustlib/x86_64-unknown-linux-musl/lib/$filename" >> "$CMD_FILE"
+    STDLIB_SRC_DIR="$RUST_TOOLCHAIN_DIR/lib/rustlib/x86_64-unknown-linux-musl/lib"
+    find "$STDLIB_SRC_DIR" -type f | while read -r filepath; do
+        relpath="${filepath#$STDLIB_SRC_DIR/}"
+        echo "write $filepath /lib/rustlib/x86_64-unknown-linux-musl/lib/$relpath" >> "$CMD_FILE"
     done
 else
     echo "WARNING: Rust toolchain dir $RUST_TOOLCHAIN_DIR not found!"
@@ -208,8 +277,8 @@ echo "Staging KontsnorOS kernel source code..."
 echo "mkdir /src" >> "$CMD_FILE"
 echo "mkdir /src/KontsnorOS" >> "$CMD_FILE"
 
-# Pre-create all subdirectories under kernel and driver-sdk
-find "$PROJECT_DIR/kernel" "$PROJECT_DIR/driver-sdk" -type d | while read -r dirpath; do
+# Pre-create all subdirectories under kernel, driver-sdk, and tools
+find "$PROJECT_DIR/kernel" "$PROJECT_DIR/driver-sdk" "$PROJECT_DIR/tools" -type d | while read -r dirpath; do
     relpath="${dirpath#$PROJECT_DIR/}"
     echo "mkdir /src/KontsnorOS/$relpath" >> "$CMD_FILE"
 done
@@ -223,8 +292,8 @@ if [ -f "$PROJECT_DIR/rust-toolchain.toml" ]; then
     echo "write $PROJECT_DIR/rust-toolchain.toml /src/KontsnorOS/rust-toolchain.toml" >> "$CMD_FILE"
 fi
 
-# Copy all source files under kernel and driver-sdk
-find "$PROJECT_DIR/kernel" "$PROJECT_DIR/driver-sdk" -type f | while read -r filepath; do
+# Copy all source files under kernel, driver-sdk, and tools
+find "$PROJECT_DIR/kernel" "$PROJECT_DIR/driver-sdk" "$PROJECT_DIR/tools" -type f | while read -r filepath; do
     relpath="${filepath#$PROJECT_DIR/}"
     echo "write $filepath /src/KontsnorOS/$relpath" >> "$CMD_FILE"
 done

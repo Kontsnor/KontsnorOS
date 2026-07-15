@@ -83,6 +83,7 @@ impl PipeState {
 pub struct PipeReader {
     inode: Inode,
     state: Arc<PipeState>,
+    non_blocking: core::sync::atomic::AtomicBool,
 }
 
 impl InodeOps for PipeReader {
@@ -119,9 +120,31 @@ impl InodeOps for PipeReader {
                 return Ok(0); // EOF
             }
 
+            if self.non_blocking.load(Ordering::SeqCst) {
+                return Err(-11); // EAGAIN / EWOULDBLOCK
+            }
+
             // Yield and block cooperatively
             crate::process::scheduler::yield_now();
         }
+    }
+
+    fn ioctl(&self, request: u64, arg: u64) -> Result<u64, i32> {
+        if request == 0x5413 {
+            // FIONBIO
+            if !crate::syscall::fs::validate_user_ptr(arg as *const u8, 4) {
+                return Err(-14); // EFAULT
+            }
+            let val = unsafe { *(arg as *const i32) };
+            self.non_blocking.store(val != 0, Ordering::SeqCst);
+            Ok(0)
+        } else {
+            Err(-22) // EINVAL
+        }
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) {
+        self.non_blocking.store(nonblocking, Ordering::SeqCst);
     }
 
     fn readdir(&self) -> Vec<DirEntry> {
@@ -151,6 +174,7 @@ impl Drop for PipeReader {
 pub struct PipeWriter {
     inode: Inode,
     state: Arc<PipeState>,
+    non_blocking: core::sync::atomic::AtomicBool,
 }
 
 impl InodeOps for PipeWriter {
@@ -192,12 +216,37 @@ impl InodeOps for PipeWriter {
             };
 
             if !space_available {
+                if self.non_blocking.load(Ordering::SeqCst) {
+                    if written > 0 {
+                        return Ok(written);
+                    } else {
+                        return Err(-11); // EAGAIN
+                    }
+                }
                 // Yield and block cooperatively until space is freed
                 crate::process::scheduler::yield_now();
             }
         }
 
         Ok(written)
+    }
+
+    fn ioctl(&self, request: u64, arg: u64) -> Result<u64, i32> {
+        if request == 0x5413 {
+            // FIONBIO
+            if !crate::syscall::fs::validate_user_ptr(arg as *const u8, 4) {
+                return Err(-14); // EFAULT
+            }
+            let val = unsafe { *(arg as *const i32) };
+            self.non_blocking.store(val != 0, Ordering::SeqCst);
+            Ok(0)
+        } else {
+            Err(-22) // EINVAL
+        }
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) {
+        self.non_blocking.store(nonblocking, Ordering::SeqCst);
     }
 
     fn readdir(&self) -> Vec<DirEntry> {
@@ -233,11 +282,13 @@ pub fn make_pipe() -> (Arc<dyn InodeOps>, Arc<dyn InodeOps>) {
     let reader = Arc::new(PipeReader {
         inode: Inode::new(0, FileType::Pipe),
         state: state.clone(),
+        non_blocking: core::sync::atomic::AtomicBool::new(false),
     });
 
     let writer = Arc::new(PipeWriter {
         inode: Inode::new(0, FileType::Pipe),
         state,
+        non_blocking: core::sync::atomic::AtomicBool::new(false),
     });
 
     (reader, writer)

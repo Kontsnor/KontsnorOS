@@ -64,6 +64,10 @@ pub fn sys_futex(
     }
 
     let cmd = op & 127;
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
 
     match cmd {
         0 | 9 => {
@@ -78,10 +82,13 @@ pub fn sys_futex(
                 0xffffffff
             };
 
-            let current_pid = match scheduler::current_pid() {
-                Some(p) => p,
-                None => return Errno::ESRCH.into(),
-            };
+            crate::kprintln!(
+                "[syscall pid={}] sys_futex WAIT: uaddr={:#x}, val={}, op={}",
+                current_pid,
+                uaddr as u64,
+                val,
+                op
+            );
 
             let mut queues = FUTEX_QUEUES.lock();
 
@@ -89,6 +96,12 @@ pub fn sys_futex(
             // and contains a valid 32-bit integer.
             let current_val = unsafe { core::ptr::read_volatile(uaddr) };
             if current_val != val {
+                crate::kprintln!(
+                    "[syscall pid={}] sys_futex WAIT: val mismatch (current={}, expected={}) -> EAGAIN",
+                    current_pid,
+                    current_val,
+                    val
+                );
                 return Errno::EAGAIN.into();
             }
 
@@ -118,6 +131,14 @@ pub fn sys_futex(
                 0xffffffff
             };
 
+            crate::kprintln!(
+                "[syscall pid={}] sys_futex WAKE: uaddr={:#x}, val={}, op={}",
+                current_pid,
+                uaddr as u64,
+                val,
+                op
+            );
+
             let mut queues = FUTEX_QUEUES.lock();
             let mut woken = 0;
 
@@ -140,7 +161,7 @@ pub fn sys_futex(
             woken as SyscallResult
         }
         _ => {
-            crate::kprintln!("[syscall] sys_futex unknown op={}", op);
+            crate::kprintln!("[syscall pid={}] sys_futex unknown op={}", current_pid, op);
             Errno::ENOSYS.into()
         }
     }

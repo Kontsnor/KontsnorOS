@@ -110,7 +110,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         .expect("Physical memory offset not provided by bootloader");
 
     // Initialize the physical frame allocator
-    memory::physical::init(&boot_info.memory_regions);
+    memory::physical::init(&boot_info.memory_regions, phys_mem_offset);
     kprintln!("[boot] Physical frame allocator initialized.");
 
     // Initialize the virtual memory manager

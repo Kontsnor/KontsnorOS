@@ -964,3 +964,24 @@ pub fn sys_fstatfs(fd: i32, buf: *mut LinuxStatfs) -> SyscallResult {
     }
     0
 }
+
+/// `umask(mask)` — Set file mode creation mask.
+pub fn sys_umask(mask: u32) -> SyscallResult {
+    if crate::syscall::DEBUG_SYSCALLS {
+        kprintln!("[syscall] umask(mask={:#o})", mask);
+    }
+
+    let current_pid = match crate::process::scheduler::current_pid() {
+        Some(pid) => pid,
+        None => return 0o022,
+    };
+
+    if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+        let mut task = task_arc.lock();
+        let old_mask = task.umask;
+        task.umask = mask & 0o777;
+        old_mask as SyscallResult
+    } else {
+        0o022
+    }
+}

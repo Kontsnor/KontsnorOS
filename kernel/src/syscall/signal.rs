@@ -318,6 +318,40 @@ pub struct SignalFrame {
     pub mask: u64, // Saved signal mask (blocked_signals)
 }
 
+fn terminate_group_and_exit(current_pid: crate::process::pid::Pid, exit_code: i32) -> ! {
+    use crate::process::scheduler;
+    let tgid = if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+        task_arc.lock().tgid
+    } else {
+        scheduler::exit_current_thread(exit_code);
+    };
+
+    let mut other_pids = alloc::vec::Vec::new();
+    {
+        let tasks = scheduler::TASKS.read();
+        for slot in tasks.iter() {
+            if let Some(task_arc) = slot {
+                let task = task_arc.lock();
+                if task.tgid == tgid && task.pid != current_pid {
+                    other_pids.push(task.pid);
+                }
+            }
+        }
+    }
+
+    if !other_pids.is_empty() {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            if let Some(ref mut sched) = *scheduler::SCHEDULER.lock() {
+                for pid in other_pids {
+                    sched.exit_task(pid, exit_code);
+                }
+            }
+        });
+    }
+
+    scheduler::exit_current_thread(exit_code);
+}
+
 /// Delivers pending unblocked signals to the current process.
 pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
     use crate::process::scheduler;
@@ -389,10 +423,10 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
             return;
         }
         kprintln!(
-            "[signal] Default action for signal {} is termination. Exiting task.",
+            "[signal] Default action for signal {} is termination. Exiting task group.",
             sig
         );
-        scheduler::exit_current_thread(sig | 128);
+        terminate_group_and_exit(current_pid, sig | 128);
     } else {
         let original_user_sp = unsafe { (*regs).rsp };
         let mut user_sp = original_user_sp;
@@ -418,8 +452,8 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
             new_user_sp as *const u8,
             core::mem::size_of::<SignalFrame>(),
         ) {
-            kprintln!("[signal] Invalid user stack for signal delivery. Exiting task.");
-            scheduler::exit_current_thread(11 | 128); // SIGSEGV
+            kprintln!("[signal] Invalid user stack for signal delivery. Exiting task group.");
+            terminate_group_and_exit(current_pid, 11 | 128); // SIGSEGV
         }
 
         let frame = SignalFrame {

@@ -68,19 +68,29 @@ impl Scheduler {
     ///
     /// Returns the PID of the highest-priority ready task, or None
     /// if no tasks are ready.
-    pub fn pick_next(&mut self) -> Option<Pid> {
+    pub fn pick_next(&mut self) -> Option<(Pid, Priority)> {
         let tasks = TASKS.read();
         // Check queues from highest to lowest priority
         for queue in &mut self.queues {
-            while let Some(pid) = queue.pop_front() {
+            let mut i = 0;
+            while i < queue.len() {
+                let pid = queue[i];
                 let idx = pid.as_u64() as usize;
                 if let Some(Some(task_arc)) = tasks.get(idx) {
-                    let mut task = task_arc.lock();
-                    task.in_queue = false;
-                    if task.state == TaskState::Ready {
-                        return Some(pid);
+                    if let Some(mut task) = task_arc.try_lock() {
+                        if task.state == TaskState::Ready {
+                            queue.remove(i);
+                            task.in_queue = false;
+                            let priority = task.priority;
+                            return Some((pid, priority));
+                        }
+                    } else {
+                        // Skip locked tasks in this round to prevent permanent queue loss / starvation
+                        i += 1;
+                        continue;
                     }
                 }
+                queue.remove(i);
             }
         }
         None
@@ -138,11 +148,12 @@ impl Scheduler {
                         }
                     }
                 } else {
-                    let mut task = task_arc.lock();
-                    if task.priority > Priority::High
-                        && (task.state == TaskState::Ready || task.state == TaskState::Running)
-                    {
-                        task.priority = Priority::High;
+                    if let Some(mut task) = task_arc.try_lock() {
+                        if task.priority > Priority::High
+                            && (task.state == TaskState::Ready || task.state == TaskState::Running)
+                        {
+                            task.priority = Priority::High;
+                        }
                     }
                 }
             }
@@ -253,9 +264,6 @@ impl Scheduler {
             let mut task = task_arc.lock();
             task.state = TaskState::Zombie;
             task.exit_code = Some(exit_code);
-            if alloc::sync::Arc::strong_count(&task.fd_table) == 1 {
-                task.fd_table.lock().entries.clear();
-            }
             parent_pid = Some(task.parent_pid);
             clear_ctid = task.clear_child_tid;
         }
@@ -482,9 +490,35 @@ pub fn schedule() {
             None => return,
         };
 
+        // If the current task is already locked by the interrupted thread on this core,
+        // we cannot safely reschedule. Skip this tick.
+        let current_idx = current_pid.as_u64() as usize;
+        {
+            let tasks = TASKS.read();
+            if let Some(Some(current_task_arc)) = tasks.get(current_idx) {
+                if current_task_arc.try_lock().is_none() {
+                    return;
+                }
+            }
+        }
+
         // Pick the next task to run
         let next_pid = match scheduler.pick_next() {
-            Some(pid) => pid,
+            Some((pid, prio)) => {
+                let next_idx = pid.as_u64() as usize;
+                let tasks = TASKS.read();
+                let is_locked = if let Some(Some(next_task_arc)) = tasks.get(next_idx) {
+                    next_task_arc.try_lock().is_none()
+                } else {
+                    false
+                };
+                if is_locked {
+                    let prio_idx = prio as usize;
+                    scheduler.queues[prio_idx].push_back(pid);
+                    return;
+                }
+                pid
+            }
             None => {
                 // No other ready tasks; keep running current if it's still runnable
                 let current_idx = current_pid.as_u64() as usize;

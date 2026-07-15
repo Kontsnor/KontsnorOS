@@ -20,7 +20,11 @@ if [ ! -f "$KERNEL_BIN" ]; then
     exit 1
 fi
 
-bootloader_linker build "$KERNEL_BIN" -o "$PROJECT_DIR" -s
+STRIPPED_DIR="$PROJECT_DIR/target/stripped"
+mkdir -p "$STRIPPED_DIR"
+cp "$KERNEL_BIN" "$STRIPPED_DIR/kontsnor-kernel"
+strip "$STRIPPED_DIR/kontsnor-kernel"
+bootloader_linker build "$STRIPPED_DIR/kontsnor-kernel" -o "$PROJECT_DIR" -s
 
 echo "Starting QEMU in test mode..."
 # Disable "exit on error" temporarily so we can capture the exit status from QEMU

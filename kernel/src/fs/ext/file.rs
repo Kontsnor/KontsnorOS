@@ -17,19 +17,18 @@ impl ExtInode {
             self.ino,
             file_block
         );
-        let mut root_buf = [0u8; 60];
+        let mut current_buf = [0u8; 4096];
+        let mut current_len = 60;
         for i in 0..15 {
-            root_buf[i * 4..i * 4 + 4].copy_from_slice(&i_block[i].to_le_bytes());
+            current_buf[i * 4..i * 4 + 4].copy_from_slice(&i_block[i].to_le_bytes());
         }
-
-        let mut current_buf = root_buf.to_vec();
 
         loop {
             crate::kprintln!(
                 "[resolve_extent_block] loop offset, buf len={}",
-                current_buf.len()
+                current_len
             );
-            if current_buf.len() < 12 {
+            if current_len < 12 {
                 return Err("Extent buffer too small for header");
             }
             // SAFETY: Safe to read Ext4ExtentHeader from a valid aligned/unaligned buffer of sufficient size.
@@ -40,12 +39,10 @@ impl ExtInode {
             let eh_depth = header.eh_depth;
             let eh_entries = header.eh_entries;
             crate::kprintln!(
-                "[resolve_extent_block] magic={:#x}, depth={}, entries={}, bytes=[{:02x}, {:02x}, {:02x}, {:02x}, {:02x}, {:02x}, {:02x}, {:02x}]",
+                "[resolve_extent_block] magic={:#x}, depth={}, entries={}",
                 eh_magic,
                 eh_depth,
-                eh_entries,
-                current_buf[0], current_buf[1], current_buf[2], current_buf[3],
-                current_buf[4], current_buf[5], current_buf[6], current_buf[7]
+                eh_entries
             );
             if eh_magic != 0xF30A {
                 return Err("Invalid extent header magic");
@@ -58,7 +55,7 @@ impl ExtInode {
                 let entry_size = core::mem::size_of::<Ext4Extent>(); // 12 bytes
                 for i in 0..eh_entries {
                     let offset = 12 + i * entry_size;
-                    if offset + entry_size > current_buf.len() {
+                    if offset + entry_size > current_len {
                         return Err("Extent entry out of bounds");
                     }
                     // SAFETY: Safe to read Ext4Extent from a valid aligned/unaligned buffer of sufficient size.
@@ -81,7 +78,7 @@ impl ExtInode {
                 let mut best_idx: Option<Ext4ExtentIdx> = None;
                 for i in 0..eh_entries {
                     let offset = 12 + i * entry_size;
-                    if offset + entry_size > current_buf.len() {
+                    if offset + entry_size > current_len {
                         return Err("Extent index entry out of bounds");
                     }
                     // SAFETY: Safe to read Ext4ExtentIdx from a valid aligned/unaligned buffer of sufficient size.
@@ -111,14 +108,15 @@ impl ExtInode {
                         best_ei_block,
                         child_block
                     );
-                    let mut next_buf = alloc::vec![0u8; self.fs.block_size as usize];
+                    let block_size = self.fs.block_size as usize;
+                    assert!(block_size <= 4096);
                     read_blocks(
                         &*self.fs.device,
                         child_block,
-                        &mut next_buf,
+                        &mut current_buf[..block_size],
                         self.fs.block_size,
                     )?;
-                    current_buf = next_buf;
+                    current_len = block_size;
                 } else {
                     return Ok(0); // Not found
                 }
@@ -151,11 +149,13 @@ impl ExtInode {
                 return Ok(0);
             }
 
-            let mut ind_buf = alloc::vec![0u8; self.fs.block_size as usize];
+            let mut ind_buf = [0u8; 4096];
+            let block_size = self.fs.block_size as usize;
+            assert!(block_size <= 4096);
             read_blocks(
                 &*self.fs.device,
                 sib as u64,
-                &mut ind_buf,
+                &mut ind_buf[..block_size],
                 self.fs.block_size,
             )?;
 
@@ -177,11 +177,13 @@ impl ExtInode {
                 return Ok(0);
             }
 
-            let mut dib_buf = alloc::vec![0u8; self.fs.block_size as usize];
+            let mut dib_buf = [0u8; 4096];
+            let block_size = self.fs.block_size as usize;
+            assert!(block_size <= 4096);
             read_blocks(
                 &*self.fs.device,
                 dib as u64,
-                &mut dib_buf,
+                &mut dib_buf[..block_size],
                 self.fs.block_size,
             )?;
 
@@ -197,11 +199,11 @@ impl ExtInode {
                 return Ok(0);
             }
 
-            let mut sib_buf = alloc::vec![0u8; self.fs.block_size as usize];
+            let mut sib_buf = [0u8; 4096];
             read_blocks(
                 &*self.fs.device,
                 sib as u64,
-                &mut sib_buf,
+                &mut sib_buf[..block_size],
                 self.fs.block_size,
             )?;
 
@@ -267,11 +269,13 @@ impl ExtInode {
                 self.fs.write_inode(self.ino, raw)?;
             }
 
-            let mut ind_buf = alloc::vec![0u8; self.fs.block_size as usize];
+            let mut ind_buf = [0u8; 4096];
+            let block_size = self.fs.block_size as usize;
+            assert!(block_size <= 4096);
             read_blocks(
                 &*self.fs.device,
                 sib as u64,
-                &mut ind_buf,
+                &mut ind_buf[..block_size],
                 self.fs.block_size,
             )?;
 
@@ -287,7 +291,12 @@ impl ExtInode {
                 phys_block = self.fs.allocate_block()?;
                 let bytes = phys_block.to_le_bytes();
                 ind_buf[ptr_offset..ptr_offset + 4].copy_from_slice(&bytes);
-                write_blocks(&*self.fs.device, sib as u64, &ind_buf, self.fs.block_size)?;
+                write_blocks(
+                    &*self.fs.device,
+                    sib as u64,
+                    &ind_buf[..block_size],
+                    self.fs.block_size,
+                )?;
 
                 raw.i_blocks += self.fs.block_size / 512;
                 self.fs.write_inode(self.ino, raw)?;
@@ -307,11 +316,13 @@ impl ExtInode {
                 self.fs.write_inode(self.ino, raw)?;
             }
 
-            let mut dib_buf = alloc::vec![0u8; self.fs.block_size as usize];
+            let mut dib_buf = [0u8; 4096];
+            let block_size = self.fs.block_size as usize;
+            assert!(block_size <= 4096);
             read_blocks(
                 &*self.fs.device,
                 dib as u64,
-                &mut dib_buf,
+                &mut dib_buf[..block_size],
                 self.fs.block_size,
             )?;
 
@@ -328,17 +339,22 @@ impl ExtInode {
                 sib = self.fs.allocate_block()?;
                 let bytes = sib.to_le_bytes();
                 dib_buf[sib_ptr_offset..sib_ptr_offset + 4].copy_from_slice(&bytes);
-                write_blocks(&*self.fs.device, dib as u64, &dib_buf, self.fs.block_size)?;
+                write_blocks(
+                    &*self.fs.device,
+                    dib as u64,
+                    &dib_buf[..block_size],
+                    self.fs.block_size,
+                )?;
 
                 raw.i_blocks += self.fs.block_size / 512;
                 self.fs.write_inode(self.ino, raw)?;
             }
 
-            let mut sib_buf = alloc::vec![0u8; self.fs.block_size as usize];
+            let mut sib_buf = [0u8; 4096];
             read_blocks(
                 &*self.fs.device,
                 sib as u64,
-                &mut sib_buf,
+                &mut sib_buf[..block_size],
                 self.fs.block_size,
             )?;
 
@@ -355,7 +371,12 @@ impl ExtInode {
                 phys_block = self.fs.allocate_block()?;
                 let bytes = phys_block.to_le_bytes();
                 sib_buf[data_ptr_offset..data_ptr_offset + 4].copy_from_slice(&bytes);
-                write_blocks(&*self.fs.device, sib as u64, &sib_buf, self.fs.block_size)?;
+                write_blocks(
+                    &*self.fs.device,
+                    sib as u64,
+                    &sib_buf[..block_size],
+                    self.fs.block_size,
+                )?;
 
                 raw.i_blocks += self.fs.block_size / 512;
                 self.fs.write_inode(self.ino, raw)?;
@@ -418,11 +439,13 @@ impl ExtInode {
                     *b = 0;
                 }
             } else {
-                let mut block_buf = alloc::vec![0u8; self.fs.block_size as usize];
+                let mut block_buf = [0u8; 4096];
+                let block_size = self.fs.block_size as usize;
+                assert!(block_size <= 4096);
                 if read_blocks(
                     &*self.fs.device,
                     phys_block as u64,
-                    &mut block_buf,
+                    &mut block_buf[..block_size],
                     self.fs.block_size,
                 )
                 .is_err()
@@ -478,11 +501,13 @@ impl ExtInode {
                 self.fs.block_size as usize - block_offset,
             );
 
-            let mut block_buf = alloc::vec![0u8; self.fs.block_size as usize];
+            let mut block_buf = [0u8; 4096];
+            let block_size = self.fs.block_size as usize;
+            assert!(block_size <= 4096);
             if read_blocks(
                 &*self.fs.device,
                 phys_block as u64,
-                &mut block_buf,
+                &mut block_buf[..block_size],
                 self.fs.block_size,
             )
             .is_err()
@@ -496,7 +521,7 @@ impl ExtInode {
             if write_blocks(
                 &*self.fs.device,
                 phys_block as u64,
-                &block_buf,
+                &block_buf[..block_size],
                 self.fs.block_size,
             )
             .is_err()
@@ -521,103 +546,112 @@ impl ExtInode {
 
     /// Truncate file size to 0.
     pub fn truncate_file(&self, size: u64) -> Result<(), i32> {
-        if size != 0 {
-            return Err(-22); // EINVAL
-        }
+        if size == 0 {
+            let mut raw = self.raw.lock();
+            let mut vfs = self.vfs_inode.lock();
 
-        let mut raw = self.raw.lock();
-        let mut vfs = self.vfs_inode.lock();
-
-        let mut i_block = raw.i_block;
-        for block in &mut i_block[0..12] {
-            if *block != 0 {
-                self.fs.deallocate_block(*block).map_err(|_| -5)?;
-                *block = 0;
-            }
-        }
-        raw.i_block = i_block;
-
-        let sib = raw.i_block[12];
-        if sib != 0 {
-            let mut ind_buf = alloc::vec![0u8; self.fs.block_size as usize];
-            read_blocks(
-                &*self.fs.device,
-                sib as u64,
-                &mut ind_buf,
-                self.fs.block_size,
-            )
-            .map_err(|_| -5)?;
-            let refs_per_block = self.fs.block_size / 4;
-            for j in 0..refs_per_block {
-                let ptr_offset = (j * 4) as usize;
-                let phys_block = u32::from_le_bytes([
-                    ind_buf[ptr_offset],
-                    ind_buf[ptr_offset + 1],
-                    ind_buf[ptr_offset + 2],
-                    ind_buf[ptr_offset + 3],
-                ]);
-                if phys_block != 0 {
-                    self.fs.deallocate_block(phys_block).map_err(|_| -5)?;
+            let mut i_block = raw.i_block;
+            for block in &mut i_block[0..12] {
+                if *block != 0 {
+                    self.fs.deallocate_block(*block).map_err(|_| -5)?;
+                    *block = 0;
                 }
             }
-            self.fs.deallocate_block(sib).map_err(|_| -5)?;
-            raw.i_block[12] = 0;
-        }
+            raw.i_block = i_block;
 
-        let dib = raw.i_block[13];
-        if dib != 0 {
-            let mut dib_buf = alloc::vec![0u8; self.fs.block_size as usize];
-            read_blocks(
-                &*self.fs.device,
-                dib as u64,
-                &mut dib_buf,
-                self.fs.block_size,
-            )
-            .map_err(|_| -5)?;
-            let refs_per_block = self.fs.block_size / 4;
-            for i in 0..refs_per_block {
-                let sib_offset = (i * 4) as usize;
-                let sib = u32::from_le_bytes([
-                    dib_buf[sib_offset],
-                    dib_buf[sib_offset + 1],
-                    dib_buf[sib_offset + 2],
-                    dib_buf[sib_offset + 3],
-                ]);
-                if sib != 0 {
-                    let mut sib_buf = alloc::vec![0u8; self.fs.block_size as usize];
-                    read_blocks(
-                        &*self.fs.device,
-                        sib as u64,
-                        &mut sib_buf,
-                        self.fs.block_size,
-                    )
-                    .map_err(|_| -5)?;
-                    for j in 0..refs_per_block {
-                        let ptr_offset = (j * 4) as usize;
-                        let phys_block = u32::from_le_bytes([
-                            sib_buf[ptr_offset],
-                            sib_buf[ptr_offset + 1],
-                            sib_buf[ptr_offset + 2],
-                            sib_buf[ptr_offset + 3],
-                        ]);
-                        if phys_block != 0 {
-                            self.fs.deallocate_block(phys_block).map_err(|_| -5)?;
-                        }
+            let sib = raw.i_block[12];
+            if sib != 0 {
+                let mut ind_buf = [0u8; 4096];
+                let block_size = self.fs.block_size as usize;
+                assert!(block_size <= 4096);
+                read_blocks(
+                    &*self.fs.device,
+                    sib as u64,
+                    &mut ind_buf[..block_size],
+                    self.fs.block_size,
+                )
+                .map_err(|_| -5)?;
+                let refs_per_block = self.fs.block_size / 4;
+                for j in 0..refs_per_block {
+                    let ptr_offset = (j * 4) as usize;
+                    let phys_block = u32::from_le_bytes([
+                        ind_buf[ptr_offset],
+                        ind_buf[ptr_offset + 1],
+                        ind_buf[ptr_offset + 2],
+                        ind_buf[ptr_offset + 3],
+                    ]);
+                    if phys_block != 0 {
+                        self.fs.deallocate_block(phys_block).map_err(|_| -5)?;
                     }
-                    self.fs.deallocate_block(sib).map_err(|_| -5)?;
                 }
+                self.fs.deallocate_block(sib).map_err(|_| -5)?;
+                raw.i_block[12] = 0;
             }
-            self.fs.deallocate_block(dib).map_err(|_| -5)?;
-            raw.i_block[13] = 0;
+
+            let dib = raw.i_block[13];
+            if dib != 0 {
+                let mut dib_buf = [0u8; 4096];
+                let block_size = self.fs.block_size as usize;
+                assert!(block_size <= 4096);
+                read_blocks(
+                    &*self.fs.device,
+                    dib as u64,
+                    &mut dib_buf[..block_size],
+                    self.fs.block_size,
+                )
+                .map_err(|_| -5)?;
+                let refs_per_block = self.fs.block_size / 4;
+                for i in 0..refs_per_block {
+                    let sib_offset = (i * 4) as usize;
+                    let sib = u32::from_le_bytes([
+                        dib_buf[sib_offset],
+                        dib_buf[sib_offset + 1],
+                        dib_buf[sib_offset + 2],
+                        dib_buf[sib_offset + 3],
+                    ]);
+                    if sib != 0 {
+                        let mut sib_buf = [0u8; 4096];
+                        read_blocks(
+                            &*self.fs.device,
+                            sib as u64,
+                            &mut sib_buf[..block_size],
+                            self.fs.block_size,
+                        )
+                        .map_err(|_| -5)?;
+                        for j in 0..refs_per_block {
+                            let ptr_offset = (j * 4) as usize;
+                            let phys_block = u32::from_le_bytes([
+                                sib_buf[ptr_offset],
+                                sib_buf[ptr_offset + 1],
+                                sib_buf[ptr_offset + 2],
+                                sib_buf[ptr_offset + 3],
+                            ]);
+                            if phys_block != 0 {
+                                self.fs.deallocate_block(phys_block).map_err(|_| -5)?;
+                            }
+                        }
+                        self.fs.deallocate_block(sib).map_err(|_| -5)?;
+                    }
+                }
+                self.fs.deallocate_block(dib).map_err(|_| -5)?;
+                raw.i_block[13] = 0;
+            }
+
+            raw.i_size = 0;
+            raw.i_blocks = 0;
+            vfs.size = 0;
+            vfs.blocks = 0;
+
+            self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?;
+            Ok(())
+        } else {
+            let mut raw = self.raw.lock();
+            let mut vfs = self.vfs_inode.lock();
+            raw.i_size = size as u32;
+            vfs.size = size;
+            self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?;
+            Ok(())
         }
-
-        raw.i_size = 0;
-        raw.i_blocks = 0;
-        vfs.size = 0;
-        vfs.blocks = 0;
-
-        self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?;
-        Ok(())
     }
 
     /// Read data from regular file or symlink using the Page Cache.

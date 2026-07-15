@@ -61,6 +61,7 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
             let parent_fds = parent_task.fd_table.lock();
             let mut child_fds = child_task.fd_table.lock();
             child_fds.entries = parent_fds.entries.clone();
+            child_fds.cloexec = parent_fds.cloexec.clone();
             for slot in &child_fds.entries {
                 if let Some(ref file_desc) = slot {
                     *file_desc.ref_count.lock() += 1;
@@ -91,6 +92,10 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
             child_task.euid = parent_task.euid;
             child_task.egid = parent_task.egid;
             child_task.pgid = parent_task.pgid;
+            child_task.rlimit_nofile_cur = parent_task.rlimit_nofile_cur;
+            child_task.rlimit_nofile_max = parent_task.rlimit_nofile_max;
+            child_task.cmdline = parent_task.cmdline.clone();
+            child_task.umask = parent_task.umask;
         } else {
             return Errno::ESRCH.into();
         }
@@ -504,38 +509,36 @@ pub fn sys_execve(
     }
 
     // Map user stack
-    let stack_size: u64 = 64 * 1024;
+    let stack_size: u64 = 8 * 1024 * 1024; // 8 MiB stack size
     let stack_bottom = crate::process::elf::USER_STACK_TOP - stack_size;
-    let stack_start = Page::<Size4KiB>::containing_address(VirtAddr::new(stack_bottom));
-    let stack_end = Page::<Size4KiB>::containing_address(VirtAddr::new(
-        crate::process::elf::USER_STACK_TOP - 1,
+
+    // Allocate and map ONLY the top page of the stack physically (for construct_user_stack)
+    let highest_stack_phys = match crate::memory::physical::allocate_frame() {
+        Some(p) => p,
+        None => return Errno::ENOMEM.into(),
+    };
+
+    let top_page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+        crate::process::elf::USER_STACK_TOP - 4096,
     ));
-    let mut highest_stack_phys = 0;
-    for page in Page::range_inclusive(stack_start, stack_end) {
-        let phys = match crate::memory::physical::allocate_frame() {
-            Some(p) => p,
-            None => return Errno::ENOMEM.into(),
-        };
-        if page.start_address().as_u64() == crate::process::elf::USER_STACK_TOP - 4096 {
-            highest_stack_phys = phys;
-        }
-        let frame = PhysFrame::containing_address(PhysAddr::new(phys));
-        let flags = PageTableFlags::PRESENT
-            | PageTableFlags::WRITABLE
-            | PageTableFlags::USER_ACCESSIBLE
-            | PageTableFlags::NO_EXECUTE;
-        // SAFETY: The page table root points to a valid PML4 page table structure and frame/page parameters are valid.
-        unsafe {
-            if crate::memory::r#virtual::map_user_page_no_shootdown(
-                new_page_table,
-                page,
-                frame,
-                flags,
-            )
-            .is_err()
-            {
-                return Errno::ENOMEM.into();
-            }
+    let frame = PhysFrame::containing_address(PhysAddr::new(highest_stack_phys));
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+
+    // SAFETY: The page table root points to a valid PML4 page table structure and frame/page parameters are valid.
+    unsafe {
+        if crate::memory::r#virtual::map_user_page_no_shootdown(
+            new_page_table,
+            top_page,
+            frame,
+            flags,
+        )
+        .is_err()
+        {
+            crate::memory::physical::deallocate_frame(highest_stack_phys);
+            return Errno::ENOMEM.into();
         }
     }
 
@@ -573,6 +576,47 @@ pub fn sys_execve(
         };
         if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
             let mut task = task_arc.lock();
+            let tgid = task.tgid;
+
+            // Terminate other threads in the same thread group (polite try-lock loop)
+            let mut other_pids = alloc::vec::Vec::new();
+            let mut success = false;
+            while !success {
+                success = true;
+                other_pids.clear();
+                let tasks = scheduler::TASKS.read();
+                for slot in tasks.iter() {
+                    if let Some(other_arc) = slot {
+                        if Arc::ptr_eq(other_arc, &task_arc) {
+                            continue;
+                        }
+                        if let Some(other) = other_arc.try_lock() {
+                            if other.tgid == tgid {
+                                other_pids.push(other.pid);
+                            }
+                        } else {
+                            success = false;
+                            break;
+                        }
+                    }
+                }
+                if !success {
+                    // Release task lock and retry to avoid deadlock
+                    drop(task);
+                    core::hint::spin_loop();
+                    task = task_arc.lock();
+                }
+            }
+
+            if !other_pids.is_empty() {
+                x86_64::instructions::interrupts::without_interrupts(|| {
+                    if let Some(ref mut sched) = *scheduler::SCHEDULER.lock() {
+                        for pid in other_pids {
+                            sched.exit_task(pid, 0);
+                        }
+                    }
+                });
+            }
 
             // Set-UID and Set-GID executable support
             let exec_mode = inode.inode().permissions.mode;
@@ -603,58 +647,47 @@ pub fn sys_execve(
             }
             // Close O_CLOEXEC file descriptors
             let mut fd_table = task.fd_table.lock();
-            for slot in fd_table.entries.iter_mut() {
-                let mut close = false;
-                if let Some(ref fd) = slot {
-                    if fd.flags.lock().0 & crate::fs::file::OpenFlags::O_CLOEXEC != 0 {
-                        close = true;
-                    }
-                }
-                if close {
-                    if let Some(desc) = slot.take() {
+            for i in 0..fd_table.entries.len() {
+                if i < fd_table.cloexec.len() && fd_table.cloexec[i] {
+                    if let Some(desc) = fd_table.entries[i].take() {
                         let mut rc = desc.ref_count.lock();
                         if *rc > 0 {
                             *rc -= 1;
                         }
                     }
+                    fd_table.cloexec[i] = false;
                 }
             }
             drop(fd_table);
 
             task.name = path.clone();
+            task.cmdline = argv.clone();
             task.sigaltstack = None; // Reset alternate signal stack on execve
-            let old = {
-                let mut addr_space = task.address_space.lock();
-                let old_pt = addr_space.page_table_root;
-                addr_space.page_table_root = 0; // Prevent drop() from double-freeing
-                old_pt
-            };
+
+            // Switch to the new page table first so the CPU is no longer using the old one.
+            unsafe {
+                x86_64::registers::control::Cr3::write(
+                    x86_64::structures::paging::PhysFrame::containing_address(
+                        x86_64::PhysAddr::new(new_page_table),
+                    ),
+                    x86_64::registers::control::Cr3Flags::empty(),
+                );
+            }
+
+            // Replace address space. This drops the old Arc<Mutex<AddressSpace>>.
+            // If no other processes (like a parent process in CLONE_VM/vfork) are sharing it,
+            // the old AddressSpace will be dropped and its page table root freed automatically.
             task.address_space = Arc::new(spin::Mutex::new(crate::process::task::AddressSpace {
                 page_table_root: new_page_table,
                 brk: initial_brk,
                 mmap_bump: 0x0000_5000_0000_0000u64,
                 mmap_regions: exec_mmap_regions,
             }));
+
             task.context.fs_base = 0; // Clear TLS base for new process
-            old
-        } else {
-            0
+            task.context.cr3 = new_page_table; // Set the new page table root in CPU context!
         }
     };
-
-    if old_page_table != 0 && old_page_table != crate::memory::r#virtual::kernel_pml4_phys() {
-        // Switch to the new page table first so the CPU is no longer using the old one.
-        unsafe {
-            x86_64::registers::control::Cr3::write(
-                x86_64::structures::paging::PhysFrame::containing_address(x86_64::PhysAddr::new(
-                    new_page_table,
-                )),
-                x86_64::registers::control::Cr3Flags::empty(),
-            );
-        }
-        // Now safely free all resources of the old page table
-        let _ = crate::memory::r#virtual::free_user_page_table(old_page_table);
-    }
 
     kprintln!(
         "[syscall] execve: loading OK, entry={:#x}, jumping to Ring 3...",
@@ -708,6 +741,17 @@ pub fn sys_exit_group(status: i32) -> SyscallResult {
                     other_pids.push(task.pid);
                 }
             }
+        }
+    }
+
+    // Clear fd_table entries OUTSIDE the scheduler lock
+    if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+        let fd_table = {
+            let task = task_arc.lock();
+            task.fd_table.clone()
+        };
+        if Arc::strong_count(&fd_table) == 1 {
+            fd_table.lock().entries.clear();
         }
     }
 
@@ -778,12 +822,14 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
                         wstatus.write_volatile((exit_code & 0xFF) << 8);
                     }
                 }
-                // Remove the zombie from the task list
+                // Remove the zombie from the task list and drop it outside the TASKS lock
                 let idx = child_pid.as_u64() as usize;
-                x86_64::instructions::interrupts::without_interrupts(|| {
+                let _removed_task = x86_64::instructions::interrupts::without_interrupts(|| {
                     let mut tasks_write = scheduler::TASKS.write();
                     if let Some(slot) = tasks_write.get_mut(idx) {
-                        *slot = None;
+                        slot.take()
+                    } else {
+                        None
                     }
                 });
                 Some(Ok(child_pid.as_u64() as SyscallResult))
@@ -988,7 +1034,11 @@ pub fn sys_clone(
     let mut child_task = Task::new(
         child_pid,
         alloc::format!("clone:{}", child_pid),
-        child_page_table,
+        if flags & 0x00000100 != 0 {
+            0
+        } else {
+            child_page_table
+        },
     );
 
     if flags & 0x00200000 != 0 {
@@ -1006,6 +1056,7 @@ pub fn sys_clone(
                 let parent_fds = parent_task.fd_table.lock();
                 let mut child_fds = child_task.fd_table.lock();
                 child_fds.entries = parent_fds.entries.clone();
+                child_fds.cloexec = parent_fds.cloexec.clone();
                 for slot in &child_fds.entries {
                     if let Some(ref file_desc) = slot {
                         *file_desc.ref_count.lock() += 1;
@@ -1046,6 +1097,10 @@ pub fn sys_clone(
             child_task.euid = parent_task.euid;
             child_task.egid = parent_task.egid;
             child_task.pgid = parent_task.pgid;
+            child_task.rlimit_nofile_cur = parent_task.rlimit_nofile_cur;
+            child_task.rlimit_nofile_max = parent_task.rlimit_nofile_max;
+            child_task.cmdline = parent_task.cmdline.clone();
+            child_task.umask = parent_task.umask;
         } else {
             return Errno::ESRCH.into();
         }
@@ -1091,6 +1146,20 @@ pub fn sys_clone(
     debug_assert_eq!(child_context.r15, 0);
 
     child_task.context = child_context;
+
+    unsafe {
+        let child_regs = &*child_regs_ptr;
+        crate::kprintln!(
+            "[syscall] clone debug: child_pid = {}, ctx.rip = {:#x}, ctx.rsp = {:#x}, ctx.cr3 = {:#x}, regs.rip = {:#x}, regs.rsp = {:#x}, regs.rax = {:#x}",
+            child_pid,
+            child_context.rip,
+            child_context.rsp,
+            child_context.cr3,
+            child_regs.rip,
+            child_regs.rsp,
+            child_regs.rax
+        );
+    }
 
     if flags & 0x00100000 != 0 && !parent_tidptr.is_null() {
         if validate_user_ptr_write(parent_tidptr as *mut u8, core::mem::size_of::<i32>()).is_err() {

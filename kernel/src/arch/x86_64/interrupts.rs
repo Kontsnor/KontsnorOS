@@ -238,8 +238,22 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
     use x86_64::structures::paging::{Page, PageTable, PageTableFlags, PhysFrame, Size4KiB};
     use x86_64::{PhysAddr, VirtAddr};
 
+    macro_rules! kprintln {
+        ($fmt:expr $(, $arg:expr)* $(,)?) => {
+            if !$fmt.starts_with("[debug pf]") {
+                crate::kprintln!($fmt $(, $arg)*);
+            }
+        };
+    }
+
     let fault_addr = Cr2::read().unwrap();
     let is_user = stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3;
+    crate::kprintln!(
+        "[debug pf] RAW Page Fault at vaddr {:#x}, err_code={:#x}, is_user={}",
+        fault_addr.as_u64(),
+        error_code.bits(),
+        is_user
+    );
 
     // Check if the fault was caused by a write operation
     if error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE) {
@@ -310,6 +324,7 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
 
                                                 // Flush local TLB for this virtual address
                                                 x86_64::instructions::tlb::flush(fault_addr);
+                                                // kprintln!("[debug pf] CoW sole owner resolved at vaddr {:#x}", fault_addr.as_u64());
                                                 return; // Fault resolved!
                                             } else {
                                                 // Shared page! Allocate a new page frame, copy contents, and map writable
@@ -357,6 +372,7 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                                                             new_phys,
                                                         );
                                                     }
+                                                    // kprintln!("[debug pf] CoW shared resolved at vaddr {:#x}", fault_addr.as_u64());
                                                     return; // Fault resolved!
                                                 }
                                             }
@@ -366,6 +382,7 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                                         // one of the intermediate directory entries was read-only. We have already
                                         // upgraded them, so the fault is now resolved.
                                         x86_64::instructions::tlb::flush(fault_addr);
+                                        // kprintln!("[debug pf] Protection violation already writable resolved at vaddr {:#x}", fault_addr.as_u64());
                                         return;
                                     }
                                 }
@@ -377,19 +394,30 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
         }
     }
 
-    if !error_code.contains(x86_64::structures::idt::PageFaultErrorCode::PROTECTION_VIOLATION) {
+    if !error_code.contains(x86_64::structures::idt::PageFaultErrorCode::PROTECTION_VIOLATION)
+        && fault_addr.as_u64() < 0x0000_8000_0000_0000
+    {
+        kprintln!("[debug pf] start for vaddr {:#x}", fault_addr.as_u64());
         let resolved = crate::process::scheduler::current_pid()
-            .and_then(|pid| crate::process::scheduler::get_task_arc(pid))
+            .and_then(|pid| {
+                kprintln!("[debug pf] pid={}", pid.as_u64());
+                crate::process::scheduler::get_task_arc(pid)
+            })
             .and_then(|task_arc| {
+                kprintln!("[debug pf] task_arc found");
                 let fault_vaddr = fault_addr.as_u64();
+                kprintln!("[debug pf] locking task");
                 let task_guard = if !is_user {
                     task_arc.try_lock()
                 } else {
                     Some(task_arc.lock())
                 };
+                kprintln!("[debug pf] task locked");
                 let (region, page_table_root) = {
                     let task = task_guard?;
+                    kprintln!("[debug pf] locking addr_space");
                     let addr_space = task.address_space.lock();
+                    kprintln!("[debug pf] addr_space locked");
 
                     // Find if fault_vaddr falls inside any mapped region
                     let region_opt = addr_space
@@ -401,6 +429,10 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                         })
                         .cloned();
                     let pt_root = addr_space.page_table_root;
+                    kprintln!(
+                        "[debug pf] region search done: found={}",
+                        region_opt.is_some()
+                    );
                     region_opt.map(|r| (r, pt_root))
                 }?;
 
@@ -410,20 +442,19 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                 let prot = region.prot;
                 let mut page_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
                 if (prot & 2) != 0 {
-                    // PROT_WRITE
                     page_flags |= PageTableFlags::WRITABLE;
                 }
                 if (prot & 4) == 0 {
-                    // NOT PROT_EXEC
                     page_flags |= PageTableFlags::NO_EXECUTE;
                 }
 
                 let is_shared = region.is_shared;
 
+                kprintln!("[debug pf] checking inode for vaddr={:#x}", page_vaddr);
                 let (phys, do_cow) = match region.inode {
                     Some(ref inode) => {
+                        kprintln!("[debug pf] file-backed page");
                         let file_offset = region.offset + page_offset;
-                        // File-backed page cache lookup
                         match crate::memory::page_cache::get_or_create_page(inode, file_offset) {
                             Ok(p) => {
                                 let cow = !is_shared && (prot & 2) != 0;
@@ -435,18 +466,20 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                         }
                     }
                     None => {
-                        // Anonymous page frame allocation
+                        kprintln!("[debug pf] anon page: calling allocate_frame");
                         match crate::memory::physical::allocate_frame() {
                             Some(p) => {
-                                // Zero-fill the anonymous frame
+                                kprintln!("[debug pf] allocated frame {:#x}", p);
                                 let dest =
                                     (p + crate::memory::r#virtual::phys_mem_offset()) as *mut u8;
                                 unsafe {
                                     core::ptr::write_bytes(dest, 0, 4096);
                                 }
+                                kprintln!("[debug pf] zeroed frame");
                                 (p, false)
                             }
                             None => {
+                                kprintln!("[debug pf] allocate_frame returned None (ENOMEM)!");
                                 return Some(Err((-12, page_vaddr))); // ENOMEM
                             }
                         }
@@ -467,27 +500,33 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
 
                 unsafe {
                     if region.inode.is_some() {
+                        kprintln!("[debug pf] incrementing ref count");
                         crate::memory::physical::increment_ref(phys);
                     }
 
+                    kprintln!("[debug pf] unmapping page if present");
                     if let Ok(old_phys) = crate::memory::r#virtual::unmap_user_page_no_shootdown(
                         page_table_root,
                         page,
                     ) {
+                        kprintln!("[debug pf] old page at {:#x} deallocating", old_phys);
                         crate::memory::physical::deallocate_frame(old_phys);
                     }
 
+                    kprintln!("[debug pf] ensure directory permissions");
                     crate::memory::r#virtual::ensure_directory_permissions(
                         page_table_root,
                         VirtAddr::new(page_vaddr),
                     );
 
+                    kprintln!("[debug pf] mapping user page");
                     if let Err(e) = crate::memory::r#virtual::map_user_page_no_shootdown(
                         page_table_root,
                         page,
                         frame,
                         actual_flags,
                     ) {
+                        kprintln!("[debug pf] map_user_page failed!");
                         if region.inode.is_some() {
                             crate::memory::physical::decrement_ref(phys);
                         } else {
@@ -497,13 +536,18 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                     }
                 }
 
+                kprintln!("[debug pf] flushing TLB");
                 x86_64::instructions::tlb::flush(VirtAddr::new(page_vaddr));
+                kprintln!("[debug pf] done successfully");
                 Some(Ok(()))
             });
 
         if let Some(res) = resolved {
             match res {
-                Ok(()) => return, // Page fault resolved successfully!
+                Ok(()) => {
+                    // kprintln!("[debug pf] Resolved Page Fault at vaddr {:#x}", fault_addr.as_u64());
+                    return; // Page fault resolved successfully!
+                }
                 Err((errno, page_vaddr)) => {
                     crate::kprintln!(
                         "[demand_page] Error resolving page fault at vaddr {:#x}: errno {}",
@@ -547,8 +591,17 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     }
 
     let ticks = TIMER_TICKS.fetch_add(1, core::sync::atomic::Ordering::Release) + 1;
-    if ticks % 500 == 0 {
-        crate::kprintln!("[timer] Tick {}", ticks);
+    if ticks % 10 == 0 {
+        let current_pid = crate::process::scheduler::current_pid()
+            .map(|p| p.as_u64())
+            .unwrap_or(0);
+        crate::kprintln!(
+            "[timer] Tick {}, PID={}, RIP={:#x}, RSP={:#x}",
+            ticks,
+            current_pid,
+            stack_frame.instruction_pointer.as_u64(),
+            stack_frame.stack_pointer.as_u64()
+        );
     }
 
     // Update scheduler tick counter

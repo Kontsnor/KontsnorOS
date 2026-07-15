@@ -13,6 +13,7 @@
 use crate::kprintln;
 use crate::sync::spinlock::TicketLock;
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
+use x86_64::structures::paging::{PageTable, PageTableFlags};
 
 use super::PAGE_SIZE;
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -149,15 +150,39 @@ impl FrameAllocator {
             return None;
         }
 
-        // Start searching from the hint
-        for i in 0..MAX_FRAMES {
-            let index = (self.next_free_hint + i) % MAX_FRAMES;
+        let mut searched = 0;
+        let mut index = self.next_free_hint;
+        while searched < MAX_FRAMES {
+            // Try to skip 64 frames (8 bytes) at once
+            if index % 64 == 0 && searched + 64 <= MAX_FRAMES {
+                let byte_idx = index / 8;
+                if byte_idx + 8 <= self.bitmap.len() {
+                    let bytes = &self.bitmap[byte_idx..byte_idx + 8];
+                    let val = u64::from_ne_bytes(bytes.try_into().unwrap());
+                    if val == 0xffff_ffff_ffff_ffffu64 {
+                        index = (index + 64) % MAX_FRAMES;
+                        searched += 64;
+                        continue;
+                    }
+                }
+            }
+            // Try to skip 8 frames (1 byte) at once
+            if index % 8 == 0 && searched + 8 <= MAX_FRAMES {
+                let byte_idx = index / 8;
+                if byte_idx < self.bitmap.len() && self.bitmap[byte_idx] == 0xFF {
+                    index = (index + 8) % MAX_FRAMES;
+                    searched += 8;
+                    continue;
+                }
+            }
             if self.is_free(index) {
                 self.mark_used(index);
                 self.allocated_frames += 1;
                 self.next_free_hint = (index + 1) % MAX_FRAMES;
                 return Some(index as u64 * PAGE_SIZE as u64);
             }
+            index = (index + 1) % MAX_FRAMES;
+            searched += 1;
         }
 
         None // Out of memory
@@ -178,11 +203,78 @@ impl FrameAllocator {
     }
 }
 
+fn reserve_page_table_frame(paddr: u64, allocator: &mut FrameAllocator) {
+    let frame_index = (paddr / PAGE_SIZE as u64) as usize;
+    if frame_index < MAX_FRAMES {
+        allocator.mark_used(frame_index);
+    }
+}
+
+unsafe fn walk_and_reserve_page_tables(
+    pml4_phys: u64,
+    phys_mem_offset: u64,
+    allocator: &mut FrameAllocator,
+) {
+    // 1. Reserve PML4 itself
+    reserve_page_table_frame(pml4_phys, allocator);
+
+    let pml4_virt = pml4_phys + phys_mem_offset;
+    // SAFETY: pml4_virt is mapped and points to the valid PML4 page table.
+    let pml4 = unsafe { &*(pml4_virt as *const PageTable) };
+
+    for i in 0..512 {
+        let pml4_entry = &pml4[i];
+        if pml4_entry.flags().contains(PageTableFlags::PRESENT) {
+            if let Ok(pdpt_frame) = pml4_entry.frame() {
+                let pdpt_phys = pdpt_frame.start_address().as_u64();
+                reserve_page_table_frame(pdpt_phys, allocator);
+
+                let pdpt_virt = pdpt_phys + phys_mem_offset;
+                // SAFETY: pdpt_virt is mapped and points to the valid PDPT page table.
+                let pdpt = unsafe { &*(pdpt_virt as *const PageTable) };
+
+                for j in 0..512 {
+                    let pdpt_entry = &pdpt[j];
+                    if pdpt_entry.flags().contains(PageTableFlags::PRESENT) {
+                        if pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                            continue;
+                        }
+                        if let Ok(pd_frame) = pdpt_entry.frame() {
+                            let pd_phys = pd_frame.start_address().as_u64();
+                            reserve_page_table_frame(pd_phys, allocator);
+
+                            let pd_virt = pd_phys + phys_mem_offset;
+                            // SAFETY: pd_virt is mapped and points to the valid PD page table.
+                            let pd = unsafe { &*(pd_virt as *const PageTable) };
+
+                            for k in 0..512 {
+                                let pd_entry = &pd[k];
+                                if pd_entry.flags().contains(PageTableFlags::PRESENT) {
+                                    if pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                                        continue;
+                                    }
+                                    if let Ok(pt_frame) = pd_entry.frame() {
+                                        let pt_phys = pt_frame.start_address().as_u64();
+                                        reserve_page_table_frame(pt_phys, allocator);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Initialize the physical frame allocator using the bootloader's memory map.
 ///
 /// This must be called during early boot, before any physical memory
 /// allocation is attempted.
-pub fn init(memory_regions: &MemoryRegions) {
+pub fn init(memory_regions: &MemoryRegions, phys_mem_offset: u64) {
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::{PageTable, PageTableFlags};
+
     let mut allocator = FRAME_ALLOCATOR.lock();
 
     let mut total = 0usize;
@@ -201,7 +293,22 @@ pub fn init(memory_regions: &MemoryRegions) {
         }
     }
 
-    allocator.total_frames = total;
+    // F-07: Walk and reserve active boot page tables to prevent their physical frames
+    // from being allocated and zeroed out by the kernel.
+    let (active_pml4_frame, _) = Cr3::read();
+    let pml4_phys = active_pml4_frame.start_address().as_u64();
+    unsafe {
+        walk_and_reserve_page_tables(pml4_phys, phys_mem_offset, &mut allocator);
+    }
+
+    // Recalculate total free frames after reserving page tables
+    let mut actual_free = 0usize;
+    for i in 0..MAX_FRAMES {
+        if allocator.is_free(i) {
+            actual_free += 1;
+        }
+    }
+    allocator.total_frames = actual_free;
     allocator.allocated_frames = 0;
     allocator.initialized = true;
 

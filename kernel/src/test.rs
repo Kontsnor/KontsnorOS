@@ -151,15 +151,31 @@ fn test_scheduler_priority_queues() {
     sched.add_task(task_normal);
 
     // pick_next should retrieve them in priority order: High (10), Normal (11), Low (12)
-    assert_eq!(sched.pick_next(), Some(pid_high));
-    assert_eq!(sched.pick_next(), Some(pid_normal));
-    assert_eq!(sched.pick_next(), Some(pid_low));
+    assert_eq!(sched.pick_next().map(|(p, _)| p), Some(pid_high));
+    assert_eq!(sched.pick_next().map(|(p, _)| p), Some(pid_normal));
+    assert_eq!(sched.pick_next().map(|(p, _)| p), Some(pid_low));
     assert_eq!(sched.pick_next(), None);
+
+    // Clean up mock tasks from global TASKS list
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut tasks = crate::process::scheduler::TASKS.write();
+        if tasks.len() > 12 {
+            tasks[10] = None;
+            tasks[11] = None;
+            tasks[12] = None;
+        }
+    });
 }
 
 #[test_case]
 fn test_orphan_reparenting() {
     let mut sched = crate::process::scheduler::Scheduler::new();
+
+    // Save the original bootstrap thread (PID 1) from TASKS
+    let original_init = x86_64::instructions::interrupts::without_interrupts(|| {
+        let tasks = crate::process::scheduler::TASKS.read();
+        tasks.get(1).cloned().flatten()
+    });
 
     // Create a mock init task (PID 1) so it exists in TASKS
     let pid_init = crate::process::pid::Pid::from_raw(1);
@@ -196,6 +212,18 @@ fn test_orphan_reparenting() {
         crate::process::scheduler::get_task_arc(pid_parent).expect("Parent task missing");
     let parent = parent_arc.lock();
     assert_eq!(parent.state, crate::process::task::TaskState::Zombie);
+
+    // Restore original bootstrap thread and clear mock parent/child
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut tasks = crate::process::scheduler::TASKS.write();
+        if tasks.len() > 1 {
+            tasks[1] = original_init;
+        }
+        if tasks.len() > 21 {
+            tasks[20] = None;
+            tasks[21] = None;
+        }
+    });
 }
 
 #[test_case]
@@ -1560,6 +1588,15 @@ fn test_thread_clone_vm() {
     }
 
     kprintln!("[test] Thread Shared VM test PASSED!");
+
+    // Clean up mock tasks from global TASKS list
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut tasks = crate::process::scheduler::TASKS.write();
+        if tasks.len() > 41 {
+            tasks[40] = None;
+            tasks[41] = None;
+        }
+    });
 }
 
 static STRESS_FUTEX_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -1911,6 +1948,15 @@ fn test_futex_bitset_and_cleartid() {
 
     // Clean up
     crate::syscall::memory::sys_munmap(addr, 4096);
+
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut tasks = crate::process::scheduler::TASKS.write();
+        let idx = pid_child.as_u64() as usize;
+        if idx < tasks.len() {
+            tasks[idx] = None;
+        }
+    });
+
     kprintln!("[test] futex bitset and CLONE_CHILD_CLEARTID verification test PASSED!");
 }
 

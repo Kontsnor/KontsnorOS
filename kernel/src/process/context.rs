@@ -299,7 +299,12 @@ pub unsafe extern "C" fn enter_user_mode(
 
 #[no_mangle]
 pub extern "C" fn fork_child_return_debug() {
-    crate::kprintln!("[debug] Entering fork_child_return in child task!");
+    unsafe {
+        let mut port = x86_64::instructions::port::Port::<u8>::new(0x3F8);
+        for &b in b"[debug] Entering fork_child_return in child task!\n" {
+            port.write(b);
+        }
+    }
 }
 
 /// Naked assembly return path for fork'ed child processes.

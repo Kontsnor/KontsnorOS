@@ -23,7 +23,7 @@ for arg in "$@"; do
             BUILD_TYPE="release"
             ;;
         --debug)
-            GDB_FLAG="-s -S"
+            GDB_FLAG="-s"
             echo "GDB server will listen on localhost:1234"
             echo "Connect with: gdb -ex 'target remote :1234'"
             ;;
@@ -45,13 +45,17 @@ echo "╔═══════════════════════�
 echo "║     KontsnorOS — QEMU Launcher        ║"
 echo "╠═══════════════════════════════════════╣"
 echo "║  Build:  $BUILD_TYPE                  ║"
-echo "║  Kernel: $KERNEL_BIN"
+echo "║  Kernel: $KERNEL_BIN                  ║"
 echo "║  Serial: stdio                        ║"
 echo "╚═══════════════════════════════════════╝"
 echo ""
 
 echo "Building bootable disk image..."
-bootloader_linker build "$KERNEL_BIN" -o "$PROJECT_DIR" -s
+STRIPPED_DIR="$PROJECT_DIR/target/stripped"
+mkdir -p "$STRIPPED_DIR"
+cp "$KERNEL_BIN" "$STRIPPED_DIR/kontsnor-kernel"
+strip "$STRIPPED_DIR/kontsnor-kernel"
+bootloader_linker build "$STRIPPED_DIR/kontsnor-kernel" -o "$PROJECT_DIR" -s
 
 DISK_IMG="$PROJECT_DIR/disk.img"
 if [ ! -f "$DISK_IMG" ]; then
@@ -64,8 +68,8 @@ qemu-system-x86_64 \
     -drive format=raw,file="$DISK_IMG",index=1,media=disk \
     -serial stdio \
     -display none \
-    -m 8G \
-    -smp 4 \
+    -m 4G \
+    -smp 1 \
     -cpu qemu64,+fsgsbase \
     -no-reboot \
     -no-shutdown \

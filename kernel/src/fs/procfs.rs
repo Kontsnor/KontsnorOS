@@ -260,6 +260,16 @@ impl InodeOps for ProcFsSelfDir {
                 inode: Inode::new(103, FileType::Regular),
             }));
         }
+        if name == "status" {
+            return Some(Arc::new(ProcFsSelfStatus {
+                inode: Inode::new(104, FileType::Regular),
+            }));
+        }
+        if name == "cmdline" {
+            return Some(Arc::new(ProcFsSelfCmdline {
+                inode: Inode::new(105, FileType::Regular),
+            }));
+        }
         None
     }
 
@@ -288,6 +298,16 @@ impl InodeOps for ProcFsSelfDir {
             DirEntry {
                 name: String::from("maps"),
                 ino: 103,
+                file_type: FileType::Regular,
+            },
+            DirEntry {
+                name: String::from("status"),
+                ino: 104,
+                file_type: FileType::Regular,
+            },
+            DirEntry {
+                name: String::from("cmdline"),
+                ino: 105,
                 file_type: FileType::Regular,
             },
         ]
@@ -511,6 +531,121 @@ impl InodeOps for ProcFsSelfMaps {
         let available = bytes.len() - offset;
         let to_read = buf.len().min(available);
         buf[..to_read].copy_from_slice(&bytes[offset..offset + to_read]);
+
+        Ok(to_read)
+    }
+}
+
+/// Special `/proc/self/status` file.
+struct ProcFsSelfStatus {
+    inode: Inode,
+}
+
+impl InodeOps for ProcFsSelfStatus {
+    fn inode(&self) -> &Inode {
+        &self.inode
+    }
+
+    fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
+        let current_pid = crate::process::scheduler::current_pid().ok_or(-3)?; // ESRCH
+        let task_arc = crate::process::scheduler::get_task_arc(current_pid).ok_or(-3)?;
+
+        let (name, ppid, tgid, state, vmsize, vmrss) = {
+            let task = task_arc.lock();
+            let name = task.name.clone();
+            let ppid = task.parent_pid.as_u64();
+            let tgid = task.tgid.as_u64();
+            let state_char = match task.state {
+                crate::process::task::TaskState::Running => "R (running)",
+                crate::process::task::TaskState::Ready => "S (sleeping)",
+                crate::process::task::TaskState::Blocked => "D (disk sleep)",
+                crate::process::task::TaskState::Zombie => "Z (zombie)",
+            };
+
+            // Sum memory region sizes
+            let mut size_bytes = 0;
+            let addr_space = task.address_space.lock();
+            for r in &addr_space.mmap_regions {
+                size_bytes += r.len;
+            }
+            let vmsize_kb = size_bytes / 1024;
+            let vmrss_kb = vmsize_kb; // For simplicity, resident matches virtual size in this environment
+
+            (name, ppid, tgid, state_char, vmsize_kb, vmrss_kb)
+        };
+
+        // Count threads with the same tgid (outside the task lock)
+        let threads = {
+            let tasks = crate::process::scheduler::TASKS.read();
+            tasks
+                .iter()
+                .filter_map(|t| t.as_ref())
+                .filter(|t| {
+                    let t_lock = t.lock();
+                    t_lock.tgid.as_u64() == tgid
+                        && t_lock.state != crate::process::task::TaskState::Zombie
+                })
+                .count()
+        };
+
+        let content = format!(
+            "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nThreads:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\n",
+            name, state, tgid, current_pid.as_u64(), ppid, threads, vmsize, vmrss
+        );
+
+        let bytes = content.as_bytes();
+        let offset = offset as usize;
+
+        if offset >= bytes.len() {
+            return Ok(0);
+        }
+
+        let available = bytes.len() - offset;
+        let to_read = buf.len().min(available);
+        buf[..to_read].copy_from_slice(&bytes[offset..offset + to_read]);
+
+        Ok(to_read)
+    }
+}
+
+/// Special `/proc/self/cmdline` file.
+struct ProcFsSelfCmdline {
+    inode: Inode,
+}
+
+impl InodeOps for ProcFsSelfCmdline {
+    fn inode(&self) -> &Inode {
+        &self.inode
+    }
+
+    fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
+        let current_pid = crate::process::scheduler::current_pid().ok_or(-3)?; // ESRCH
+        let task_arc = crate::process::scheduler::get_task_arc(current_pid).ok_or(-3)?;
+
+        let cmdline_bytes = {
+            let task = task_arc.lock();
+            if task.cmdline.is_empty() {
+                let mut bytes = task.name.as_bytes().to_vec();
+                bytes.push(0);
+                bytes
+            } else {
+                let mut bytes = Vec::new();
+                for arg in &task.cmdline {
+                    bytes.extend_from_slice(arg.as_bytes());
+                    bytes.push(0);
+                }
+                bytes
+            }
+        };
+
+        let offset = offset as usize;
+        if offset >= cmdline_bytes.len() {
+            return Ok(0);
+        }
+
+        let available = cmdline_bytes.len() - offset;
+        let to_read = buf.len().min(available);
+        buf[..to_read].copy_from_slice(&cmdline_bytes[offset..offset + to_read]);
 
         Ok(to_read)
     }

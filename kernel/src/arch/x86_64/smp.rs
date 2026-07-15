@@ -35,8 +35,7 @@ impl CpuManager {
 static CPU_MANAGER: Mutex<CpuManager> = Mutex::new(CpuManager::new());
 
 /// Global lock for serializing TLB shootdowns across all cores.
-static TLB_SHOOTDOWN_LOCK: crate::sync::spinlock::TicketLock<()> =
-    crate::sync::spinlock::TicketLock::new(());
+static TLB_SHOOTDOWN_LOCK: Mutex<()> = Mutex::new(());
 
 /// Global atomic counter for tracking TLB shootdown acknowledgements.
 static TLB_SHOOTDOWN_ACKS: AtomicU32 = AtomicU32::new(0);

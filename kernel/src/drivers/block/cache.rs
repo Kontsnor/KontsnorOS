@@ -7,6 +7,39 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+struct AlignedBuffer {
+    ptr: *mut u8,
+    layout: ::core::alloc::Layout,
+}
+
+impl AlignedBuffer {
+    fn new(size: usize, align: usize) -> Option<Self> {
+        let layout = ::core::alloc::Layout::from_size_align(size, align).ok()?;
+        let ptr = unsafe { alloc::alloc::alloc(layout) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Self { ptr, layout })
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.ptr, self.layout.size()) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.layout.size()) }
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            alloc::alloc::dealloc(self.ptr, self.layout);
+        }
+    }
+}
+
 struct CacheEntry {
     data: Vec<u8>,
     last_access: u64,
@@ -75,10 +108,11 @@ impl BlockDevice for BlockCache {
 
         // kprintln!("[cache] read_block miss: block={}", block);
 
-        // 2. Cache miss: release lock and read the whole range from the underlying device
+        // 2. Cache miss: release lock and read the whole range from the underlying device into an aligned buffer
         drop(inner);
-        let mut disk_data = alloc::vec![0u8; buf.len()];
-        self.device.read_block(block, &mut disk_data)?;
+        let mut aligned_buf = AlignedBuffer::new(buf.len(), 512).ok_or(DriverError::IoError)?;
+        self.device.read_block(block, aligned_buf.as_mut_slice())?;
+        let disk_data = aligned_buf.as_slice();
 
         // 3. Re-acquire lock to insert new entries and update access times
         let mut inner = self.inner.lock();
@@ -126,8 +160,10 @@ impl BlockDevice for BlockCache {
         }
         let num_blocks = data.len() / block_size;
 
-        // Write-through: write the entire range to the physical device first
-        self.device.write_block(block, data)?;
+        // Write-through: write the entire range to the physical device first via an aligned buffer
+        let mut aligned_buf = AlignedBuffer::new(data.len(), 512).ok_or(DriverError::IoError)?;
+        aligned_buf.as_mut_slice().copy_from_slice(data);
+        self.device.write_block(block, aligned_buf.as_slice())?;
 
         let mut inner = self.inner.lock();
         inner.counter += 1;

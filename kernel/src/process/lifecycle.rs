@@ -270,6 +270,18 @@ pub fn user_process_trampoline_addr() -> u64 {
 
 /// Exits the currently running task.
 pub fn exit_current_thread(exit_code: i32) -> ! {
+    if let Some(current_pid) = scheduler::current_pid() {
+        if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+            let fd_table = {
+                let task = task_arc.lock();
+                task.fd_table.clone()
+            };
+            if Arc::strong_count(&fd_table) == 1 {
+                fd_table.lock().entries.clear();
+            }
+        }
+    }
+
     x86_64::instructions::interrupts::disable();
     if let Some(current_pid) = scheduler::current_pid() {
         if let Some(ref mut scheduler) = *SCHEDULER.lock() {

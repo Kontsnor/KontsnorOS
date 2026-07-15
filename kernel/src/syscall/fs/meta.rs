@@ -316,13 +316,16 @@ pub fn sys_faccessat(dfd: i32, pathname: *const u8, mode: i32, _flags: i32) -> S
 }
 
 /// `mkdir(pathname, mode)` — Create a directory.
-pub fn sys_mkdir(pathname: *const u8, _mode: u32) -> SyscallResult {
+pub fn sys_mkdir(pathname: *const u8, mode: u32) -> SyscallResult {
     let raw_path = match unsafe { copy_string_from_user(pathname) } {
         Some(p) => p,
         None => return Errno::EFAULT.into(),
     };
-
     let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+    sys_mkdir_with_resolved_path(resolved_path, mode)
+}
+
+pub fn sys_mkdir_with_resolved_path(resolved_path: String, _mode: u32) -> SyscallResult {
     kprintln!("[syscall] mkdir(\"{}\")", resolved_path);
 
     // Check if the destination already exists
@@ -365,6 +368,10 @@ pub fn sys_rmdir(pathname: *const u8) -> SyscallResult {
     };
 
     let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+    sys_rmdir_with_resolved_path(resolved_path)
+}
+
+pub fn sys_rmdir_with_resolved_path(resolved_path: String) -> SyscallResult {
     kprintln!("[syscall] rmdir(\"{}\")", resolved_path);
 
     // Split resolved_path into parent directory and base name
@@ -405,6 +412,10 @@ pub fn sys_unlink(pathname: *const u8) -> SyscallResult {
     };
 
     let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+    sys_unlink_with_resolved_path(resolved_path)
+}
+
+pub fn sys_unlink_with_resolved_path(resolved_path: String) -> SyscallResult {
     kprintln!("[syscall] unlink(\"{}\")", resolved_path);
 
     // Split resolved_path into parent directory and base name
@@ -517,6 +528,10 @@ pub fn sys_rename(oldpath: *const u8, newpath: *const u8) -> SyscallResult {
 
     let resolved_old = crate::fs::vfs::resolve_relative_path(&raw_old);
     let resolved_new = crate::fs::vfs::resolve_relative_path(&raw_new);
+    sys_rename_with_resolved_paths(resolved_old, resolved_new)
+}
+
+pub fn sys_rename_with_resolved_paths(resolved_old: String, resolved_new: String) -> SyscallResult {
     kprintln!(
         "[syscall] rename(\"{}\" -> \"{}\")",
         resolved_old,
@@ -778,11 +793,24 @@ pub fn sys_chmod(pathname: *const u8, mode: u32) -> SyscallResult {
     };
 
     let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+    sys_chmod_with_resolved_path_follow(resolved_path, mode, true)
+}
+
+pub fn sys_chmod_with_resolved_path_follow(
+    resolved_path: String,
+    mode: u32,
+    follow_last: bool,
+) -> SyscallResult {
     if crate::syscall::DEBUG_SYSCALLS {
-        kprintln!("[syscall] chmod(\"{}\", mode={:#o})", resolved_path, mode);
+        kprintln!(
+            "[syscall] chmod(\"{}\", mode={:#o}, follow={})",
+            resolved_path,
+            mode,
+            follow_last
+        );
     }
 
-    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved_path, true) {
+    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved_path, follow_last) {
         Some(i) => i,
         None => return Errno::ENOENT.into(),
     };
@@ -1004,4 +1032,245 @@ pub fn sys_umask(mask: u32) -> SyscallResult {
     } else {
         0o022
     }
+}
+
+/// Helper function to perform permission checks and call set_owner.
+fn change_inode_owner(
+    inode_ops: &dyn crate::fs::inode::InodeOps,
+    uid: u32,
+    gid: u32,
+) -> SyscallResult {
+    let (euid, is_root) = if let Some(pid) = crate::process::scheduler::current_pid() {
+        if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+            let task = task_arc.lock();
+            (task.euid, task.euid == 0)
+        } else {
+            (0, true)
+        }
+    } else {
+        (0, true)
+    };
+
+    let metadata = inode_ops.inode();
+    if !is_root && metadata.uid != euid {
+        return Errno::EPERM.into();
+    }
+
+    let target_uid = if uid == 0xffffffff { metadata.uid } else { uid };
+    let target_gid = if gid == 0xffffffff { metadata.gid } else { gid };
+
+    match inode_ops.set_owner(target_uid, target_gid) {
+        Ok(_) => 0,
+        Err(e) => e as SyscallResult,
+    }
+}
+
+/// `chown(pathname, uid, gid)` — Change ownership of a file.
+pub fn sys_chown(pathname: *const u8, uid: u32, gid: u32) -> SyscallResult {
+    if pathname.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved_path, true) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+    change_inode_owner(inode_ops.as_ref(), uid, gid)
+}
+
+/// `lchown(pathname, uid, gid)` — Change ownership of a file, don't follow symlinks.
+pub fn sys_lchown(pathname: *const u8, uid: u32, gid: u32) -> SyscallResult {
+    if pathname.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved_path, false) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+    change_inode_owner(inode_ops.as_ref(), uid, gid)
+}
+
+/// `fchown(fd, uid, gid)` — Change ownership of an open file descriptor.
+pub fn sys_fchown(fd: i32, uid: u32, gid: u32) -> SyscallResult {
+    let inode_ops = match proc_fd::current_task_read_fd(fd) {
+        Some(i) => i,
+        None => return Errno::EBADF.into(),
+    };
+    change_inode_owner(inode_ops.as_ref(), uid, gid)
+}
+
+/// `fchownat(dfd, pathname, uid, gid, flags)` — Change ownership relative to a directory fd.
+pub fn sys_fchownat(
+    dfd: i32,
+    pathname: *const u8,
+    uid: u32,
+    gid: u32,
+    flags: i32,
+) -> SyscallResult {
+    if pathname.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
+        Ok(path) => path,
+        Err(e) => return e.into(),
+    };
+
+    let follow_last = (flags & 0x100) == 0; // AT_SYMLINK_NOFOLLOW = 0x100
+    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved_path, follow_last) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+    change_inode_owner(inode_ops.as_ref(), uid, gid)
+}
+
+/// `mount(source, target, filesystemtype, mountflags, data)` — Mount a filesystem.
+pub fn sys_mount(
+    _source: *const u8,
+    target: *const u8,
+    filesystemtype: *const u8,
+    _mountflags: u64,
+    _data: *const u8,
+) -> SyscallResult {
+    if target.is_null() || filesystemtype.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let target_raw = match unsafe { copy_string_from_user(target) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let fs_type = match unsafe { copy_string_from_user(filesystemtype) } {
+        Some(t) => t,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let target_path = crate::fs::vfs::resolve_relative_path(&target_raw);
+
+    let fs_instance: alloc::sync::Arc<dyn crate::fs::vfs::FileSystem> = match fs_type.as_str() {
+        "proc" | "procfs" => crate::fs::procfs::create_procfs(),
+        "sysfs" => crate::fs::sysfs::create_sysfs(),
+        "tmpfs" => crate::fs::tmpfs::create_tmpfs(),
+        "devtmpfs" | "devfs" => crate::fs::devfs::create_devfs(),
+        _ => return Errno::EINVAL.into(),
+    };
+
+    crate::fs::vfs::mount(target_path, fs_instance);
+    0
+}
+
+/// `umount2(target, flags)` — Unmount a filesystem.
+pub fn sys_umount2(target: *const u8, _flags: i32) -> SyscallResult {
+    if target.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let target_raw = match unsafe { copy_string_from_user(target) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let target_path = crate::fs::vfs::resolve_relative_path(&target_raw);
+
+    if crate::fs::vfs::unmount(&target_path) {
+        0
+    } else {
+        Errno::EINVAL.into()
+    }
+}
+
+/// `unlinkat(dfd, pathname, flags)` — Remove a file/directory relative to a directory fd.
+pub fn sys_unlinkat(dfd: i32, pathname: *const u8, flags: i32) -> SyscallResult {
+    if pathname.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
+        Ok(path) => path,
+        Err(e) => return e.into(),
+    };
+
+    if (flags & 0x200) != 0 {
+        // AT_REMOVEDIR
+        sys_rmdir_with_resolved_path(resolved_path)
+    } else {
+        sys_unlink_with_resolved_path(resolved_path)
+    }
+}
+
+/// `mkdirat(dfd, pathname, mode)` — Create a directory relative to a directory fd.
+pub fn sys_mkdirat(dfd: i32, pathname: *const u8, mode: u32) -> SyscallResult {
+    if pathname.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
+        Ok(path) => path,
+        Err(e) => return e.into(),
+    };
+    sys_mkdir_with_resolved_path(resolved_path, mode)
+}
+
+/// `renameat(olddirfd, oldpath, newdirfd, newpath)` — Rename relative to directory fds.
+pub fn sys_renameat(
+    olddirfd: i32,
+    oldpath: *const u8,
+    newdirfd: i32,
+    newpath: *const u8,
+) -> SyscallResult {
+    if oldpath.is_null() || newpath.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let raw_old = match unsafe { copy_string_from_user(oldpath) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let raw_new = match unsafe { copy_string_from_user(newpath) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved_old = match crate::fs::vfs::resolve_relative_path_at(olddirfd, &raw_old) {
+        Ok(path) => path,
+        Err(e) => return e.into(),
+    };
+    let resolved_new = match crate::fs::vfs::resolve_relative_path_at(newdirfd, &raw_new) {
+        Ok(path) => path,
+        Err(e) => return e.into(),
+    };
+
+    sys_rename_with_resolved_paths(resolved_old, resolved_new)
+}
+
+/// `fchmodat(dfd, pathname, mode, flags)` — Change permissions relative to a directory fd.
+pub fn sys_fchmodat(dfd: i32, pathname: *const u8, mode: u32, flags: i32) -> SyscallResult {
+    if pathname.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
+        Ok(path) => path,
+        Err(e) => return e.into(),
+    };
+
+    let follow_last = (flags & 0x100) == 0; // AT_SYMLINK_NOFOLLOW = 0x100
+    sys_chmod_with_resolved_path_follow(resolved_path, mode, follow_last)
 }

@@ -288,6 +288,15 @@ pub fn mount(path: String, filesystem: Arc<dyn FileSystem>) {
     }
 }
 
+/// Unmount the filesystem at the given path.
+pub fn unmount(path: &str) -> bool {
+    if let Some(ref mut vfs) = *VFS.write() {
+        vfs.unmount(path)
+    } else {
+        false
+    }
+}
+
 /// Lookup an inode by path.
 pub fn lookup(path: &str) -> Option<Arc<dyn InodeOps>> {
     VFS.read().as_ref()?.lookup(path)

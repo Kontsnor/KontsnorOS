@@ -156,8 +156,8 @@ impl InodeOps for DevRandom {
     }
 }
 
-/// Initialize devfs and register standard device nodes.
-pub fn init() {
+/// Create a new devfs instance.
+pub fn create_devfs() -> Arc<DevFs> {
     let mut entries = BTreeMap::new();
 
     // Create standard device nodes
@@ -212,10 +212,17 @@ pub fn init() {
     });
 
     let devfs = Arc::new(DevFs { root });
+    *DEVFS.write() = Some(devfs.clone());
+
+    devfs
+}
+
+/// Initialize devfs and register standard device nodes.
+pub fn init() {
+    let devfs = create_devfs();
 
     // Mount at /dev
-    super::vfs::mount(String::from("/dev"), devfs.clone());
-    *DEVFS.write() = Some(devfs);
+    super::vfs::mount(String::from("/dev"), devfs);
 
     // Register TTY character devices: stdin, stdout, stderr, tty
     register_device("stdin", super::tty::make_stdin());

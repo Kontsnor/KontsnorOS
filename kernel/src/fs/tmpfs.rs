@@ -234,14 +234,19 @@ impl InodeOps for TmpFsFile {
     }
 }
 
-/// Initialize tmpfs and mount at `/tmp`.
-pub fn init() {
+/// Create a new tmpfs instance.
+pub fn create_tmpfs() -> Arc<TmpFs> {
     let root = Arc::new(TmpFsDir {
         inode: RwLock::new(Inode::new(alloc_ino(), FileType::Directory)),
         entries: RwLock::new(BTreeMap::new()),
     });
 
-    let tmpfs = Arc::new(TmpFs { root });
+    Arc::new(TmpFs { root })
+}
+
+/// Initialize tmpfs and mount at `/tmp`.
+pub fn init() {
+    let tmpfs = create_tmpfs();
     super::vfs::mount(String::from("/tmp"), tmpfs);
 }
 

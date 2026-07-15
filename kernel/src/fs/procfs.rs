@@ -185,8 +185,8 @@ fn gen_tasks() -> String {
     out
 }
 
-/// Initialize procfs and mount at `/proc`.
-pub fn init() {
+/// Create a new procfs instance.
+pub fn create_procfs() -> Arc<ProcFs> {
     let entries = vec![
         (
             String::from("version"),
@@ -230,7 +230,12 @@ pub fn init() {
         entries,
     });
 
-    let procfs = Arc::new(ProcFs { root });
+    Arc::new(ProcFs { root })
+}
+
+/// Initialize procfs and mount at `/proc`.
+pub fn init() {
+    let procfs = create_procfs();
     super::vfs::mount(String::from("/proc"), procfs);
 }
 

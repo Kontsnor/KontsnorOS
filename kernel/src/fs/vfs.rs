@@ -14,6 +14,7 @@ use spin::RwLock;
 
 use super::inode::{FileType, InodeOps};
 use crate::drivers::traits::BlockDevice;
+use crate::syscall::Errno;
 
 /// The global VFS instance.
 static VFS: RwLock<Option<Vfs>> = RwLock::new(None);
@@ -334,4 +335,26 @@ pub fn resolve_relative_path(path: &str) -> String {
         };
         crate::fs::path::normalize(&crate::fs::path::join(&cwd, path))
     }
+}
+
+/// Helper to resolve paths relative to a directory file descriptor.
+pub fn resolve_relative_path_at(dfd: i32, path: &str) -> Result<String, Errno> {
+    if path.starts_with('/') {
+        return Ok(crate::fs::path::normalize(path));
+    }
+    if dfd == -100 {
+        // AT_FDCWD
+        return Ok(resolve_relative_path(path));
+    }
+
+    let desc = crate::process::fd::current_task_get_file_desc(dfd).ok_or(Errno::EBADF)?;
+
+    if desc.inode.inode().file_type != FileType::Directory {
+        return Err(Errno::ENOTDIR);
+    }
+
+    let desc_path = desc.path.as_deref().unwrap_or("/");
+    Ok(crate::fs::path::normalize(&crate::fs::path::join(
+        desc_path, path,
+    )))
 }

@@ -647,16 +647,39 @@ pub fn sys_sched_getaffinity(_pid: i32, cpusetsize: usize, mask: *mut u8) -> Sys
     8
 }
 
-/// `set_robust_list(head, len)` — Stub returning ENOSYS.
-pub fn sys_set_robust_list(_head: *const u8, _len: usize) -> SyscallResult {
-    Errno::ENOSYS.into()
+/// `set_robust_list(head, len)` — Stub returning 0.
+pub fn sys_set_robust_list(head: *const u8, len: usize) -> SyscallResult {
+    if !head.is_null() {
+        if !validate_user_ptr(head, len) {
+            return Errno::EFAULT.into();
+        }
+    }
+    0
 }
 
-/// `get_robust_list(pid, head_ptr, len_ptr)` — Stub returning ENOSYS.
+/// `get_robust_list(pid, head_ptr, len_ptr)` — Stub returning 0.
 pub fn sys_get_robust_list(
     _pid: i32,
-    _head_ptr: *mut *mut u8,
-    _len_ptr: *mut usize,
+    head_ptr: *mut *mut u8,
+    len_ptr: *mut usize,
 ) -> SyscallResult {
-    Errno::ENOSYS.into()
+    if !head_ptr.is_null() {
+        if validate_user_ptr_write(head_ptr as *mut u8, core::mem::size_of::<*mut u8>()).is_err() {
+            return Errno::EFAULT.into();
+        }
+        // SAFETY: The pointer was validated using validate_user_ptr_write and is safe to write.
+        unsafe {
+            head_ptr.write(core::ptr::null_mut());
+        }
+    }
+    if !len_ptr.is_null() {
+        if validate_user_ptr_write(len_ptr as *mut u8, core::mem::size_of::<usize>()).is_err() {
+            return Errno::EFAULT.into();
+        }
+        // SAFETY: The pointer was validated using validate_user_ptr_write and is safe to write.
+        unsafe {
+            len_ptr.write(0);
+        }
+    }
+    0
 }

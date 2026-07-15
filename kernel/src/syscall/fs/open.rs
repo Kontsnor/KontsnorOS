@@ -4,18 +4,24 @@ use super::super::{Errno, SyscallResult};
 use crate::kprintln;
 use crate::process::fd as proc_fd;
 use crate::syscall::validation::copy_string_from_user;
+use alloc::string::String;
 
 /// `open(pathname, flags, mode)` — Open a file.
 ///
 /// Resolves `pathname` through the VFS, allocates a file descriptor in the
 /// current task's `fd_table`, and returns the new fd number.
-pub fn sys_open(pathname: *const u8, flags: i32, _mode: u32) -> SyscallResult {
+pub fn sys_open(pathname: *const u8, flags: i32, mode: u32) -> SyscallResult {
     let raw_path = match unsafe { copy_string_from_user(pathname) } {
         Some(p) => p,
         None => return Errno::EFAULT.into(),
     };
 
     let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+    sys_open_with_resolved_path(resolved_path, flags, mode)
+}
+
+/// Core open logic with an already resolved path.
+pub fn sys_open_with_resolved_path(resolved_path: String, flags: i32, _mode: u32) -> SyscallResult {
     kprintln!("[syscall] open(\"{}\", flags={:#x})", resolved_path, flags);
 
     let flags_u32 = flags as u32;
@@ -137,22 +143,20 @@ pub fn sys_open(pathname: *const u8, flags: i32, _mode: u32) -> SyscallResult {
 
 /// `openat(dfd, pathname, flags, mode)` — Open file relative to directory file descriptor.
 pub fn sys_openat(dfd: i32, pathname: *const u8, flags: i32, mode: u32) -> SyscallResult {
-    if dfd == -100 {
-        // AT_FDCWD
-        sys_open(pathname, flags, mode)
-    } else {
-        if pathname.is_null() {
-            return Errno::EFAULT.into();
-        }
-        // If the path starts with '/', it is absolute, so dfd is ignored.
-        let first_byte = unsafe { pathname.read() };
-        if first_byte == b'/' {
-            sys_open(pathname, flags, mode)
-        } else {
-            // Relative to directory fd is not supported yet
-            Errno::ENOSYS.into()
-        }
+    if pathname.is_null() {
+        return Errno::EFAULT.into();
     }
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
+        Ok(path) => path,
+        Err(e) => return e.into(),
+    };
+
+    sys_open_with_resolved_path(resolved_path, flags, mode)
 }
 
 /// `close(fd)` — Close a file descriptor.

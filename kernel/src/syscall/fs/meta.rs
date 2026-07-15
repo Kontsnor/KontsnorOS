@@ -7,6 +7,7 @@ use crate::process::fd as proc_fd;
 use crate::syscall::validation::{
     copy_string_from_user, validate_user_ptr, validate_user_ptr_write,
 };
+use alloc::string::String;
 use alloc::vec::Vec;
 
 #[repr(C)]
@@ -255,13 +256,9 @@ pub fn sys_newfstatat(
         None => return Errno::EFAULT.into(),
     };
 
-    let resolved_path = if raw_path.starts_with('/') {
-        raw_path
-    } else if dfd == -100 {
-        // AT_FDCWD
-        crate::fs::vfs::resolve_relative_path(&raw_path)
-    } else {
-        crate::fs::vfs::resolve_relative_path(&raw_path)
+    let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
+        Ok(path) => path,
+        Err(e) => return e.into(),
     };
 
     let follow_last = (_flags & 0x100) == 0; // AT_SYMLINK_NOFOLLOW = 0x100
@@ -288,13 +285,9 @@ pub fn sys_faccessat(dfd: i32, pathname: *const u8, mode: i32, _flags: i32) -> S
         None => return Errno::EFAULT.into(),
     };
 
-    let resolved_path = if raw_path.starts_with('/') {
-        raw_path
-    } else if dfd == -100 {
-        // AT_FDCWD
-        crate::fs::vfs::resolve_relative_path(&raw_path)
-    } else {
-        crate::fs::vfs::resolve_relative_path(&raw_path)
+    let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
+        Ok(path) => path,
+        Err(e) => return e.into(),
     };
 
     let inode_ops = match crate::fs::vfs::lookup_follow(&resolved_path, true) {
@@ -586,6 +579,15 @@ pub fn sys_readlink(pathname: *const u8, buf: *mut u8, bufsize: usize) -> Syscal
         None => return Errno::EFAULT.into(),
     };
     let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+    sys_readlink_with_resolved_path(resolved_path, buf, bufsize)
+}
+
+/// Core readlink logic with an already resolved path.
+pub fn sys_readlink_with_resolved_path(
+    resolved_path: String,
+    buf: *mut u8,
+    bufsize: usize,
+) -> SyscallResult {
     if crate::syscall::DEBUG_SYSCALLS {
         kprintln!("[syscall] readlink(\"{}\")", resolved_path);
     }
@@ -609,6 +611,7 @@ pub fn sys_readlink(pathname: *const u8, buf: *mut u8, bufsize: usize) -> Syscal
     let mut kernel_buf = alloc::vec![0u8; bufsize];
     match inode_ops.read(0, &mut kernel_buf) {
         Ok(n) => {
+            // SAFETY: The destination user buffer is checked using validate_user_ptr.
             unsafe {
                 core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf, n);
             }
@@ -625,15 +628,18 @@ pub fn sys_readlinkat(
     buf: *mut u8,
     bufsize: usize,
 ) -> SyscallResult {
-    if dirfd == -100 {
-        // AT_FDCWD
-        sys_readlink(pathname, buf, bufsize)
-    } else {
-        if crate::syscall::DEBUG_SYSCALLS {
-            kprintln!("[syscall] sys_readlinkat: only AT_FDCWD is supported currently");
-        }
-        Errno::ENOSYS.into()
+    if pathname.is_null() {
+        return Errno::EFAULT.into();
     }
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dirfd, &raw_path) {
+        Ok(path) => path,
+        Err(e) => return e.into(),
+    };
+    sys_readlink_with_resolved_path(resolved_path, buf, bufsize)
 }
 
 /// `symlink(target, linkpath)` — Create a symbolic link.
@@ -648,6 +654,14 @@ pub fn sys_symlink(target: *const u8, linkpath: *const u8) -> SyscallResult {
     };
 
     let resolved_linkpath = crate::fs::vfs::resolve_relative_path(&raw_linkpath);
+    sys_symlink_with_resolved_linkpath(raw_target, resolved_linkpath)
+}
+
+/// Core symlink logic with an already resolved linkpath.
+pub fn sys_symlink_with_resolved_linkpath(
+    raw_target: String,
+    resolved_linkpath: String,
+) -> SyscallResult {
     if crate::syscall::DEBUG_SYSCALLS {
         kprintln!(
             "[syscall] symlink(\"{}\" -> \"{}\")",
@@ -692,15 +706,21 @@ pub fn sys_symlink(target: *const u8, linkpath: *const u8) -> SyscallResult {
 
 /// `symlinkat(target, newdirfd, linkpath)` — Create a symbolic link relative to a directory fd.
 pub fn sys_symlinkat(target: *const u8, newdirfd: i32, linkpath: *const u8) -> SyscallResult {
-    if newdirfd == -100 {
-        // AT_FDCWD
-        sys_symlink(target, linkpath)
-    } else {
-        if crate::syscall::DEBUG_SYSCALLS {
-            kprintln!("[syscall] sys_symlinkat: only AT_FDCWD is supported currently");
-        }
-        Errno::ENOSYS.into()
-    }
+    let raw_target = match unsafe { copy_string_from_user(target) } {
+        Some(t) => t,
+        None => return Errno::EFAULT.into(),
+    };
+    let raw_linkpath = match unsafe { copy_string_from_user(linkpath) } {
+        Some(l) => l,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved_linkpath = match crate::fs::vfs::resolve_relative_path_at(newdirfd, &raw_linkpath)
+    {
+        Ok(path) => path,
+        Err(e) => return e.into(),
+    };
+    sys_symlink_with_resolved_linkpath(raw_target, resolved_linkpath)
 }
 
 /// `poll` fd event struct.

@@ -340,13 +340,16 @@ fn terminate_group_and_exit(current_pid: crate::process::pid::Pid, exit_code: i3
     }
 
     if !other_pids.is_empty() {
-        x86_64::instructions::interrupts::without_interrupts(|| {
+        let fds = x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut collected = alloc::vec::Vec::new();
             if let Some(ref mut sched) = *scheduler::SCHEDULER.lock() {
                 for pid in other_pids {
-                    sched.exit_task(pid, exit_code);
+                    collected.push(sched.exit_task(pid, exit_code));
                 }
             }
+            collected
         });
+        drop(fds);
     }
 
     scheduler::exit_current_thread(exit_code);

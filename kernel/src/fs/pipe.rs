@@ -130,7 +130,7 @@ impl InodeOps for PipeReader {
     }
 
     fn ioctl(&self, request: u64, arg: u64) -> Result<u64, i32> {
-        if request == 0x5413 {
+        if request == 0x5421 {
             // FIONBIO
             if !crate::syscall::fs::validate_user_ptr(arg as *const u8, 4) {
                 return Err(-14); // EFAULT
@@ -232,7 +232,7 @@ impl InodeOps for PipeWriter {
     }
 
     fn ioctl(&self, request: u64, arg: u64) -> Result<u64, i32> {
-        if request == 0x5413 {
+        if request == 0x5421 {
             // FIONBIO
             if !crate::syscall::fs::validate_user_ptr(arg as *const u8, 4) {
                 return Err(-14); // EFAULT

@@ -285,8 +285,8 @@ pub trait InodeOps: Send + Sync {
     fn set_nonblocking(&self, _nonblocking: bool) {}
 
     /// Poll for I/O readiness.
-    fn poll(&self, _events: u32) -> u32 {
-        0
+    fn poll(&self, events: u32) -> u32 {
+        events
     }
 
     /// Downcast helpers

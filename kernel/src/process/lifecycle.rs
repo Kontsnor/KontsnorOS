@@ -283,11 +283,16 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
     }
 
     x86_64::instructions::interrupts::disable();
-    if let Some(current_pid) = scheduler::current_pid() {
+    let fds = if let Some(current_pid) = scheduler::current_pid() {
         if let Some(ref mut scheduler) = *SCHEDULER.lock() {
-            scheduler.exit_task(current_pid, exit_code);
+            scheduler.exit_task(current_pid, exit_code)
+        } else {
+            alloc::vec::Vec::new()
         }
-    }
+    } else {
+        alloc::vec::Vec::new()
+    };
+    drop(fds);
 
     scheduler::schedule();
 

@@ -13,7 +13,7 @@ pub mod process;
 pub mod signal;
 pub mod validation;
 
-pub const DEBUG_SYSCALLS: bool = true;
+pub const DEBUG_SYSCALLS: bool = false;
 
 /// Syscall numbers for KontsnorOS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

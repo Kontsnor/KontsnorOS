@@ -751,7 +751,7 @@ struct PollFd {
 ///
 /// Stub: marks all fds as having POLLIN|POLLOUT ready and returns immediately.
 /// A real implementation would block in the scheduler until events fire.
-pub fn sys_poll(fds: *mut u8, nfds: u64, _timeout: i32) -> SyscallResult {
+pub fn sys_poll(fds: *mut u8, nfds: u64, timeout: i32) -> SyscallResult {
     if fds.is_null() || nfds == 0 {
         return 0;
     }
@@ -768,21 +768,59 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, _timeout: i32) -> SyscallResult {
         core::ptr::copy_nonoverlapping(fds as *const PollFd, local_fds.as_mut_ptr(), nfds as usize);
     }
 
-    let mut ready = 0i64;
-    for pfd in local_fds.iter_mut() {
-        if pfd.fd >= 0 {
-            pfd.revents = pfd.events;
-            ready += 1;
-        } else {
-            pfd.revents = 0;
+    let start_ticks = crate::arch::x86_64::interrupts::timer_ticks();
+    let timeout_ticks = if timeout > 0 {
+        Some((timeout as u64 + 9) / 10)
+    } else {
+        None
+    };
+
+    loop {
+        let mut ready = 0i64;
+        for pfd in local_fds.iter_mut() {
+            if pfd.fd >= 0 {
+                if let Some(inode) = proc_fd::current_task_read_fd(pfd.fd) {
+                    let revents = inode.poll(pfd.events as u32);
+                    pfd.revents = revents as i16;
+                    if revents != 0 {
+                        ready += 1;
+                    }
+                } else {
+                    pfd.revents = 0x0008; // POLLERR
+                    ready += 1;
+                }
+            } else {
+                pfd.revents = 0;
+            }
         }
-    }
 
-    unsafe {
-        core::ptr::copy_nonoverlapping(local_fds.as_ptr(), fds as *mut PollFd, nfds as usize);
-    }
+        if ready > 0 || timeout == 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    local_fds.as_ptr(),
+                    fds as *mut PollFd,
+                    nfds as usize,
+                );
+            }
+            return ready as SyscallResult;
+        }
 
-    ready as SyscallResult
+        if let Some(limit) = timeout_ticks {
+            let current = crate::arch::x86_64::interrupts::timer_ticks();
+            if current >= start_ticks + limit {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        local_fds.as_ptr(),
+                        fds as *mut PollFd,
+                        nfds as usize,
+                    );
+                }
+                return 0; // timeout expired
+            }
+        }
+
+        crate::process::scheduler::yield_now();
+    }
 }
 
 /// `chmod(pathname, mode)` — Change file permissions.

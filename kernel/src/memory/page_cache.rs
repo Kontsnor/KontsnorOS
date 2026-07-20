@@ -242,16 +242,18 @@ pub fn flush_all_for_inode(inode: &Arc<dyn InodeOps>) -> Result<(), Errno> {
 /// Helper function implementing dirty page cache flushing for all pages of an inode using raw `&dyn InodeOps`.
 pub fn flush_all_for_inode_inner(inode: &dyn InodeOps) -> Result<(), Errno> {
     let ino = inode.inode().ino;
+    /*
     crate::kprintln!(
         "[debug flush_all] scanning page tables of all tasks for ino={}",
         ino
     );
+    */
 
     // Collect Arc references to all active tasks under the read lock, then drop it immediately
     // to prevent cross-thread read-write lock deadlocks if a task exits/forks concurrently.
     let task_arcs: alloc::vec::Vec<(usize, Arc<spin::Mutex<crate::process::task::Task>>)> = {
         let tasks = crate::process::scheduler::TASKS.read();
-        crate::kprintln!("[debug flush_all] TASKS locked, count={}", tasks.len());
+        // crate::kprintln!("[debug flush_all] TASKS locked, count={}", tasks.len());
         tasks
             .iter()
             .enumerate()
@@ -259,23 +261,29 @@ pub fn flush_all_for_inode_inner(inode: &dyn InodeOps) -> Result<(), Errno> {
             .collect()
     };
 
+    /*
     crate::kprintln!(
         "[debug flush_all] collected tasks, count={}",
         task_arcs.len()
     );
+    */
     for (idx, task_arc) in task_arcs {
-        crate::kprintln!("[debug flush_all] locking task idx={}", idx);
+        // crate::kprintln!("[debug flush_all] locking task idx={}", idx);
         x86_64::instructions::interrupts::without_interrupts(|| {
             let mut task = task_arc.lock();
+            /*
             crate::kprintln!(
                 "[debug flush_all] task idx={} locked, locking addr_space",
                 idx
             );
+            */
             let addr_space = task.address_space.lock();
+            /*
             crate::kprintln!(
                 "[debug flush_all] addr_space idx={} locked, checking regions",
                 idx
             );
+            */
             for region in &addr_space.mmap_regions {
                 if region.is_shared && region.inode.as_ref().map(|i| i.inode().ino) == Some(ino) {
                     let start_page = region.start & !4095;
@@ -308,12 +316,14 @@ pub fn flush_all_for_inode_inner(inode: &dyn InodeOps) -> Result<(), Errno> {
                     }
                 }
             }
+            /*
             crate::kprintln!(
                 "[debug flush_all] finished checking regions for idx={}",
                 idx
             );
+            */
         });
-        crate::kprintln!("[debug flush_all] task idx={} unlocked", idx);
+        // crate::kprintln!("[debug flush_all] task idx={} unlocked", idx);
     }
 
     let mut offsets = alloc::vec::Vec::new();

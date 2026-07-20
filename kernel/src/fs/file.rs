@@ -155,20 +155,22 @@ impl FileDescription {
 
 impl Drop for FileDescription {
     fn drop(&mut self) {
+        /*
         crate::kprintln!(
             "[debug file_desc drop] starting drop for ino={}",
             self.inode.inode().ino
         );
+        */
         if self.inode.inode().file_type == crate::fs::inode::FileType::Regular {
-            crate::kprintln!("[debug file_desc drop] calling flush_all_for_inode");
+            // crate::kprintln!("[debug file_desc drop] calling flush_all_for_inode");
             let _ = crate::memory::page_cache::flush_all_for_inode(&self.inode);
-            crate::kprintln!("[debug file_desc drop] flush_all_for_inode returned");
+            // crate::kprintln!("[debug file_desc drop] flush_all_for_inode returned");
         }
         let fd_desc_ptr = self as *mut FileDescription as usize;
         let ino = self.inode.inode().ino;
-        crate::kprintln!("[debug file_desc drop] releasing flock locks");
+        // crate::kprintln!("[debug file_desc drop] releasing flock locks");
         crate::syscall::fs::io::release_flock_locks(fd_desc_ptr, ino);
-        crate::kprintln!("[debug file_desc drop] finished drop");
+        // crate::kprintln!("[debug file_desc drop] finished drop");
     }
 }
 

@@ -34,10 +34,11 @@ for arg in "$@"; do
 done
 
 KERNEL_BIN="$PROJECT_DIR/target/x86_64-unknown-none/$BUILD_TYPE/kontsnor-kernel"
+BIOS_IMG="$PROJECT_DIR/bios.img"
 
-if [ ! -f "$KERNEL_BIN" ]; then
-    echo "Kernel binary not found at: $KERNEL_BIN"
-    echo "Build the kernel first: cargo build"
+if [ ! -f "$BIOS_IMG" ]; then
+    echo "Bootable bios image not found at: $BIOS_IMG"
+    echo "Please build the image first: ./tools/build-image.sh"
     exit 1
 fi
 
@@ -46,16 +47,10 @@ echo "║     KontsnorOS — QEMU Launcher        ║"
 echo "╠═══════════════════════════════════════╣"
 echo "║  Build:  $BUILD_TYPE                  ║"
 echo "║  Kernel: $KERNEL_BIN                  ║"
+echo "║  Image:  $BIOS_IMG                    ║"
 echo "║  Serial: stdio                        ║"
 echo "╚═══════════════════════════════════════╝"
 echo ""
-
-echo "Building bootable disk image..."
-STRIPPED_DIR="$PROJECT_DIR/target/stripped"
-mkdir -p "$STRIPPED_DIR"
-cp "$KERNEL_BIN" "$STRIPPED_DIR/kontsnor-kernel"
-strip "$STRIPPED_DIR/kontsnor-kernel"
-bootloader_linker build "$STRIPPED_DIR/kontsnor-kernel" -o "$PROJECT_DIR" -s
 
 DISK_IMG="$PROJECT_DIR/disk.img"
 if [ ! -f "$DISK_IMG" ]; then
@@ -64,7 +59,7 @@ if [ ! -f "$DISK_IMG" ]; then
 fi
 
 qemu-system-x86_64 \
-    -drive format=raw,file="$PROJECT_DIR/bios.img" \
+    -drive format=raw,file="$BIOS_IMG" \
     -drive format=raw,file="$DISK_IMG",index=1,media=disk \
     -serial stdio \
     -display none \

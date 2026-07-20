@@ -1931,8 +1931,9 @@ fn test_futex_bitset_and_cleartid() {
     sched.add_task(task_child);
 
     // Exit it
-    sched.exit_task(pid_child, 0);
+    let fds = sched.exit_task(pid_child, 0);
     drop(sched_lock);
+    drop(fds);
 
     // Yield to let join_waiter run
     for _ in 0..20 {

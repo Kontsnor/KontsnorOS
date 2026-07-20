@@ -609,13 +609,16 @@ pub fn sys_execve(
             }
 
             if !other_pids.is_empty() {
-                x86_64::instructions::interrupts::without_interrupts(|| {
+                let fds = x86_64::instructions::interrupts::without_interrupts(|| {
+                    let mut collected = alloc::vec::Vec::new();
                     if let Some(ref mut sched) = *scheduler::SCHEDULER.lock() {
                         for pid in other_pids {
-                            sched.exit_task(pid, 0);
+                            collected.push(sched.exit_task(pid, 0));
                         }
                     }
+                    collected
                 });
+                drop(fds);
             }
 
             // Set-UID and Set-GID executable support
@@ -758,12 +761,14 @@ pub fn sys_exit_group(status: i32) -> SyscallResult {
     // Disable interrupts before scheduler manipulation
     x86_64::instructions::interrupts::disable();
 
+    let mut all_fds = alloc::vec::Vec::new();
     if let Some(ref mut sched) = *scheduler::SCHEDULER.lock() {
         for pid in other_pids {
-            sched.exit_task(pid, status);
+            all_fds.push(sched.exit_task(pid, status));
         }
-        sched.exit_task(current_pid, status);
+        all_fds.push(sched.exit_task(current_pid, status));
     }
+    drop(all_fds);
 
     scheduler::schedule();
 
@@ -778,7 +783,9 @@ pub fn sys_exit_group(status: i32) -> SyscallResult {
 pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -> SyscallResult {
     use crate::process::task::TaskState;
 
-    if !wstatus.is_null() && !validate_user_ptr(wstatus as *const u8, core::mem::size_of::<i32>()) {
+    if !wstatus.is_null()
+        && validate_user_ptr_write(wstatus as *mut u8, core::mem::size_of::<i32>()).is_err()
+    {
         return Errno::EFAULT.into();
     }
 

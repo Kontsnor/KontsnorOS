@@ -248,12 +248,14 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
 
     let fault_addr = Cr2::read().unwrap();
     let is_user = stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3;
+    /*
     crate::kprintln!(
         "[debug pf] RAW Page Fault at vaddr {:#x}, err_code={:#x}, is_user={}",
         fault_addr.as_u64(),
         error_code.bits(),
         is_user
     );
+    */
 
     // Check if the fault was caused by a write operation
     if error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE) {
@@ -591,6 +593,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     }
 
     let ticks = TIMER_TICKS.fetch_add(1, core::sync::atomic::Ordering::Release) + 1;
+    /*
     if ticks % 10 == 0 {
         let current_pid = crate::process::scheduler::current_pid()
             .map(|p| p.as_u64())
@@ -603,6 +606,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
             stack_frame.stack_pointer.as_u64()
         );
     }
+    */
 
     // Update scheduler tick counter
     crate::process::scheduler::tick();

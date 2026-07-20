@@ -227,7 +227,11 @@ impl Scheduler {
     }
 
     /// Terminate a task.
-    pub fn exit_task(&mut self, pid: Pid, exit_code: i32) {
+    pub fn exit_task(
+        &mut self,
+        pid: Pid,
+        exit_code: i32,
+    ) -> Vec<Option<Arc<crate::fs::file::FileDescription>>> {
         // Re-parent orphan children of the exiting task to PID 1 (INIT)
         let mut adopted_any = false;
         let tasks = TASKS.read();
@@ -259,6 +263,7 @@ impl Scheduler {
         let idx = pid.as_u64() as usize;
         let mut parent_pid = None;
         let mut clear_ctid = None;
+        let mut fds_to_drop = Vec::new();
         let tasks = TASKS.read();
         if let Some(Some(task_arc)) = tasks.get(idx) {
             let mut task = task_arc.lock();
@@ -266,6 +271,10 @@ impl Scheduler {
             task.exit_code = Some(exit_code);
             parent_pid = Some(task.parent_pid);
             clear_ctid = task.clear_child_tid;
+
+            let mut fd_table = task.fd_table.lock();
+            fds_to_drop = core::mem::take(&mut fd_table.entries);
+            fd_table.cloexec.clear();
         }
         drop(tasks); // Drop TASKS read lock before calling wake_task to keep correct order
 
@@ -327,6 +336,7 @@ impl Scheduler {
                 }
             }
         }
+        fds_to_drop
     }
 
     /// Get the currently running task's PID.

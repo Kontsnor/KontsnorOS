@@ -423,29 +423,35 @@ pub fn sys_pipe(pipefds: *mut i32) -> SyscallResult {
     if pipefds.is_null() {
         return Errno::EFAULT.into();
     }
-    if !validate_user_ptr(pipefds as *const u8, 8) {
+    if validate_user_ptr_write(pipefds as *mut u8, 8).is_err() {
         return Errno::EFAULT.into();
     }
 
-    // Create the pipe VFS endpoints
+    use crate::fs::file::OpenFlags;
     let (reader, writer) = crate::fs::pipe::make_pipe();
 
-    // Allocate file descriptors
-    let fd0 = match proc_fd::current_task_alloc_fd(reader) {
+    let fd0 = match proc_fd::current_task_alloc_fd_with_flags_and_path(
+        reader,
+        OpenFlags(OpenFlags::O_RDWR),
+        Some(alloc::string::String::from("pipe:[reader]")),
+    ) {
         Some(fd) => fd,
         None => return Errno::EMFILE.into(),
     };
 
-    let fd1 = match proc_fd::current_task_alloc_fd(writer) {
+    let fd1 = match proc_fd::current_task_alloc_fd_with_flags_and_path(
+        writer,
+        OpenFlags(OpenFlags::O_RDWR),
+        Some(alloc::string::String::from("pipe:[writer]")),
+    ) {
         Some(fd) => fd,
         None => {
-            // Roll back fd0
             proc_fd::current_task_close_fd(fd0);
             return Errno::EMFILE.into();
         }
     };
 
-    // Write to user space
+    // SAFETY: The pipefds pointer was validated for write access using validate_user_ptr_write.
     unsafe {
         pipefds.write(fd0);
         pipefds.add(1).write(fd1);
@@ -460,7 +466,7 @@ pub fn sys_pipe2(pipefds: *mut i32, flags: i32) -> SyscallResult {
     if pipefds.is_null() {
         return Errno::EFAULT.into();
     }
-    if !validate_user_ptr(pipefds as *const u8, 8) {
+    if validate_user_ptr_write(pipefds as *mut u8, 8).is_err() {
         return Errno::EFAULT.into();
     }
 

@@ -35,7 +35,9 @@ mkfs.ext2 -b 4096 -F "$DISK_IMG"
 
 echo "Making binaries executable on host..."
 chmod +x "$SH_BIN"
-chmod +x "$BUSYBOX_BIN"
+if [ -f "$BUSYBOX_BIN" ]; then
+    chmod +x "$BUSYBOX_BIN"
+fi
 chmod +x "$INIT_BIN"
 if [ -f "$BASH_BIN" ]; then
     chmod +x "$BASH_BIN"
@@ -44,33 +46,61 @@ fi
 echo "Writing directories, headers, libraries and files to disk.img via debugfs..."
 CMD_FILE=$(mktemp)
 
-cat <<EOF > "$CMD_FILE"
-mkdir /bin
-mkdir /sbin
-mkdir /etc
-mkdir /tmp
-mkdir /var
-mkdir /usr
-mkdir /usr/bin
-mkdir /usr/include
-mkdir /usr/lib
-mkdir /usr/lib/tcc
-mkdir /usr/lib/tcc/include
-mkdir /usr/lib/x86_64-linux-gnu
-mkdir /usr/include/x86_64-linux-gnu
-EOF
+ALPINE_TAR="/tmp/alpine-minirootfs-3.20.0-x86_64.tar.gz"
+ALPINE_STAGE="/tmp/alpine-stage"
+
+if [ ! -f "$ALPINE_TAR" ]; then
+    echo "Downloading Alpine Linux minirootfs..."
+    wget -O "$ALPINE_TAR" https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.0-x86_64.tar.gz
+fi
+
+if [ ! -d "$ALPINE_STAGE" ]; then
+    echo "Extracting Alpine Linux minirootfs..."
+    rm -rf "$ALPINE_STAGE"
+    mkdir -p "$ALPINE_STAGE"
+    tar -xzf "$ALPINE_TAR" -C "$ALPINE_STAGE"
+fi
+
+# 1. Directories from Alpine rootfs
+find "$ALPINE_STAGE" -type d | sort | while read -r dirpath; do
+    relpath="${dirpath#$ALPINE_STAGE}"
+    if [ -n "$relpath" ]; then
+        echo "mkdir $relpath" >> "$CMD_FILE"
+    fi
+done
+
+# Ensure extra non-Alpine directories required by compiler/TCC/toolchain are present
+for dir in /usr/lib/tcc /usr/lib/tcc/include /usr/include /usr/lib/x86_64-linux-gnu /usr/include/x86_64-linux-gnu; do
+    echo "mkdir $dir" >> "$CMD_FILE"
+done
 
 # Create nested directories for musl headers
 for dir in net bits scsi netinet sys netpacket arpa; do
     echo "mkdir /usr/include/$dir" >> "$CMD_FILE"
 done
 
-# Copy bash, busybox, sh, init
+# 2. Files from Alpine rootfs
+find "$ALPINE_STAGE" -type f | while read -r filepath; do
+    relpath="${filepath#$ALPINE_STAGE}"
+    echo "write $filepath $relpath" >> "$CMD_FILE"
+done
+
+# 3. Symbolic links from Alpine rootfs
+find "$ALPINE_STAGE" -type l | while read -r linkpath; do
+    relpath="${linkpath#$ALPINE_STAGE}"
+    target=$(readlink "$linkpath")
+    echo "symlink $relpath $target" >> "$CMD_FILE"
+done
+
+# Delete existing init and library symlinks in rootfs so we can write our custom versions
+echo "rm /sbin/init" >> "$CMD_FILE"
+echo "rm /lib/ld-musl-x86_64.so.1" >> "$CMD_FILE"
+echo "rm /lib/libc.so" >> "$CMD_FILE"
+
+# Copy bash, sh, custom init
 if [ -f "$BASH_BIN" ]; then
     echo "write $BASH_BIN /bin/bash" >> "$CMD_FILE"
 fi
-echo "write $BUSYBOX_BIN /bin/sh" >> "$CMD_FILE"
-echo "write $BUSYBOX_BIN /bin/busybox" >> "$CMD_FILE"
 echo "write $SH_BIN /bin/sh_c" >> "$CMD_FILE"
 echo "write $INIT_BIN /sbin/init" >> "$CMD_FILE"
 
@@ -139,7 +169,6 @@ int _dl_find_object(void *address, void *result) {
 EOF
 musl-gcc -shared -fPIC -o /tmp/libstubs.so /tmp/stubs.c
 
-echo "mkdir /lib" >> "$CMD_FILE"
 echo "write /usr/lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1" >> "$CMD_FILE"
 echo "write /usr/lib/x86_64-linux-musl/libc.so /lib/libc.so" >> "$CMD_FILE"
 echo "write /tmp/hello_dyn /bin/hello_dyn" >> "$CMD_FILE"

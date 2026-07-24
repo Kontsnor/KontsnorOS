@@ -34,15 +34,6 @@ pub fn sys_mmap(
     use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
     use x86_64::{PhysAddr, VirtAddr};
 
-    kprintln!(
-        "[syscall] mmap(addr={:#x}, len={}, prot={:#x}, flags={:#x}, fd={})",
-        addr,
-        length,
-        prot,
-        flags,
-        fd
-    );
-
     if length == 0 {
         return Errno::EINVAL.into();
     }
@@ -112,22 +103,17 @@ pub fn sys_mmap(
         (resolved, addr_space.page_table_root)
     };
 
-    crate::kprintln!("[debug mmap] calling sys_munmap");
     // Unmap any existing overlapping regions/pages in this range
     let _ = sys_munmap(resolved_addr, aligned_len);
-    crate::kprintln!("[debug mmap] sys_munmap returned");
 
     // Add to task's mmap_regions
     {
-        crate::kprintln!("[debug mmap] locking task_arc");
         let task_arc = match scheduler::get_task_arc(current_pid) {
             Some(t) => t,
             None => return Errno::ESRCH.into(),
         };
         let mut task = task_arc.lock();
-        crate::kprintln!("[debug mmap] task locked, locking addr_space");
         let mut addr_space = task.address_space.lock();
-        crate::kprintln!("[debug mmap] addr_space locked, pushing region");
         addr_space
             .mmap_regions
             .push(crate::process::task::MappedRegion {
@@ -139,12 +125,9 @@ pub fn sys_mmap(
                 prot,
                 pathname: file_desc.as_ref().and_then(|d| d.path.clone()),
             });
-        crate::kprintln!("[debug mmap] region pushed");
     }
 
-    crate::kprintln!("[debug mmap] calling shootdown_tlb");
     crate::arch::x86_64::smp::shootdown_tlb();
-    crate::kprintln!("[debug mmap] shootdown_tlb returned");
     resolved_addr as SyscallResult
 }
 
@@ -153,8 +136,6 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
     use crate::process::scheduler;
     use x86_64::structures::paging::{Page, Size4KiB};
     use x86_64::VirtAddr;
-
-    kprintln!("[syscall] munmap(addr={:#x}, len={})", addr, length);
 
     if length == 0 || (addr & 4095) != 0 {
         return Errno::EINVAL.into(); // addr must be page-aligned
@@ -423,7 +404,7 @@ pub fn sys_mprotect(addr: u64, length: usize, prot: i32) -> SyscallResult {
                 }
 
                 // Handle NO_EXECUTE
-                if (prot & 4) != 0 {
+                if (prot & 5) != 0 {
                     pte_flags.remove(PageTableFlags::NO_EXECUTE);
                 } else {
                     pte_flags.insert(PageTableFlags::NO_EXECUTE);

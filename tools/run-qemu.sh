@@ -58,14 +58,21 @@ if [ ! -f "$DISK_IMG" ]; then
     dd if=/dev/zero of="$DISK_IMG" bs=1M count=1536 2>/dev/null
 fi
 
+ACCEL_OPTS="-cpu qemu64,+fsgsbase -smp 1"
+if [ -w /dev/kvm ]; then
+    echo "Enabling KVM Hardware Acceleration (-enable-kvm -cpu host -smp 4)..."
+    ACCEL_OPTS="-enable-kvm -cpu host -smp 4"
+else
+    echo "KVM unavailable, falling back to software TCG emulation..."
+fi
+
 qemu-system-x86_64 \
     -drive format=raw,file="$BIOS_IMG" \
     -drive format=raw,file="$DISK_IMG",index=1,media=disk \
     -serial stdio \
     -display none \
-    -m 4G \
-    -smp 1 \
-    -cpu qemu64,+fsgsbase \
+    -m 5G \
+    $ACCEL_OPTS \
     -no-reboot \
     -no-shutdown \
     $GDB_FLAG \

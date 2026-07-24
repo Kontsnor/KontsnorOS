@@ -33,6 +33,9 @@ pub struct Scheduler {
     /// The currently running task's PID per CPU core.
     pub(crate) current_cpus: [Option<Pid>; 32],
 
+    /// The core-specific idle task's PID per CPU core.
+    pub(crate) idle_cpus: [Pid; 32],
+
     /// Tick counter for priority boosting.
     ticks_since_boost: u64,
 
@@ -59,6 +62,7 @@ impl Scheduler {
                 VecDeque::new(),
             ],
             current_cpus: [None; 32],
+            idle_cpus: [Pid::IDLE; 32],
             ticks_since_boost: 0,
             context_switches: 0,
         }
@@ -99,6 +103,9 @@ impl Scheduler {
     /// Called on each timer tick to handle preemption.
     pub fn tick(&mut self) {
         self.ticks_since_boost += 1;
+
+        // Check for timed futex expirations
+        crate::syscall::process::futex::check_futex_timeouts_locked(self);
 
         // Periodic priority boost to prevent starvation
         if self.ticks_since_boost >= BOOST_INTERVAL {
@@ -272,9 +279,11 @@ impl Scheduler {
             parent_pid = Some(task.parent_pid);
             clear_ctid = task.clear_child_tid;
 
-            let mut fd_table = task.fd_table.lock();
-            fds_to_drop = core::mem::take(&mut fd_table.entries);
-            fd_table.cloexec.clear();
+            {
+                let mut fd_table = task.fd_table.lock();
+                fds_to_drop = core::mem::take(&mut fd_table.entries);
+                fd_table.cloexec.clear();
+            }
         }
         drop(tasks); // Drop TASKS read lock before calling wake_task to keep correct order
 
@@ -287,6 +296,19 @@ impl Scheduler {
             }
             crate::syscall::process::futex::futex_wake_locked(ctid, 1, 0xffffffff, self);
         }
+
+        let tasks = TASKS.read();
+        if let Some(Some(task_arc)) = tasks.get(idx) {
+            let mut task = task_arc.lock();
+            // Replace address_space with kernel-only address space to immediately free user memory frames and page tables
+            task.address_space = Arc::new(spin::Mutex::new(crate::process::task::AddressSpace {
+                page_table_root: crate::memory::r#virtual::kernel_pml4_phys(),
+                brk: 0,
+                mmap_bump: 0,
+                mmap_regions: Vec::new(),
+            }));
+        }
+        drop(tasks);
 
         if let Some(parent) = parent_pid {
             // Wake the parent task if it was blocked waiting
@@ -542,8 +564,8 @@ pub fn schedule() {
                         return;
                     }
                 }
-                // Otherwise, switch to the idle task (PID 0)
-                Pid::IDLE
+                // Otherwise, switch to this core's idle task
+                scheduler.idle_cpus[apic_id]
             }
         };
 

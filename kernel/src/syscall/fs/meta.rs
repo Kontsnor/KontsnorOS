@@ -547,34 +547,93 @@ pub fn sys_rename_with_resolved_paths(resolved_old: String, resolved_new: String
         None => return Errno::ENOENT.into(),
     };
 
-    // For now: read the file data, create at new location, remove at old location.
-    // This works for regular files in tmpfs; directory rename is not supported.
     let src_inode_ops = match crate::fs::vfs::lookup(&resolved_old) {
         Some(i) => i,
         None => return Errno::ENOENT.into(),
     };
 
-    let file_size = src_inode_ops.inode().size as usize;
-    let mut buf = alloc::vec![0u8; file_size];
-    if file_size > 0 {
-        let _ = src_inode_ops.read(0, &mut buf);
-    }
-
-    // Create file at new location
     let new_parent = match crate::fs::vfs::lookup(new_parent_path) {
         Some(i) => i,
         None => return Errno::ENOENT.into(),
     };
-    let new_inode = match new_parent.create(new_name, FileType::Regular) {
-        Some(i) => i,
-        None => return Errno::ENOSPC.into(),
-    };
-    if file_size > 0 {
-        let _ = new_inode.write(0, &buf);
+
+    if src_inode_ops.inode().file_type == FileType::Directory {
+        let new_dir = match new_parent
+            .mkdir(new_name)
+            .or_else(|| new_parent.create(new_name, FileType::Directory))
+        {
+            Some(i) => i,
+            None => return Errno::ENOSPC.into(),
+        };
+
+        fn copy_dir_rec(
+            src: &alloc::sync::Arc<dyn crate::fs::inode::InodeOps>,
+            dst: &alloc::sync::Arc<dyn crate::fs::inode::InodeOps>,
+        ) {
+            for entry in src.readdir() {
+                if entry.name == "." || entry.name == ".." {
+                    continue;
+                }
+                if let Some(child_src) = src.lookup(&entry.name) {
+                    if entry.file_type == FileType::Directory {
+                        if let Some(child_dst) = dst
+                            .mkdir(&entry.name)
+                            .or_else(|| dst.create(&entry.name, FileType::Directory))
+                        {
+                            copy_dir_rec(&child_src, &child_dst);
+                        }
+                    } else {
+                        if let Some(child_dst) = dst.create(&entry.name, entry.file_type) {
+                            let file_size = child_src.inode().size as usize;
+                            if file_size > 0 {
+                                let mut buf = alloc::vec![0u8; file_size];
+                                if child_src.read(0, &mut buf).is_ok() {
+                                    let _ = child_dst.write(0, &buf);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        fn remove_dir_rec(dir: &alloc::sync::Arc<dyn crate::fs::inode::InodeOps>) {
+            for entry in dir.readdir() {
+                if entry.name == "." || entry.name == ".." {
+                    continue;
+                }
+                if entry.file_type == FileType::Directory {
+                    if let Some(child) = dir.lookup(&entry.name) {
+                        remove_dir_rec(&child);
+                    }
+                    let _ = dir.rmdir(&entry.name);
+                } else {
+                    let _ = dir.unlink(&entry.name);
+                }
+            }
+        }
+
+        copy_dir_rec(&src_inode_ops, &new_dir);
+        remove_dir_rec(&src_inode_ops);
+        let _ = old_parent.rmdir(old_name);
+    } else {
+        let file_size = src_inode_ops.inode().size as usize;
+        let mut buf = alloc::vec![0u8; file_size];
+        if file_size > 0 {
+            let _ = src_inode_ops.read(0, &mut buf);
+        }
+
+        let new_inode = match new_parent.create(new_name, FileType::Regular) {
+            Some(i) => i,
+            None => return Errno::ENOSPC.into(),
+        };
+        if file_size > 0 {
+            let _ = new_inode.write(0, &buf);
+        }
+
+        let _ = old_parent.unlink(old_name);
     }
 
-    // Remove old file
-    let _ = old_parent.unlink(old_name);
     crate::fs::vfs::invalidate_dentry(&resolved_old);
     crate::fs::vfs::invalidate_dentry(&resolved_new);
     0

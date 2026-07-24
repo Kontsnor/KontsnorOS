@@ -28,3 +28,12 @@ lto = true
 codegen-units = 1
 opt-level = 2
 debug = true
+
+[profile.fast-build]
+inherits = "release"
+panic = "abort"
+lto = false
+codegen-units = 16
+opt-level = 0
+debug = false
+

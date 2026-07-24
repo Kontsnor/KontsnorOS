@@ -8,7 +8,7 @@ use crate::sync::spinlock::TicketLock;
 use ::alloc::string::String;
 use ::alloc::sync::Arc;
 use ::alloc::vec::Vec;
-use spin::Mutex;
+use spin::{Mutex, RwLock};
 
 pub mod alloc;
 pub mod dir;
@@ -796,7 +796,7 @@ impl ExtFileSystem {
             fs: self.clone(),
             ino,
             raw: TicketLock::new(raw_inode),
-            vfs_inode: TicketLock::new(inode),
+            vfs_inode: RwLock::new(inode),
         })
     }
 
@@ -865,14 +865,14 @@ pub struct ExtInode {
     pub(crate) fs: Arc<ExtFileSystem>,
     pub(crate) ino: u32,
     pub(crate) raw: TicketLock<ExtRawInode>,
-    pub(crate) vfs_inode: TicketLock<Inode>,
+    pub(crate) vfs_inode: RwLock<Inode>,
 }
 
 impl InodeOps for ExtInode {
     fn inode(&self) -> &Inode {
-        // SAFETY: The reference to Inode is protected by Mutex but the caller requires a lifetime matched reference.
-        // We cast the reference to a raw pointer to satisfy the signature.
-        unsafe { &*(&*self.vfs_inode.lock() as *const Inode) }
+        // SAFETY: The reference to Inode is protected by RwLock. Reading allows shared re-entrant access on the same thread.
+        // We cast the reference to a raw pointer to satisfy the trait signature.
+        unsafe { &*(&*self.vfs_inode.read() as *const Inode) }
     }
 
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
@@ -900,7 +900,7 @@ impl InodeOps for ExtInode {
     }
 
     fn set_permissions(&self, mode: u16) -> Result<(), i32> {
-        let mut vfs = self.vfs_inode.lock();
+        let mut vfs = self.vfs_inode.write();
         let mut raw = self.raw.lock();
         let new_mode = (raw.i_mode & 0xF000) | (mode & 0x0FFF);
         raw.i_mode = new_mode;
@@ -910,7 +910,7 @@ impl InodeOps for ExtInode {
     }
 
     fn set_owner(&self, uid: u32, gid: u32) -> Result<(), i32> {
-        let mut vfs = self.vfs_inode.lock();
+        let mut vfs = self.vfs_inode.write();
         let mut raw = self.raw.lock();
         raw.i_uid = uid as u16;
         raw.i_gid = gid as u16;

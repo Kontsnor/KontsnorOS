@@ -200,6 +200,29 @@ EOF
 chmod +x /tmp/compile.sh
 echo "write /tmp/compile.sh /compile.sh" >> "$CMD_FILE"
 
+echo "Writing /build_cargo.sh..."
+cat << 'EOF' > /tmp/build_cargo.sh
+#!/bin/sh
+echo "Starting Native Cargo Build inside KontsnorOS..."
+cd /disk/src/KontsnorOS || cd /src/KontsnorOS || exit 1
+export CARGO_TARGET_DIR=/tmp/target
+mkdir -p /tmp/target
+export CARGO_BUILD_JOBS=4
+export RUSTFLAGS="-C codegen-units=16 -C lto=off -C debuginfo=0 -C opt-level=0"
+/usr/bin/cargo build --package kontsnor-kernel --profile fast-build --target x86_64-unknown-linux-musl --offline -j 4 2>&1 | tee /tmp/cargo_output.log
+STATUS=$?
+echo "Cargo build finished with exit status $STATUS"
+if [ $STATUS -eq 0 ]; then
+    echo "Copying compiled kernel binary to persistent disk..."
+    mkdir -p /disk/src/KontsnorOS/target/x86_64-unknown-linux-musl/fast-build/
+    cp /tmp/target/x86_64-unknown-linux-musl/fast-build/kontsnor-kernel /disk/src/KontsnorOS/target/x86_64-unknown-linux-musl/fast-build/ 2>/dev/null
+fi
+sync
+ls -lh /tmp/target/x86_64-unknown-linux-musl/fast-build/kontsnor-kernel /disk/src/KontsnorOS/target/x86_64-unknown-linux-musl/fast-build/kontsnor-kernel 2>/dev/null
+EOF
+chmod +x /tmp/build_cargo.sh
+echo "write /tmp/build_cargo.sh /build_cargo.sh" >> "$CMD_FILE"
+
 # Copy Rust Toolchain
 RUST_TOOLCHAIN_DIR="/home/kontsnor/.rustup/toolchains/nightly-x86_64-unknown-linux-musl"
 if [ -d "$RUST_TOOLCHAIN_DIR" ]; then
@@ -219,6 +242,26 @@ if [ -d "$RUST_TOOLCHAIN_DIR" ]; then
         filename=$(basename "$filepath")
         echo "write $filepath /lib/$filename" >> "$CMD_FILE"
     done
+
+    # Copy Cargo registry cache
+    CARGO_REGISTRY_DIR="/home/kontsnor/.cargo/registry"
+    if [ -d "$CARGO_REGISTRY_DIR" ]; then
+        echo "Staging Cargo registry cache..."
+        echo "mkdir /root" >> "$CMD_FILE"
+        echo "mkdir /root/.cargo" >> "$CMD_FILE"
+        find "$CARGO_REGISTRY_DIR" -type d | while read -r dirpath; do
+            relpath="${dirpath#$CARGO_REGISTRY_DIR/}"
+            if [ "$dirpath" != "$CARGO_REGISTRY_DIR" ]; then
+                echo "mkdir /root/.cargo/registry/$relpath" >> "$CMD_FILE"
+            else
+                echo "mkdir /root/.cargo/registry" >> "$CMD_FILE"
+            fi
+        done
+        find "$CARGO_REGISTRY_DIR" -type f | while read -r filepath; do
+            relpath="${filepath#$CARGO_REGISTRY_DIR/}"
+            echo "write $filepath /root/.cargo/registry/$relpath" >> "$CMD_FILE"
+        done
+    fi
     
     # Compile a musl-compatible libgcc_s.so.1 stub library
     cat << 'EOF' > /tmp/libgcc_s.c
@@ -334,7 +377,7 @@ echo "write /tmp/hello.rs /hello.rs" >> "$CMD_FILE"
 # Execute debugfs
 debugfs -w "$DISK_IMG" -f "$CMD_FILE" >/dev/null
 
-rm -f "$CMD_FILE" /tmp/hello.c /tmp/install-busybox.sh /tmp/hello.txt /tmp/hello_dyn /tmp/hello.rs /tmp/stubs.c /tmp/libstubs.so /tmp/libgcc_s.c /tmp/libgcc_s.so.1
+rm -f "$CMD_FILE" /tmp/hello.c /tmp/install-busybox.sh /tmp/hello.txt /tmp/hello_dyn /tmp/hello.rs /tmp/stubs.c /tmp/libstubs.so /tmp/libgcc_s.c /tmp/libgcc_s.so.1 /tmp/build_cargo.sh
 
 echo "Done! disk.img is ready."
 

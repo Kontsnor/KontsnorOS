@@ -6,10 +6,18 @@ use crate::sync::spinlock::TicketLock;
 use crate::syscall::{Errno, SyscallResult};
 use alloc::collections::{BTreeMap, VecDeque};
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Timespec {
+    pub tv_sec: i64,
+    pub tv_nsec: i64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct FutexWaiter {
     pid: Pid,
     bitset: u32,
+    deadline: Option<u64>,
 }
 
 static FUTEX_QUEUES: TicketLock<BTreeMap<u64, VecDeque<FutexWaiter>>> =
@@ -43,12 +51,40 @@ pub fn futex_wake_locked(
     woken
 }
 
+/// Scan futex queues and wake any waiters whose deadlines have expired.
+pub fn check_futex_timeouts_locked(sched: &mut crate::process::scheduler::Scheduler) {
+    let current_ticks = crate::arch::x86_64::interrupts::timer_ticks();
+    let mut queues = FUTEX_QUEUES.lock();
+    let mut empty_keys = alloc::vec::Vec::new();
+
+    for (&uaddr, queue) in queues.iter_mut() {
+        let mut i = 0;
+        while i < queue.len() {
+            if let Some(dl) = queue[i].deadline {
+                if current_ticks >= dl {
+                    let waiter = queue.remove(i).unwrap();
+                    sched.wake_task(waiter.pid);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        if queue.is_empty() {
+            empty_keys.push(uaddr);
+        }
+    }
+
+    for key in empty_keys {
+        queues.remove(&key);
+    }
+}
+
 /// `futex(uaddr, op, val, timeout, uaddr2, val3)`
 pub fn sys_futex(
     uaddr: *mut i32,
     op: i32,
     val: i32,
-    _timeout: u64,
+    timeout: u64,
     _uaddr2: *mut i32,
     val3: i32,
 ) -> SyscallResult {
@@ -82,13 +118,26 @@ pub fn sys_futex(
                 0xffffffff
             };
 
-            crate::kprintln!(
-                "[syscall pid={}] sys_futex WAIT: uaddr={:#x}, val={}, op={}",
-                current_pid,
-                uaddr as u64,
-                val,
-                op
-            );
+            let deadline = if timeout != 0 {
+                if !crate::syscall::validation::validate_user_ptr(
+                    timeout as *const u8,
+                    core::mem::size_of::<Timespec>(),
+                ) {
+                    return Errno::EFAULT.into();
+                }
+                // SAFETY: validate_user_ptr verified memory location bounds
+                let ts = unsafe { core::ptr::read_volatile(timeout as *const Timespec) };
+                if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+                    return Errno::EINVAL.into();
+                }
+                if ts.tv_sec == 0 && ts.tv_nsec == 0 {
+                    return Errno::ETIMEDOUT.into();
+                }
+                let ticks = (ts.tv_sec as u64) * 100 + (ts.tv_nsec as u64) / 10_000_000;
+                Some(crate::arch::x86_64::interrupts::timer_ticks() + core::cmp::max(1, ticks))
+            } else {
+                None
+            };
 
             let mut queues = FUTEX_QUEUES.lock();
 
@@ -96,12 +145,6 @@ pub fn sys_futex(
             // and contains a valid 32-bit integer.
             let current_val = unsafe { core::ptr::read_volatile(uaddr) };
             if current_val != val {
-                crate::kprintln!(
-                    "[syscall pid={}] sys_futex WAIT: val mismatch (current={}, expected={}) -> EAGAIN",
-                    current_pid,
-                    current_val,
-                    val
-                );
                 return Errno::EAGAIN.into();
             }
 
@@ -111,12 +154,20 @@ pub fn sys_futex(
                 .push_back(FutexWaiter {
                     pid: current_pid,
                     bitset,
+                    deadline,
                 });
 
             crate::process::lifecycle::block_task(current_pid);
             drop(queues);
 
             scheduler::yield_now();
+
+            if let Some(dl) = deadline {
+                if crate::arch::x86_64::interrupts::timer_ticks() >= dl {
+                    return Errno::ETIMEDOUT.into();
+                }
+            }
+
             0
         }
         1 | 10 => {

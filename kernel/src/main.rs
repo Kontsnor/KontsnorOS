@@ -180,6 +180,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     process::init();
     kprintln!("[boot] Process subsystem initialized.");
 
+    kprintln!("[boot] Starting secondary CPU cores...");
+    arch::x86_64::smp::start_aps();
+    kprintln!("[boot] Secondary CPU cores started.");
+
     // Spawn demo multitasking threads
     if ENABLE_DEMO_THREADS {
         kprintln!("[boot] Spawning kernel multitasking demo threads...");

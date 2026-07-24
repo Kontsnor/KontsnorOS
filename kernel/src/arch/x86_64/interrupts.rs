@@ -446,7 +446,7 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                 if (prot & 2) != 0 {
                     page_flags |= PageTableFlags::WRITABLE;
                 }
-                if (prot & 4) == 0 {
+                if (prot & 5) == 0 {
                     page_flags |= PageTableFlags::NO_EXECUTE;
                 }
 
@@ -573,6 +573,17 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
         stack_frame.stack_segment.0
     );
     crate::memory::r#virtual::debug_dump_mapping(fault_addr.as_u64());
+
+    if is_user {
+        kprintln!(
+            "[page_fault] Process PID {:?} caused unhandled page fault at {:#x} (RIP={:#x}) — terminating task",
+            crate::process::scheduler::current_pid(),
+            fault_addr.as_u64(),
+            stack_frame.instruction_pointer.as_u64()
+        );
+        let _ = crate::syscall::process::sys_exit_group(139);
+    }
+
     panic!("Unhandled page fault — system cannot recover");
 }
 

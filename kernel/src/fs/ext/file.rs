@@ -391,7 +391,7 @@ impl ExtInode {
     /// Read data from regular file or symlink.
     pub fn read_file(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
         let (file_size, is_symlink) = {
-            let vfs = self.vfs_inode.lock();
+            let vfs = self.vfs_inode.read();
             (vfs.size, vfs.file_type == FileType::Symlink)
         };
         if offset >= file_size {
@@ -466,7 +466,7 @@ impl ExtInode {
     /// Write data to regular file or symlink.
     pub fn write_file(&self, offset: u64, buf: &[u8]) -> Result<usize, i32> {
         let mut raw = self.raw.lock();
-        let mut vfs = self.vfs_inode.lock();
+        let mut vfs = self.vfs_inode.write();
 
         if vfs.file_type == FileType::Symlink && (offset + buf.len() as u64) < 60 {
             let mut i_block = raw.i_block;
@@ -548,7 +548,7 @@ impl ExtInode {
     pub fn truncate_file(&self, size: u64) -> Result<(), i32> {
         if size == 0 {
             let mut raw = self.raw.lock();
-            let mut vfs = self.vfs_inode.lock();
+            let mut vfs = self.vfs_inode.write();
 
             let mut i_block = raw.i_block;
             for block in &mut i_block[0..12] {
@@ -646,7 +646,7 @@ impl ExtInode {
             Ok(())
         } else {
             let mut raw = self.raw.lock();
-            let mut vfs = self.vfs_inode.lock();
+            let mut vfs = self.vfs_inode.write();
             raw.i_size = size as u32;
             vfs.size = size;
             self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?;
@@ -697,7 +697,7 @@ impl ExtInode {
     /// Write data to regular file or symlink using the Page Cache.
     pub fn write_page_cache(&self, offset: u64, buf: &[u8]) -> Result<usize, i32> {
         let mut raw = self.raw.lock();
-        let mut vfs = self.vfs_inode.lock();
+        let mut vfs = self.vfs_inode.write();
 
         let mut written_bytes = 0;
         let mut current_offset = offset;
@@ -745,7 +745,7 @@ impl ExtInode {
 
             // Re-acquire locks for the next block allocation check or loop finalization
             raw = self.raw.lock();
-            vfs = self.vfs_inode.lock();
+            vfs = self.vfs_inode.write();
         }
 
         if current_offset > vfs.size {

@@ -810,9 +810,13 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
                     if is_child && matches_pid {
                         has_children = true;
                         if task.state == TaskState::Zombie {
+                            let (total_f, alloc_f, free_f) = crate::memory::physical::stats();
                             crate::kprintln!(
-                                "[syscall] wait4: found zombie child PID {}",
-                                task.pid
+                                "[syscall] wait4: found zombie child PID {}, free_mem={}MB/{}MB (alloc_frames={})",
+                                task.pid,
+                                (free_f * 4096) / (1024 * 1024),
+                                (total_f * 4096) / (1024 * 1024),
+                                alloc_f
                             );
                             found = Some((task.pid, task.exit_code.unwrap_or(0)));
                             break;
@@ -980,8 +984,18 @@ pub fn sys_set_tid_address(tidptr: *mut i32) -> SyscallResult {
     if !tidptr.is_null() && !validate_user_ptr(tidptr as *const u8, core::mem::size_of::<i32>()) {
         return Errno::EFAULT.into();
     }
-    let pid = scheduler::current_pid().map(|p| p.as_u64()).unwrap_or(0);
-    pid as i64
+    let pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    if let Some(task_arc) = scheduler::get_task_arc(pid) {
+        task_arc.lock().clear_child_tid = if tidptr.is_null() {
+            None
+        } else {
+            Some(tidptr as u64)
+        };
+    }
+    pid.as_u64() as i64
 }
 
 /// `prctl(option, ...)` — Process control (stub).

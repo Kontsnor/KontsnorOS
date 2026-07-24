@@ -100,6 +100,7 @@ pub enum Errno {
     EISCONN = -106,
     ENOTCONN = -107,
     ECONNREFUSED = -111,
+    ETIMEDOUT = -110,
 }
 
 impl From<Errno> for SyscallResult {
@@ -485,6 +486,7 @@ pub fn dispatch(
         8 => fs::sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32),
         16 => io::sys_ioctl(arg0 as i32, arg1, arg2),
         17 => fs::sys_pread64(arg0 as i32, arg1 as *mut u8, arg2 as usize, arg3 as i64),
+        18 => fs::sys_pwrite64(arg0 as i32, arg1 as *const u8, arg2 as usize, arg3 as i64),
         19 => fs::sys_readv(arg0 as i32, arg1 as *const fs::IoVec, arg2 as i32),
         20 => fs::sys_writev(arg0 as i32, arg1 as *const fs::IoVec, arg2 as i32),
         21 => fs::sys_access(arg0 as *const u8, arg1 as i32),
@@ -648,6 +650,7 @@ pub fn dispatch(
         274 => process::sys_get_robust_list(arg0 as i32, arg1 as *mut *mut u8, arg2 as *mut usize),
         302 => process::sys_prlimit64(arg0 as i32, arg1 as i32, arg2 as *const u8, arg3 as *mut u8),
         318 => process::sys_getrandom(arg0 as *mut u8, arg1 as usize, arg2 as u32),
+        324 => memory::sys_mprotect(arg0, arg1 as usize, arg2 as i32),
         // Identity
         102 => process::sys_getuid(),
         104 => process::sys_getgid(),

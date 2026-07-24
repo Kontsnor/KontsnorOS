@@ -140,8 +140,8 @@ void _start() {
                 print_err("[init] Warning: Failed to open /dev/pts/0 in child\n");
             }
 
-            char *argv_bash[] = { "/bin/bash", NULL };
-            char *argv_sh[] = { "/bin/sh", NULL };
+            char *argv_bash[] = { "/bin/bash", "/build_cargo.sh", NULL };
+            char *argv_sh[] = { "/bin/sh", "/build_cargo.sh", NULL };
             char *envp[] = { "LD_PRELOAD=/lib/libstubs.so", NULL };
 
             // Try execve("/bin/bash")

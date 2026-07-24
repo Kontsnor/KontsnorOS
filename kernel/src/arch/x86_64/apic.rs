@@ -225,6 +225,8 @@ pub fn get_lapic_timer_current() -> u32 {
 
 /// Send an Inter-Processor Interrupt (IPI) to a specific target Local APIC.
 pub fn send_ipi(target_lapic_id: u8, vector: u8) {
+    // SAFETY: Writing to the Local APIC MMIO registers to send an IPI is safe because
+    // the registers are memory-mapped and the base address is verified to be active.
     unsafe {
         // Write the target Local APIC ID to the high 32 bits of the ICR (bits 24-31)
         lapic_write(LAPIC_REG_ICR_HIGH, (target_lapic_id as u32) << 24);
@@ -241,6 +243,7 @@ pub fn send_ipi(target_lapic_id: u8, vector: u8) {
 
 /// Broadcast an Inter-Processor Interrupt (IPI) to all other cores (excluding self).
 pub fn broadcast_ipi_all_excluding_self(vector: u8) {
+    // SAFETY: Writing to the Local APIC MMIO registers to broadcast an IPI is safe.
     unsafe {
         // High 32 bits of ICR is 0 when using shorthand
         lapic_write(LAPIC_REG_ICR_HIGH, 0);
@@ -254,4 +257,108 @@ pub fn broadcast_ipi_all_excluding_self(vector: u8) {
             core::hint::spin_loop();
         }
     }
+}
+
+/// Send an INIT IPI assert command to a target Local APIC.
+pub fn send_init_ipi(target_lapic_id: u8) {
+    // SAFETY: Writing to the Local APIC MMIO registers to send an INIT IPI is safe
+    // for configuring the processor topologies during AP bootstrap.
+    unsafe {
+        // Wait for delivery status bit to clear
+        while (lapic_read(LAPIC_REG_ICR_LOW) & (1 << 12)) != 0 {
+            core::hint::spin_loop();
+        }
+
+        // 1. Set target APIC ID in high ICR
+        let high_val = (target_lapic_id as u32) << 24;
+        lapic_write(LAPIC_REG_ICR_HIGH, high_val);
+
+        // 2. Write INIT IPI command to low ICR: Delivery Mode: 101 (5 = INIT), Level: 1 (Assert), Trigger Mode: 1 (Level)
+        let low_val_assert = (5 << 8) | (1 << 14) | (1 << 15);
+        kprintln!(
+            "[apic] send_init_ipi: target {}, ICR_HIGH={:#010x}, ICR_LOW_ASSERT={:#010x}",
+            target_lapic_id,
+            high_val,
+            low_val_assert
+        );
+        lapic_write(LAPIC_REG_ICR_LOW, low_val_assert);
+
+        // Wait for delivery status bit to clear
+        while (lapic_read(LAPIC_REG_ICR_LOW) & (1 << 12)) != 0 {
+            core::hint::spin_loop();
+        }
+
+        // 3. Write INIT De-assert command to low ICR: Delivery Mode: 101 (5 = INIT), Level: 0 (De-assert), Trigger Mode: 1 (Level)
+        let low_val_deassert = (5 << 8) | (1 << 15);
+        kprintln!(
+            "[apic] send_init_ipi: target {}, ICR_LOW_DEASSERT={:#010x}",
+            target_lapic_id,
+            low_val_deassert
+        );
+        lapic_write(LAPIC_REG_ICR_LOW, low_val_deassert);
+
+        // Wait for delivery status bit to clear
+        while (lapic_read(LAPIC_REG_ICR_LOW) & (1 << 12)) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Send a Startup IPI (SIPI) command to a target Local APIC with the designated vector page.
+pub fn send_startup_ipi(target_lapic_id: u8, vector: u8) {
+    // SAFETY: Writing to the Local APIC MMIO registers to send a SIPI is safe
+    // for configuring the processor topologies during AP bootstrap.
+    unsafe {
+        // Wait for delivery status bit to clear
+        while (lapic_read(LAPIC_REG_ICR_LOW) & (1 << 12)) != 0 {
+            core::hint::spin_loop();
+        }
+
+        // Set target APIC ID in high ICR
+        let high_val = (target_lapic_id as u32) << 24;
+        lapic_write(LAPIC_REG_ICR_HIGH, high_val);
+
+        // Write SIPI command to low ICR: Delivery Mode: 110 (6 = Startup), Level: 0 (reserved/should be 0)
+        let low_val = (6 << 8) | (vector as u32);
+        kprintln!("[apic] send_startup_ipi: target {}, vector {:#04x}, ICR_HIGH={:#010x}, ICR_LOW={:#010x}", target_lapic_id, vector, high_val, low_val);
+        lapic_write(LAPIC_REG_ICR_LOW, low_val);
+
+        // Wait for delivery status bit to clear
+        while (lapic_read(LAPIC_REG_ICR_LOW) & (1 << 12)) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Delay execution for a specified number of microseconds using LAPIC timer tick calibration.
+pub fn delay_us(us: u32) {
+    let ticks_to_wait = (us as u64) * 1000;
+    let mut elapsed = 0u64;
+    let mut last_val = get_lapic_timer_current() as u64;
+    while elapsed < ticks_to_wait {
+        let current_val = get_lapic_timer_current() as u64;
+        if current_val < last_val {
+            elapsed += last_val - current_val;
+        } else if current_val > last_val {
+            // Wrapped!
+            elapsed += last_val + (10000000 - current_val);
+        }
+        last_val = current_val;
+        core::hint::spin_loop();
+    }
+}
+
+/// Initialize the Local APIC on a secondary (AP) CPU core.
+pub fn init_ap() {
+    // SAFETY: Enabling the local APIC and setting registers on the current CPU core is safe.
+    unsafe {
+        // Enable LAPIC by setting spurious vector to 0xFF and bit 8 to 1
+        let svr = lapic_read(LAPIC_REG_SVR);
+        lapic_write(LAPIC_REG_SVR, svr | 0x1FF); // 0xFF vector | 0x100 enable bit
+
+        // Clear Task Priority to accept all interrupts
+        lapic_write(LAPIC_REG_TPR, 0);
+    }
+    // Initialize per-core Local APIC periodic timer tick
+    init_lapic_timer();
 }

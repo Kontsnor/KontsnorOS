@@ -551,6 +551,7 @@ pub fn free_user_page_table(pml4_phys: u64) -> Result<(), &'static str> {
     let pml4_virt = VirtAddr::new(pml4_phys + phys_mem_offset());
     let pml4: &PageTable = unsafe { &*pml4_virt.as_ptr() };
     let pml4_index = (phys_mem_offset() >> 39) & 0x1FF;
+    let mut freed_pages = 0usize;
 
     for i in 0..256 {
         if i == pml4_index as usize {
@@ -608,16 +609,8 @@ pub fn free_user_page_table(pml4_phys: u64) -> Result<(), &'static str> {
                         .map_err(|_| "Invalid frame in PT")?
                         .start_address()
                         .as_u64();
-                    if pt_entry.flags().contains(PageTableFlags::BIT_9) {
-                        // COW-shared: decrement reference count
-                        if super::physical::decrement_ref(leaf_phys) == 0 {
-                            // Last reference: restore and deallocate/free
-                            super::physical::increment_ref(leaf_phys);
-                            super::physical::deallocate_frame(leaf_phys);
-                        }
-                    } else {
-                        super::physical::deallocate_frame(leaf_phys);
-                    }
+                    super::physical::deallocate_frame(leaf_phys);
+                    freed_pages += 1;
                 }
 
                 super::physical::deallocate_frame(pt_phys);
@@ -630,6 +623,12 @@ pub fn free_user_page_table(pml4_phys: u64) -> Result<(), &'static str> {
     }
 
     super::physical::deallocate_frame(pml4_phys);
+
+    crate::kprintln!(
+        "[virtual] free_user_page_table({:#x}): freed {} physical pages",
+        pml4_phys,
+        freed_pages
+    );
 
     // Broadcast TLB shootdown to notify other CPU cores
     crate::arch::x86_64::smp::shootdown_tlb();

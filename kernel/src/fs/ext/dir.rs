@@ -16,7 +16,7 @@ impl ExtInode {
         child_type: FileType,
     ) -> Result<(), &'static str> {
         let mut raw = self.raw.lock();
-        let mut vfs = self.vfs_inode.lock();
+        let mut vfs = self.vfs_inode.write();
 
         let file_size = vfs.size;
         let block_size = self.fs.block_size;
@@ -124,7 +124,7 @@ impl ExtInode {
 
     /// Remove a directory entry from the parent.
     pub fn remove_directory_entry(&self, child_name: &str) -> Result<u32, &'static str> {
-        let vfs = self.vfs_inode.lock();
+        let vfs = self.vfs_inode.read();
         let block_size = self.fs.block_size;
         let file_size = vfs.size;
 
@@ -275,7 +275,7 @@ impl ExtInode {
             let mut parent_raw = self.raw.lock();
             parent_raw.i_links_count += 1;
             self.fs.write_inode(self.ino, &parent_raw).ok()?;
-            self.vfs_inode.lock().nlink = parent_raw.i_links_count as u32;
+            self.vfs_inode.write().nlink = parent_raw.i_links_count as u32;
         }
 
         self.fs.get_inode(child_ino).ok()
@@ -315,7 +315,7 @@ impl ExtInode {
             parent_raw.i_links_count -= 1;
         }
         self.fs.write_inode(self.ino, &parent_raw).map_err(|_| -5)?;
-        self.vfs_inode.lock().nlink = parent_raw.i_links_count as u32;
+        self.vfs_inode.write().nlink = parent_raw.i_links_count as u32;
 
         self.fs
             .decrement_links_count(child_ino, true)
@@ -329,14 +329,16 @@ impl ExtInode {
 
     /// Implement VFS readdir.
     pub fn readdir_dir_entry(&self) -> Vec<DirEntry> {
-        let is_dir = self.vfs_inode.lock().is_dir();
+        let (is_dir, file_size) = {
+            let vfs = self.vfs_inode.read();
+            (vfs.is_dir(), vfs.size)
+        };
         if !is_dir {
             return Vec::new();
         }
 
         let mut entries = Vec::new();
         let mut offset = 0u64;
-        let file_size = self.vfs_inode.lock().size;
 
         while offset < file_size {
             let file_block = (offset / self.fs.block_size as u64) as u32;

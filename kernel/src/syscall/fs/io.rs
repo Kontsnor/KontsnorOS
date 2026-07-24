@@ -234,25 +234,11 @@ pub fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
                     core::ptr::copy_nonoverlapping(temp_buf.as_ptr(), buf.add(total_read), n);
                 }
                 total_read += n;
-                if is_pipe {
-                    crate::kprintln!(
-                        "[syscall] sys_read on pipe fd {} chunk returned {} bytes",
-                        fd,
-                        n
-                    );
-                }
                 if n < chunk_size {
                     break;
                 }
             }
             Err(e) => {
-                if is_pipe {
-                    crate::kprintln!(
-                        "[syscall] sys_read on pipe fd {} failed with error {}",
-                        fd,
-                        e
-                    );
-                }
                 if total_read > 0 {
                     break;
                 }
@@ -315,17 +301,10 @@ pub fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
                 total_written += n;
                 if fd == 1 || fd == 2 {
                     if let Ok(s) = core::str::from_utf8(&temp_buf[..n]) {
-                        crate::kprintln!("[fd {}] {}", fd, s);
+                        crate::kprint!("{}", s);
                     } else {
-                        crate::kprintln!("[fd {} raw] {:?}", fd, &temp_buf[..n]);
+                        crate::kprint!("{:?}", &temp_buf[..n]);
                     }
-                }
-                if is_pipe {
-                    crate::kprintln!(
-                        "[syscall] sys_write on pipe fd {} returned {} bytes written",
-                        fd,
-                        n
-                    );
                 }
                 if n < chunk_size {
                     break;
@@ -919,6 +898,62 @@ pub fn sys_pread64(fd: i32, buf: *mut u8, count: usize, offset: i64) -> SyscallR
     }
 
     total_read as SyscallResult
+}
+
+/// `pwrite64(fd, buf, count, offset)` — Write to a file descriptor at an offset.
+///
+/// Unlike `write`, this does not change the file's seek position.
+pub fn sys_pwrite64(fd: i32, buf: *const u8, count: usize, offset: i64) -> SyscallResult {
+    if fd < 0 {
+        return Errno::EBADF.into();
+    }
+    if buf.is_null() || count == 0 {
+        return 0;
+    }
+    if !validate_user_ptr(buf, count) {
+        return Errno::EFAULT.into();
+    }
+
+    let file = match proc_fd::current_task_get_file_desc(fd) {
+        Some(f) => f,
+        None => return Errno::EBADF.into(),
+    };
+
+    let mut total_written = 0;
+    let mut temp_buf = [0u8; 4096];
+
+    while total_written < count {
+        let chunk_size = core::cmp::min(count - total_written, 4096);
+        let chunk_offset = offset + total_written as i64;
+        // SAFETY: validate_user_ptr checked pointer validity for `count` bytes
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                buf.add(total_written),
+                temp_buf.as_mut_ptr(),
+                chunk_size,
+            );
+        }
+        match file
+            .inode
+            .write(chunk_offset as u64, &temp_buf[..chunk_size])
+        {
+            Ok(0) => break,
+            Ok(n) => {
+                total_written += n;
+                if n < chunk_size {
+                    break;
+                }
+            }
+            Err(e) => {
+                if total_written > 0 {
+                    break;
+                }
+                return e as SyscallResult;
+            }
+        }
+    }
+
+    total_written as SyscallResult
 }
 
 /// `IoVec` structure for `writev`.

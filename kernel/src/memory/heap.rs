@@ -29,11 +29,11 @@ use super::PAGE_SIZE;
 /// Placed at a high virtual address to leave room for user space mappings.
 pub const HEAP_START: u64 = 0xFFFF_8000_0000_0000;
 
-/// Size of the kernel heap (64 MiB).
+/// Size of the kernel heap (512 MiB).
 ///
-/// This is the initial heap size. The heap can be extended later by
-/// mapping additional pages.
-pub const HEAP_SIZE: u64 = 64 * 1024 * 1024;
+/// This provides ample heap memory for kernel objects, task stacks, and VFS buffers
+/// during heavy multi-process workloads like native Cargo compilation.
+pub const HEAP_SIZE: u64 = 512 * 1024 * 1024;
 
 /// The global kernel heap allocator.
 ///
@@ -53,12 +53,26 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 ///
 /// Returns an error if physical frame allocation or page mapping fails.
 pub fn init() -> Result<(), &'static str> {
-    let num_pages = (HEAP_SIZE as usize) / PAGE_SIZE;
+    let (_, _, free_frames) = super::physical::stats();
+    let free_bytes = free_frames as u64 * PAGE_SIZE as u64;
+
+    // Dynamically adjust initial heap allocation based on total available RAM:
+    // In 5+ GB VMs (cargo build mode), reserve 512 MiB for kernel heap.
+    // In smaller VMs (e.g., 256 MB test runner mode), reserve up to 64 MiB or half of free RAM.
+    let heap_size_to_alloc = if free_bytes >= 1024 * 1024 * 1024 {
+        512 * 1024 * 1024
+    } else if free_bytes >= 256 * 1024 * 1024 {
+        128 * 1024 * 1024
+    } else {
+        (free_bytes / 2) & !(PAGE_SIZE as u64 - 1)
+    };
+
+    let num_pages = (heap_size_to_alloc as usize) / PAGE_SIZE;
 
     kprintln!(
         "[heap] Allocating {} pages ({} MiB) at {:#x}",
         num_pages,
-        HEAP_SIZE / (1024 * 1024),
+        heap_size_to_alloc / (1024 * 1024),
         HEAP_START
     );
 
@@ -79,12 +93,12 @@ pub fn init() -> Result<(), &'static str> {
         }
     }
 
-    // SAFETY: The heap memory region [HEAP_START, HEAP_START + HEAP_SIZE) has
+    // SAFETY: The heap memory region [HEAP_START, HEAP_START + heap_size_to_alloc) has
     // been fully mapped with writable pages. No other code uses this region.
     unsafe {
         ALLOCATOR
             .lock()
-            .init(HEAP_START as *mut u8, HEAP_SIZE as usize);
+            .init(HEAP_START as *mut u8, heap_size_to_alloc as usize);
     }
 
     kprintln!("[heap] Kernel heap initialized successfully.");

@@ -14,6 +14,13 @@
 [![Language: Rust](https://img.shields.io/badge/language-Rust-orange.svg)]()
 [![Architecture: x86_64](https://img.shields.io/badge/arch-x86__64-green.svg)]()
 
+> [!WARNING]
+> **DISCLAIMER & EXPERIMENTAL STATUS**
+>
+> ⚠️ **HIGHLY EXPERIMENTAL & UNTESTED**: This project is highly experimental and is not properly tested whatsoever. **NO WARRANTY WILL BE GIVEN WHATSOEVER.**
+>
+> 🚀 **ORIGIN STORY**: The creator of this project wanted to test the limits of the new **Antigravity IDE** with the new **Gemini 3.5 Flash** (and now **Gemini 3.6**), and accidentally built a kernel that appears to be (kind of) working!
+
 ## Vision
 
 KontsnorOS is a **hybrid kernel** that combines the performance of a monolithic kernel with the modularity and safety of a microkernel — all written in Rust.

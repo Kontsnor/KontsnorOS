@@ -2,6 +2,13 @@
 //!
 //! A Unix-compatible hybrid kernel written entirely in Rust.
 //!
+//! > **WARNING**: This kernel is highly experimental and not properly tested whatsoever!
+//! > **NO WARRANTY IS GIVEN WHATSOEVER.**
+//! >
+//! > **ORIGIN**: The creator of this project wanted to test the limits of the new
+//! > Antigravity IDE with the new Gemini 3.5 Flash (and now Gemini 3.6), and
+//! > accidentally built a kernel that appears to be (kind of) working!
+//!
 //! ## Architecture
 //!
 //! KontsnorOS is a hybrid kernel that combines the performance of a monolithic
@@ -75,11 +82,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Initialize serial output first so we can log everything else
     arch::x86_64::serial::init();
 
-    kprintln!("=========================================");
+    kprintln!("==================================================================");
     kprintln!("  KontsnorOS v{}", env!("CARGO_PKG_VERSION"));
     kprintln!("  A Unix-Compatible Hybrid Kernel");
     kprintln!("  Written in Rust — Safe, Fast, Modern");
-    kprintln!("=========================================");
+    kprintln!("------------------------------------------------------------------");
+    kprintln!("  WARNING: Highly experimental & not properly tested whatsoever!");
+    kprintln!("  NO WARRANTY WILL BE GIVEN WHATSOEVER.");
+    kprintln!("  Built to test Antigravity IDE with Gemini 3.5 Flash (and 3.6)...");
+    kprintln!("  ...and accidentally ended up with a (kind of) working kernel!");
+    kprintln!("==================================================================");
     kprintln!();
 
     // ── Phase 2: Architecture-specific initialization ──────────────────

@@ -326,7 +326,7 @@ pub fn sys_mkdir(pathname: *const u8, mode: u32) -> SyscallResult {
 }
 
 pub fn sys_mkdir_with_resolved_path(resolved_path: String, _mode: u32) -> SyscallResult {
-    kprintln!("[syscall] mkdir(\"{}\")", resolved_path);
+    // kprintln!("[syscall] mkdir(\"{}\")", resolved_path);
 
     // Check if the destination already exists
     if crate::fs::vfs::lookup(&resolved_path).is_some() {
@@ -372,7 +372,7 @@ pub fn sys_rmdir(pathname: *const u8) -> SyscallResult {
 }
 
 pub fn sys_rmdir_with_resolved_path(resolved_path: String) -> SyscallResult {
-    kprintln!("[syscall] rmdir(\"{}\")", resolved_path);
+    // kprintln!("[syscall] rmdir(\"{}\")", resolved_path);
 
     // Split resolved_path into parent directory and base name
     let (parent_path, name) = crate::fs::path::split_path(&resolved_path);
@@ -416,7 +416,7 @@ pub fn sys_unlink(pathname: *const u8) -> SyscallResult {
 }
 
 pub fn sys_unlink_with_resolved_path(resolved_path: String) -> SyscallResult {
-    kprintln!("[syscall] unlink(\"{}\")", resolved_path);
+    // kprintln!("[syscall] unlink(\"{}\")", resolved_path);
 
     // Split resolved_path into parent directory and base name
     let (parent_path, name) = crate::fs::path::split_path(&resolved_path);

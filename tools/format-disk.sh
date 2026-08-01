@@ -209,7 +209,7 @@ export CARGO_TARGET_DIR=/tmp/target
 mkdir -p /tmp/target
 export CARGO_BUILD_JOBS=4
 export RUSTFLAGS="-C codegen-units=16 -C lto=off -C debuginfo=0 -C opt-level=0"
-/usr/bin/cargo build --package kontsnor-kernel --profile fast-build --target x86_64-unknown-linux-musl --offline -j 4 2>&1 | tee /tmp/cargo_output.log
+/usr/bin/cargo build --package kontsnor-kernel --profile fast-build --target x86_64-unknown-linux-musl --offline -j 4 2>&1 | tee /tmp/cargo_output.log | tee /dev/tty
 STATUS=$?
 echo "Cargo build finished with exit status $STATUS"
 if [ $STATUS -eq 0 ]; then

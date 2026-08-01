@@ -436,7 +436,7 @@ pub fn sys_pipe(pipefds: *mut i32) -> SyscallResult {
         pipefds.add(1).write(fd1);
     }
 
-    kprintln!("[syscall] pipe() -> fds: [{}, {}]", fd0, fd1);
+    // kprintln!("[syscall] pipe() -> fds: [{}, {}]", fd0, fd1);
     0 // Success
 }
 

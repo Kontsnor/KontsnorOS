@@ -20,7 +20,7 @@ use crate::syscall::validation::{validate_user_ptr, validate_user_ptr_write};
 pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
     use crate::process::{pid, scheduler, task::Task};
 
-    kprintln!("[syscall] fork()");
+    // kprintln!("[syscall] fork()");
 
     let current_pid = match scheduler::current_pid() {
         Some(p) => p,
@@ -714,13 +714,13 @@ pub fn sys_execve(
 
 /// `exit(status)` — Terminate the calling process.
 pub fn sys_exit(status: i32) -> SyscallResult {
-    kprintln!("[syscall] exit(status={})", status);
+    // kprintln!("[syscall] exit(status={})", status);
     crate::process::scheduler::exit_current_thread(status);
 }
 
 /// `exit_group(status)` — Terminate all threads in the thread group.
 pub fn sys_exit_group(status: i32) -> SyscallResult {
-    kprintln!("[syscall] exit_group(status={})", status);
+    // kprintln!("[syscall] exit_group(status={})", status);
 
     let current_pid = match scheduler::current_pid() {
         Some(p) => p,
@@ -794,7 +794,7 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
         None => return Errno::ESRCH.into(),
     };
 
-    kprintln!("[syscall] wait4(pid={})", pid);
+    // kprintln!("[syscall] wait4(pid={})", pid);
 
     loop {
         // Scan for a zombie child
@@ -949,7 +949,7 @@ pub fn sys_brk(addr: u64) -> SyscallResult {
 
 /// `arch_prctl()` — Set thread base register (FS_BASE).
 pub fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
-    kprintln!("[syscall] arch_prctl(code={:#x}, addr={:#x})", code, addr);
+    // kprintln!("[syscall] arch_prctl(code={:#x}, addr={:#x})", code, addr);
     if code == 0x1002 {
         // ARCH_SET_FS
         x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(addr));
@@ -1014,8 +1014,8 @@ pub fn sys_clone(
 ) -> SyscallResult {
     use crate::process::{context::CpuContext, pid, scheduler, task::Task};
 
-    kprintln!("[syscall] clone(flags={:#x}, child_stack={:#x}, parent_tid={:?}, child_tid={:?}, newtls={:#x})",
-        flags, child_stack, parent_tidptr, child_tidptr, newtls);
+    // kprintln!("[syscall] clone(flags={:#x}, child_stack={:#x}, parent_tid={:?}, child_tid={:?}, newtls={:#x})",
+    //    flags, child_stack, parent_tidptr, child_tidptr, newtls);
 
     if child_stack != 0 && child_stack > 0x0000_7FFF_FFFF_FFFF {
         return Errno::EINVAL.into();

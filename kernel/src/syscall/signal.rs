@@ -79,7 +79,7 @@ pub fn deliver_signal(pid: crate::process::pid::Pid, sig: i32) {
 /// `kill(pid, sig)` — Send a signal to a process.
 pub fn sys_kill(pid: i32, sig: i32) -> SyscallResult {
     use crate::process::pid::Pid;
-    kprintln!("[syscall] kill(pid={}, sig={})", pid, sig);
+    // kprintln!("[syscall] kill(pid={}, sig={})", pid, sig);
     if sig < 0 || sig > 64 {
         return Errno::EINVAL.into();
     }

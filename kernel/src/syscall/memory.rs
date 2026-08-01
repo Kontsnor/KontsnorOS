@@ -103,8 +103,10 @@ pub fn sys_mmap(
         (resolved, addr_space.page_table_root)
     };
 
-    // Unmap any existing overlapping regions/pages in this range
-    let _ = sys_munmap(resolved_addr, aligned_len);
+    // Unmap any existing overlapping regions/pages only if a specific address was requested
+    if addr != 0 {
+        let _ = sys_munmap(resolved_addr, aligned_len);
+    }
 
     // Add to task's mmap_regions
     {
@@ -127,7 +129,6 @@ pub fn sys_mmap(
             });
     }
 
-    crate::arch::x86_64::smp::shootdown_tlb();
     resolved_addr as SyscallResult
 }
 
@@ -444,14 +445,14 @@ pub fn sys_mremap(
     use crate::process::scheduler;
     use x86_64::VirtAddr;
 
-    kprintln!(
-        "[syscall] mremap(old_addr={:#x}, old_size={}, new_size={}, flags={:#x}, new_addr={:#x})",
-        old_address,
-        old_size,
-        new_size,
-        flags,
-        new_address
-    );
+    // kprintln!(
+    //     "[syscall] mremap(old_addr={:#x}, old_size={}, new_size={}, flags={:#x}, new_addr={:#x})",
+    //     old_address,
+    //     old_size,
+    //     new_size,
+    //     flags,
+    //     new_address
+    // );
 
     if (old_address & 4095) != 0 {
         return Errno::EINVAL.into();
@@ -709,12 +710,12 @@ pub fn sys_madvise(addr: u64, length: usize, advice: i32) -> SyscallResult {
     use x86_64::structures::paging::{Page, Size4KiB};
     use x86_64::VirtAddr;
 
-    kprintln!(
-        "[syscall] madvise(addr={:#x}, len={}, advice={})",
-        addr,
-        length,
-        advice
-    );
+    // kprintln!(
+    //     "[syscall] madvise(addr={:#x}, len={}, advice={})",
+    //     addr,
+    //     length,
+    //     advice
+    // );
 
     if (addr & 4095) != 0 {
         return Errno::EINVAL.into();

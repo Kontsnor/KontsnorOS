@@ -74,7 +74,9 @@ pub fn write_byte(byte: u8) {
         {
             if let Some(ref mut console) = *crate::drivers::gpu::bochs::GRAPHICS_CONSOLE.lock() {
                 console.write_char(byte);
-                console.gpu.blit();
+                if byte == b'\n' {
+                    console.gpu.blit();
+                }
             }
         }
     });

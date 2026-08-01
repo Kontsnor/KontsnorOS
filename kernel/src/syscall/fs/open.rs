@@ -22,7 +22,7 @@ pub fn sys_open(pathname: *const u8, flags: i32, mode: u32) -> SyscallResult {
 
 /// Core open logic with an already resolved path.
 pub fn sys_open_with_resolved_path(resolved_path: String, flags: i32, _mode: u32) -> SyscallResult {
-    kprintln!("[syscall] open(\"{}\", flags={:#x})", resolved_path, flags);
+    // kprintln!("[syscall] open(\"{}\", flags={:#x})", resolved_path, flags);
 
     let flags_u32 = flags as u32;
 

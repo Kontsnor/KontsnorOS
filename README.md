@@ -15,11 +15,16 @@
 [![Architecture: x86_64](https://img.shields.io/badge/arch-x86__64-green.svg)]()
 
 > [!WARNING]
-> **DISCLAIMER & EXPERIMENTAL STATUS**
+> **DISCLAIMER, DANGER, & UNCONTROLLED ESCALATION**
 >
-> ⚠️ **HIGHLY EXPERIMENTAL & UNTESTED**: This project is highly experimental and is not properly tested whatsoever. **NO WARRANTY WILL BE GIVEN WHATSOEVER.**
+> ⚠️ **HIGHLY EXPERIMENTAL**: This project is highly experimental and is not properly tested whatsoever. **NO WARRANTY IS GIVEN.** If your machine starts playing Doom or becomes sentient, that is on you.
 >
-> 🚀 **ORIGIN STORY**: The creator of this project wanted to test the limits of the new **Antigravity IDE** with the new **Gemini 3.5 Flash** (and now **Gemini 3.6**), and accidentally built a kernel that appears to be (kind of) working!
+> 🚀 **HOW IT ESCALATED (A 3-MONTH ACCIDENT)**:
+> This project was only supposed to be a quick test. The creator wanted to evaluate the capabilities of the new **Antigravity IDE** paired with the **Gemini 3.5 Flash** model. The goal was simple: write a basic script or two and check out the new tooling.
+>
+> Somehow, due to a severe lack of impulse control and a hyper-collaborative AI, things escalated. Three months later, we have a custom POSIX-compatible hybrid OS kernel with page table mapping, virtual filesystems, and symmetric multiprocessing (SMP) schedulers.
+>
+> *How did we get here?* We don't know. *Does it boot?* Yes. *Should you trust it with anything more valuable than a pocket calculator?* Absolutely not.
 
 ## Vision
 

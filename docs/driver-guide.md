@@ -61,7 +61,7 @@ impl NetDevice for MyNetDriver {
             name: "my-net-driver".into(),
             version: "1.0.0".into(),
             author: "My Company".into(),
-            license: "MIT".into(),
+            license: "GPL-3.0-only".into(),
             description: "My custom network driver".into(),
         }
     }
@@ -228,9 +228,8 @@ let dma_buf = DmaBuffer {
 
 ## Licensing
 
-The driver SDK is dual-licensed under **MIT and Apache-2.0**. You are free to
-write proprietary drivers that use the public SDK API. We encourage open-source
-drivers, but it is not required.
+The driver SDK is licensed under the **GNU General Public License v3.0 (GPLv3 only)**.
+Any hardware driver using this SDK must comply with copyleft obligations and be distributed under a compatible GPLv3 license.
 
 ## Questions?
 

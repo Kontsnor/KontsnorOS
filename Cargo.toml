@@ -9,9 +9,9 @@ members = [
 version = "0.1.0"
 edition = "2021"
 authors = ["KontsnorOS Contributors"]
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-only"
 repository = "https://github.com/kontsnor/KontsnorOS"
-description = "A Unix-compatible operating system kernel written in Rust"
+description = "Highly experimental Unix-compatible Rust kernel built while testing Antigravity IDE with Gemini 3.5 & 3.6 (no warranty)"
 
 [workspace.dependencies]
 # Shared dependency versions across workspace

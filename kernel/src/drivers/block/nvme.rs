@@ -660,7 +660,7 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
             name: String::from("nvme0"),
             version: String::from("0.1.0"),
             author: String::from("Antigravity Systems"),
-            license: String::from("MIT"),
+            license: String::from("GPL-3.0-only"),
             description: String::from("PCIe NVMe Block Storage Namespace"),
         };
 

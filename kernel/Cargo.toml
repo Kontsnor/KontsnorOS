@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "KontsnorOS kernel — a Unix-compatible hybrid kernel written in Rust"
+description = "KontsnorOS kernel — highly experimental Unix-compatible hybrid kernel written in Rust (built with Antigravity IDE & Gemini 3.5/3.6)"
 
 [dependencies]
 # Workspace dependencies

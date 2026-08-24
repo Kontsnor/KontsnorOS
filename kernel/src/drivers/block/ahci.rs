@@ -733,7 +733,7 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
                         name: alloc::format!("sata{}", i),
                         version: String::from("0.1.0"),
                         author: String::from("Antigravity Systems"),
-                        license: String::from("MIT"),
+                        license: String::from("GPL-3.0-only"),
                         description: alloc::format!("SATA Disk Drive on AHCI Port {}", i),
                     };
 

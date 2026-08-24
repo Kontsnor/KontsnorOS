@@ -27,7 +27,7 @@ pub struct DriverInfo {
     pub version: String,
     /// Driver author/vendor.
     pub author: String,
-    /// Driver license (e.g., "MIT", "GPL-2.0", "Proprietary").
+    /// Driver license (e.g., "GPL-3.0-only", "GPL-2.0", "Proprietary").
     pub license: String,
     /// Brief description.
     pub description: String,

@@ -180,7 +180,7 @@ impl NetDevice for E1000Device {
             name: alloc::string::String::from("e1000"),
             version: alloc::string::String::from("0.1.0"),
             author: alloc::string::String::from("KontsnorOS Core Devs"),
-            license: alloc::string::String::from("MIT"),
+            license: alloc::string::String::from("GPL-3.0-only"),
             description: alloc::string::String::from("Intel e1000 Gigabit Ethernet Driver"),
         }
     }

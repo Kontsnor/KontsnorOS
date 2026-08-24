@@ -7,7 +7,7 @@ The official SDK for developing hardware drivers for KontsnorOS.
 - **Safe by default** — Use safe Rust for most driver logic
 - **Stable API** — Versioned trait interface with backward compatibility
 - **Comprehensive types** — DMA buffers, MMIO regions, IRQ handlers
-- **Permissive license** — MIT/Apache-2.0 enables proprietary drivers
+- **GPLv3 license** — Copyleft licensing to protect software freedom
 - **Well documented** — Every API has documentation and examples
 
 ## Quick Start
@@ -23,4 +23,4 @@ See [docs/driver-guide.md](../docs/driver-guide.md) for the full development gui
 
 ## License
 
-Licensed under either MIT or Apache-2.0 at your option.
+Licensed under the GNU General Public License v3.0 (GPLv3 only).

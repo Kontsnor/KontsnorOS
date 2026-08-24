@@ -34,7 +34,7 @@
 //!             name: "my-device".into(),
 //!             version: "1.0.0".into(),
 //!             author: "Your Company".into(),
-//!             license: "MIT".into(),
+//!             license: "GPL-3.0-only".into(),
 //!             description: "My custom device driver".into(),
 //!         }
 //!     }
@@ -57,8 +57,7 @@
 //!
 //! ## License
 //!
-//! This SDK is dual-licensed under MIT and Apache-2.0, allowing both
-//! open-source and proprietary driver development.
+//! This SDK is licensed under the GNU General Public License v3.0 (GPLv3 only).
 
 #![no_std]
 #![warn(missing_docs)]

@@ -37,7 +37,7 @@ impl CharDevice for SerialConsole {
             name: String::from("serial-console"),
             version: String::from("0.1.0"),
             author: String::from("KontsnorOS"),
-            license: String::from("MIT OR Apache-2.0"),
+            license: String::from("GPL-3.0-only"),
             description: String::from("Serial console driver (COM1)"),
         }
     }

@@ -10,7 +10,7 @@
 
 ---
 
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)]()
+[![License: GPLv3](https://img.shields.io/badge/license-GPLv3-blue.svg)]()
 [![Language: Rust](https://img.shields.io/badge/language-Rust-orange.svg)]()
 [![Architecture: x86_64](https://img.shields.io/badge/arch-x86__64-green.svg)]()
 
@@ -29,7 +29,7 @@ KontsnorOS is a **hybrid kernel** that combines the performance of a monolithic 
 
 - 🦀 **100% Rust** — Memory-safe kernel with zero-cost abstractions
 - 🐧 **Unix/POSIX Compatible** — Standard syscall interface (fork, exec, open, read, write, ...)
-- 🔌 **Driver-Friendly SDK** — Permissively licensed SDK inviting companies like NVIDIA and AMD
+- 🔌 **Driver SDK** — Comprehensive SDK for writing driver modules in safe Rust
 - ⚡ **Hybrid Architecture** — Monolithic performance with modular driver loading
 - 🔒 **Safe by Default** — Rust's borrow checker prevents data races and memory bugs
 - 📦 **Modern Tooling** — Cargo-based build system, integrated testing
@@ -191,12 +191,7 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
-KontsnorOS is dual-licensed under:
-
-- [MIT License](LICENSE-MIT)
-- [Apache License 2.0](LICENSE-APACHE)
-
-You may choose either license. This permissive licensing is intentional — we want companies to be able to contribute drivers without copyleft concerns.
+KontsnorOS is licensed under the [GNU General Public License v3.0 (GPLv3 only)](LICENSE).
 
 ## Acknowledgments
 

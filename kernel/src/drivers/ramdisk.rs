@@ -338,7 +338,7 @@ pub fn create_ext2_ramdisk() -> Arc<dyn BlockDevice> {
         name: alloc::string::String::from("ramdisk"),
         version: alloc::string::String::from("1.0.0"),
         author: alloc::string::String::from("KontsnorOS Team"),
-        license: alloc::string::String::from("MIT"),
+        license: alloc::string::String::from("GPL-3.0-only"),
         description: alloc::string::String::from(
             "In-memory ramdisk pre-populated with ext2 file system",
         ),

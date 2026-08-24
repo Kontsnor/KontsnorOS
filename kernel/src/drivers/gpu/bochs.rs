@@ -144,7 +144,7 @@ impl GpuDevice for BochsGpuDevice {
             name: String::from("bochs-gpu"),
             version: String::from("0.1.0"),
             author: String::from("KontsnorOS Core Devs"),
-            license: String::from("MIT OR Apache-2.0"),
+            license: String::from("GPL-3.0-only"),
             description: String::from("Bochs/QEMU VBE PCI Display Driver"),
         }
     }

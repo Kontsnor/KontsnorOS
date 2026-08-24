@@ -110,8 +110,8 @@ If you're contributing a hardware driver:
 
 ### Driver Licensing
 
-Drivers may use any license compatible with MIT or Apache-2.0. Proprietary
-drivers that use only the public `driver-sdk` API are permitted.
+Drivers must use a license compatible with the GNU General Public License v3.
+Because the entire repository (including the driver SDK) is under GPLv3, all linked driver modules must comply with copyleft obligations.
 
 ## Architecture Decisions
 
@@ -126,4 +126,4 @@ these principles:
 ## License
 
 By contributing to KontsnorOS, you agree that your contributions will be
-licensed under both the MIT License and the Apache License 2.0.
+licensed under the GNU General Public License v3.0 (GPLv3 only).

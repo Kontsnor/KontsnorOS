@@ -326,7 +326,8 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
 
                                                 // Flush local TLB for this virtual address
                                                 x86_64::instructions::tlb::flush(fault_addr);
-                                                // kprintln!("[debug pf] CoW sole owner resolved at vaddr {:#x}", fault_addr.as_u64());
+                                                let ref_count = crate::memory::physical::FRAME_REFS[idx].load(Ordering::SeqCst);
+                                                kprintln!("[debug pf] CoW sole owner resolved at vaddr {:#x}, refcount={}", fault_addr.as_u64(), ref_count);
                                                 return; // Fault resolved!
                                             } else {
                                                 // Shared page! Allocate a new page frame, copy contents, and map writable
@@ -374,7 +375,8 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                                                             new_phys,
                                                         );
                                                     }
-                                                    // kprintln!("[debug pf] CoW shared resolved at vaddr {:#x}", fault_addr.as_u64());
+                                                    let ref_count = crate::memory::physical::FRAME_REFS[idx].load(Ordering::SeqCst);
+                                                    kprintln!("[debug pf] CoW shared resolved at vaddr {:#x}, refcount of old was {}, now {}", fault_addr.as_u64(), ref_count + 1, ref_count);
                                                     return; // Fault resolved!
                                                 }
                                             }
@@ -492,8 +494,10 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                     let mut flags = page_flags;
                     flags.remove(PageTableFlags::WRITABLE);
                     flags.insert(PageTableFlags::BIT_9);
+                    kprintln!("[debug pf] phys={:#x}, do_cow = true, flags before={:?}, after={:?}", phys, page_flags, flags);
                     flags
                 } else {
+                    kprintln!("[debug pf] phys={:#x}, do_cow = false, flags={:?}", phys, page_flags);
                     page_flags
                 };
 

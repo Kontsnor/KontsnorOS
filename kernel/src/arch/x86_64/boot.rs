@@ -40,7 +40,7 @@ pub unsafe fn enable_sse() {
 
     let mut cr0 = Cr0::read();
     cr0.remove(Cr0Flags::EMULATE_COPROCESSOR);
-    cr0.insert(Cr0Flags::MONITOR_COPROCESSOR);
+    cr0.insert(Cr0Flags::MONITOR_COPROCESSOR | Cr0Flags::WRITE_PROTECT);
     unsafe {
         Cr0::write(cr0);
     }

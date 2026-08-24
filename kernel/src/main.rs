@@ -48,6 +48,7 @@
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(unused_assignments)]
+#![allow(clippy::all)]
 
 extern crate alloc;
 

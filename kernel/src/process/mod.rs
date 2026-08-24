@@ -34,10 +34,7 @@ pub mod task;
 
 pub use binaries::create_net_test_elf;
 pub use binaries::{hello_elf, net_test_elf, shell_elf};
-pub use lifecycle::{
-    spawn_kernel_thread, spawn_user_process,
-    spawn_user_process_with_pid,
-};
+pub use lifecycle::{spawn_kernel_thread, spawn_user_process, spawn_user_process_with_pid};
 
 /// Initialize the process management subsystem.
 pub fn init() {

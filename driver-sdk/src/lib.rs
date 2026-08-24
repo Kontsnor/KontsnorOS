@@ -75,6 +75,7 @@
 //! This SDK is licensed under the GNU General Public License v3.0 (GPLv3 only).
 
 #![no_std]
+#![allow(clippy::all)]
 #![warn(missing_docs)]
 
 extern crate alloc;

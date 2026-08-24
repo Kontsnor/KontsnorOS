@@ -288,7 +288,6 @@ unsafe fn walk_and_reserve_page_tables(
 /// allocation is attempted.
 pub fn init(memory_regions: &MemoryRegions, phys_mem_offset: u64) {
     use x86_64::registers::control::Cr3;
-    
 
     let mut allocator = FRAME_ALLOCATOR.lock();
 

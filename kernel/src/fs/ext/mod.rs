@@ -30,8 +30,8 @@ pub mod file;
 pub mod types;
 
 pub use types::{
-    Ext4Extent, Ext4ExtentHeader, Ext4ExtentIdx, ExtRawInode, GroupDescriptor,
-    JournalSuperblock, Superblock,
+    Ext4Extent, Ext4ExtentHeader, Ext4ExtentIdx, ExtRawInode, GroupDescriptor, JournalSuperblock,
+    Superblock,
 };
 
 /// Helper to count free bits (zeros) in a bitmap buffer.

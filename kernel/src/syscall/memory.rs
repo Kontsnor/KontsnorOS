@@ -46,8 +46,6 @@ pub fn sys_mmap(
 ) -> SyscallResult {
     use crate::process::fd as proc_fd;
     use crate::process::scheduler;
-    
-    
 
     if length == 0 {
         return Errno::EINVAL.into();

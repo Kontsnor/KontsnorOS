@@ -31,8 +31,8 @@ pub fn sys_mmap(
 ) -> SyscallResult {
     use crate::process::fd as proc_fd;
     use crate::process::scheduler;
-    use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
-    use x86_64::{PhysAddr, VirtAddr};
+    
+    
 
     if length == 0 {
         return Errno::EINVAL.into();
@@ -63,12 +63,12 @@ pub fn sys_mmap(
     };
 
     // Get current mmap_bump and page table root
-    let (resolved_addr, page_table_root) = {
+    let (resolved_addr, _page_table_root) = {
         let task_arc = match scheduler::get_task_arc(current_pid) {
             Some(t) => t,
             None => return Errno::ESRCH.into(),
         };
-        let mut task = task_arc.lock();
+        let task = task_arc.lock();
         let mut addr_space = task.address_space.lock();
 
         let resolved = if addr == 0 {
@@ -114,7 +114,7 @@ pub fn sys_mmap(
             Some(t) => t,
             None => return Errno::ESRCH.into(),
         };
-        let mut task = task_arc.lock();
+        let task = task_arc.lock();
         let mut addr_space = task.address_space.lock();
         addr_space
             .mmap_regions
@@ -185,7 +185,7 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
 
     // unmap and remove/shrink task.mmap_regions
     {
-        let mut task = task_arc.lock();
+        let task = task_arc.lock();
         let mut addr_space = task.address_space.lock();
         let mut new_regions = alloc::vec::Vec::new();
         let unmap_start = addr;
@@ -306,7 +306,7 @@ pub fn sys_mprotect(addr: u64, length: usize, prot: i32) -> SyscallResult {
 
     // 2. Split and update task.mmap_regions
     {
-        let mut task = task_arc.lock();
+        let task = task_arc.lock();
         let mut addr_space = task.address_space.lock();
         let mut new_regions = alloc::vec::Vec::new();
         let mprotect_start = addr;
@@ -551,7 +551,7 @@ pub fn sys_mremap(
             return Errno::ENOMEM.into();
         }
 
-        let mut target_addr = 0;
+        let target_addr;
 
         if (flags & MREMAP_FIXED) != 0 {
             if (new_address & 4095) != 0 {

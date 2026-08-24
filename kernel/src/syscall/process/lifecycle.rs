@@ -1,7 +1,6 @@
 //! Process lifecycle and scheduler/memory control system calls.
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 use super::super::{Errno, SyscallResult};
 use super::creds::calculate_exec_creds;
@@ -173,7 +172,7 @@ fn map_elf_segments(
             max_vaddr = end;
         }
 
-        let aligned_len = ((segment.mem_size + 4095) & !4095) as usize;
+        let _aligned_len = ((segment.mem_size + 4095) & !4095) as usize;
         let mut prot = 0;
         if segment.flags.read {
             prot |= 1;
@@ -569,7 +568,7 @@ pub fn sys_execve(
     };
 
     // Reset signal state and update page table root for execve
-    let old_page_table = {
+    let _old_page_table = {
         let current_pid = match scheduler::current_pid() {
             Some(p) => p,
             None => return Errno::ESRCH.into(),

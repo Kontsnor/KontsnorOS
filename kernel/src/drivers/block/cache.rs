@@ -1,7 +1,6 @@
 //! Thread-safe Least Recently Used (LRU) block buffer cache for KontsnorOS.
 
 use crate::drivers::traits::{BlockDevice, DriverError, DriverInfo};
-use crate::kprintln;
 use crate::sync::spinlock::TicketLock;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;

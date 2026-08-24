@@ -18,7 +18,7 @@ fn ensure_page_mapped(vaddr: u64) -> bool {
         .and_then(|pid| crate::process::scheduler::get_task_arc(pid))
         .and_then(|task_arc| {
             let task = task_arc.lock();
-            let mut addr_space = task.address_space.lock();
+            let addr_space = task.address_space.lock();
             let page_vaddr = vaddr & !4095;
 
             // Find if page_vaddr falls inside any mapped region

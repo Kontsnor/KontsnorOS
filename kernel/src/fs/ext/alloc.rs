@@ -1,7 +1,7 @@
 //! Block and inode allocation/deallocation routines.
 
 use super::{read_blocks, write_blocks};
-use super::{ExtFileSystem, ExtRawInode, GroupDescriptor};
+use super::{ExtFileSystem, ExtRawInode};
 
 /// Helper to count free bits (zeros) in a bitmap buffer.
 pub fn count_free_bits(bitmap: &[u8], total_count: u32) -> u32 {

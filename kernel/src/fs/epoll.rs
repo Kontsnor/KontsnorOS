@@ -1,6 +1,6 @@
 //! epoll — I/O event notification facility.
 
-use crate::fs::inode::{DirEntry, FileType, Inode, InodeOps, POLLERR, POLLHUP, POLLIN, POLLOUT};
+use crate::fs::inode::{DirEntry, FileType, Inode, InodeOps};
 use crate::sync::wait_queue::WaitQueue;
 use crate::syscall::{Errno, SyscallResult};
 use alloc::collections::BTreeMap;

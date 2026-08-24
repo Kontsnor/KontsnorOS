@@ -86,7 +86,7 @@ pub fn current_task_alloc_fd_with_flags_and_path(
 ) -> Option<i32> {
     let current_pid = scheduler::current_pid()?;
     let task_arc = scheduler::get_task_arc(current_pid)?;
-    let mut task = task_arc.lock();
+    let task = task_arc.lock();
     let mut fd_table = task.fd_table.lock();
     let file_desc = Arc::new(FileDescription::new(inode, flags, path));
 
@@ -131,7 +131,7 @@ pub fn current_task_close_fd(fd: i32) -> bool {
         Some(t) => t,
         None => return false,
     };
-    let mut task = task_arc.lock();
+    let task = task_arc.lock();
     let mut fd_table = task.fd_table.lock();
 
     let desc = if fd_idx < fd_table.entries.len() && fd_table.entries[fd_idx].is_some() {
@@ -165,7 +165,7 @@ pub fn current_task_dup_fd(fd: i32) -> Option<i32> {
     let fd_idx = fd as usize;
     let current_pid = scheduler::current_pid()?;
     let task_arc = scheduler::get_task_arc(current_pid)?;
-    let mut task = task_arc.lock();
+    let task = task_arc.lock();
     let mut fd_table = task.fd_table.lock();
 
     let file_desc = fd_table.entries.get(fd_idx)?.as_ref().cloned()?;
@@ -219,7 +219,7 @@ pub fn current_task_dup2_fd(oldfd: i32, newfd: i32) -> Option<i32> {
         }
     }
 
-    let mut task = task_arc.lock();
+    let task = task_arc.lock();
     if newfd as u64 >= task.rlimit_nofile_cur {
         return None;
     }

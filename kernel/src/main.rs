@@ -28,7 +28,11 @@
 #![cfg_attr(feature = "test", reexport_test_harness_main = "test_main")]
 #![cfg_attr(feature = "test", test_runner(crate::test::test_runner))]
 #![deny(unsafe_op_in_unsafe_fn)]
-#![allow(warnings)]
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
 
 extern crate alloc;
 
@@ -255,7 +259,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     let slave =
                         crate::fs::vfs::lookup("/dev/pts/0").expect("Failed to lookup PTY slave");
                     if let Some(task_arc) = process::scheduler::get_task_arc(pid) {
-                        let mut task = task_arc.lock();
+                        let task = task_arc.lock();
                         let mut fd_table = task.fd_table.lock();
                         fd_table.entries.clear();
                         let slave_desc =

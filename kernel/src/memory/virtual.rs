@@ -12,7 +12,6 @@
 //! ```
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::Mutex;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
     FrameAllocator as X86FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,

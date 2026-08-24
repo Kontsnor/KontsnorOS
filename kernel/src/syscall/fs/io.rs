@@ -1,7 +1,7 @@
 //! File I/O system calls: read, write, lseek, dup, pipe, fcntl, pread64, writev.
 
 use super::super::{Errno, SyscallResult};
-use crate::fs::file::{FileDescription, OpenFlags};
+use crate::fs::file::OpenFlags;
 use crate::kprintln;
 use crate::process::fd as proc_fd;
 use crate::sync::spinlock::TicketLock;
@@ -569,7 +569,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                 Some(t) => t,
                 None => return Errno::ESRCH.into(),
             };
-            let mut task = task_arc.lock();
+            let task = task_arc.lock();
             let mut fd_table = task.fd_table.lock();
 
             let file_desc = match fd_table.entries.get(fd as usize) {
@@ -633,7 +633,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                 None => return Errno::ESRCH.into(),
             };
             if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
-                let mut task = task_arc.lock();
+                let task = task_arc.lock();
                 let mut fd_table = task.fd_table.lock();
                 if (fd as usize) < fd_table.entries.len() && fd_table.entries[fd as usize].is_some()
                 {
@@ -668,7 +668,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                 None => return Errno::ESRCH.into(),
             };
             if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
-                let mut task = task_arc.lock();
+                let task = task_arc.lock();
                 let mut fd_table = task.fd_table.lock();
                 if let Some(Some(desc)) = fd_table.entries.get_mut(fd as usize) {
                     let allowed_flags = OpenFlags::O_APPEND | OpenFlags::O_NONBLOCK;

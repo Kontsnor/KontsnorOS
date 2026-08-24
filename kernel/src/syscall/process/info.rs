@@ -368,7 +368,7 @@ pub fn sys_sysinfo(info: *mut u8) -> SyscallResult {
     if validate_user_ptr_write(info, core::mem::size_of::<SysInfo>()).is_err() {
         return Errno::EFAULT.into();
     }
-    let (total_frames, allocated_frames, free_frames) = crate::memory::physical::stats();
+    let (total_frames, _allocated_frames, free_frames) = crate::memory::physical::stats();
     let uptime = (crate::arch::x86_64::interrupts::timer_ticks() / 18) as i64;
     let si = SysInfo {
         uptime,

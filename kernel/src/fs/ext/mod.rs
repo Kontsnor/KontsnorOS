@@ -5,10 +5,9 @@ use crate::fs::inode::{DirEntry, FilePermissions, FileType, Inode, InodeOps};
 use crate::fs::vfs::{FileSystem, FsStats};
 use crate::kprintln;
 use crate::sync::spinlock::TicketLock;
-use ::alloc::string::String;
 use ::alloc::sync::Arc;
 use ::alloc::vec::Vec;
-use spin::{Mutex, RwLock};
+use spin::RwLock;
 
 pub mod alloc;
 pub mod dir;
@@ -16,7 +15,7 @@ pub mod file;
 pub mod types;
 
 pub use types::{
-    Ext4Extent, Ext4ExtentHeader, Ext4ExtentIdx, ExtRawInode, GroupDescriptor, JournalHeader,
+    Ext4Extent, Ext4ExtentHeader, Ext4ExtentIdx, ExtRawInode, GroupDescriptor,
     JournalSuperblock, Superblock,
 };
 

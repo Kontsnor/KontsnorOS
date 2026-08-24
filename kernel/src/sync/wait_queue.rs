@@ -28,7 +28,7 @@ impl WaitQueue {
 
         x86_64::instructions::interrupts::without_interrupts(|| {
             // F-09: Acquire SCHEDULER lock first to close the missed wakeup TOCTOU window
-            let mut sched_lock = scheduler::SCHEDULER.lock();
+            let sched_lock = scheduler::SCHEDULER.lock();
 
             // Add the current task to the wait queue under both locks
             self.pids.lock().push_back(current_pid);

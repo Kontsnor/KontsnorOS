@@ -352,7 +352,7 @@ pub fn start_aps() {
 
             // 3. Get current CR3
             // SAFETY: Reading CR3 on the BSP is safe.
-            let (cr3_frame, _) = unsafe { x86_64::registers::control::Cr3::read() };
+            let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
             let cr3_val = cr3_frame.start_address().as_u64();
 
             // 4. Create task
@@ -399,7 +399,7 @@ pub fn start_aps() {
                 );
                 core::ptr::write_volatile(
                     (dest_addr + ap_entry_ptr_offset as u64) as *mut u64,
-                    ap_entry as u64,
+                    ap_entry as *const () as u64,
                 );
                 core::ptr::write_volatile((dest_addr + ap_ready_offset as u64) as *mut u32, 0);
             }

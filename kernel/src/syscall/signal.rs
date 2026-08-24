@@ -205,7 +205,7 @@ pub fn sys_rt_sigaction(
         Some(t) => t,
         None => return Errno::ESRCH.into(),
     };
-    let mut task = task_arc.lock();
+    let task = task_arc.lock();
     let mut sigactions = task.sigactions.lock();
 
     if !oldact.is_null() {
@@ -541,11 +541,9 @@ pub fn sys_rt_sigreturn(regs: *mut super::SavedRegisters) -> SyscallResult {
 
                 let pending_unblocked = task.pending_signals & !task.blocked_signals;
                 let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
-                unsafe {
-                    if apic_id < 32 {
-                        crate::syscall::CPU_SCRATCHES[apic_id].signals_pending =
-                            if pending_unblocked != 0 { 1 } else { 0 };
-                    }
+                if apic_id < 32 {
+                    crate::syscall::CPU_SCRATCHES[apic_id].signals_pending =
+                        if pending_unblocked != 0 { 1 } else { 0 };
                 }
             }
         }

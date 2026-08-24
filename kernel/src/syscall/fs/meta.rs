@@ -8,7 +8,6 @@ use crate::syscall::validation::{
     copy_string_from_user, validate_user_ptr, validate_user_ptr_write,
 };
 use alloc::string::String;
-use alloc::vec::Vec;
 
 #[repr(C)]
 struct LinuxDirent64 {

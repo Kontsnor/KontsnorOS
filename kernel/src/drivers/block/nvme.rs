@@ -378,7 +378,7 @@ impl BlockDevice for NvmeNamespace {
 
 /// Helper module containing exposed initializers for memory-based mock register validation in unit tests.
 pub mod test_helpers {
-    use super::*;
+    
 
     /// Helper to read registers directly
     pub unsafe fn read_reg32(virt_base: u64, offset: u32) -> u32 {

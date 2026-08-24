@@ -526,7 +526,7 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                     );
 
                     kprintln!("[debug pf] mapping user page");
-                    if let Err(e) = crate::memory::r#virtual::map_user_page_no_shootdown(
+                    if let Err(_e) = crate::memory::r#virtual::map_user_page_no_shootdown(
                         page_table_root,
                         page,
                         frame,
@@ -607,7 +607,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
         }
     }
 
-    let ticks = TIMER_TICKS.fetch_add(1, core::sync::atomic::Ordering::Release) + 1;
+    let _ticks = TIMER_TICKS.fetch_add(1, core::sync::atomic::Ordering::Release) + 1;
     /*
     if ticks % 10 == 0 {
         let current_pid = crate::process::scheduler::current_pid()

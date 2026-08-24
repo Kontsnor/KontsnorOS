@@ -1,6 +1,5 @@
 //! Process and thread lifecycle logic: creation, termination, and state wrappers.
 
-use crate::kprintln;
 use alloc::sync::Arc;
 use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
@@ -8,8 +7,8 @@ use x86_64::{PhysAddr, VirtAddr};
 use super::context::{self, CpuContext};
 use super::elf;
 use super::pid::{self, Pid};
-use super::scheduler::{self, SCHEDULER, TASKS};
-use super::task::{Priority, Task, TaskState};
+use super::scheduler::{self, SCHEDULER};
+use super::task::Task;
 
 /// Spawn a new kernel thread.
 pub fn spawn_kernel_thread(name: alloc::string::String, entry_point: fn()) -> Pid {
@@ -49,15 +48,13 @@ pub fn spawn_kernel_thread(name: alloc::string::String, entry_point: fn()) -> Pi
 #[unsafe(naked)]
 extern "C" fn thread_trampoline() -> ! {
     // SAFETY: Naked assembly stub serving as a trampoline entry point for kernel threads.
-    unsafe {
-        core::arch::naked_asm!(
-            "sti",          // Enable interrupts since context switch disabled them
-            "call r12",     // Call the entry_point (stored in r12)
-            "mov rdi, 0",   // Set first argument (exit status) to 0
-            "call {}",      // Call exit_current_thread
-            sym exit_current_thread,
-        );
-    }
+    core::arch::naked_asm!(
+        "sti",          // Enable interrupts since context switch disabled them
+        "call r12",     // Call the entry_point (stored in r12)
+        "mov rdi, 0",   // Set first argument (exit status) to 0
+        "call {}",      // Call exit_current_thread
+        sym exit_current_thread,
+    );
 }
 
 /// Spawn a new Ring 3 user process from ELF data.
@@ -248,17 +245,15 @@ pub fn spawn_user_process_with_pid(name: alloc::string::String, elf_data: &[u8],
 #[unsafe(naked)]
 extern "C" fn user_process_trampoline() -> ! {
     // SAFETY: Naked assembly stub serving as a trampoline entry point for Ring 3 user processes.
-    unsafe {
-        core::arch::naked_asm!(
-            "mov rdi, r12", // Set entry_point as 1st argument (rdi)
-            "mov rsi, r13", // Set user_stack as 2nd argument (rsi)
-            "mov rdx, r14", // Set page_table as 3rd argument (rdx)
-            "mov rcx, r15", // Set user_code_selector as 4th argument (rcx)
-            "mov r8, rbx",  // Set user_data_selector as 5th argument (r8)
-            "jmp {}",       // Jump to enter_user_mode (never returns)
-            sym context::enter_user_mode,
-        );
-    }
+    core::arch::naked_asm!(
+        "mov rdi, r12", // Set entry_point as 1st argument (rdi)
+        "mov rsi, r13", // Set user_stack as 2nd argument (rsi)
+        "mov rdx, r14", // Set page_table as 3rd argument (rdx)
+        "mov rcx, r15", // Set user_code_selector as 4th argument (rcx)
+        "mov r8, rbx",  // Set user_data_selector as 5th argument (r8)
+        "jmp {}",       // Jump to enter_user_mode (never returns)
+        sym context::enter_user_mode,
+    );
 }
 
 /// Returns the virtual address of `user_process_trampoline`.

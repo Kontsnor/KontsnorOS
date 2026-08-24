@@ -273,11 +273,9 @@ unsafe fn walk_and_reserve_page_tables(
 /// allocation is attempted.
 pub fn init(memory_regions: &MemoryRegions, phys_mem_offset: u64) {
     use x86_64::registers::control::Cr3;
-    use x86_64::structures::paging::{PageTable, PageTableFlags};
+    
 
     let mut allocator = FRAME_ALLOCATOR.lock();
-
-    let mut total = 0usize;
 
     for region in memory_regions.iter() {
         if region.kind == MemoryRegionKind::Usable {
@@ -287,7 +285,6 @@ pub fn init(memory_regions: &MemoryRegions, phys_mem_offset: u64) {
             for frame in start_frame..end_frame {
                 if frame < MAX_FRAMES {
                     allocator.mark_free(frame);
-                    total += 1;
                 }
             }
         }

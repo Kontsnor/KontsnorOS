@@ -38,7 +38,7 @@ impl AtaDrive {
     /// Polls the status register until the BSY bit is clear and DRDY bit is set.
     fn wait_ready(&self) -> Result<(), &'static str> {
         let mut status_port = Port::<u8>::new(0x1F7);
-        for i in 0..1_000_000 {
+        for _i in 0..1_000_000 {
             let status = unsafe { status_port.read() };
             if (status & 0x80) == 0 && (status & 0x40) != 0 {
                 return Ok(());
@@ -51,7 +51,7 @@ impl AtaDrive {
     /// Polls the status register until BSY is clear and DRQ (Data Request) is set.
     fn wait_data_request(&self) -> Result<(), &'static str> {
         let mut status_port = Port::<u8>::new(0x1F7);
-        for i in 0..1_000_000 {
+        for _i in 0..1_000_000 {
             let status = unsafe { status_port.read() };
             if (status & 0x80) == 0 && (status & 0x08) != 0 {
                 return Ok(());
@@ -279,7 +279,7 @@ impl AtaDrive {
 
         // 8. Poll Bus Master Status register for completion
         let mut success = false;
-        for i in 0..1_000_000 {
+        for _i in 0..1_000_000 {
             let status = unsafe { status_port.read() };
             // Bit 2: Interrupt, Bit 1: Error, Bit 0: Active
             if (status & 0x04) != 0 {
@@ -310,7 +310,7 @@ impl AtaDrive {
 
 impl BlockDevice for AtaDrive {
     fn read_block(&self, block: u64, buf: &mut [u8]) -> Result<(), DriverError> {
-        let mut inner = self.inner.lock();
+        let inner = self.inner.lock();
         let mut lba = block as u32;
         let sector_count = (buf.len() / 512) as u32;
         let mut sectors_read = 0;
@@ -351,7 +351,7 @@ impl BlockDevice for AtaDrive {
     }
 
     fn write_block(&self, block: u64, data: &[u8]) -> Result<(), DriverError> {
-        let mut inner = self.inner.lock();
+        let inner = self.inner.lock();
         let mut lba = block as u32;
         let sector_count = (data.len() / 512) as u32;
         let mut sectors_written = 0;

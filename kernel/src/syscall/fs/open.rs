@@ -1,7 +1,6 @@
 //! Open, openat, and close system calls.
 
 use super::super::{Errno, SyscallResult};
-use crate::kprintln;
 use crate::process::fd as proc_fd;
 use crate::syscall::validation::copy_string_from_user;
 use alloc::string::String;

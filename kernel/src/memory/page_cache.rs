@@ -267,10 +267,10 @@ pub fn flush_all_for_inode_inner(inode: &dyn InodeOps) -> Result<(), Errno> {
         task_arcs.len()
     );
     */
-    for (idx, task_arc) in task_arcs {
+    for (_idx, task_arc) in task_arcs {
         // crate::kprintln!("[debug flush_all] locking task idx={}", idx);
         x86_64::instructions::interrupts::without_interrupts(|| {
-            let mut task = task_arc.lock();
+            let task = task_arc.lock();
             /*
             crate::kprintln!(
                 "[debug flush_all] task idx={} locked, locking addr_space",

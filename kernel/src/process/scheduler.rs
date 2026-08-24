@@ -603,7 +603,7 @@ pub fn schedule() {
             &mut current_task.context as *mut super::context::CpuContext
         };
 
-        let mut pending_unblocked = 0;
+        let pending_unblocked;
         let new_ctx_ptr = {
             let mut next_task = next_task_arc.lock();
             next_task.state = TaskState::Running;
@@ -635,8 +635,8 @@ pub fn schedule() {
         // Drop lock before switching to prevent deadlock
         drop(sched_lock);
 
-        let from_pid = current_pid;
-        let to_pid = next_pid;
+        let _from_pid = current_pid;
+        let _to_pid = next_pid;
 
         // Perform raw context switch directly
         unsafe {
@@ -676,4 +676,4 @@ pub fn set_bootstrap_thread(task: Task) {
     }
 }
 
-pub use super::lifecycle::{block_task, wake_task};
+pub use super::lifecycle::wake_task;

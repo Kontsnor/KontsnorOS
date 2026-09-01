@@ -892,7 +892,36 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, timeout: i32) -> SyscallResult {
             }
         }
 
-        crate::process::scheduler::yield_now();
+        // Handle signals checking (break with EINTR if a signal is pending)
+        let current_pid = match crate::process::scheduler::current_pid() {
+            Some(p) => p,
+            None => return Errno::ESRCH.into(),
+        };
+        if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+            let task = task_arc.lock();
+            let unblocked = task.pending_signals & !task.blocked_signals;
+            if unblocked != 0 {
+                return Errno::EINTR.into();
+            }
+        }
+
+        // Sleep on wait queue with timeout instead of burning CPU in yield_now()
+        if let Some(limit) = timeout_ticks {
+            crate::fs::epoll::add_sleep_timeout(current_pid, start_ticks + limit);
+        }
+        if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+            let wait_queue = {
+                let mut task = task_arc.lock();
+                task.state = crate::process::task::TaskState::Blocked;
+                task.child_wait_queue.clone()
+            };
+            wait_queue.register(current_pid);
+            crate::process::scheduler::schedule();
+            wait_queue.remove(current_pid);
+        }
+        if timeout_ticks.is_some() {
+            crate::fs::epoll::remove_sleep_timeout(current_pid);
+        }
     }
 }
 
@@ -1384,4 +1413,169 @@ pub fn sys_fchmodat(dfd: i32, pathname: *const u8, mode: u32, flags: i32) -> Sys
 
     let follow_last = (flags & 0x100) == 0; // AT_SYMLINK_NOFOLLOW = 0x100
     sys_chmod_with_resolved_path_follow(resolved_path, mode, follow_last)
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct TimeSpec {
+    pub tv_sec: i64,
+    pub tv_nsec: i64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct TimeVal {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct UTimeBuf {
+    pub actime: i64,
+    pub modtime: i64,
+}
+
+const UTIME_NOW: i64 = 0x3fffffff;
+const UTIME_OMIT: i64 = 0x3ffffffe;
+
+/// `utimensat(dirfd, pathname, times, flags)` — Change file timestamps with nanosecond precision.
+pub fn sys_utimensat(
+    dirfd: i32,
+    pathname: *const u8,
+    times: *const TimeSpec,
+    flags: i32,
+) -> SyscallResult {
+    let now = crate::fs::vfs::current_time_sec() as u64;
+
+    let (mut atime, mut mtime) = if !times.is_null() {
+        if !validate_user_ptr(times as *const u8, core::mem::size_of::<[TimeSpec; 2]>()) {
+            return Errno::EFAULT.into();
+        }
+        let ts = unsafe { *(times as *const [TimeSpec; 2]) };
+        let a = match ts[0].tv_nsec {
+            UTIME_NOW => now,
+            UTIME_OMIT => u64::MAX,
+            _ => ts[0].tv_sec as u64,
+        };
+        let m = match ts[1].tv_nsec {
+            UTIME_NOW => now,
+            UTIME_OMIT => u64::MAX,
+            _ => ts[1].tv_sec as u64,
+        };
+        (a, m)
+    } else {
+        (now, now)
+    };
+
+    let inode_ops = if pathname.is_null() || (flags & 0x1000) != 0 {
+        // Operates directly on dirfd (or AT_EMPTY_PATH)
+        if dirfd == -100 {
+            // AT_FDCWD
+            let cwd = if let Some(pid) = crate::process::scheduler::current_pid() {
+                if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+                    task_arc.lock().cwd.clone()
+                } else {
+                    alloc::string::String::from("/")
+                }
+            } else {
+                alloc::string::String::from("/")
+            };
+            match crate::fs::vfs::lookup(&cwd) {
+                Some(i) => i,
+                None => return Errno::ENOENT.into(),
+            }
+        } else {
+            let desc = match proc_fd::current_task_get_file_desc(dirfd) {
+                Some(d) => d,
+                None => return Errno::EBADF.into(),
+            };
+            desc.inode.clone()
+        }
+    } else {
+        let raw_path = match unsafe { copy_string_from_user(pathname) } {
+            Some(p) => p,
+            None => return Errno::EFAULT.into(),
+        };
+        let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dirfd, &raw_path) {
+            Ok(path) => path,
+            Err(e) => return e.into(),
+        };
+        let follow_symlinks = (flags & 0x100) == 0; // AT_SYMLINK_NOFOLLOW = 0x100
+        match crate::fs::vfs::lookup_follow(&resolved_path, follow_symlinks) {
+            Some(i) => i,
+            None => return Errno::ENOENT.into(),
+        }
+    };
+
+    let cur_inode = inode_ops.inode();
+    if atime == u64::MAX {
+        atime = cur_inode.atime;
+    }
+    if mtime == u64::MAX {
+        mtime = cur_inode.mtime;
+    }
+
+    match inode_ops.set_times(atime, mtime) {
+        Ok(_) => 0,
+        Err(e) => e as SyscallResult,
+    }
+}
+
+/// `utimes(filename, times)` — Change file timestamps.
+pub fn sys_utimes(filename: *const u8, times: *const TimeVal) -> SyscallResult {
+    let now = crate::fs::vfs::current_time_sec() as u64;
+    let (atime, mtime) = if !times.is_null() {
+        if !validate_user_ptr(times as *const u8, core::mem::size_of::<[TimeVal; 2]>()) {
+            return Errno::EFAULT.into();
+        }
+        let tv = unsafe { *(times as *const [TimeVal; 2]) };
+        (tv[0].tv_sec as u64, tv[1].tv_sec as u64)
+    } else {
+        (now, now)
+    };
+
+    let raw_path = match unsafe { copy_string_from_user(filename) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved_path, true) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    match inode_ops.set_times(atime, mtime) {
+        Ok(_) => 0,
+        Err(e) => e as SyscallResult,
+    }
+}
+
+/// `utime(filename, times)` — Change file timestamps.
+pub fn sys_utime(filename: *const u8, times: *const UTimeBuf) -> SyscallResult {
+    let now = crate::fs::vfs::current_time_sec() as u64;
+    let (atime, mtime) = if !times.is_null() {
+        if !validate_user_ptr(times as *const u8, core::mem::size_of::<UTimeBuf>()) {
+            return Errno::EFAULT.into();
+        }
+        let utb = unsafe { *times };
+        (utb.actime as u64, utb.modtime as u64)
+    } else {
+        (now, now)
+    };
+
+    let raw_path = match unsafe { copy_string_from_user(filename) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved_path, true) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    match inode_ops.set_times(atime, mtime) {
+        Ok(_) => 0,
+        Err(e) => e as SyscallResult,
+    }
 }

@@ -28,7 +28,7 @@ pub mod process;
 pub mod signal;
 pub mod validation;
 
-pub const DEBUG_SYSCALLS: bool = false;
+pub const DEBUG_SYSCALLS: bool = true;
 
 /// Syscall numbers for KontsnorOS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +299,9 @@ pub extern "C" fn syscall_dispatch_rust(regs: *mut SavedRegisters, syscall_num: 
         return crate::syscall::signal::sys_rt_sigreturn(regs);
     }
 
+    // Enable interrupts for the duration of the system call
+    x86_64::instructions::interrupts::enable();
+
     let arg0 = unsafe { (*regs).rdi };
     let arg1 = unsafe { (*regs).rsi };
     let arg2 = unsafe { (*regs).rdx };
@@ -393,6 +396,9 @@ pub extern "C" fn syscall_dispatch_rust(regs: *mut SavedRegisters, syscall_num: 
 
     // Call signal delivery handler before returning to user space
     crate::syscall::signal::handle_pending_signals(regs);
+
+    // Disable interrupts before returning to assembly (which will exit to user space)
+    x86_64::instructions::interrupts::disable();
 
     unsafe { (*regs).rax as i64 }
 }
@@ -511,6 +517,7 @@ pub fn dispatch(
         72 => fs::sys_fcntl(arg0 as i32, arg1 as i32, arg2),
         73 => fs::sys_flock(arg0 as i32, arg1 as i32),
         74 => fs::sys_fsync(arg0 as i32),
+        162 => fs::sys_sync(),
         76 => fs::sys_truncate(arg0 as *const u8, arg1 as i64),
         77 => fs::sys_ftruncate(arg0 as i32, arg1 as i64),
         79 => fs::sys_getcwd(arg0 as *mut u8, arg1 as usize),
@@ -592,6 +599,14 @@ pub fn dispatch(
             arg4 as *const u8,
         ),
         166 => fs::sys_umount2(arg0 as *const u8, arg1 as i32),
+        132 => fs::sys_utime(arg0 as *const u8, arg1 as *const fs::UTimeBuf),
+        235 => fs::sys_utimes(arg0 as *const u8, arg1 as *const fs::TimeVal),
+        280 => fs::sys_utimensat(
+            arg0 as i32,
+            arg1 as *const u8,
+            arg2 as *const fs::TimeSpec,
+            arg3 as i32,
+        ),
         293 => fs::sys_pipe2(arg0 as *mut i32, arg1 as i32),
         319 => fs::sys_memfd_create(arg0 as *const u8, arg1 as u32),
         // Memory
@@ -673,6 +688,7 @@ pub fn dispatch(
         106 => process::sys_setgid(arg0 as u32),
         107 => process::sys_geteuid(),
         108 => process::sys_getegid(),
+        24 => process::sys_sched_yield(),
         // Network
         41 => net::sys_socket(arg0 as i32, arg1 as i32, arg2 as i32),
         42 => net::sys_connect(arg0 as i32, arg1 as *const net::SockAddrIn, arg2 as u32),
@@ -693,8 +709,26 @@ pub fn dispatch(
             arg4 as *mut net::SockAddrIn,
             _arg5 as *mut u32,
         ),
+        48 => net::sys_shutdown(arg0 as i32, arg1 as i32),
         49 => net::sys_bind(arg0 as i32, arg1 as *const net::SockAddrIn, arg2 as u32),
         50 => net::sys_listen(arg0 as i32, arg1 as i32),
+        51 => net::sys_getsockname(arg0 as i32, arg1 as *mut net::SockAddrIn, arg2 as *mut u32),
+        52 => net::sys_getpeername(arg0 as i32, arg1 as *mut net::SockAddrIn, arg2 as *mut u32),
+        53 => net::sys_socketpair(arg0 as i32, arg1 as i32, arg2 as i32, arg3 as *mut i32),
+        54 => net::sys_setsockopt(
+            arg0 as i32,
+            arg1 as i32,
+            arg2 as i32,
+            arg3 as *const u8,
+            arg4 as u32,
+        ),
+        55 => net::sys_getsockopt(
+            arg0 as i32,
+            arg1 as i32,
+            arg2 as i32,
+            arg3 as *mut u8,
+            arg4 as *mut u32,
+        ),
         _ => {
             kprintln!("[syscall] Unknown syscall: {}", syscall_num);
             Errno::ENOSYS.into()

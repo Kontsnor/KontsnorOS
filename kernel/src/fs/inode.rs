@@ -231,6 +231,11 @@ pub trait InodeOps: Send + Sync {
         Err(-1) // EPERM
     }
 
+    /// Set access and modification timestamps.
+    fn set_times(&self, _atime: u64, _mtime: u64) -> Result<(), i32> {
+        Ok(())
+    }
+
     /// Return the inner socket if this inode is a socket.
     fn as_socket(&self) -> Option<Arc<Mutex<crate::net::socket::Socket>>> {
         None

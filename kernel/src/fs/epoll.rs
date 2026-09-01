@@ -78,11 +78,35 @@ pub static EPOLL_WAIT_QUEUES: Mutex<Vec<Arc<WaitQueue>>> = Mutex::new(Vec::new()
 
 pub fn wake_all_epolls() {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
-        if let Some(ref mut sched) = *sched_lock {
-            let wqs = EPOLL_WAIT_QUEUES.lock();
-            for wq in wqs.iter() {
-                wq.wake_all_locked(sched);
+        if let Some(mut sched_lock) = crate::process::scheduler::SCHEDULER.try_lock() {
+            if let Some(ref mut sched) = *sched_lock {
+                let wqs = EPOLL_WAIT_QUEUES.lock();
+                for wq in wqs.iter() {
+                    wq.wake_all_locked(sched);
+                }
+            }
+        } else {
+            let apic_id = crate::arch::x86_64::smp::current_lapic_id() as u32;
+            if crate::process::scheduler::SCHEDULER.holding_cpu_id() == apic_id {
+                // SAFETY: The current CPU already holds SCHEDULER exclusively
+                unsafe {
+                    if let Some(ref mut sched) =
+                        *crate::process::scheduler::SCHEDULER.get_mut_unchecked()
+                    {
+                        let wqs = EPOLL_WAIT_QUEUES.lock();
+                        for wq in wqs.iter() {
+                            wq.wake_all_locked(sched);
+                        }
+                    }
+                }
+            } else {
+                let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
+                if let Some(ref mut sched) = *sched_lock {
+                    let wqs = EPOLL_WAIT_QUEUES.lock();
+                    for wq in wqs.iter() {
+                        wq.wake_all_locked(sched);
+                    }
+                }
             }
         }
     });
@@ -120,10 +144,11 @@ pub fn check_sleep_timeouts() {
     drop(timeouts);
     if !pids_to_wake.is_empty() {
         x86_64::instructions::interrupts::without_interrupts(|| {
-            let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
-            if let Some(ref mut sched) = *sched_lock {
-                for pid in pids_to_wake {
-                    sched.wake_task(pid);
+            if let Some(mut sched_lock) = crate::process::scheduler::SCHEDULER.try_lock() {
+                if let Some(ref mut sched) = *sched_lock {
+                    for pid in pids_to_wake {
+                        sched.wake_task(pid);
+                    }
                 }
             }
         });

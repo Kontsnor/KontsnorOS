@@ -221,6 +221,7 @@ impl ExtInode {
         let is_dir = file_type == FileType::Directory;
         let child_ino = self.fs.allocate_inode(is_dir).ok()?;
 
+        let now = crate::fs::vfs::current_time_sec();
         let mut raw_child = ExtRawInode {
             i_mode: match file_type {
                 FileType::Directory => 0x4000 | 0o755,
@@ -229,9 +230,9 @@ impl ExtInode {
             },
             i_uid: 0,
             i_size: 0,
-            i_atime: 0,
-            i_ctime: 0,
-            i_mtime: 0,
+            i_atime: now,
+            i_ctime: now,
+            i_mtime: now,
             i_dtime: 0,
             i_gid: 0,
             i_links_count: if is_dir { 2 } else { 1 },

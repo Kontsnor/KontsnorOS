@@ -34,6 +34,15 @@ use crate::syscall::Errno;
 /// The global VFS instance.
 static VFS: RwLock<Option<Vfs>> = RwLock::new(None);
 
+/// Sync all mounted filesystems.
+pub fn sync_all() {
+    if let Some(ref vfs) = *VFS.read() {
+        for entry in vfs.mounts.values() {
+            entry.filesystem.sync();
+        }
+    }
+}
+
 /// VFS drive map (global block devices registry).
 pub static BLOCK_DEVICES: RwLock<BTreeMap<String, Arc<dyn BlockDevice>>> =
     RwLock::new(BTreeMap::new());
@@ -381,4 +390,10 @@ pub fn resolve_relative_path_at(dfd: i32, path: &str) -> Result<String, Errno> {
     Ok(crate::fs::path::normalize(&crate::fs::path::join(
         desc_path, path,
     )))
+}
+
+/// Helper to get the current real-world timestamp in seconds.
+pub fn current_time_sec() -> u32 {
+    let ticks = crate::arch::x86_64::interrupts::timer_ticks();
+    (1782158506 + (ticks / 100)) as u32
 }

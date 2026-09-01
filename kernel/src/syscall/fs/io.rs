@@ -229,14 +229,6 @@ pub fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
         None => return Errno::EBADF.into(),
     };
 
-    let is_pipe = file_desc.inode.inode().file_type == crate::fs::inode::FileType::Pipe;
-    if is_pipe {
-        let pid_str = crate::process::scheduler::current_pid()
-            .map(|p| p.as_u64())
-            .unwrap_or(0);
-        crate::kprintln!("[syscall pid={}] sys_read on pipe fd {}", pid_str, fd);
-    }
-
     let mut total_read = 0;
     let mut temp_buf = [0u8; 4096];
 
@@ -358,6 +350,12 @@ pub fn sys_fsync(fd: i32) -> SyscallResult {
         Ok(_) => 0,
         Err(e) => e as SyscallResult,
     }
+}
+
+/// `sync()` — Commit all filesystem caches to disk.
+pub fn sys_sync() -> SyscallResult {
+    crate::fs::vfs::sync_all();
+    0
 }
 
 /// `lseek(fd, offset, whence)` — Reposition file offset.

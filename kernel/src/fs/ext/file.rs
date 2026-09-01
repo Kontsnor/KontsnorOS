@@ -554,6 +554,12 @@ impl ExtInode {
         }
         vfs.blocks = raw.i_blocks as u64;
 
+        let now = crate::fs::vfs::current_time_sec();
+        raw.i_mtime = now;
+        raw.i_ctime = now;
+        vfs.mtime = now as u64;
+        vfs.ctime = now as u64;
+
         self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?;
 
         Ok(written_bytes)

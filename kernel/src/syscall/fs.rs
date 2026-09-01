@@ -21,15 +21,16 @@ pub mod open;
 
 pub use io::{
     sys_dup, sys_dup2, sys_fcntl, sys_flock, sys_fsync, sys_ftruncate, sys_lseek, sys_memfd_create,
-    sys_pipe, sys_pipe2, sys_pread64, sys_pwrite64, sys_read, sys_readv, sys_write, sys_writev,
-    IoVec,
+    sys_pipe, sys_pipe2, sys_pread64, sys_pwrite64, sys_read, sys_readv, sys_sync, sys_write,
+    sys_writev, IoVec,
 };
 pub use meta::{
     sys_access, sys_chdir, sys_chmod, sys_chown, sys_faccessat, sys_fchmod, sys_fchmodat,
     sys_fchown, sys_fchownat, sys_fstat, sys_fstatfs, sys_getcwd, sys_getdents64, sys_lchown,
     sys_link, sys_lstat, sys_mkdir, sys_mkdirat, sys_mount, sys_newfstatat, sys_poll, sys_readlink,
     sys_readlinkat, sys_rename, sys_renameat, sys_rmdir, sys_stat, sys_statfs, sys_symlink,
-    sys_symlinkat, sys_umask, sys_umount2, sys_unlink, sys_unlinkat, LinuxStat, LinuxStatfs,
+    sys_symlinkat, sys_umask, sys_umount2, sys_unlink, sys_unlinkat, sys_utime, sys_utimensat,
+    sys_utimes, LinuxStat, LinuxStatfs, TimeSpec, TimeVal, UTimeBuf,
 };
 pub use open::{sys_close, sys_open, sys_openat, sys_truncate};
 

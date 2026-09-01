@@ -629,10 +629,9 @@ fn test_auxiliary_vectors() {
     let phent = 56;
     let interpreter_base = 0x0000_7FFF_F7F0_0000;
 
-    let user_sp = crate::process::elf::construct_user_stack(
+    let init_stack = crate::process::elf::construct_user_stack(
         &argv,
         &envp,
-        phys,
         entry_point,
         phdr,
         phnum,
@@ -641,21 +640,14 @@ fn test_auxiliary_vectors() {
     )
     .expect("Failed to construct user stack");
 
-    // Read the stack from the allocated page.
-    let page_virt = (phys + crate::memory::r#virtual::phys_mem_offset()) as *const u8;
+    let user_sp = init_stack.user_sp;
 
     // The stack pointer returned is at some offset in the stack top.
-    // Let's translate user_sp to the offset in our page.
-    // stack top is USER_STACK_TOP = 0x0000_7FFF_FFFF_0000.
-    // page is USER_STACK_TOP - 4096.
-    let page_base_vaddr = crate::process::elf::USER_STACK_TOP - 4096;
-    assert!(user_sp >= page_base_vaddr);
+    assert!(user_sp >= init_stack.base_vaddr);
     assert!(user_sp < crate::process::elf::USER_STACK_TOP);
-    let offset_in_page = (user_sp - page_base_vaddr) as usize;
+    let offset_in_buf = (user_sp - init_stack.base_vaddr) as usize;
 
-    // Now let's parse the stack starting at `page_virt + offset_in_page`.
-    // SAFETY: The stack_ptr is a valid pointer within the page boundary of the allocated frame.
-    let stack_ptr = unsafe { page_virt.add(offset_in_page) } as *const u64;
+    let stack_ptr = unsafe { init_stack.stack_buf.as_ptr().add(offset_in_buf) } as *const u64;
 
     let argc = unsafe { stack_ptr.read() };
     assert_eq!(argc, 1);
@@ -1724,9 +1716,20 @@ fn test_multicore_deadlock_stress() {
     while STRESS_THREADS_ACTIVE.load(core::sync::atomic::Ordering::SeqCst) > 0 {
         main_step += 1;
         if main_step % 20 == 0 {
+            let tasks = crate::process::scheduler::TASKS.read();
+            let mut stress_states = alloc::vec::Vec::new();
+            for (idx, task_opt) in tasks.iter().enumerate() {
+                if let Some(task_arc) = task_opt {
+                    let t = task_arc.lock();
+                    if t.name.contains("stress") {
+                        stress_states.push((idx, t.state, t.priority, t.in_queue));
+                    }
+                }
+            }
             kprintln!(
-                "[stress] Main thread monitoring (remaining: {})...",
-                STRESS_THREADS_ACTIVE.load(core::sync::atomic::Ordering::SeqCst)
+                "[stress] Main thread monitoring (remaining: {}). Stress threads: {:?}",
+                STRESS_THREADS_ACTIVE.load(core::sync::atomic::Ordering::SeqCst),
+                stress_states
             );
         }
         // Force the futex wake sometimes from the main thread
@@ -1882,8 +1885,8 @@ fn test_futex_bitset_and_cleartid() {
     );
     assert_eq!(woken2, 1);
 
-    // Yield to let the helper thread finish
-    for _ in 0..10 {
+    // Wait for the helper thread to finish
+    while !BITSET_WOKE.load(core::sync::atomic::Ordering::SeqCst) {
         crate::process::scheduler::yield_now();
     }
     assert_eq!(BITSET_WOKE.load(core::sync::atomic::Ordering::SeqCst), true);
@@ -1937,6 +1940,21 @@ fn test_futex_bitset_and_cleartid() {
     for _ in 0..10 {
         crate::process::scheduler::yield_now();
     }
+    // Emit the clear_child_tid write + futex wake BEFORE taking the scheduler
+    // lock, exactly mirroring exit_current_thread (lifecycle.rs:343-353).
+    // validate_user_ptr_write needs to call current_pid() which requires the
+    // scheduler NOT to be locked.
+    if let Some(ctid) = task_child.clear_child_tid {
+        if crate::syscall::validation::validate_user_ptr_write(ctid as *mut u8, 4).is_ok() {
+            // SAFETY: validate_user_ptr_write verified pointer lies in user memory
+            unsafe {
+                (ctid as *mut u32).write_volatile(0);
+            }
+        }
+        crate::process::lifecycle::run_with_scheduler_lock(|sched| {
+            crate::syscall::process::futex::futex_wake_locked(ctid, 1, 0xffffffff, sched);
+        });
+    }
 
     // Now exit the mock child task via the scheduler
     let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
@@ -1950,8 +1968,8 @@ fn test_futex_bitset_and_cleartid() {
     drop(sched_lock);
     drop(fds);
 
-    // Yield to let join_waiter run
-    for _ in 0..20 {
+    // Wait to let join_waiter run and set JOIN_WOKE
+    while !JOIN_WOKE.load(core::sync::atomic::Ordering::SeqCst) {
         crate::process::scheduler::yield_now();
     }
 
@@ -1974,6 +1992,71 @@ fn test_futex_bitset_and_cleartid() {
     });
 
     kprintln!("[test] futex bitset and CLONE_CHILD_CLEARTID verification test PASSED!");
+}
+
+#[test_case]
+fn test_futex_bitset_timeout_and_requeue() {
+    kprintln!("[test] Starting futex bitset timeout and requeue verification test...");
+
+    let addr1 = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    let addr2 = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    assert!(addr1 > 0 && addr2 > 0);
+
+    let uaddr1 = addr1 as *mut i32;
+    let uaddr2 = addr2 as *mut i32;
+    unsafe {
+        uaddr1.write_volatile(42);
+        uaddr2.write_volatile(100);
+    }
+
+    // 1. Test FUTEX_WAIT_BITSET with past deadline (should return ETIMEDOUT immediately)
+    let past_ts = crate::syscall::process::futex::Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let res = crate::syscall::process::sys_futex(
+        uaddr1,
+        9,  // FUTEX_WAIT_BITSET
+        42, // Expected val
+        &past_ts as *const _ as u64,
+        core::ptr::null_mut(),
+        -1,
+    );
+    assert_eq!(res, crate::syscall::Errno::ETIMEDOUT as i64);
+
+    // 2. Test FUTEX_WAIT_BITSET with future monotonic timeout
+    let current_ticks = crate::arch::x86_64::interrupts::timer_ticks();
+    let current_mono_ns = current_ticks * 10_000_000;
+    let target_mono_ns = current_mono_ns + 50_000_000; // 50ms in the future
+    let future_ts = crate::syscall::process::futex::Timespec {
+        tv_sec: (target_mono_ns / 1_000_000_000) as i64,
+        tv_nsec: (target_mono_ns % 1_000_000_000) as i64,
+    };
+
+    let res_timed = crate::syscall::process::sys_futex(
+        uaddr1,
+        9,  // FUTEX_WAIT_BITSET (CLOCK_MONOTONIC)
+        42, // Expected val
+        &future_ts as *const _ as u64,
+        core::ptr::null_mut(),
+        -1,
+    );
+    assert_eq!(res_timed, crate::syscall::Errno::ETIMEDOUT as i64);
+
+    // 3. Test FUTEX_CMP_REQUEUE
+    // Test CMP_REQUEUE mismatch (expected 999 != 42) -> EAGAIN
+    let res_mismatch = crate::syscall::process::sys_futex(
+        uaddr1, 4, // FUTEX_CMP_REQUEUE
+        1, // Wake 1
+        1, // Requeue 1 (val2)
+        uaddr2, 999, // Mismatched val3
+    );
+    assert_eq!(res_mismatch, crate::syscall::Errno::EAGAIN as i64);
+
+    // Clean up
+    crate::syscall::memory::sys_munmap(addr1, 4096);
+    crate::syscall::memory::sys_munmap(addr2, 4096);
+    kprintln!("[test] futex bitset timeout and requeue verification test PASSED!");
 }
 
 #[test_case]

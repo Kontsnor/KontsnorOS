@@ -139,8 +139,8 @@ impl InodeOps for PipeReader {
                 return Err(-11); // EAGAIN / EWOULDBLOCK
             }
 
-            // Yield and block cooperatively
-            crate::process::scheduler::yield_now();
+            // Sleep on wait queue until data is written or writers close
+            self.state.wait_queue.wait();
         }
     }
 
@@ -238,8 +238,8 @@ impl InodeOps for PipeWriter {
                         return Err(-11); // EAGAIN
                     }
                 }
-                // Yield and block cooperatively until space is freed
-                crate::process::scheduler::yield_now();
+                // Sleep on wait queue until space is freed or readers close
+                self.state.wait_queue.wait();
             }
         }
 
@@ -307,4 +307,70 @@ pub fn make_pipe() -> (Arc<dyn InodeOps>, Arc<dyn InodeOps>) {
     });
 
     (reader, writer)
+}
+
+/// Bidirectional Unix socket created via socketpair.
+pub struct UnixSocket {
+    pub inode: Inode,
+    pub reader: Arc<dyn InodeOps>,
+    pub writer: Arc<dyn InodeOps>,
+}
+
+impl InodeOps for UnixSocket {
+    fn inode(&self) -> &Inode {
+        &self.inode
+    }
+
+    fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
+        self.reader.read(offset, buf)
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> Result<usize, i32> {
+        self.writer.write(offset, data)
+    }
+
+    fn ioctl(&self, request: u64, arg: u64) -> Result<u64, i32> {
+        let _ = self.writer.ioctl(request, arg);
+        self.reader.ioctl(request, arg)
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) {
+        self.reader.set_nonblocking(nonblocking);
+        self.writer.set_nonblocking(nonblocking);
+    }
+
+    fn poll(&self, events: u32) -> u32 {
+        self.reader.poll(events) | self.writer.poll(events)
+    }
+
+    fn readdir(&self) -> Vec<DirEntry> {
+        Vec::new()
+    }
+}
+
+/// Construct a bidirectional connected socket pair.
+pub fn make_socketpair(nonblock: bool) -> (Arc<dyn InodeOps>, Arc<dyn InodeOps>) {
+    let (r1, w1) = make_pipe();
+    let (r2, w2) = make_pipe();
+
+    if nonblock {
+        r1.set_nonblocking(true);
+        w1.set_nonblocking(true);
+        r2.set_nonblocking(true);
+        w2.set_nonblocking(true);
+    }
+
+    let sock_a = Arc::new(UnixSocket {
+        inode: Inode::new(0, FileType::Socket),
+        reader: r1,
+        writer: w2,
+    });
+
+    let sock_b = Arc::new(UnixSocket {
+        inode: Inode::new(0, FileType::Socket),
+        reader: r2,
+        writer: w1,
+    });
+
+    (sock_a, sock_b)
 }

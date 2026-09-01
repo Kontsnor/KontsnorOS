@@ -302,76 +302,76 @@ pub fn sys_sendto(
         return Errno::EFAULT.into();
     }
 
-    let socket = match get_socket(fd) {
-        Some(s) => s,
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
         None => return Errno::EBADF.into(),
     };
 
     let mut kernel_buf = alloc::vec![0u8; len];
+    // SAFETY: buf is validated user pointer with length len.
     unsafe {
         core::ptr::copy_nonoverlapping(buf, kernel_buf.as_mut_ptr(), len);
     }
 
-    if !dest_addr.is_null() {
-        if !validate_user_ptr(dest_addr as *const u8, core::mem::size_of::<SockAddrIn>()) {
-            return Errno::EFAULT.into();
-        }
-        if addrlen < 16 {
-            return Errno::EINVAL.into();
-        }
-        let addr = unsafe { core::ptr::read_volatile(dest_addr) };
-        if addr.sin_family != 2 {
-            return Errno::EINVAL.into();
-        }
-
-        let remote_ip = Ipv4Addr::new(
-            addr.sin_addr[0],
-            addr.sin_addr[1],
-            addr.sin_addr[2],
-            addr.sin_addr[3],
-        );
-        let remote_port = u16::from_be(addr.sin_port);
-
-        let (sock_type, local_ip, local_port) = {
-            let sock = socket.lock();
-            (
-                sock.sock_type,
-                sock.local_addr.unwrap_or(Ipv4Addr::LOCALHOST),
-                sock.local_port.unwrap_or(50000),
-            )
-        };
-        if sock_type == 2 {
-            // UDP
-            let mut udp_buf = [0u8; 2048];
-            let udp_len = match crate::net::udp::build_datagram(
-                &mut udp_buf,
-                local_port,
-                remote_port,
-                &kernel_buf,
-            ) {
-                Some(l) => l,
-                None => return Errno::EINVAL.into(),
-            };
-
-            if let Err(_) = crate::net::ipv4::send_packet(
-                local_ip,
-                remote_ip,
-                crate::net::ipv4::PROTO_UDP,
-                &udp_buf[..udp_len],
-            ) {
-                return Errno::ENETUNREACH.into();
+    if let Some(socket) = file_desc.inode.as_socket() {
+        if !dest_addr.is_null() {
+            if !validate_user_ptr(dest_addr as *const u8, core::mem::size_of::<SockAddrIn>()) {
+                return Errno::EFAULT.into();
             }
-            return len as SyscallResult;
-        } else {
-            return Errno::EINVAL.into();
+            if addrlen < 16 {
+                return Errno::EINVAL.into();
+            }
+            // SAFETY: dest_addr is validated above.
+            let addr = unsafe { core::ptr::read_volatile(dest_addr) };
+            if addr.sin_family != 2 {
+                return Errno::EINVAL.into();
+            }
+
+            let remote_ip = Ipv4Addr::new(
+                addr.sin_addr[0],
+                addr.sin_addr[1],
+                addr.sin_addr[2],
+                addr.sin_addr[3],
+            );
+            let remote_port = u16::from_be(addr.sin_port);
+
+            let (sock_type, local_ip, local_port) = {
+                let sock = socket.lock();
+                (
+                    sock.sock_type,
+                    sock.local_addr.unwrap_or(Ipv4Addr::LOCALHOST),
+                    sock.local_port.unwrap_or(50000),
+                )
+            };
+            if sock_type == 2 {
+                // UDP
+                let mut udp_buf = [0u8; 2048];
+                let udp_len = match crate::net::udp::build_datagram(
+                    &mut udp_buf,
+                    local_port,
+                    remote_port,
+                    &kernel_buf,
+                ) {
+                    Some(l) => l,
+                    None => return Errno::EINVAL.into(),
+                };
+
+                if let Err(_) = crate::net::ipv4::send_packet(
+                    local_ip,
+                    remote_ip,
+                    crate::net::ipv4::PROTO_UDP,
+                    &udp_buf[..udp_len],
+                ) {
+                    return Errno::ENETUNREACH.into();
+                }
+                return len as SyscallResult;
+            } else {
+                return Errno::EINVAL.into();
+            }
         }
     }
 
-    let inode = match proc_fd::current_task_read_fd(fd) {
-        Some(i) => i,
-        None => return Errno::EBADF.into(),
-    };
-    match inode.write(0, &kernel_buf) {
+    match file_desc.write(&kernel_buf) {
         Ok(n) => n as SyscallResult,
         Err(e) => e as SyscallResult,
     }
@@ -393,64 +393,64 @@ pub fn sys_recvfrom(
         return Errno::EFAULT.into();
     }
 
-    let socket = match get_socket(fd) {
-        Some(s) => s,
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
         None => return Errno::EBADF.into(),
     };
 
-    let mut sock = socket.lock();
-    if sock.sock_type == 2 {
-        // UDP
-        if sock.udp_recv_queue.is_empty() {
-            let wq = sock.wait_queue.clone();
-            drop(sock);
-            wq.wait();
-            sock = socket.lock();
-        }
-
-        if let Some(dg) = sock.udp_recv_queue.pop_front() {
-            let n = len.min(dg.data.len());
-            unsafe {
-                core::ptr::copy_nonoverlapping(dg.data.as_ptr(), buf, n);
+    if let Some(socket) = file_desc.inode.as_socket() {
+        let mut sock = socket.lock();
+        if sock.sock_type == 2 {
+            // UDP
+            if sock.udp_recv_queue.is_empty() {
+                let wq = sock.wait_queue.clone();
+                drop(sock);
+                wq.wait();
+                sock = socket.lock();
             }
 
-            if !src_addr.is_null() && !addrlen_ptr.is_null() {
-                if crate::syscall::fs::validate_user_ptr_write(
-                    src_addr as *mut u8,
-                    core::mem::size_of::<SockAddrIn>(),
-                )
-                .is_err()
-                    || crate::syscall::fs::validate_user_ptr_write(addrlen_ptr as *mut u8, 4)
-                        .is_err()
-                {
-                    return Errno::EFAULT.into();
-                }
-
+            if let Some(dg) = sock.udp_recv_queue.pop_front() {
+                let n = len.min(dg.data.len());
+                // SAFETY: buf is validated user pointer for write access with length len.
                 unsafe {
-                    src_addr.write(SockAddrIn {
-                        sin_family: 2,
-                        sin_port: dg.src_port.to_be(),
-                        sin_addr: dg.src_addr.octets,
-                        sin_zero: [0; 8],
-                    });
-                    addrlen_ptr.write(16);
+                    core::ptr::copy_nonoverlapping(dg.data.as_ptr(), buf, n);
                 }
-            }
 
-            return n as SyscallResult;
+                if !src_addr.is_null() && !addrlen_ptr.is_null() {
+                    if crate::syscall::fs::validate_user_ptr_write(
+                        src_addr as *mut u8,
+                        core::mem::size_of::<SockAddrIn>(),
+                    )
+                    .is_err()
+                        || crate::syscall::fs::validate_user_ptr_write(addrlen_ptr as *mut u8, 4)
+                            .is_err()
+                    {
+                        return Errno::EFAULT.into();
+                    }
+
+                    // SAFETY: pointers are validated for write above.
+                    unsafe {
+                        src_addr.write(SockAddrIn {
+                            sin_family: 2,
+                            sin_port: dg.src_port.to_be(),
+                            sin_addr: dg.src_addr.octets,
+                            sin_zero: [0; 8],
+                        });
+                        addrlen_ptr.write(16);
+                    }
+                }
+
+                return n as SyscallResult;
+            }
+            return 0;
         }
-        return 0;
     }
 
-    // TCP
-    drop(sock);
-    let inode = match proc_fd::current_task_read_fd(fd) {
-        Some(i) => i,
-        None => return Errno::EBADF.into(),
-    };
+    // Stream / TCP / Pipe / Socketpair
     let mut kernel_buf = alloc::vec![0u8; len];
-    match inode.read(0, &mut kernel_buf) {
+    match file_desc.read(&mut kernel_buf) {
         Ok(n) => {
+            // SAFETY: buf is validated user pointer for write access.
             unsafe {
                 core::ptr::copy_nonoverlapping(kernel_buf.as_ptr(), buf, n);
             }
@@ -466,22 +466,242 @@ pub fn sys_recvfrom(
                     return Errno::EFAULT.into();
                 }
 
-                let child_sock = socket.lock();
-                let remote_ip = child_sock.remote_addr.unwrap_or(Ipv4Addr::LOCALHOST);
-                let remote_port = child_sock.remote_port.unwrap_or(0);
+                if let Some(socket) = file_desc.inode.as_socket() {
+                    let child_sock = socket.lock();
+                    let remote_ip = child_sock.remote_addr.unwrap_or(Ipv4Addr::LOCALHOST);
+                    let remote_port = child_sock.remote_port.unwrap_or(0);
 
-                unsafe {
-                    src_addr.write(SockAddrIn {
-                        sin_family: 2,
-                        sin_port: remote_port.to_be(),
-                        sin_addr: remote_ip.octets,
-                        sin_zero: [0; 8],
-                    });
-                    addrlen_ptr.write(16);
+                    // SAFETY: pointers are validated for write above.
+                    unsafe {
+                        src_addr.write(SockAddrIn {
+                            sin_family: 2,
+                            sin_port: remote_port.to_be(),
+                            sin_addr: remote_ip.octets,
+                            sin_zero: [0; 8],
+                        });
+                        addrlen_ptr.write(16);
+                    }
+                } else {
+                    // SAFETY: addrlen_ptr is validated above.
+                    unsafe {
+                        addrlen_ptr.write(0);
+                    }
                 }
             }
             n as SyscallResult
         }
         Err(e) => e as SyscallResult,
     }
+}
+
+/// `shutdown(fd, how)` — shut down part of a full-duplex connection.
+pub fn sys_shutdown(fd: i32, _how: i32) -> SyscallResult {
+    if proc_fd::current_task_get_file_desc(fd).is_none() {
+        return Errno::EBADF.into();
+    }
+    0
+}
+
+/// `getsockname(fd, addr_ptr, addrlen_ptr)` — get socket name.
+pub fn sys_getsockname(fd: i32, addr_ptr: *mut SockAddrIn, addrlen_ptr: *mut u32) -> SyscallResult {
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+
+    if addr_ptr.is_null() || addrlen_ptr.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if crate::syscall::fs::validate_user_ptr_write(
+        addr_ptr as *mut u8,
+        core::mem::size_of::<SockAddrIn>(),
+    )
+    .is_err()
+        || crate::syscall::fs::validate_user_ptr_write(addrlen_ptr as *mut u8, 4).is_err()
+    {
+        return Errno::EFAULT.into();
+    }
+
+    if let Some(socket) = file_desc.inode.as_socket() {
+        let sock = socket.lock();
+        let local_ip = sock.local_addr.unwrap_or(Ipv4Addr::LOCALHOST);
+        let local_port = sock.local_port.unwrap_or(0);
+
+        // SAFETY: pointers are validated for write above.
+        unsafe {
+            addr_ptr.write(SockAddrIn {
+                sin_family: 2,
+                sin_port: local_port.to_be(),
+                sin_addr: local_ip.octets,
+                sin_zero: [0; 8],
+            });
+            addrlen_ptr.write(16);
+        }
+    } else {
+        // AF_UNIX / socketpair
+        // SAFETY: pointers are validated for write above.
+        unsafe {
+            addr_ptr.write(SockAddrIn {
+                sin_family: 1, // AF_UNIX
+                sin_port: 0,
+                sin_addr: [0; 4],
+                sin_zero: [0; 8],
+            });
+            addrlen_ptr.write(2);
+        }
+    }
+
+    0
+}
+
+/// `getpeername(fd, addr_ptr, addrlen_ptr)` — get name of connected peer socket.
+pub fn sys_getpeername(fd: i32, addr_ptr: *mut SockAddrIn, addrlen_ptr: *mut u32) -> SyscallResult {
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+
+    if addr_ptr.is_null() || addrlen_ptr.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if crate::syscall::fs::validate_user_ptr_write(
+        addr_ptr as *mut u8,
+        core::mem::size_of::<SockAddrIn>(),
+    )
+    .is_err()
+        || crate::syscall::fs::validate_user_ptr_write(addrlen_ptr as *mut u8, 4).is_err()
+    {
+        return Errno::EFAULT.into();
+    }
+
+    if let Some(socket) = file_desc.inode.as_socket() {
+        let sock = socket.lock();
+        let remote_ip = sock.remote_addr.unwrap_or(Ipv4Addr::LOCALHOST);
+        let remote_port = sock.remote_port.unwrap_or(0);
+
+        // SAFETY: pointers are validated for write above.
+        unsafe {
+            addr_ptr.write(SockAddrIn {
+                sin_family: 2,
+                sin_port: remote_port.to_be(),
+                sin_addr: remote_ip.octets,
+                sin_zero: [0; 8],
+            });
+            addrlen_ptr.write(16);
+        }
+    } else {
+        // AF_UNIX / socketpair
+        // SAFETY: pointers are validated for write above.
+        unsafe {
+            addr_ptr.write(SockAddrIn {
+                sin_family: 1, // AF_UNIX
+                sin_port: 0,
+                sin_addr: [0; 4],
+                sin_zero: [0; 8],
+            });
+            addrlen_ptr.write(2);
+        }
+    }
+
+    0
+}
+
+/// `setsockopt(fd, level, optname, optval, optlen)` — set options on sockets.
+pub fn sys_setsockopt(
+    fd: i32,
+    _level: i32,
+    _optname: i32,
+    _optval: *const u8,
+    _optlen: u32,
+) -> SyscallResult {
+    if proc_fd::current_task_get_file_desc(fd).is_none() {
+        return Errno::EBADF.into();
+    }
+    0
+}
+
+/// `getsockopt(fd, level, optname, optval, optlen)` — get options on sockets.
+pub fn sys_getsockopt(
+    fd: i32,
+    _level: i32,
+    optname: i32,
+    optval: *mut u8,
+    optlen: *mut u32,
+) -> SyscallResult {
+    if proc_fd::current_task_get_file_desc(fd).is_none() {
+        return Errno::EBADF.into();
+    }
+    if !optval.is_null() && !optlen.is_null() {
+        if crate::syscall::fs::validate_user_ptr_write(optlen as *mut u8, 4).is_ok() {
+            // SAFETY: optlen pointer validated above.
+            let max_len = unsafe { optlen.read() } as usize;
+            if max_len >= 4 && crate::syscall::fs::validate_user_ptr_write(optval, 4).is_ok() {
+                // Return 0 (no error) for SO_ERROR (optname 4)
+                if optname == 4 {
+                    // SAFETY: optval and optlen validated above.
+                    unsafe {
+                        (optval as *mut i32).write(0);
+                        optlen.write(4);
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+/// `socketpair(domain, type, protocol, sv)` — create a pair of connected sockets.
+pub fn sys_socketpair(domain: i32, sock_type: i32, _protocol: i32, sv: *mut i32) -> SyscallResult {
+    if sv.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if crate::syscall::fs::validate_user_ptr_write(sv as *mut u8, 8).is_err() {
+        return Errno::EFAULT.into();
+    }
+    // Support AF_UNIX / AF_LOCAL (1) and AF_INET (2)
+    if domain != 1 && domain != 2 {
+        return Errno::EINVAL.into();
+    }
+
+    let nonblock = (sock_type & 0x800) != 0;
+    let cloexec = (sock_type & 0x80000) != 0;
+
+    let mut open_flags = OpenFlags(OpenFlags::O_RDWR);
+    if nonblock {
+        open_flags.0 |= OpenFlags::O_NONBLOCK;
+    }
+    if cloexec {
+        open_flags.0 |= OpenFlags::O_CLOEXEC;
+    }
+
+    let (sock_a, sock_b) = crate::fs::pipe::make_socketpair(nonblock);
+
+    let fd0 = match proc_fd::current_task_alloc_fd_with_flags_and_path(
+        sock_a,
+        open_flags,
+        Some(alloc::string::String::from("socketpair:[0]")),
+    ) {
+        Some(fd) => fd,
+        None => return Errno::EMFILE.into(),
+    };
+
+    let fd1 = match proc_fd::current_task_alloc_fd_with_flags_and_path(
+        sock_b,
+        open_flags,
+        Some(alloc::string::String::from("socketpair:[1]")),
+    ) {
+        Some(fd) => fd,
+        None => {
+            proc_fd::current_task_close_fd(fd0);
+            return Errno::EMFILE.into();
+        }
+    };
+
+    // SAFETY: sv pointer was validated for write access above.
+    unsafe {
+        sv.write(fd0);
+        sv.add(1).write(fd1);
+    }
+
+    0
 }

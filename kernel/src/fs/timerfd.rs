@@ -71,10 +71,18 @@ impl InodeOps for TimerFd {
         }
 
         loop {
-            let mut num_exp = self.num_expirations.lock();
-            if *num_exp > 0 {
-                let val = *num_exp;
-                *num_exp = 0;
+            let val_opt = x86_64::instructions::interrupts::without_interrupts(|| {
+                let mut num_exp = self.num_expirations.lock();
+                if *num_exp > 0 {
+                    let val = *num_exp;
+                    *num_exp = 0;
+                    Some(val)
+                } else {
+                    None
+                }
+            });
+
+            if let Some(val) = val_opt {
                 buf[..8].copy_from_slice(&val.to_ne_bytes());
                 return Ok(8);
             }
@@ -83,7 +91,6 @@ impl InodeOps for TimerFd {
                 return Err(-11); // EAGAIN
             }
 
-            drop(num_exp);
             self.wait_queue.wait();
         }
     }
@@ -91,7 +98,10 @@ impl InodeOps for TimerFd {
     fn poll(&self, events: u32) -> u32 {
         let mut revents = 0;
         if (events & POLLIN) != 0 {
-            if *self.num_expirations.lock() > 0 {
+            let has_exp = x86_64::instructions::interrupts::without_interrupts(|| {
+                *self.num_expirations.lock() > 0
+            });
+            if has_exp {
                 revents |= POLLIN;
             }
         }
@@ -106,7 +116,9 @@ impl InodeOps for TimerFd {
 pub static ACTIVE_TIMERFDS: Mutex<Vec<alloc::sync::Weak<TimerFd>>> = Mutex::new(Vec::new());
 
 pub fn register_timerfd(weak: alloc::sync::Weak<TimerFd>) {
-    ACTIVE_TIMERFDS.lock().push(weak);
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        ACTIVE_TIMERFDS.lock().push(weak);
+    });
 }
 
 pub fn check_timers() {
@@ -221,22 +233,24 @@ pub fn sys_timerfd_settime(
 
     // Fill old_value if requested
     if !old_value.is_null() {
-        let current_ticks = crate::arch::x86_64::interrupts::timer_ticks();
-        let exp = *timerfd.expiration_ticks.lock();
-        let it_value = if let Some(ticks) = exp {
-            if ticks > current_ticks {
-                ticks_to_timespec(ticks - current_ticks)
+        let old_val = x86_64::instructions::interrupts::without_interrupts(|| {
+            let current_ticks = crate::arch::x86_64::interrupts::timer_ticks();
+            let exp = *timerfd.expiration_ticks.lock();
+            let it_value = if let Some(ticks) = exp {
+                if ticks > current_ticks {
+                    ticks_to_timespec(ticks - current_ticks)
+                } else {
+                    Timespec::default()
+                }
             } else {
                 Timespec::default()
+            };
+            let it_interval = ticks_to_timespec(*timerfd.interval_ticks.lock());
+            Itimerspec {
+                it_interval,
+                it_value,
             }
-        } else {
-            Timespec::default()
-        };
-        let it_interval = ticks_to_timespec(*timerfd.interval_ticks.lock());
-        let old_val = Itimerspec {
-            it_interval,
-            it_value,
-        };
+        });
         unsafe {
             core::ptr::write(old_value, old_val);
         }
@@ -247,23 +261,25 @@ pub fn sys_timerfd_settime(
     let val_ticks = timespec_to_ticks(new_val.it_value);
     let interval_ticks = timespec_to_ticks(new_val.it_interval);
 
-    let mut exp = timerfd.expiration_ticks.lock();
-    let mut interval = timerfd.interval_ticks.lock();
-    *timerfd.num_expirations.lock() = 0;
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut exp = timerfd.expiration_ticks.lock();
+        let mut interval = timerfd.interval_ticks.lock();
+        *timerfd.num_expirations.lock() = 0;
 
-    if val_ticks == 0 {
-        // Disarm timer
-        *exp = None;
-        *interval = 0;
-    } else {
-        // Arm timer
-        if is_absolute {
-            *exp = Some(val_ticks);
+        if val_ticks == 0 {
+            // Disarm timer
+            *exp = None;
+            *interval = 0;
         } else {
-            *exp = Some(crate::arch::x86_64::interrupts::timer_ticks() + val_ticks);
+            // Arm timer
+            if is_absolute {
+                *exp = Some(val_ticks);
+            } else {
+                *exp = Some(crate::arch::x86_64::interrupts::timer_ticks() + val_ticks);
+            }
+            *interval = interval_ticks;
         }
-        *interval = interval_ticks;
-    }
+    });
 
     0
 }

@@ -190,15 +190,6 @@ pub fn sys_close(fd: i32) -> SyscallResult {
         None
     };
 
-    let is_pipe = proc_fd::current_task_read_fd(fd)
-        .map(|i| i.inode().file_type == crate::fs::inode::FileType::Pipe)
-        .unwrap_or(false);
-    if is_pipe {
-        let pid_str = crate::process::scheduler::current_pid()
-            .map(|p| p.as_u64())
-            .unwrap_or(0);
-        crate::kprintln!("[syscall pid={}] sys_close on pipe fd {}", pid_str, fd);
-    }
     if proc_fd::current_task_close_fd(fd) {
         if let Some((pid, ino)) = lock_cleanup_info {
             crate::syscall::fs::io::release_fcntl_locks_for_pid_and_ino(pid, ino);

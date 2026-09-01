@@ -89,6 +89,7 @@ pub struct ExtFileSystem {
     pub(crate) superblock: TicketLock<Superblock>,
     pub(crate) group_descriptors: TicketLock<Vec<GroupDescriptor>>,
     pub(crate) root_node: TicketLock<Option<Arc<dyn InodeOps>>>,
+    pub(crate) self_weak: spin::Mutex<Option<::alloc::sync::Weak<ExtFileSystem>>>,
 }
 
 impl ExtFileSystem {
@@ -705,7 +706,10 @@ impl ExtFileSystem {
             superblock: TicketLock::new(sb),
             group_descriptors: TicketLock::new(gds),
             root_node: TicketLock::new(None),
+            self_weak: spin::Mutex::new(None),
         });
+
+        *fs.self_weak.lock() = Some(Arc::downgrade(&fs));
 
         // Parse JBD2 Journal if HAS_JOURNAL feature is set
         if (sb.s_feature_compat & 0x0004) != 0 {
@@ -934,6 +938,20 @@ impl InodeOps for ExtInode {
         Ok(())
     }
 
+    fn set_times(&self, atime: u64, mtime: u64) -> Result<(), i32> {
+        let mut vfs = self.vfs_inode.write();
+        let mut raw = self.raw.lock();
+        raw.i_atime = atime as u32;
+        raw.i_mtime = mtime as u32;
+        let now = crate::fs::vfs::current_time_sec();
+        raw.i_ctime = now;
+        vfs.atime = atime;
+        vfs.mtime = mtime;
+        vfs.ctime = now as u64;
+        self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?; // -EIO
+        Ok(())
+    }
+
     fn create(&self, name: &str, file_type: FileType) -> Option<Arc<dyn InodeOps>> {
         self.create_dir_entry(name, file_type)
     }
@@ -970,6 +988,31 @@ impl FileSystem for ExtFileSystem {
 
     fn name(&self) -> &str {
         "ext"
+    }
+
+    fn sync(&self) {
+        let self_arc = match self.self_weak.lock().as_ref().and_then(|w| w.upgrade()) {
+            Some(arc) => arc,
+            None => return,
+        };
+
+        let mut dirty_inodes = ::alloc::vec::Vec::new();
+        {
+            let cache = crate::memory::page_cache::PAGE_CACHE.lock();
+            for (key, entry) in cache.iter() {
+                if entry.dirty {
+                    dirty_inodes.push(key.0);
+                }
+            }
+        }
+        dirty_inodes.sort_unstable();
+        dirty_inodes.dedup();
+
+        for ino in dirty_inodes {
+            if let Ok(inode) = self_arc.get_inode(ino as u32) {
+                let _ = crate::memory::page_cache::flush_all_for_inode(&inode);
+            }
+        }
     }
 
     fn statfs(&self) -> FsStats {

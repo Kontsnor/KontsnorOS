@@ -18,57 +18,107 @@
 //! This module provides a global serial port interface for kernel logging.
 //! The serial port is the primary output channel during boot before any
 //! framebuffer or console is available.
-//!
-//! ## Usage
-//!
-//! Use the `kprint!` and `kprintln!` macros for kernel output:
-//!
-//! ```rust
-//! kprintln!("Hello from KontsnorOS!");
-//! kprintln!("[boot] Memory initialized: {} KiB free", free_kb);
-//! ```
 
+use core::cell::UnsafeCell;
+use core::fmt::Write;
+use core::sync::atomic::{AtomicU32, Ordering};
 use lazy_static::lazy_static;
-use spin::Mutex;
 use uart_16550::SerialPort;
 
 /// Standard COM1 I/O port address.
 const COM1_PORT: u16 = 0x3F8;
 
-lazy_static! {
-    /// Global serial port instance, protected by a spinlock.
+/// A re-entrant, interrupt-safe spinlock protecting the serial port.
+pub struct ReentrantSerialLock {
+    holding_cpu: AtomicU32,
+    recursion: AtomicU32,
+    port: UnsafeCell<SerialPort>,
+}
+
+unsafe impl Send for ReentrantSerialLock {}
+unsafe impl Sync for ReentrantSerialLock {}
+
+impl ReentrantSerialLock {
+    pub const fn new(port: SerialPort) -> Self {
+        Self {
+            holding_cpu: AtomicU32::new(0xFFFF_FFFF),
+            recursion: AtomicU32::new(0),
+            port: UnsafeCell::new(port),
+        }
+    }
+
+    /// Execute a closure with exclusive access to the serial port.
     ///
-    /// The serial port is initialized once during early boot and then
-    /// used by the `kprint!`/`kprintln!` macros throughout the kernel.
-    pub static ref SERIAL1: Mutex<SerialPort> = {
-        // SAFETY: COM1 port address 0x3F8 is the standard x86 serial port.
-        // We are the only code accessing this port during initialization.
+    /// Supports re-entrant acquisition from the same CPU core (e.g. within
+    /// page fault handlers or exception dumps) without deadlocking.
+    pub fn with_lock<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut SerialPort) -> R,
+    {
+        let interrupts_enabled = x86_64::instructions::interrupts::are_enabled();
+        if interrupts_enabled {
+            x86_64::instructions::interrupts::disable();
+        }
+
+        let cpu_id = crate::arch::x86_64::smp::current_lapic_id() as u32;
+
+        // Check for recursive re-entrancy on the same CPU core
+        if self.holding_cpu.load(Ordering::Relaxed) == cpu_id {
+            self.recursion.fetch_add(1, Ordering::Relaxed);
+            let port = unsafe { &mut *self.port.get() };
+            let res = f(port);
+            self.recursion.fetch_sub(1, Ordering::Relaxed);
+            if interrupts_enabled {
+                x86_64::instructions::interrupts::enable();
+            }
+            return res;
+        }
+
+        // Spin until we acquire the lock
+        while self
+            .holding_cpu
+            .compare_exchange_weak(0xFFFF_FFFF, cpu_id, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            if crate::arch::x86_64::smp::has_pending_tlb_shootdown() {
+                x86_64::instructions::tlb::flush_all();
+                crate::arch::x86_64::smp::tlb_shootdown_ack();
+            }
+            core::hint::spin_loop();
+        }
+
+        self.recursion.store(1, Ordering::Relaxed);
+        let port = unsafe { &mut *self.port.get() };
+        let res = f(port);
+        self.recursion.store(0, Ordering::Relaxed);
+        self.holding_cpu.store(0xFFFF_FFFF, Ordering::Release);
+
+        if interrupts_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+        res
+    }
+}
+
+lazy_static! {
+    /// Global serial port instance, protected by a re-entrant spinlock.
+    pub static ref SERIAL1: ReentrantSerialLock = {
         let mut serial_port = unsafe { SerialPort::new(COM1_PORT) };
         serial_port.init();
-        Mutex::new(serial_port)
+        ReentrantSerialLock::new(serial_port)
     };
 }
 
 /// Initialize the serial port for early output.
-///
-/// This must be called before any use of `kprint!` or `kprintln!`.
-/// The lazy_static initialization happens on first access, but calling
-/// this function explicitly ensures it happens at the right time.
 pub fn init() {
-    // Force lazy_static initialization by accessing the serial port
-    let _ = SERIAL1.lock();
+    SERIAL1.with_lock(|_| {});
 }
 
 /// Try to read one byte from the serial receive buffer (non-blocking).
-///
-/// Returns `Some(byte)` if the UART has data ready, `None` if the receive buffer
-/// is empty. Used by `/dev/stdin` so user-space reads work in QEMU `-serial stdio`.
 pub fn try_read_byte() -> Option<u8> {
     use x86_64::instructions::port::Port;
-    // Line Status Register (LSR) is at base + 5. Bit 0 = Data Ready.
     let mut lsr: Port<u8> = Port::new(COM1_PORT + 5);
     let mut data: Port<u8> = Port::new(COM1_PORT);
-    // SAFETY: accessing standard COM1 I/O ports.
     let status = unsafe { lsr.read() };
     if status & 0x01 != 0 {
         Some(unsafe { data.read() })
@@ -77,48 +127,38 @@ pub fn try_read_byte() -> Option<u8> {
     }
 }
 
-///
-/// Used by TTY devices to output user-space write() data to the console.
+/// Output a single byte to serial and graphics console.
 pub fn write_byte(byte: u8) {
-    use core::fmt::Write;
-    use x86_64::instructions::interrupts;
-    interrupts::without_interrupts(|| {
-        let _ = SERIAL1.lock().write_fmt(format_args!("{}", byte as char));
-        if !crate::drivers::gpu::bochs::DISABLE_CONSOLE_MIRROR
-            .load(core::sync::atomic::Ordering::Relaxed)
-        {
-            if let Some(ref mut console) = *crate::drivers::gpu::bochs::GRAPHICS_CONSOLE.lock() {
-                console.write_char(byte);
-                if byte == b'\n' {
-                    console.gpu.blit();
-                }
+    SERIAL1.with_lock(|port| {
+        let _ = port.write_fmt(format_args!("{}", byte as char));
+    });
+
+    if !crate::drivers::gpu::bochs::DISABLE_CONSOLE_MIRROR
+        .load(core::sync::atomic::Ordering::Relaxed)
+    {
+        if let Some(ref mut console) = *crate::drivers::gpu::bochs::GRAPHICS_CONSOLE.lock() {
+            console.write_char(byte);
+            if byte == b'\n' {
+                console.gpu.blit();
             }
         }
-    });
+    }
 }
 
-/// Internal print function — writes to the serial port.
+/// Internal print function — writes to the serial port and mirrors to graphics console.
 #[doc(hidden)]
 pub fn _print(args: ::core::fmt::Arguments) {
-    use core::fmt::Write;
-    use x86_64::instructions::interrupts;
-
-    // Disable interrupts while writing to prevent deadlock
-    // (an interrupt handler might try to print while we hold the lock)
-    interrupts::without_interrupts(|| {
-        SERIAL1
-            .lock()
-            .write_fmt(args)
-            .expect("Printing to serial failed");
-
-        if !crate::drivers::gpu::bochs::DISABLE_CONSOLE_MIRROR
-            .load(core::sync::atomic::Ordering::Relaxed)
-        {
-            if let Some(ref mut console) = *crate::drivers::gpu::bochs::GRAPHICS_CONSOLE.lock() {
-                let _ = console.write_fmt(args);
-            }
-        }
+    SERIAL1.with_lock(|port| {
+        port.write_fmt(args).expect("Printing to serial failed");
     });
+
+    if !crate::drivers::gpu::bochs::DISABLE_CONSOLE_MIRROR
+        .load(core::sync::atomic::Ordering::Relaxed)
+    {
+        if let Some(ref mut console) = *crate::drivers::gpu::bochs::GRAPHICS_CONSOLE.lock() {
+            let _ = console.write_fmt(args);
+        }
+    }
 }
 
 /// Print to the kernel serial console.

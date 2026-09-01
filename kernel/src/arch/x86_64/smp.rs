@@ -254,10 +254,11 @@ pub fn current_lapic_id() -> u8 {
 pub fn shootdown_tlb() {
     let mut target_count = 0;
     {
+        let current_id = current_lapic_id();
         let manager = CPU_MANAGER.lock();
         for i in 0..manager.count {
             if let Some(ref cpu) = manager.cpus[i] {
-                if cpu.started && !cpu.is_bsp {
+                if cpu.started && cpu.apic_id != current_id {
                     target_count += 1;
                 }
             }
@@ -276,16 +277,37 @@ pub fn shootdown_tlb() {
 
         super::apic::broadcast_ipi_all_excluding_self(36);
 
-        // Spin-wait until all other cores have acknowledged the TLB flush
-        while TLB_SHOOTDOWN_ACKS.load(Ordering::SeqCst) > 0 {
+        // Spin-wait with bounded timeout until all other cores have acknowledged the TLB flush.
+        // Cores spinning in kernel space with interrupts disabled also poll and acknowledge
+        // pending shootdowns during their spin loops.
+        let mut spins = 0u32;
+        while TLB_SHOOTDOWN_ACKS.load(Ordering::SeqCst) > 0 && spins < 200_000 {
             core::hint::spin_loop();
+            spins += 1;
         }
     }
 }
 
-/// Acknowledge a pending TLB shootdown. Called by the IPI handler.
+/// Query whether there is currently an active TLB shootdown waiting for acknowledgements.
+#[inline]
+pub fn has_pending_tlb_shootdown() -> bool {
+    TLB_SHOOTDOWN_ACKS.load(Ordering::Relaxed) > 0
+}
+
+/// Acknowledge a pending TLB shootdown. Called by the IPI handler or spinlock polling.
 pub fn tlb_shootdown_ack() {
-    TLB_SHOOTDOWN_ACKS.fetch_sub(1, Ordering::SeqCst);
+    let mut current = TLB_SHOOTDOWN_ACKS.load(Ordering::Relaxed);
+    while current > 0 {
+        match TLB_SHOOTDOWN_ACKS.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(val) => current = val,
+        }
+    }
 }
 
 /// Start the secondary CPU cores (APs) using the APIC INIT-SIPI-SIPI protocol.
@@ -380,21 +402,20 @@ pub fn start_aps() {
             ap_idle_task.kernel_stack_size = stack_size;
             ap_idle_task.priority = crate::process::task::Priority::Idle;
             ap_idle_task.state = crate::process::task::TaskState::Running;
+            ap_idle_task.is_idle = true;
 
-            // 5. Register in TASKS
-            let task_arc = alloc::sync::Arc::new(spin::Mutex::new(ap_idle_task));
-            let idx = ap_idle_pid.as_u64() as usize;
-            {
-                let mut tasks = crate::process::scheduler::TASKS.write();
-                while tasks.len() <= idx {
-                    tasks.push(None);
-                }
-                tasks[idx] = Some(task_arc);
-            }
-
-            // 6. Update scheduler current_cpus and idle_cpus
+            // 5. Register in SCHEDULER and TASKS
             {
                 let mut sched = crate::process::scheduler::SCHEDULER.lock();
+                let task_arc = alloc::sync::Arc::new(spin::Mutex::new(ap_idle_task));
+                let idx = ap_idle_pid.as_u64() as usize;
+                {
+                    let mut tasks = crate::process::scheduler::TASKS.write();
+                    while tasks.len() <= idx {
+                        tasks.push(None);
+                    }
+                    tasks[idx] = Some(task_arc);
+                }
                 if let Some(ref mut s) = *sched {
                     s.current_cpus[apic_id as usize] = Some(ap_idle_pid);
                     s.idle_cpus[apic_id as usize] = ap_idle_pid;

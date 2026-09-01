@@ -524,7 +524,7 @@ pub static GRAPHICS_CONSOLE: Mutex<Option<GraphicsConsole>> = Mutex::new(None);
 
 /// Global flag to disable mirroring standard kprint/serial outputs to the graphics console.
 pub static DISABLE_CONSOLE_MIRROR: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+    core::sync::atomic::AtomicBool::new(true);
 
 /// Probes the PCI bus for Bochs graphics adapter, switches video modes,
 /// renders boot splash, and registers the GPU driver.

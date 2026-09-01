@@ -16,8 +16,8 @@
 //! Reader-writer lock.
 //!
 //! Allows multiple concurrent readers OR a single exclusive writer.
-//! This is useful for data structures that are read frequently but
-//! written infrequently (e.g., the mount table, driver registry).
+//! Disables interrupts while held and cooperatively services TLB shootdowns
+//! during spin waits to prevent SMP deadlocks.
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
@@ -50,6 +50,11 @@ impl<T> KRwLock<T> {
 
     /// Acquire a read lock.
     pub fn read(&self) -> KRwLockReadGuard<'_, T> {
+        let interrupts_enabled = x86_64::instructions::interrupts::are_enabled();
+        if interrupts_enabled {
+            x86_64::instructions::interrupts::disable();
+        }
+
         loop {
             let state = self.state.load(Ordering::Relaxed);
             if state >= 0 {
@@ -58,8 +63,15 @@ impl<T> KRwLock<T> {
                     .compare_exchange_weak(state, state + 1, Ordering::Acquire, Ordering::Relaxed)
                     .is_ok()
                 {
-                    return KRwLockReadGuard { lock: self };
+                    return KRwLockReadGuard {
+                        lock: self,
+                        interrupts_enabled,
+                    };
                 }
+            }
+            if crate::arch::x86_64::smp::has_pending_tlb_shootdown() {
+                x86_64::instructions::tlb::flush_all();
+                crate::arch::x86_64::smp::tlb_shootdown_ack();
             }
             core::hint::spin_loop();
         }
@@ -67,21 +79,34 @@ impl<T> KRwLock<T> {
 
     /// Acquire a write lock.
     pub fn write(&self) -> KRwLockWriteGuard<'_, T> {
+        let interrupts_enabled = x86_64::instructions::interrupts::are_enabled();
+        if interrupts_enabled {
+            x86_64::instructions::interrupts::disable();
+        }
+
         while self
             .state
             .compare_exchange_weak(0, -1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
+            if crate::arch::x86_64::smp::has_pending_tlb_shootdown() {
+                x86_64::instructions::tlb::flush_all();
+                crate::arch::x86_64::smp::tlb_shootdown_ack();
+            }
             core::hint::spin_loop();
         }
 
-        KRwLockWriteGuard { lock: self }
+        KRwLockWriteGuard {
+            lock: self,
+            interrupts_enabled,
+        }
     }
 }
 
 /// RAII guard for a read lock.
 pub struct KRwLockReadGuard<'a, T> {
     lock: &'a KRwLock<T>,
+    interrupts_enabled: bool,
 }
 
 impl<T> Deref for KRwLockReadGuard<'_, T> {
@@ -94,12 +119,16 @@ impl<T> Deref for KRwLockReadGuard<'_, T> {
 impl<T> Drop for KRwLockReadGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.state.fetch_sub(1, Ordering::Release);
+        if self.interrupts_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
     }
 }
 
 /// RAII guard for a write lock.
 pub struct KRwLockWriteGuard<'a, T> {
     lock: &'a KRwLock<T>,
+    interrupts_enabled: bool,
 }
 
 impl<T> Deref for KRwLockWriteGuard<'_, T> {
@@ -118,5 +147,8 @@ impl<T> DerefMut for KRwLockWriteGuard<'_, T> {
 impl<T> Drop for KRwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.state.store(0, Ordering::Release);
+        if self.interrupts_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
     }
 }

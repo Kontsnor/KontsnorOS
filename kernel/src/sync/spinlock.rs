@@ -64,6 +64,11 @@ impl<T> TicketLock<T> {
         )
     }
 
+    /// Retrieve the CPU ID currently holding the lock.
+    pub fn holding_cpu_id(&self) -> u32 {
+        self.holding_cpu.load(Ordering::Relaxed)
+    }
+
     /// Acquire the lock, returning a guard that releases it on drop.
     ///
     /// This will busy-wait until the lock is available. Interrupts
@@ -82,21 +87,26 @@ impl<T> TicketLock<T> {
 
         // Assert that the current CPU core doesn't already hold the lock (prevent recursive deadlocks)
         assert!(
-            self.holding_cpu.load(Ordering::Relaxed) != apic_id,
-            "Deadlock: TicketLock recursive re-entrancy detected on CPU {}!",
+            self.holding_cpu.load(Ordering::SeqCst) != apic_id,
+            "Deadlock: TicketLock at {:p} recursive re-entrancy detected on CPU {}!",
+            self,
             apic_id
         );
 
         // Take a ticket
-        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        let ticket = self.next_ticket.fetch_add(1, Ordering::SeqCst);
 
         // Wait until our ticket is served
-        while self.now_serving.load(Ordering::Acquire) != ticket {
+        while self.now_serving.load(Ordering::SeqCst) != ticket {
+            if crate::arch::x86_64::smp::has_pending_tlb_shootdown() {
+                x86_64::instructions::tlb::flush_all();
+                crate::arch::x86_64::smp::tlb_shootdown_ack();
+            }
             core::hint::spin_loop();
         }
 
         // Mark the lock as held by this CPU core
-        self.holding_cpu.store(apic_id, Ordering::Release);
+        self.holding_cpu.store(apic_id, Ordering::SeqCst);
 
         TicketLockGuard {
             lock: self,
@@ -114,24 +124,24 @@ impl<T> TicketLock<T> {
         let apic_id = crate::arch::x86_64::smp::current_lapic_id() as u32;
 
         // If we already hold the lock, fail try_lock to avoid deadlock
-        if self.holding_cpu.load(Ordering::Relaxed) == apic_id {
+        if self.holding_cpu.load(Ordering::SeqCst) == apic_id {
             if interrupts_enabled {
                 x86_64::instructions::interrupts::enable();
             }
             return None;
         }
 
-        let current = self.now_serving.load(Ordering::Relaxed);
+        let current = self.now_serving.load(Ordering::SeqCst);
         let result = self.next_ticket.compare_exchange(
             current,
             current + 1,
-            Ordering::Acquire,
+            Ordering::SeqCst,
             Ordering::Relaxed,
         );
 
         match result {
             Ok(_) => {
-                self.holding_cpu.store(apic_id, Ordering::Release);
+                self.holding_cpu.store(apic_id, Ordering::SeqCst);
                 Some(TicketLockGuard {
                     lock: self,
                     interrupts_enabled,
@@ -144,6 +154,24 @@ impl<T> TicketLock<T> {
                 None
             }
         }
+    }
+
+    /// Force unlock the ticket lock without an RAII guard.
+    ///
+    /// # Safety
+    /// This is unsafe because it bypasses normal RAII lock guard guarantees.
+    pub unsafe fn force_unlock(&self) {
+        self.holding_cpu.store(0xFFFFFFFF, Ordering::SeqCst);
+        self.now_serving.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Get a mutable reference to the underlying data without locking.
+    ///
+    /// # Safety
+    /// This is unsafe because it bypasses lock guarantees. The caller must ensure
+    /// that no other CPU core is concurrently accessing the data.
+    pub unsafe fn get_mut_unchecked(&self) -> &mut T {
+        unsafe { &mut *self.data.get() }
     }
 }
 
@@ -172,10 +200,10 @@ impl<T> DerefMut for TicketLockGuard<'_, T> {
 impl<T> Drop for TicketLockGuard<'_, T> {
     fn drop(&mut self) {
         // Reset holding CPU
-        self.lock.holding_cpu.store(0xFFFFFFFF, Ordering::Release);
+        self.lock.holding_cpu.store(0xFFFFFFFF, Ordering::SeqCst);
 
         // Advance to the next ticket
-        self.lock.now_serving.fetch_add(1, Ordering::Release);
+        self.lock.now_serving.fetch_add(1, Ordering::SeqCst);
 
         // Restore the original interrupt state
         if self.interrupts_enabled {

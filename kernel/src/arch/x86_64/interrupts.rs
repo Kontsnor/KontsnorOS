@@ -186,8 +186,8 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     error_code: u64,
 ) {
     let active_gs = unsafe { x86_64::registers::model_specific::Msr::new(0xC0000101).read() };
-    let swap_needed = (stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3)
-        || (active_gs < 0xFFFF800000000000);
+    let is_user = stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3;
+    let swap_needed = is_user || (active_gs < 0xFFFF800000000000);
     if swap_needed {
         // SAFETY: Swap to kernel GS base if entering from user space or if user GS is active
         unsafe {
@@ -198,8 +198,25 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     kprintln!("[EXCEPTION] General Protection Fault");
     kprintln!("  Error Code: {:#x}", error_code);
     kprintln!("{:#?}", stack_frame);
+
+    if is_user {
+        kprintln!(
+            "[gpf] Process PID {:?} caused GPF at RIP={:#x} (error_code={:#x}) — terminating",
+            crate::process::scheduler::current_pid(),
+            stack_frame.instruction_pointer.as_u64(),
+            error_code,
+        );
+        // Terminate the faulting process group with SIGSEGV exit code (139)
+        // rather than crashing the entire kernel.
+        let _ = crate::syscall::process::sys_exit_group(139);
+        // sys_exit_group does not return; but if somehow we continue, halt.
+        loop {
+            x86_64::instructions::hlt();
+        }
+    }
+
     panic!(
-        "Unhandled general protection fault (error code: {:#x})",
+        "Unhandled kernel general protection fault (error code: {:#x})",
         error_code
     );
 }
@@ -427,20 +444,13 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                 crate::process::scheduler::get_task_arc(pid)
             })
             .and_then(|task_arc| {
-                kprintln!("[debug pf] task_arc found");
                 let fault_vaddr = fault_addr.as_u64();
-                kprintln!("[debug pf] locking task");
-                let task_guard = if !is_user {
-                    task_arc.try_lock()
-                } else {
-                    Some(task_arc.lock())
+                let address_space_arc = {
+                    let task = task_arc.lock();
+                    task.address_space.clone()
                 };
-                kprintln!("[debug pf] task locked");
                 let (region, page_table_root) = {
-                    let task = task_guard?;
-                    kprintln!("[debug pf] locking addr_space");
-                    let addr_space = task.address_space.lock();
-                    kprintln!("[debug pf] addr_space locked");
+                    let addr_space = address_space_arc.lock();
 
                     // Find if fault_vaddr falls inside any mapped region
                     let region_opt = addr_space
@@ -452,10 +462,6 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                         })
                         .cloned();
                     let pt_root = addr_space.page_table_root;
-                    kprintln!(
-                        "[debug pf] region search done: found={}",
-                        region_opt.is_some()
-                    );
                     region_opt.map(|r| (r, pt_root))
                 }?;
 
@@ -567,6 +573,17 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                             crate::memory::physical::deallocate_frame(phys);
                         }
                         return Some(Err((-12, page_vaddr)));
+                    }
+
+                    let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
+                    let active_cr3 = cr3_frame.start_address().as_u64();
+                    if active_cr3 != page_table_root && active_cr3 != 0 {
+                        let _ = crate::memory::r#virtual::map_user_page_no_shootdown(
+                            active_cr3,
+                            page,
+                            frame,
+                            actual_flags,
+                        );
                     }
                 }
 

@@ -16,7 +16,7 @@
 //! Thread-safe Least Recently Used (LRU) block buffer cache for KontsnorOS.
 
 use crate::drivers::traits::{BlockDevice, DriverError, DriverInfo};
-use crate::sync::spinlock::TicketLock;
+use crate::sync::mutex::KMutex;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -67,7 +67,7 @@ struct BlockCacheInner {
 /// A wrapper block device driver that caches reads and writes to an underlying block device.
 pub struct BlockCache {
     device: Arc<dyn BlockDevice>,
-    inner: TicketLock<BlockCacheInner>,
+    inner: KMutex<BlockCacheInner>,
     max_blocks: usize,
 }
 
@@ -76,7 +76,7 @@ impl BlockCache {
     pub fn new(device: Arc<dyn BlockDevice>, max_blocks: usize) -> Self {
         Self {
             device,
-            inner: TicketLock::new(BlockCacheInner {
+            inner: KMutex::new(BlockCacheInner {
                 entries: BTreeMap::new(),
                 counter: 0,
             }),

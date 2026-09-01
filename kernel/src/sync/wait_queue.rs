@@ -68,11 +68,33 @@ impl WaitQueue {
     /// Wake up all tasks currently sleeping on this wait queue.
     pub fn wake_all(&self) {
         x86_64::instructions::interrupts::without_interrupts(|| {
-            let mut sched_lock = scheduler::SCHEDULER.lock();
-            if let Some(ref mut sched) = *sched_lock {
-                let mut pids = self.pids.lock();
-                while let Some(pid) = pids.pop_front() {
-                    sched.wake_task(pid);
+            if let Some(mut sched_lock) = scheduler::SCHEDULER.try_lock() {
+                if let Some(ref mut sched) = *sched_lock {
+                    let mut pids = self.pids.lock();
+                    while let Some(pid) = pids.pop_front() {
+                        sched.wake_task(pid);
+                    }
+                }
+            } else {
+                let apic_id = crate::arch::x86_64::smp::current_lapic_id() as u32;
+                if scheduler::SCHEDULER.holding_cpu_id() == apic_id {
+                    // SAFETY: The current CPU already holds SCHEDULER exclusively
+                    unsafe {
+                        if let Some(ref mut sched) = *scheduler::SCHEDULER.get_mut_unchecked() {
+                            let mut pids = self.pids.lock();
+                            while let Some(pid) = pids.pop_front() {
+                                sched.wake_task(pid);
+                            }
+                        }
+                    }
+                } else {
+                    let mut sched_lock = scheduler::SCHEDULER.lock();
+                    if let Some(ref mut sched) = *sched_lock {
+                        let mut pids = self.pids.lock();
+                        while let Some(pid) = pids.pop_front() {
+                            sched.wake_task(pid);
+                        }
+                    }
                 }
             }
         });
@@ -86,5 +108,16 @@ impl WaitQueue {
         while let Some(pid) = pids.pop_front() {
             sched.wake_task(pid);
         }
+    }
+
+    /// Register a task on this wait queue without locking the scheduler.
+    pub fn register(&self, pid: Pid) {
+        self.pids.lock().push_back(pid);
+    }
+
+    /// Remove a task from this wait queue.
+    pub fn remove(&self, pid: Pid) {
+        let mut pids = self.pids.lock();
+        pids.retain(|&x| x != pid);
     }
 }

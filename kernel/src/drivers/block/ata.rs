@@ -17,7 +17,7 @@
 
 use crate::drivers::traits::{BlockDevice, DriverError, DriverInfo};
 use crate::kprintln;
-use crate::sync::spinlock::TicketLock;
+use crate::sync::mutex::KMutex;
 use alloc::string::String;
 use alloc::sync::Arc;
 use x86_64::instructions::port::Port;
@@ -42,7 +42,7 @@ unsafe impl Sync for AtaDriveInner {}
 /// ATA Primary Slave drive implementation.
 pub struct AtaDrive {
     info: DriverInfo,
-    inner: TicketLock<AtaDriveInner>,
+    inner: KMutex<AtaDriveInner>,
 }
 
 // SAFETY: AtaDrive implements safe multithreaded serialization.
@@ -516,7 +516,7 @@ pub fn init_ata_drive() -> Option<Arc<dyn BlockDevice>> {
         crate::drivers::register_driver(info.clone());
         Some(Arc::new(AtaDrive {
             info,
-            inner: TicketLock::new(AtaDriveInner {
+            inner: KMutex::new(AtaDriveInner {
                 dma_base,
                 prdt_phys,
                 prdt_virt,

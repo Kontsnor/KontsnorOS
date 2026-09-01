@@ -526,37 +526,7 @@ pub fn sys_execve(
     let stack_size: u64 = 8 * 1024 * 1024; // 8 MiB stack size
     let stack_bottom = crate::process::elf::USER_STACK_TOP - stack_size;
 
-    // Allocate and map ONLY the top page of the stack physically (for construct_user_stack)
-    let highest_stack_phys = match crate::memory::physical::allocate_frame() {
-        Some(p) => p,
-        None => return Errno::ENOMEM.into(),
-    };
-
-    let top_page = Page::<Size4KiB>::containing_address(VirtAddr::new(
-        crate::process::elf::USER_STACK_TOP - 4096,
-    ));
-    let frame = PhysFrame::containing_address(PhysAddr::new(highest_stack_phys));
-    let flags = PageTableFlags::PRESENT
-        | PageTableFlags::WRITABLE
-        | PageTableFlags::USER_ACCESSIBLE
-        | PageTableFlags::NO_EXECUTE;
-
-    // SAFETY: The page table root points to a valid PML4 page table structure and frame/page parameters are valid.
-    unsafe {
-        if crate::memory::r#virtual::map_user_page_no_shootdown(
-            new_page_table,
-            top_page,
-            frame,
-            flags,
-        )
-        .is_err()
-        {
-            crate::memory::physical::deallocate_frame(highest_stack_phys);
-            return Errno::ENOMEM.into();
-        }
-    }
-
-    // Register stack in mmap_regions
+    // Register full stack in mmap_regions for demand paging
     exec_mmap_regions.push(crate::process::task::MappedRegion {
         start: stack_bottom,
         len: stack_size as usize,
@@ -567,20 +537,60 @@ pub fn sys_execve(
         pathname: Some(alloc::string::String::from("[stack]")),
     });
 
-    // Construct System V ABI compliant stack
-    let user_sp = match crate::process::elf::construct_user_stack(
+    // Construct System V ABI compliant stack with multi-page support
+    let init_stack = match crate::process::elf::construct_user_stack(
         &argv,
         &envp,
-        highest_stack_phys,
         elf_info.entry_point,
         elf_info.phdr,
         elf_info.phnum,
         elf_info.phent,
         interpreter_base,
     ) {
-        Ok(sp) => sp,
+        Ok(stack) => stack,
         Err(e) => return e.into(),
     };
+
+    let user_sp = init_stack.user_sp;
+
+    // Allocate and map all physical pages containing initial stack data
+    let num_pages = init_stack.stack_buf.len() / 4096;
+    for i in 0..num_pages {
+        let page_vaddr = init_stack.base_vaddr + (i as u64 * 4096);
+        let phys = match crate::memory::physical::allocate_frame() {
+            Some(p) => p,
+            None => return Errno::ENOMEM.into(),
+        };
+
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(page_vaddr));
+        let frame = PhysFrame::containing_address(PhysAddr::new(phys));
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+
+        // SAFETY: The page table root points to a valid PML4 page table structure and frame/page parameters are valid.
+        unsafe {
+            if crate::memory::r#virtual::map_user_page_no_shootdown(
+                new_page_table,
+                page,
+                frame,
+                flags,
+            )
+            .is_err()
+            {
+                crate::memory::physical::deallocate_frame(phys);
+                return Errno::ENOMEM.into();
+            }
+
+            let dest = (phys + crate::memory::r#virtual::phys_mem_offset()) as *mut u8;
+            core::ptr::copy_nonoverlapping(
+                init_stack.stack_buf[i * 4096..(i + 1) * 4096].as_ptr(),
+                dest,
+                4096,
+            );
+        }
+    }
 
     // Reset signal state and update page table root for execve
     let _old_page_table = {
@@ -589,36 +599,22 @@ pub fn sys_execve(
             None => return Errno::ESRCH.into(),
         };
         if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
-            let mut task = task_arc.lock();
-            let tgid = task.tgid;
+            let tgid = task_arc.lock().tgid;
 
-            // Terminate other threads in the same thread group (polite try-lock loop)
+            // Terminate other threads in the same thread group
             let mut other_pids = alloc::vec::Vec::new();
-            let mut success = false;
-            while !success {
-                success = true;
-                other_pids.clear();
+            {
                 let tasks = scheduler::TASKS.read();
                 for slot in tasks.iter() {
                     if let Some(other_arc) = slot {
                         if Arc::ptr_eq(other_arc, &task_arc) {
                             continue;
                         }
-                        if let Some(other) = other_arc.try_lock() {
-                            if other.tgid == tgid {
-                                other_pids.push(other.pid);
-                            }
-                        } else {
-                            success = false;
-                            break;
+                        let other = other_arc.lock();
+                        if other.tgid == tgid {
+                            other_pids.push(other.pid);
                         }
                     }
-                }
-                if !success {
-                    // Release task lock and retry to avoid deadlock
-                    drop(task);
-                    core::hint::spin_loop();
-                    task = task_arc.lock();
                 }
             }
 
@@ -626,14 +622,40 @@ pub fn sys_execve(
                 let fds = x86_64::instructions::interrupts::without_interrupts(|| {
                     let mut collected = alloc::vec::Vec::new();
                     if let Some(ref mut sched) = *scheduler::SCHEDULER.lock() {
-                        for pid in other_pids {
-                            collected.push(sched.exit_task(pid, 0));
+                        for pid in &other_pids {
+                            collected.push(sched.exit_task(*pid, 0));
                         }
                     }
                     collected
                 });
                 drop(fds);
+
+                // Wait for other cores to context-switch away from the terminated threads
+                let mut waiting = true;
+                while waiting {
+                    waiting = false;
+                    x86_64::instructions::interrupts::without_interrupts(|| {
+                        if let Some(ref sched) = *scheduler::SCHEDULER.lock() {
+                            for &pid in &other_pids {
+                                for cpu_pid in &sched.current_cpus {
+                                    if *cpu_pid == Some(pid) {
+                                        waiting = true;
+                                        break;
+                                    }
+                                }
+                                if waiting {
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                    if waiting {
+                        core::hint::spin_loop();
+                    }
+                }
             }
+
+            let mut task = task_arc.lock();
 
             // Set-UID and Set-GID executable support
             let exec_mode = inode.inode().permissions.mode;
@@ -662,6 +684,23 @@ pub fn sys_execve(
                     crate::syscall::CPU_SCRATCHES[apic_id].signals_pending = 0;
                 }
             }
+            // Unshare fd_table if it was shared with threads across CLONE_FILES
+            if Arc::strong_count(&task.fd_table) > 1 {
+                let current_table = task.fd_table.lock();
+                let new_entries = current_table.entries.clone();
+                let new_cloexec = current_table.cloexec.clone();
+                for slot in &new_entries {
+                    if let Some(ref file_desc) = slot {
+                        *file_desc.ref_count.lock() += 1;
+                    }
+                }
+                drop(current_table);
+                task.fd_table = Arc::new(spin::Mutex::new(crate::process::task::FdTable {
+                    entries: new_entries,
+                    cloexec: new_cloexec,
+                }));
+            }
+
             // Close O_CLOEXEC file descriptors
             let mut fd_table = task.fd_table.lock();
             for i in 0..fd_table.entries.len() {
@@ -778,8 +817,22 @@ pub fn sys_exit_group(status: i32) -> SyscallResult {
     let mut all_fds = alloc::vec::Vec::new();
     if let Some(ref mut sched) = *scheduler::SCHEDULER.lock() {
         for pid in other_pids {
+            // Drain futex registrations for this thread before marking it Zombie
+            crate::syscall::process::futex::futex_drain_pid_locked(pid, sched);
+
+            // Fire clear_child_tid for forcibly-killed threads
+            if let Some(task_arc) = scheduler::get_task_arc(pid) {
+                let ctid = task_arc.lock().clear_child_tid;
+                if let Some(uaddr) = ctid {
+                    crate::syscall::process::futex::clear_child_tid_wake_locked(uaddr, sched);
+                }
+            }
+
             all_fds.push(sched.exit_task(pid, status));
         }
+
+        // Drain own futex registrations
+        crate::syscall::process::futex::futex_drain_pid_locked(current_pid, sched);
         all_fds.push(sched.exit_task(current_pid, status));
     }
     drop(all_fds);
@@ -789,6 +842,12 @@ pub fn sys_exit_group(status: i32) -> SyscallResult {
     loop {
         x86_64::instructions::hlt();
     }
+}
+
+/// `sched_yield()` — Yield the processor.
+pub fn sys_sched_yield() -> SyscallResult {
+    crate::process::scheduler::yield_now();
+    0
 }
 
 /// `wait4(pid, wstatus, options, rusage)` — Wait for a child process.
@@ -811,6 +870,10 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
     // kprintln!("[syscall] wait4(pid={})", pid);
 
     loop {
+        // Disable interrupts and lock SCHEDULER
+        x86_64::instructions::interrupts::disable();
+        let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
+
         // Scan for a zombie child
         let result = {
             let tasks = scheduler::TASKS.read();
@@ -821,7 +884,11 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
                     let task = task_arc.lock();
                     let is_child = task.parent_pid == current_pid;
                     let matches_pid = pid == -1 || task.pid.as_u64() as i32 == pid;
-                    if is_child && matches_pid {
+                    // CLONE_THREAD tasks (threads, not process leaders) are never
+                    // wait4-able from an external process.  They are reaped by
+                    // the thread-group leader via pthread_join / futex, not wait4.
+                    let is_process_leader = task.tgid == task.pid;
+                    if is_child && matches_pid && is_process_leader {
                         has_children = true;
                         if task.state == TaskState::Zombie {
                             let (total_f, alloc_f, free_f) = crate::memory::physical::stats();
@@ -841,23 +908,15 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
             drop(tasks);
 
             if let Some((child_pid, exit_code)) = found {
-                // Write exit status to user-space if wstatus is non-null
-                if !wstatus.is_null() {
-                    unsafe {
-                        wstatus.write_volatile((exit_code & 0xFF) << 8);
-                    }
-                }
                 // Remove the zombie from the task list and drop it outside the TASKS lock
                 let idx = child_pid.as_u64() as usize;
-                let _removed_task = x86_64::instructions::interrupts::without_interrupts(|| {
-                    let mut tasks_write = scheduler::TASKS.write();
-                    if let Some(slot) = tasks_write.get_mut(idx) {
-                        slot.take()
-                    } else {
-                        None
-                    }
-                });
-                Some(Ok(child_pid.as_u64() as SyscallResult))
+                let mut tasks_write = scheduler::TASKS.write();
+                if let Some(slot) = tasks_write.get_mut(idx) {
+                    slot.take();
+                }
+                drop(tasks_write);
+
+                Some(Ok((child_pid, exit_code)))
             } else if !has_children {
                 Some(Err(Errno::ECHILD))
             } else {
@@ -866,16 +925,49 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
         };
 
         match result {
-            Some(Ok(ret)) => return ret,
-            Some(Err(err)) => return err.into(),
+            Some(Ok((child_pid, exit_code))) => {
+                drop(sched_lock);
+                x86_64::instructions::interrupts::enable();
+
+                // Write exit status to user-space if wstatus is non-null with interrupts enabled
+                if !wstatus.is_null() {
+                    unsafe {
+                        wstatus.write_volatile((exit_code & 0xFF) << 8);
+                    }
+                }
+                return child_pid.as_u64() as SyscallResult;
+            }
+            Some(Err(err)) => {
+                drop(sched_lock);
+                x86_64::instructions::interrupts::enable();
+                return err.into();
+            }
             None => {
-                // Sleep on our child_wait_queue until a child exits
+                // Sleep on our child_wait_queue until a child exits.
+                // Since we hold the SCHEDULER lock, no child can exit or wake us up before we block!
                 let task_arc = match scheduler::get_task_arc(current_pid) {
                     Some(t) => t,
-                    None => return Errno::ESRCH.into(),
+                    None => {
+                        drop(sched_lock);
+                        x86_64::instructions::interrupts::enable();
+                        return Errno::ESRCH.into();
+                    }
                 };
-                let wait_queue = task_arc.lock().child_wait_queue.clone();
-                wait_queue.wait();
+                let wait_queue = {
+                    let mut task = task_arc.lock();
+                    task.state = TaskState::Blocked;
+                    task.child_wait_queue.clone()
+                };
+                wait_queue.register(current_pid);
+                drop(sched_lock);
+
+                // Note: schedule() will yield CPU and re-enable interrupts inside the new task's context switch
+                scheduler::schedule();
+
+                // When we wake up, interrupts are enabled. We must disable them again to clean up and re-loop
+                x86_64::instructions::interrupts::disable();
+                wait_queue.remove(current_pid);
+                x86_64::instructions::interrupts::enable();
             }
         }
     }

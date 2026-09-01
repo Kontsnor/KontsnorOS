@@ -216,6 +216,9 @@ pub struct Task {
     /// Tracks whether this task is currently queued in the scheduler priority queues.
     pub in_queue: bool,
 
+    /// Tracks whether this task is a CPU core's idle task.
+    pub is_idle: bool,
+
     /// Real User ID
     pub uid: u32,
     /// Real Group ID
@@ -296,6 +299,7 @@ impl Task {
             pgid: pid.as_u64(),
             tgid: pid,
             in_queue: false,
+            is_idle: false,
             uid: 0,
             gid: 0,
             euid: 0,
@@ -311,7 +315,10 @@ impl Task {
 
     /// Create the kernel idle task (PID 0).
     pub fn idle() -> Self {
-        Self::new(Pid::IDLE, String::from("idle"), 0)
+        let mut task = Self::new(Pid::IDLE, String::from("idle"), 0);
+        task.priority = Priority::Idle;
+        task.is_idle = true;
+        task
     }
 
     /// Check if this task is runnable.

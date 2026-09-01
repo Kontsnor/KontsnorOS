@@ -64,10 +64,11 @@ pub fn spawn_kernel_thread(name: alloc::string::String, entry_point: fn()) -> Pi
 extern "C" fn thread_trampoline() -> ! {
     // SAFETY: Naked assembly stub serving as a trampoline entry point for kernel threads.
     core::arch::naked_asm!(
-        "sti",          // Enable interrupts since context switch disabled them
+        "call {}",      // Release scheduler lock and enable interrupts
         "call r12",     // Call the entry_point (stored in r12)
         "mov rdi, 0",   // Set first argument (exit status) to 0
         "call {}",      // Call exit_current_thread
+        sym crate::process::scheduler::scheduler_unlock_after_switch,
         sym exit_current_thread,
     );
 }
@@ -162,20 +163,31 @@ pub fn spawn_user_process_with_pid(name: alloc::string::String, elf_data: &[u8],
         }
     }
 
-    // Allocate and map user stack (64KB below USER_STACK_TOP)
-    let stack_size = 64 * 1024;
+    // Allocate and map user stack (8MB below USER_STACK_TOP)
+    let stack_size: u64 = 8 * 1024 * 1024;
     let stack_bottom = elf::USER_STACK_TOP - stack_size;
-    let stack_start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(stack_bottom));
-    let stack_end_page =
-        Page::<Size4KiB>::containing_address(VirtAddr::new(elf::USER_STACK_TOP - 1));
 
-    let mut highest_stack_phys = 0;
-    for page in Page::range_inclusive(stack_start_page, stack_end_page) {
+    // Construct System V ABI stack
+    let default_argv = [name.clone()];
+    let default_envp: [alloc::string::String; 0] = [];
+    let init_stack = elf::construct_user_stack(
+        &default_argv,
+        &default_envp,
+        elf_info.entry_point,
+        elf_info.phdr,
+        elf_info.phnum,
+        elf_info.phent,
+        0, // interpreter_base is 0 for statically linked spawned user processes
+    )
+    .expect("Failed to construct user stack");
+
+    // Allocate and map physical frames for the initial stack data
+    let num_init_pages = init_stack.stack_buf.len() / 4096;
+    for i in 0..num_init_pages {
+        let page_vaddr = init_stack.base_vaddr + (i as u64 * 4096);
         let phys_addr =
             crate::memory::physical::allocate_frame().expect("OOM allocating user stack frame");
-        if page.start_address().as_u64() == elf::USER_STACK_TOP - 4096 {
-            highest_stack_phys = phys_addr;
-        }
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(page_vaddr));
         let frame = PhysFrame::containing_address(PhysAddr::new(phys_addr));
 
         let flags = PageTableFlags::PRESENT
@@ -192,23 +204,17 @@ pub fn spawn_user_process_with_pid(name: alloc::string::String, elf_data: &[u8],
                 flags,
             )
             .expect("Failed to map user stack page");
+
+            let dest = (phys_addr + crate::memory::r#virtual::phys_mem_offset()) as *mut u8;
+            core::ptr::copy_nonoverlapping(
+                init_stack.stack_buf[i * 4096..(i + 1) * 4096].as_ptr(),
+                dest,
+                4096,
+            );
         }
     }
 
-    // Construct System V ABI stack
-    let default_argv = [name.clone()];
-    let default_envp: [alloc::string::String; 0] = [];
-    let user_sp = elf::construct_user_stack(
-        &default_argv,
-        &default_envp,
-        highest_stack_phys,
-        elf_info.entry_point,
-        elf_info.phdr,
-        elf_info.phnum,
-        elf_info.phent,
-        0, // interpreter_base is 0 for statically linked spawned user processes
-    )
-    .expect("Failed to construct user stack");
+    let user_sp = init_stack.user_sp;
 
     // Calculate initial program break (brk) dynamically from loaded ELF segment boundaries
     let mut max_vaddr = 0;
@@ -261,12 +267,14 @@ pub fn spawn_user_process_with_pid(name: alloc::string::String, elf_data: &[u8],
 extern "C" fn user_process_trampoline() -> ! {
     // SAFETY: Naked assembly stub serving as a trampoline entry point for Ring 3 user processes.
     core::arch::naked_asm!(
+        "call {}",      // Release scheduler lock and enable interrupts
         "mov rdi, r12", // Set entry_point as 1st argument (rdi)
         "mov rsi, r13", // Set user_stack as 2nd argument (rsi)
         "mov rdx, r14", // Set page_table as 3rd argument (rdx)
         "mov rcx, r15", // Set user_code_selector as 4th argument (rcx)
         "mov r8, rbx",  // Set user_data_selector as 5th argument (r8)
         "jmp {}",       // Jump to enter_user_mode (never returns)
+        sym crate::process::scheduler::scheduler_unlock_after_switch,
         sym context::enter_user_mode,
     );
 }
@@ -278,19 +286,86 @@ pub fn user_process_trampoline_addr() -> u64 {
     user_process_trampoline as *const () as u64
 }
 
+/// Safely clean up the current task's address space while interrupts are enabled to prevent deadlocks in shootdown_tlb.
+pub fn cleanup_address_space() {
+    let current_pid = match scheduler::current_pid() {
+        Some(pid) => pid,
+        None => return,
+    };
+    let task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return,
+    };
+
+    // 1. Switch CR3 to kernel PML4 first to prevent page table use-after-free
+    let kernel_pml4 = crate::memory::r#virtual::kernel_pml4_phys();
+    unsafe {
+        use x86_64::registers::control::{Cr3, Cr3Flags};
+        use x86_64::structures::paging::PhysFrame;
+        use x86_64::PhysAddr;
+        let (current_cr3_frame, _) = Cr3::read();
+        let current_cr3 = current_cr3_frame.start_address().as_u64();
+        if current_cr3 != kernel_pml4 {
+            Cr3::write(
+                PhysFrame::containing_address(PhysAddr::new(kernel_pml4)),
+                Cr3Flags::empty(),
+            );
+        }
+    }
+
+    // 2. Replace task's address space with kernel-only address space, freeing the old one.
+    // Since interrupts are enabled and we do not hold the SCHEDULER lock, TLB shootdown will not deadlock!
+    let old_address_space = {
+        let mut task = task_arc.lock();
+        let old = task.address_space.clone();
+        task.address_space = Arc::new(spin::Mutex::new(crate::process::task::AddressSpace {
+            page_table_root: kernel_pml4,
+            brk: 0,
+            mmap_bump: 0,
+            mmap_regions: alloc::vec::Vec::new(),
+        }));
+        // Update context CR3 to 0 (kernel task) or kernel PML4
+        task.context.cr3 = 0;
+        old
+    };
+    drop(old_address_space);
+}
+
 /// Exits the currently running task.
 pub fn exit_current_thread(exit_code: i32) -> ! {
+    let mut clear_ctid = None;
     if let Some(current_pid) = scheduler::current_pid() {
         if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
-            let fd_table = {
-                let task = task_arc.lock();
-                task.fd_table.clone()
-            };
+            let mut task = task_arc.lock();
+            clear_ctid = task.clear_child_tid;
+            let fd_table = task.fd_table.clone();
             if Arc::strong_count(&fd_table) == 1 {
                 fd_table.lock().entries.clear();
             }
         }
     }
+
+    if let Some(ctid) = clear_ctid {
+        if crate::syscall::validation::validate_user_ptr_write(ctid as *mut u8, 4).is_ok() {
+            // SAFETY: validate_user_ptr_write verifies pointer lies in user memory and is writable
+            unsafe {
+                (ctid as *mut u32).write_volatile(0);
+            }
+        }
+        run_with_scheduler_lock(|sched| {
+            crate::syscall::process::futex::futex_wake_locked(ctid, 1, 0xffffffff, sched);
+        });
+    }
+
+    // Drain stale futex registrations for this task before cleaning up address space
+    if let Some(current_pid) = scheduler::current_pid() {
+        run_with_scheduler_lock(|sched| {
+            crate::syscall::process::futex::futex_drain_pid_locked(current_pid, sched);
+        });
+    }
+
+    // Safely free the address space and run TLB shootdown before disabling interrupts
+    cleanup_address_space();
 
     x86_64::instructions::interrupts::disable();
     let fds = if let Some(current_pid) = scheduler::current_pid() {
@@ -322,10 +397,62 @@ pub fn block_task(pid: Pid) {
 }
 
 /// Wake up a blocked task.
-pub fn wake_task(pid: Pid) {
+pub fn wake_task(pid: Pid) -> bool {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        if let Some(ref mut scheduler) = *SCHEDULER.lock() {
-            scheduler.wake_task(pid);
+        if let Some(mut sched_lock) = SCHEDULER.try_lock() {
+            if let Some(ref mut scheduler) = *sched_lock {
+                scheduler.wake_task(pid)
+            } else {
+                false
+            }
+        } else {
+            let apic_id = crate::arch::x86_64::smp::current_lapic_id() as u32;
+            if SCHEDULER.holding_cpu_id() == apic_id {
+                // SAFETY: The current CPU already holds SCHEDULER exclusively
+                unsafe {
+                    if let Some(ref mut scheduler) = *SCHEDULER.get_mut_unchecked() {
+                        scheduler.wake_task(pid)
+                    } else {
+                        false
+                    }
+                }
+            } else if let Some(ref mut scheduler) = *SCHEDULER.lock() {
+                scheduler.wake_task(pid)
+            } else {
+                false
+            }
         }
-    });
+    })
+}
+
+/// Run a closure with the scheduler lock held.
+pub fn run_with_scheduler_lock<R, F>(f: F) -> R
+where
+    F: FnOnce(&mut crate::process::scheduler::Scheduler) -> R,
+{
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(mut sched_lock) = SCHEDULER.try_lock() {
+            if let Some(ref mut scheduler) = *sched_lock {
+                f(scheduler)
+            } else {
+                panic!("run_with_scheduler_lock: Scheduler not initialized");
+            }
+        } else {
+            let apic_id = crate::arch::x86_64::smp::current_lapic_id() as u32;
+            if SCHEDULER.holding_cpu_id() == apic_id {
+                // SAFETY: The current CPU already holds SCHEDULER exclusively
+                unsafe {
+                    if let Some(ref mut scheduler) = *SCHEDULER.get_mut_unchecked() {
+                        f(scheduler)
+                    } else {
+                        panic!("run_with_scheduler_lock: Scheduler not initialized");
+                    }
+                }
+            } else if let Some(ref mut scheduler) = *SCHEDULER.lock() {
+                f(scheduler)
+            } else {
+                panic!("run_with_scheduler_lock: Scheduler not initialized");
+            }
+        }
+    })
 }

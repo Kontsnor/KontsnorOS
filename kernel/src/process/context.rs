@@ -46,9 +46,11 @@
 /// 0x50    fs_base
 /// 0x58    gs_base
 /// 0x60    kernel_gs_base
+/// 0x68    _reserved (alignment pad)
+/// 0x70    fxsave (512 bytes, 16-byte aligned FPU/SSE state)
 /// ```
 #[derive(Debug, Clone, Copy)]
-#[repr(C)]
+#[repr(C, align(16))]
 pub struct CpuContext {
     /// General purpose registers (callee-saved).
     pub rbx: u64,
@@ -76,10 +78,21 @@ pub struct CpuContext {
     pub gs_base: u64,
     /// IA32_KERNEL_GS_BASE MSR — offset 0x60.
     pub kernel_gs_base: u64,
+    /// Reserved alignment padding for 16-byte aligned FXSAVE area.
+    pub _reserved: u64,
+    /// 512-byte x87 FPU and SSE/AVX register state.
+    pub fxsave: [u8; 512],
 }
 
 impl Default for CpuContext {
     fn default() -> Self {
+        let mut fxsave = [0u8; 512];
+        // FCW = 0x037F (default x87 control word: mask all exceptions, 64-bit precision, round to nearest)
+        fxsave[0] = 0x7f;
+        fxsave[1] = 0x03;
+        // MXCSR = 0x1F80 (default SSE control/status register: mask all SIMD exceptions, round to nearest)
+        fxsave[24] = 0x80;
+        fxsave[25] = 0x1f;
         Self {
             rbx: 0,
             rbp: 0,
@@ -94,6 +107,8 @@ impl Default for CpuContext {
             fs_base: 0,
             gs_base: 0,
             kernel_gs_base: 0,
+            _reserved: 0,
+            fxsave,
         }
     }
 }
@@ -130,10 +145,10 @@ impl CpuContext {
 ///
 /// ## How it works
 ///
-/// 1. Save all callee-saved registers into `old_ctx`
+/// 1. Save all callee-saved registers and FPU/SSE state into `old_ctx`
 /// 2. Save the current stack pointer and return address
 /// 3. If the new task has a different CR3 (page table), switch address spaces
-/// 4. Restore all callee-saved registers from `new_ctx`
+/// 4. Restore FPU/SSE state and all callee-saved registers from `new_ctx`
 /// 5. Jump to the new task's saved instruction pointer
 ///
 /// After this function, execution continues at the point where `new_ctx`
@@ -167,66 +182,51 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut CpuContext, _new_ctx: *co
         // Save FS_BASE using rdfsbase (since userspace can now modify FS_BASE directly)
         "rdfsbase rax",
         "mov [rdi + 0x50], rax",
-        // Note: We skip saving GS_BASE and KERNEL_GS_BASE MSRs via rdmsr.
-        // They are kept up-to-date in CpuContext via sys_arch_prctl / initialization.
+        // Save FPU/SSE state (XMM0-XMM15, MXCSR, FPU control words)
+        "fxsave64 [rdi + 0x70]",
 
         // ── Restore new context ────────────────────────────────────
         // rsi = new_ctx pointer
 
-        // Cache the old fs_base and kernel_gs_base in GPRs before stack/CR3 switch
-        // so that we don't dereference old context [rdi] afterwards.
-        // We use rbx and rbp temporarily; they will be overwritten when restoring
-        // the new context anyway.
-        "mov rbx, [rdi + 0x50]", // rbx = old fs_base
-        "mov rbp, [rdi + 0x60]", // rbp = old kernel_gs_base
-        // Check if we need to switch page tables
-        "mov rax, [rsi + 0x48]", // Load new CR3
-        "test rax, rax",         // Skip if CR3 is 0 (kernel task)
-        "jz 2f",
-        "mov rcx, cr3", // Current CR3
-        "cmp rax, rcx", // Same page table?
-        "je 2f",        // Skip if same
-        "mov cr3, rax", // Switch page tables (flushes TLB)
-        "2:",
-        // Switch stack FIRST, so we are on a valid, mapped stack in the new page table
-        "mov rsp, [rsi + 0x30]",
-        // Restore RFLAGS
-        "mov rax, [rsi + 0x40]",
-        "push rax",
-        "popfq",
-        // Restore FS_BASE MSR only if it changed
-        "mov rax, [rsi + 0x50]", // Load new fs_base
-        "cmp rax, rbx",          // Compare with cached old fs_base
-        "je 3f",                 // Skip if same
-        "mov rdx, rax",
-        "shr rdx, 32",         // High 32 bits of new fs_base in edx
-        "mov ecx, 0xC0000100", // FS_BASE MSR
-        "wrmsr",               // Writes edx:eax to MSR
-        "3:",
-        // Note: GS_BASE is permanently pinned to the core's scratch block, so we never restore it here.
+        // Restore FPU/SSE state before register clobbers
+        "fxrstor64 [rsi + 0x70]",
 
-        // Restore KERNEL_GS_BASE MSR only if it changed
-        "mov rax, [rsi + 0x60]", // Load new kernel_gs_base
-        "cmp rax, rbp",          // Compare with cached old kernel_gs_base
-        "je 4f",                 // Skip if same
-        "mov rdx, rax",
-        "shr rdx, 32",         // High 32 bits of new kernel_gs_base in edx
-        "mov ecx, 0xC0000102", // KERNEL_GS_BASE MSR
-        "wrmsr",               // Writes edx:eax to MSR
-        "4:",
-        // Restore callee-saved registers
+        // 1. Read all values from [rsi] while still in the current address space
+        // where [rsi] is guaranteed to be mapped.
         "mov rbx, [rsi + 0x00]",
         "mov rbp, [rsi + 0x08]",
         "mov r12, [rsi + 0x10]",
         "mov r13, [rsi + 0x18]",
         "mov r14, [rsi + 0x20]",
         "mov r15, [rsi + 0x28]",
-        // Jump to the new task's saved instruction pointer.
-        // We push the RIP onto the new stack and ret into it,
-        // which simulates a normal function return.
-        "mov rax, [rsi + 0x38]",
-        "push rax",
-        "ret",
+        "mov r8,  [rsi + 0x30]", // r8 = new RSP
+        "mov r9,  [rsi + 0x38]", // r9 = new RIP
+        "mov r10, [rsi + 0x40]", // r10 = new RFLAGS
+        "mov r11, [rsi + 0x48]", // r11 = new CR3
+        "mov rax, [rsi + 0x50]", // rax = new FS_BASE
+        "mov rdx, [rsi + 0x60]", // rdx = new KERNEL_GS_BASE
+        // 2. Switch CR3 page table (all values are already safely in CPU registers)
+        "test r11, r11",
+        "jz 4f",
+        "mov cr3, r11",
+        "4:",
+        // 3. Switch to the new stack (now mapped in the new address space)
+        "mov rsp, r8",
+        // 4. Restore RFLAGS
+        "push r10",
+        "popfq",
+        // 5. Restore FS_BASE (TLS)
+        "wrfsbase rax",
+        // 6. Restore KERNEL_GS_BASE MSR if non-zero
+        "test rdx, rdx",
+        "jz 5f",
+        "mov rax, rdx",
+        "shr rdx, 32",
+        "mov ecx, 0xC0000102",
+        "wrmsr",
+        "5:",
+        // 7. Jump to the new task's entry point
+        "jmp r9",
     );
 }
 
@@ -331,7 +331,7 @@ pub extern "C" fn fork_child_return_debug() {
 #[unsafe(naked)]
 pub unsafe extern "C" fn fork_child_return() -> ! {
     core::arch::naked_asm!(
-        "call fork_child_return_debug",
+        "call {}",      // Release scheduler lock
         "pop rax",      // Pop and discard the parent's rax
         "xor rax, rax", // rax = 0 (child process return value)
         "pop rdi",
@@ -350,6 +350,7 @@ pub unsafe extern "C" fn fork_child_return() -> ! {
         "pop r11", // User RFLAGS
         "pop rsp", // Restore User RSP
         "swapgs",
-        "sysretq"
+        "sysretq",
+        sym crate::process::scheduler::scheduler_unlock_after_switch,
     );
 }

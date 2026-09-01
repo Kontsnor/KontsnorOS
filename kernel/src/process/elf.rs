@@ -401,7 +401,7 @@ pub unsafe fn copy_argv_from_user(
         let s = unsafe { crate::syscall::fs::copy_string_from_user_pub(str_ptr) }?;
         args.push(s);
         argv_ptr = unsafe { argv_ptr.add(1) };
-        if args.len() > 512 {
+        if args.len() > 4096 {
             // Sanity check to avoid infinite loops or huge allocations
             return None;
         }
@@ -409,60 +409,81 @@ pub unsafe fn copy_argv_from_user(
     Some(args)
 }
 
-/// Constructs a System V AMD64 ABI compliant user stack in the designated physical frame.
+/// Initial user stack layout data containing initial RSP, buffer bytes, and virtual base address.
+#[derive(Debug, Clone)]
+pub struct StackInit {
+    pub user_sp: u64,
+    pub stack_buf: alloc::vec::Vec<u8>,
+    pub base_vaddr: u64,
+}
+
+/// Constructs a System V AMD64 ABI compliant user stack with dynamically sized multi-page support.
 ///
 /// Places argc, argv pointer array, envp pointer array, terminating auxv, and the actual
 /// string data onto a 16-byte aligned layout at the top of the stack.
 pub fn construct_user_stack(
     argv: &[alloc::string::String],
     envp: &[alloc::string::String],
-    phys_frame_addr: u64,
     entry_point: u64,
     phdr: u64,
     phnum: u64,
     phent: u64,
     interpreter_base: u64,
-) -> Result<u64, crate::syscall::Errno> {
-    let mut page_buf = alloc::vec![0u8; 4096];
-    let mut str_pos = 4096;
+) -> Result<StackInit, crate::syscall::Errno> {
+    let max_stack_init_size: usize = 512 * 1024; // 512 KiB max for initial arguments & environment
 
-    // Allocate 16 bytes for AT_RANDOM value at the top of the stack
-    if str_pos < 16 {
+    // 1. Calculate space required
+    let mut total_str_bytes = 0usize;
+    for env in envp {
+        total_str_bytes = total_str_bytes.saturating_add(env.as_bytes().len() + 1);
+    }
+    for arg in argv {
+        total_str_bytes = total_str_bytes.saturating_add(arg.as_bytes().len() + 1);
+    }
+
+    let auxv_count = 13usize;
+    let ptrs_size = 8 + (argv.len() * 8) + 8 + (envp.len() * 8) + 8 + (auxv_count * 16);
+    let required_bytes = 16 + total_str_bytes + ptrs_size + 16; // 16 for AT_RANDOM, 16 for alignment
+
+    if required_bytes > max_stack_init_size {
         return Err(crate::syscall::Errno::E2BIG);
     }
+
+    let num_pages = (required_bytes + 4095) / 4096;
+    let buf_size = num_pages * 4096;
+    let base_vaddr = USER_STACK_TOP - buf_size as u64;
+
+    let mut stack_buf = alloc::vec![0u8; buf_size];
+    let mut str_pos = buf_size;
+
+    // Allocate 16 bytes for AT_RANDOM value at the top of the stack
     str_pos -= 16;
-    for (i, b) in page_buf[str_pos..str_pos + 16].iter_mut().enumerate() {
+    for (i, b) in stack_buf[str_pos..str_pos + 16].iter_mut().enumerate() {
         *b = (i as u8 + 42) ^ 0xAA;
     }
-    let random_vaddr = (USER_STACK_TOP - 4096) + str_pos as u64;
+    let random_vaddr = base_vaddr + str_pos as u64;
 
-    // 1. Copy environment strings
+    // 2. Copy environment strings
     let mut envp_vaddrs = alloc::vec::Vec::new();
     for env in envp.iter().rev() {
         let bytes = env.as_bytes();
         let len = bytes.len() + 1; // plus null terminator
-        if len > str_pos {
-            return Err(crate::syscall::Errno::E2BIG);
-        }
         str_pos -= len;
-        page_buf[str_pos..str_pos + bytes.len()].copy_from_slice(bytes);
-        page_buf[str_pos + bytes.len()] = 0;
-        envp_vaddrs.push((USER_STACK_TOP - 4096) + str_pos as u64);
+        stack_buf[str_pos..str_pos + bytes.len()].copy_from_slice(bytes);
+        stack_buf[str_pos + bytes.len()] = 0;
+        envp_vaddrs.push(base_vaddr + str_pos as u64);
     }
     envp_vaddrs.reverse();
 
-    // 2. Copy argument strings
+    // 3. Copy argument strings
     let mut argv_vaddrs = alloc::vec::Vec::new();
     for arg in argv.iter().rev() {
         let bytes = arg.as_bytes();
         let len = bytes.len() + 1; // plus null terminator
-        if len > str_pos {
-            return Err(crate::syscall::Errno::E2BIG);
-        }
         str_pos -= len;
-        page_buf[str_pos..str_pos + bytes.len()].copy_from_slice(bytes);
-        page_buf[str_pos + bytes.len()] = 0;
-        argv_vaddrs.push((USER_STACK_TOP - 4096) + str_pos as u64);
+        stack_buf[str_pos..str_pos + bytes.len()].copy_from_slice(bytes);
+        stack_buf[str_pos + bytes.len()] = 0;
+        argv_vaddrs.push(base_vaddr + str_pos as u64);
     }
     argv_vaddrs.reverse();
 
@@ -483,17 +504,8 @@ pub fn construct_user_stack(
         (0u64, 0),                // AT_NULL
     ];
 
-    // 3. Calculate space for pointers:
-    // pointers size = 8 (argc) + (argv.len() * 8) + 8 (null) + (envp.len() * 8) + 8 (null) + (auxv.len() * 16)
-    let ptrs_size = 8 + (argv.len() * 8) + 8 + (envp.len() * 8) + 8 + (auxv.len() * 16);
-    if ptrs_size > str_pos {
-        return Err(crate::syscall::Errno::E2BIG);
-    }
-
     // Align stack pointer (RSP) down to 16 bytes for System V ABI compliance
-    let mut rsp_pos = str_pos - ptrs_size;
-    rsp_pos = rsp_pos & !15;
-
+    let rsp_pos = (str_pos - ptrs_size) & !15;
     let mut write_pos = rsp_pos;
 
     // Helper to write a u64
@@ -503,32 +515,30 @@ pub fn construct_user_stack(
     };
 
     // Write argc
-    write_u64(argv.len() as u64, &mut page_buf, &mut write_pos);
+    write_u64(argv.len() as u64, &mut stack_buf, &mut write_pos);
 
     // Write argv pointers
     for vaddr in argv_vaddrs {
-        write_u64(vaddr, &mut page_buf, &mut write_pos);
+        write_u64(vaddr, &mut stack_buf, &mut write_pos);
     }
-    write_u64(0, &mut page_buf, &mut write_pos); // argv NULL
+    write_u64(0, &mut stack_buf, &mut write_pos); // argv NULL
 
     // Write envp pointers
     for vaddr in envp_vaddrs {
-        write_u64(vaddr, &mut page_buf, &mut write_pos);
+        write_u64(vaddr, &mut stack_buf, &mut write_pos);
     }
-    write_u64(0, &mut page_buf, &mut write_pos); // envp NULL
+    write_u64(0, &mut stack_buf, &mut write_pos); // envp NULL
 
     // Write auxiliary vector entries
     for (type_, val) in &auxv {
-        write_u64(*type_, &mut page_buf, &mut write_pos);
-        write_u64(*val, &mut page_buf, &mut write_pos);
+        write_u64(*type_, &mut stack_buf, &mut write_pos);
+        write_u64(*val, &mut stack_buf, &mut write_pos);
     }
 
-    // Copy constructed stack page to physical memory
-    let dest = (phys_frame_addr + crate::memory::r#virtual::phys_mem_offset()) as *mut u8;
-    unsafe {
-        core::ptr::copy_nonoverlapping(page_buf.as_ptr(), dest, 4096);
-    }
-
-    let user_sp = (USER_STACK_TOP - 4096) + rsp_pos as u64;
-    Ok(user_sp)
+    let user_sp = base_vaddr + rsp_pos as u64;
+    Ok(StackInit {
+        user_sp,
+        stack_buf,
+        base_vaddr,
+    })
 }

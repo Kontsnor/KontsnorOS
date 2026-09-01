@@ -75,6 +75,8 @@ pub fn sys_mmap(
         None => return Errno::EINVAL.into(),
     };
 
+    let is_fixed = (flags & 0x10) != 0;
+
     // Get current mmap_bump and page table root
     let (resolved_addr, _page_table_root) = {
         let task_arc = match scheduler::get_task_arc(current_pid) {
@@ -84,23 +86,11 @@ pub fn sys_mmap(
         let task = task_arc.lock();
         let mut addr_space = task.address_space.lock();
 
-        let resolved = if addr == 0 {
-            let current_bump = addr_space.mmap_bump;
-            let next_bump = match current_bump.checked_add(aligned_len as u64) {
-                Some(b) => b,
-                None => return Errno::EINVAL.into(),
-            };
-            if next_bump > 0x0000_7FFF_FFFF_FFFF {
+        let resolved = if is_fixed {
+            if addr & 4095 != 0 || addr == 0 {
                 return Errno::EINVAL.into();
             }
-            addr_space.mmap_bump = next_bump;
-            current_bump
-        } else {
-            let aligned_addr = match addr.checked_add(4095) {
-                Some(a) => a & !4095,
-                None => return Errno::EINVAL.into(),
-            };
-            let end_addr = match aligned_addr.checked_add(aligned_len as u64) {
+            let end_addr = match addr.checked_add(aligned_len as u64) {
                 Some(end) => end,
                 None => return Errno::EINVAL.into(),
             };
@@ -110,14 +100,54 @@ pub fn sys_mmap(
             if end_addr > addr_space.mmap_bump {
                 addr_space.mmap_bump = end_addr;
             }
-            aligned_addr
+            addr
+        } else {
+            // If MAP_FIXED is not specified, addr is a hint.
+            // Check if hint address is valid, page-aligned, and does NOT overlap any existing mapping.
+            let hint_ok = if addr != 0 && (addr & 4095 == 0) {
+                let end_addr = addr.saturating_add(aligned_len as u64);
+                if end_addr <= 0x0000_7FFF_FFFF_FFFF {
+                    let mut overlaps = addr < addr_space.brk;
+                    for r in &addr_space.mmap_regions {
+                        let r_end = r.start.saturating_add(r.len as u64);
+                        if addr < r_end && end_addr > r.start {
+                            overlaps = true;
+                            break;
+                        }
+                    }
+                    !overlaps
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if hint_ok {
+                let end_addr = addr + aligned_len as u64;
+                if end_addr > addr_space.mmap_bump {
+                    addr_space.mmap_bump = end_addr;
+                }
+                addr
+            } else {
+                let current_bump = addr_space.mmap_bump;
+                let next_bump = match current_bump.checked_add(aligned_len as u64) {
+                    Some(b) => b,
+                    None => return Errno::EINVAL.into(),
+                };
+                if next_bump > 0x0000_7FFF_FFFF_FFFF {
+                    return Errno::EINVAL.into();
+                }
+                addr_space.mmap_bump = next_bump;
+                current_bump
+            }
         };
 
         (resolved, addr_space.page_table_root)
     };
 
-    // Unmap any existing overlapping regions/pages only if a specific address was requested
-    if addr != 0 {
+    // Unmap any existing overlapping regions/pages ONLY if MAP_FIXED was explicitly requested
+    if is_fixed {
         let _ = sys_munmap(resolved_addr, aligned_len);
     }
 
@@ -243,10 +273,12 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
         crate::arch::x86_64::smp::shootdown_tlb();
     }
 
-    kprintln!(
-        "[syscall] munmap: successfully unmapped {} pages",
-        unmapped_count
-    );
+    if crate::syscall::DEBUG_SYSCALLS {
+        kprintln!(
+            "[syscall] munmap: successfully unmapped {} pages",
+            unmapped_count
+        );
+    }
     0 // Success
 }
 
@@ -256,12 +288,14 @@ pub fn sys_mprotect(addr: u64, length: usize, prot: i32) -> SyscallResult {
     use x86_64::structures::paging::{Page, Size4KiB};
     use x86_64::VirtAddr;
 
-    kprintln!(
-        "[syscall] mprotect(addr={:#x}, len={}, prot={:#x})",
-        addr,
-        length,
-        prot
-    );
+    if crate::syscall::DEBUG_SYSCALLS {
+        kprintln!(
+            "[syscall] mprotect(addr={:#x}, len={}, prot={:#x})",
+            addr,
+            length,
+            prot
+        );
+    }
 
     if length == 0 || (addr & 4095) != 0 {
         return Errno::EINVAL.into();

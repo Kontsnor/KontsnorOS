@@ -33,7 +33,10 @@
 //! ```
 
 use crate::kprintln;
-use linked_list_allocator::LockedHeap;
+use crate::sync::spinlock::{TicketLock, TicketLockGuard};
+use core::alloc::{GlobalAlloc, Layout};
+use core::ptr::NonNull;
+use linked_list_allocator::Heap;
 use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
@@ -50,12 +53,47 @@ pub const HEAP_START: u64 = 0xFFFF_8000_0000_0000;
 /// during heavy multi-process workloads like native Cargo compilation.
 pub const HEAP_SIZE: u64 = 512 * 1024 * 1024;
 
-/// The global kernel heap allocator.
+/// An interrupt-safe wrapper around `linked_list_allocator::Heap`.
 ///
-/// Uses a linked-list allocator which provides reasonable performance
-/// for general-purpose allocation patterns.
+/// Disables interrupts on the calling CPU core while the heap lock is held.
+/// This prevents deadlocks between interrupt handlers (such as the timer tick)
+/// and kernel execution paths performing dynamic memory allocations.
+pub struct InterruptSafeLockedHeap(TicketLock<Heap>);
+
+impl InterruptSafeLockedHeap {
+    /// Create a new, uninitialized interrupt-safe locked heap.
+    pub const fn empty() -> Self {
+        Self(TicketLock::new(Heap::empty()))
+    }
+
+    /// Acquire the heap lock, returning a RAII guard with interrupts disabled.
+    pub fn lock(&self) -> TicketLockGuard<'_, Heap> {
+        self.0.lock()
+    }
+}
+
+unsafe impl GlobalAlloc for InterruptSafeLockedHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        self.0
+            .lock()
+            .allocate_first_fit(layout)
+            .ok()
+            .map_or(core::ptr::null_mut(), |allocation| allocation.as_ptr())
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if let Some(p) = NonNull::new(ptr) {
+            // SAFETY: The pointer was previously allocated by `allocate_first_fit` with the matching layout.
+            unsafe {
+                self.0.lock().deallocate(p, layout);
+            }
+        }
+    }
+}
+
+/// The global kernel heap allocator.
 #[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
+static ALLOCATOR: InterruptSafeLockedHeap = InterruptSafeLockedHeap::empty();
 
 /// Initialize the kernel heap.
 ///

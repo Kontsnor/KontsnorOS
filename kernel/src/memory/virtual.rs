@@ -43,6 +43,9 @@ static PHYS_MEM_OFFSET: AtomicU64 = AtomicU64::new(0);
 /// The kernel's active PML4 page table root physical address.
 static KERNEL_PML4_PHYS: AtomicU64 = AtomicU64::new(0);
 
+/// Global lock to serialize page table modifications across SMP cores.
+pub static PAGE_TABLE_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
 /// Initialize the virtual memory manager.
 ///
 /// `phys_mem_offset` is the virtual address where physical memory is
@@ -157,6 +160,7 @@ pub unsafe fn map_page(
     frame: PhysFrame<Size4KiB>,
     flags: PageTableFlags,
 ) -> Result<(), &'static str> {
+    let _lock = PAGE_TABLE_LOCK.lock();
     let mut mapper = unsafe { active_page_table() };
     let mut frame_alloc = BootInfoFrameAllocator;
 
@@ -175,6 +179,11 @@ pub unsafe fn map_page(
 /// Create a new user page table by allocating a PML4 frame and copying
 /// the kernel mappings (entries 256 to 511) from the active PML4 table.
 pub fn create_user_page_table() -> Result<u64, &'static str> {
+    let _lock = PAGE_TABLE_LOCK.lock();
+    create_user_page_table_unlocked()
+}
+
+fn create_user_page_table_unlocked() -> Result<u64, &'static str> {
     let pml4_phys = super::physical::allocate_frame()
         .ok_or("Failed to allocate physical frame for user PML4")?;
 
@@ -194,9 +203,12 @@ pub fn create_user_page_table() -> Result<u64, &'static str> {
         new_pml4[i] = active_pml4[i].clone();
     }
 
+    // Clone kernel code / data (PML4 index 1: 0x80_0000_0000)
+    new_pml4[1] = active_pml4[1].clone();
+
     // Copy the physical memory mapping PML4 entry (which resides in the lower half)
     let pml4_index = (phys_mem_offset() >> 39) & 0x1FF;
-    if pml4_index < 256 {
+    if pml4_index < 256 && pml4_index != 1 {
         return Err("Physical memory mapping overlaps user space");
     }
     crate::kprintln!(
@@ -216,8 +228,9 @@ pub fn clone_parent_page_table(
     parent_pml4_phys: u64,
     mmap_regions: &[crate::process::task::MappedRegion],
 ) -> Result<u64, &'static str> {
+    let _lock = PAGE_TABLE_LOCK.lock();
     // 1. Create a clean child PML4 pre-populated with kernel entries
-    let child_pml4_phys = create_user_page_table()?;
+    let child_pml4_phys = create_user_page_table_unlocked()?;
 
     let parent_pml4_virt = VirtAddr::new(parent_pml4_phys + phys_mem_offset());
     let parent_pml4: &PageTable = unsafe { &*parent_pml4_virt.as_ptr() };
@@ -227,10 +240,9 @@ pub fn clone_parent_page_table(
 
     let pml4_index = (phys_mem_offset() >> 39) & 0x1FF;
 
-    // 2. Deep-clone only user-space PML4 entries (0..256)
+    // 2. Deep-clone only user-space PML4 entries (0..256), skipping kernel PML4 index 1
     for i in 0..256 {
-        // Skip the physical memory offset entry if it lies in user space index region
-        if i == pml4_index as usize {
+        if i == 1 || i == pml4_index as usize {
             continue;
         }
 
@@ -314,6 +326,19 @@ pub fn clone_parent_page_table(
                         continue;
                     }
 
+                    let vaddr = ((i as u64) << 39)
+                        | ((j as u64) << 30)
+                        | ((k as u64) << 21)
+                        | ((l as u64) << 12);
+
+                    if parent_pml4_phys == kernel_pml4_phys()
+                        && !mmap_regions
+                            .iter()
+                            .any(|r| vaddr >= r.start && vaddr < r.start + r.len as u64)
+                    {
+                        continue;
+                    }
+
                     let frame = parent_pt_entry
                         .frame()
                         .map_err(|_| "Invalid frame in parent PT")?;
@@ -322,11 +347,6 @@ pub fn clone_parent_page_table(
                     let mut flags = parent_pt_entry.flags();
                     let is_writable = flags.contains(PageTableFlags::WRITABLE);
                     let is_cow = flags.contains(PageTableFlags::BIT_9);
-
-                    let vaddr = ((i as u64) << 39)
-                        | ((j as u64) << 30)
-                        | ((k as u64) << 21)
-                        | ((l as u64) << 12);
 
                     let is_shared_mapping = mmap_regions
                         .iter()
@@ -338,12 +358,14 @@ pub fn clone_parent_page_table(
                         flags.insert(PageTableFlags::BIT_9);
 
                         parent_pt_entry.set_addr(PhysAddr::new(phys_addr), flags);
+                        child_pt[l].set_addr(PhysAddr::new(phys_addr), flags);
+                    } else {
+                        // Read-only or shared mapping: direct map with same flags
+                        child_pt[l].set_addr(PhysAddr::new(phys_addr), flags);
                     }
 
-                    // Increment physical page frame reference count for all user pages
+                    // Increment physical page frame reference count for ALL shared user pages
                     super::physical::increment_ref(phys_addr);
-
-                    child_pt[l].set_addr(PhysAddr::new(phys_addr), flags);
                 }
             }
         }
@@ -372,6 +394,7 @@ pub unsafe fn map_user_page(
     frame: PhysFrame<Size4KiB>,
     flags: PageTableFlags,
 ) -> Result<(), &'static str> {
+    let _lock = PAGE_TABLE_LOCK.lock();
     unsafe {
         map_user_page_no_shootdown(pml4_phys, page, frame, flags)?;
         crate::arch::x86_64::smp::shootdown_tlb();
@@ -393,6 +416,7 @@ pub unsafe fn map_user_page_no_shootdown(
     frame: PhysFrame<Size4KiB>,
     flags: PageTableFlags,
 ) -> Result<(), &'static str> {
+    let _lock = PAGE_TABLE_LOCK.lock();
     let pml4_virt = VirtAddr::new(pml4_phys + phys_mem_offset());
     let pml4: &mut PageTable = unsafe { &mut *pml4_virt.as_mut_ptr() };
     let mut mapper = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(phys_mem_offset())) };
@@ -405,7 +429,7 @@ pub unsafe fn map_user_page_no_shootdown(
             .map_err(|_| "Failed to map user page")?
             .flush();
 
-        ensure_directory_permissions(pml4_phys, page.start_address());
+        ensure_directory_permissions_unlocked(pml4_phys, page.start_address());
     }
 
     Ok(())
@@ -414,6 +438,13 @@ pub unsafe fn map_user_page_no_shootdown(
 /// Ensure that the intermediate page table directories (PML4, PDPT, PD) for the given virtual address
 /// have USER_ACCESSIBLE and WRITABLE flags set.
 pub unsafe fn ensure_directory_permissions(pml4_phys: u64, addr: VirtAddr) {
+    let _lock = PAGE_TABLE_LOCK.lock();
+    unsafe {
+        ensure_directory_permissions_unlocked(pml4_phys, addr);
+    }
+}
+
+unsafe fn ensure_directory_permissions_unlocked(pml4_phys: u64, addr: VirtAddr) {
     let pml4_virt = VirtAddr::new(pml4_phys + phys_mem_offset());
     let pml4: &mut PageTable = unsafe { &mut *pml4_virt.as_mut_ptr() };
 
@@ -505,6 +536,7 @@ pub unsafe fn unmap_user_page_no_shootdown(
     pml4_phys: u64,
     page: Page<Size4KiB>,
 ) -> Result<u64, &'static str> {
+    let _lock = PAGE_TABLE_LOCK.lock();
     let pml4_virt = VirtAddr::new(pml4_phys + phys_mem_offset());
     let pml4: &mut PageTable = unsafe { &mut *pml4_virt.as_mut_ptr() };
     let mut mapper = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(phys_mem_offset())) };
@@ -546,6 +578,7 @@ pub unsafe fn update_user_page_flags_no_shootdown(
     page: Page<Size4KiB>,
     flags: PageTableFlags,
 ) -> Result<(), &'static str> {
+    let _lock = PAGE_TABLE_LOCK.lock();
     let pml4_virt = VirtAddr::new(pml4_phys + phys_mem_offset());
     let pml4: &mut PageTable = unsafe { &mut *pml4_virt.as_mut_ptr() };
     let mut mapper = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(phys_mem_offset())) };
@@ -562,13 +595,14 @@ pub unsafe fn update_user_page_flags_no_shootdown(
 
 /// Recursively unmaps and deallocates user space page tables and leaf pages.
 pub fn free_user_page_table(pml4_phys: u64) -> Result<(), &'static str> {
+    let _lock = PAGE_TABLE_LOCK.lock();
     let pml4_virt = VirtAddr::new(pml4_phys + phys_mem_offset());
     let pml4: &PageTable = unsafe { &*pml4_virt.as_ptr() };
     let pml4_index = (phys_mem_offset() >> 39) & 0x1FF;
     let mut freed_pages = 0usize;
 
     for i in 0..256 {
-        if i == pml4_index as usize {
+        if i == 1 || i == pml4_index as usize {
             continue;
         }
         let pml4_entry = &pml4[i];

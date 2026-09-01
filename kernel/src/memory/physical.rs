@@ -463,9 +463,24 @@ pub fn stats() -> (usize, usize, usize) {
     (total, allocated, total - allocated)
 }
 
+/// Drain the local core frame cache to the global allocator.
+pub fn drain_local_cache() {
+    let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
+    if apic_id < 32 {
+        let mut cache = CORE_CACHES[apic_id].lock();
+        let mut global_alloc = FRAME_ALLOCATOR.lock();
+        while cache.count > 0 {
+            cache.count -= 1;
+            let f = cache.frames[cache.count];
+            global_alloc.deallocate(f);
+        }
+    }
+}
+
 /// Verify COW reference counting and frame reclaim behavior.
 pub fn test_cow_refcounts() {
     kprintln!("[test] Starting COW refcount verification test...");
+    drain_local_cache();
     let (_, alloc_before, _) = stats();
 
     // 1. Allocate a page frame
@@ -485,6 +500,7 @@ pub fn test_cow_refcounts() {
     // 5. Simulate parent exit: free parent's frame (refcount drops to 0, reclaimed)
     deallocate_frame(phys);
 
+    drain_local_cache();
     let (_, alloc_after, _) = stats();
     assert_eq!(alloc_after, alloc_before);
     kprintln!("[test] COW refcount verification test PASSED!");

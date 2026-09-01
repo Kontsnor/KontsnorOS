@@ -26,7 +26,7 @@ done
 
 # Compile the kernel first
 echo "Compiling kernel ($BUILD_TYPE)..."
-cargo build "${CARGO_ARGS[@]}"
+cargo build --target x86_64-unknown-none "${CARGO_ARGS[@]}"
 
 KERNEL_BIN="$PROJECT_DIR/target/x86_64-unknown-none/$BUILD_TYPE/kontsnor-kernel"
 

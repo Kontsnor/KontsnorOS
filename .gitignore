@@ -11,6 +11,10 @@ disk.img
 # Logs
 *.log
 qemu_output.log
+qemu.err
+qemu.out
+qemu_selfhost_validate.out
+qemu_selfhost_validate_run*.out.bak
 
 # IDE and environment files
 .antigravity/

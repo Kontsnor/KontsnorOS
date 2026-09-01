@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 echo "Building kernel in test mode..."
-cargo rustc --manifest-path "$PROJECT_DIR/kernel/Cargo.toml" --features test --release -- --test
+cargo rustc --manifest-path "$PROJECT_DIR/kernel/Cargo.toml" --target x86_64-unknown-none --features test --release -- -Zpanic_abort_tests --test
 
 echo "Building bootable test image..."
 KERNEL_BIN="$PROJECT_DIR/target/x86_64-unknown-none/release/kontsnor-kernel"

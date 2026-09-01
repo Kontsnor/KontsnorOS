@@ -54,17 +54,18 @@ echo ""
 
 DISK_IMG="$PROJECT_DIR/disk.img"
 if [ ! -f "$DISK_IMG" ]; then
-    echo "Creating 1.5GB blank persistent hard drive image..."
-    dd if=/dev/zero of="$DISK_IMG" bs=1M count=1536 2>/dev/null
+    echo "Creating 6GB blank persistent hard drive image..."
+    dd if=/dev/zero of="$DISK_IMG" bs=1M count=6144 2>/dev/null
 fi
 
 ACCEL_OPTS="-cpu qemu64,+fsgsbase -smp 1"
 if [ -w /dev/kvm ]; then
-    echo "Enabling KVM Hardware Acceleration (-enable-kvm -cpu host -smp 4)..."
-    ACCEL_OPTS="-enable-kvm -cpu host -smp 4"
+    echo "Enabling KVM Hardware Acceleration (-enable-kvm -cpu host -smp 8)..."
+    ACCEL_OPTS="-enable-kvm -cpu host -smp 8"
 else
     echo "KVM unavailable, falling back to software TCG emulation..."
 fi
+rm -f /tmp/qmp-kontsnor.sock
 
 qemu-system-x86_64 \
     -drive format=raw,file="$BIOS_IMG" \
@@ -72,6 +73,7 @@ qemu-system-x86_64 \
     -serial stdio \
     -display none \
     -m 5G \
+    -qmp unix:/tmp/qmp-kontsnor.sock,server,nowait \
     $ACCEL_OPTS \
     -no-reboot \
     -no-shutdown \

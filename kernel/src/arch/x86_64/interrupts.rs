@@ -96,6 +96,8 @@ lazy_static! {
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
         idt.device_not_available.set_handler_fn(device_not_available_handler);
         idt.general_protection_fault.set_handler_fn(general_protection_fault_handler);
+        idt.x87_floating_point.set_handler_fn(x87_floating_point_handler);
+        idt.simd_floating_point.set_handler_fn(simd_floating_point_handler);
 
         // Double fault uses a separate IST stack to handle kernel stack overflow
         unsafe {
@@ -179,6 +181,31 @@ extern "x86-interrupt" fn device_not_available_handler(stack_frame: InterruptSta
     kprintln!("[EXCEPTION] Device Not Available");
     kprintln!("{:#?}", stack_frame);
     panic!("Unhandled device not available");
+}
+
+extern "x86-interrupt" fn x87_floating_point_handler(stack_frame: InterruptStackFrame) {
+    kprintln!(
+        "[EXCEPTION] x87 Floating Point Error at RIP={:#x}",
+        stack_frame.instruction_pointer.as_u64()
+    );
+    // Clear exception flags in x87 status word
+    unsafe {
+        core::arch::asm!("fnclex", options(nomem, nostack));
+    }
+}
+
+extern "x86-interrupt" fn simd_floating_point_handler(stack_frame: InterruptStackFrame) {
+    kprintln!(
+        "[EXCEPTION] SIMD Floating Point Error at RIP={:#x}",
+        stack_frame.instruction_pointer.as_u64()
+    );
+    // Clear MXCSR exception flags (bits 0-5)
+    unsafe {
+        let mut mxcsr: u32 = 0;
+        core::arch::asm!("stmxcsr [{}]", in(reg) &mut mxcsr, options(nostack));
+        mxcsr &= !0x3F;
+        core::arch::asm!("ldmxcsr [{}]", in(reg) &mxcsr, options(nostack));
+    }
 }
 
 extern "x86-interrupt" fn general_protection_fault_handler(
@@ -289,14 +316,34 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
     );
     */
 
+    // Check write_allowed before acquiring PAGE_TABLE_LOCK to eliminate ABBA deadlock with sys_mmap
+    let write_allowed = if error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE) {
+        let fault_vaddr = fault_addr.as_u64();
+        crate::process::scheduler::current_pid()
+            .and_then(|pid| crate::process::scheduler::get_task_arc(pid))
+            .map(|task_arc| {
+                let task = task_arc.lock();
+                let addr_space = task.address_space.lock();
+                addr_space.mmap_regions.iter().any(|r| {
+                    fault_vaddr >= r.start
+                        && fault_vaddr < r.start + r.len as u64
+                        && (r.prot & 2) != 0
+                })
+            })
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
     // Check if the fault was caused by a write operation
     if error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE) {
+        let _pt_lock = crate::memory::r#virtual::PAGE_TABLE_LOCK.lock();
         let (pml4_frame, _) = Cr3::read();
         let pml4_phys = pml4_frame.start_address().as_u64();
 
         // Upgrade intermediate directory flags to WRITABLE | USER_ACCESSIBLE
         unsafe {
-            crate::memory::r#virtual::ensure_directory_permissions(pml4_phys, fault_addr);
+            crate::memory::r#virtual::ensure_directory_permissions_unlocked(pml4_phys, fault_addr);
         }
 
         let phys_mem_offset = crate::memory::r#virtual::phys_mem_offset();
@@ -424,6 +471,14 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                                         x86_64::instructions::tlb::flush(fault_addr);
                                         // kprintln!("[debug pf] Protection violation already writable resolved at vaddr {:#x}", fault_addr.as_u64());
                                         return;
+                                    } else if write_allowed {
+                                        flags.insert(PageTableFlags::WRITABLE);
+                                        pt_entry.set_addr(
+                                            PhysAddr::new(pt_entry.addr().as_u64()),
+                                            flags,
+                                        );
+                                        x86_64::instructions::tlb::flush(fault_addr);
+                                        return;
                                     }
                                 }
                             }
@@ -466,6 +521,16 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                 }?;
 
                 let page_vaddr = fault_vaddr & !4095;
+                let page = Page::<Size4KiB>::containing_address(VirtAddr::new(page_vaddr));
+
+                // If another SMP core already resolved this page fault concurrently, we're done!
+                if crate::memory::r#virtual::translate_page_in_table(page_table_root, page)
+                    .is_some()
+                {
+                    x86_64::instructions::tlb::flush(VirtAddr::new(page_vaddr));
+                    return Some(Ok(()));
+                }
+
                 let page_offset = page_vaddr - region.start;
 
                 let prot = region.prot;
@@ -535,22 +600,12 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                     page_flags
                 };
 
-                let page = Page::<Size4KiB>::containing_address(VirtAddr::new(page_vaddr));
                 let frame = PhysFrame::containing_address(PhysAddr::new(phys));
 
                 unsafe {
                     if region.inode.is_some() {
                         kprintln!("[debug pf] incrementing ref count");
                         crate::memory::physical::increment_ref(phys);
-                    }
-
-                    kprintln!("[debug pf] unmapping page if present");
-                    if let Ok(old_phys) = crate::memory::r#virtual::unmap_user_page_no_shootdown(
-                        page_table_root,
-                        page,
-                    ) {
-                        kprintln!("[debug pf] old page at {:#x} deallocating", old_phys);
-                        crate::memory::physical::deallocate_frame(old_phys);
                     }
 
                     kprintln!("[debug pf] ensure directory permissions");
@@ -560,19 +615,32 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                     );
 
                     kprintln!("[debug pf] mapping user page");
-                    if let Err(_e) = crate::memory::r#virtual::map_user_page_no_shootdown(
+                    match crate::memory::r#virtual::map_user_page_no_shootdown(
                         page_table_root,
                         page,
                         frame,
                         actual_flags,
                     ) {
-                        kprintln!("[debug pf] map_user_page failed!");
-                        if region.inode.is_some() {
-                            crate::memory::physical::decrement_ref(phys);
-                        } else {
-                            crate::memory::physical::deallocate_frame(phys);
+                        Ok(()) => {}
+                        Err("PageAlreadyMapped") => {
+                            // Another core mapped this page concurrently. Deallocate our unused frame and succeed!
+                            if region.inode.is_some() {
+                                crate::memory::physical::decrement_ref(phys);
+                            } else {
+                                crate::memory::physical::deallocate_frame(phys);
+                            }
+                            x86_64::instructions::tlb::flush(VirtAddr::new(page_vaddr));
+                            return Some(Ok(()));
                         }
-                        return Some(Err((-12, page_vaddr)));
+                        Err(_e) => {
+                            kprintln!("[debug pf] map_user_page failed!");
+                            if region.inode.is_some() {
+                                crate::memory::physical::decrement_ref(phys);
+                            } else {
+                                crate::memory::physical::deallocate_frame(phys);
+                            }
+                            return Some(Err((-12, page_vaddr)));
+                        }
                     }
 
                     let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
@@ -624,6 +692,23 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
     crate::memory::r#virtual::debug_dump_mapping(fault_addr.as_u64());
 
     if is_user {
+        if let Some(pid) = crate::process::scheduler::current_pid() {
+            if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+                let task = task_arc.lock();
+                let addr_space = task.address_space.lock();
+                crate::kprintln!("  mmap_regions (count {}):", addr_space.mmap_regions.len());
+                for (i, r) in addr_space.mmap_regions.iter().enumerate() {
+                    crate::kprintln!(
+                        "    [{}] start={:#x}, len={:#x}, end={:#x}, prot={:#x}",
+                        i,
+                        r.start,
+                        r.len,
+                        r.start + r.len as u64,
+                        r.prot
+                    );
+                }
+            }
+        }
         kprintln!(
             "[page_fault] Process PID {:?} caused unhandled page fault at {:#x} (RIP={:#x}) — terminating task",
             crate::process::scheduler::current_pid(),
@@ -678,13 +763,19 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     // Acknowledge the timer interrupt to the Local APIC
     super::apic::lapic_eoi();
 
-    // Trigger rescheduling to enable preemption
-    crate::process::scheduler::schedule();
+    // Trigger rescheduling to enable preemption when returning to user mode (Ring 3),
+    // or when the CPU is running an idle task (PID >= 900) in Ring 0.
+    let is_idle = crate::process::scheduler::current_pid()
+        .map(|p| p.as_u64() >= 900)
+        .unwrap_or(false);
 
-    if swap_needed {
-        // SAFETY: Swap back to user GS base before returning
-        unsafe {
-            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+    if swap_needed || is_idle {
+        crate::process::scheduler::schedule();
+        if swap_needed {
+            // SAFETY: Swap back to user GS base before returning
+            unsafe {
+                core::arch::asm!("swapgs", options(nostack, preserves_flags));
+            }
         }
     }
 }
@@ -733,9 +824,8 @@ extern "x86-interrupt" fn ipi_reschedule_handler(stack_frame: InterruptStackFram
     }
 
     super::apic::lapic_eoi();
-    crate::process::scheduler::schedule();
-
     if swap_needed {
+        crate::process::scheduler::schedule();
         // SAFETY: Swap back to user GS base before returning
         unsafe {
             core::arch::asm!("swapgs", options(nostack, preserves_flags));

@@ -123,8 +123,8 @@ impl<T> TicketLock<T> {
 
         let apic_id = crate::arch::x86_64::smp::current_lapic_id() as u32;
 
-        // If we already hold the lock, fail try_lock to avoid deadlock
-        if self.holding_cpu.load(Ordering::SeqCst) == apic_id {
+        // If the lock is currently held, fail try_lock immediately
+        if self.holding_cpu.load(Ordering::SeqCst) != 0xFFFFFFFF {
             if interrupts_enabled {
                 x86_64::instructions::interrupts::enable();
             }
@@ -161,8 +161,10 @@ impl<T> TicketLock<T> {
     /// # Safety
     /// This is unsafe because it bypasses normal RAII lock guard guarantees.
     pub unsafe fn force_unlock(&self) {
-        self.holding_cpu.store(0xFFFFFFFF, Ordering::SeqCst);
-        self.now_serving.fetch_add(1, Ordering::SeqCst);
+        let prev = self.holding_cpu.swap(0xFFFFFFFF, Ordering::SeqCst);
+        if prev != 0xFFFFFFFF {
+            self.now_serving.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     /// Get a mutable reference to the underlying data without locking.
@@ -199,11 +201,11 @@ impl<T> DerefMut for TicketLockGuard<'_, T> {
 
 impl<T> Drop for TicketLockGuard<'_, T> {
     fn drop(&mut self) {
-        // Reset holding CPU
-        self.lock.holding_cpu.store(0xFFFFFFFF, Ordering::SeqCst);
-
-        // Advance to the next ticket
-        self.lock.now_serving.fetch_add(1, Ordering::SeqCst);
+        // Reset holding CPU and only advance now_serving if the lock was actively held
+        let prev = self.lock.holding_cpu.swap(0xFFFFFFFF, Ordering::SeqCst);
+        if prev != 0xFFFFFFFF {
+            self.lock.now_serving.fetch_add(1, Ordering::SeqCst);
+        }
 
         // Restore the original interrupt state
         if self.interrupts_enabled {

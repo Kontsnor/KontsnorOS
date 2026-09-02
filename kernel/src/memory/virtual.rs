@@ -424,15 +424,19 @@ pub unsafe fn map_user_page_no_shootdown(
 
     // SAFETY: The caller guarantees that the mapping is valid and safe.
     unsafe {
-        mapper
-            .map_to(page, frame, flags, &mut frame_alloc)
-            .map_err(|_| "Failed to map user page")?
-            .flush();
-
-        ensure_directory_permissions_unlocked(pml4_phys, page.start_address());
+        match mapper.map_to(page, frame, flags, &mut frame_alloc) {
+            Ok(flush) => {
+                flush.flush();
+                ensure_directory_permissions_unlocked(pml4_phys, page.start_address());
+                Ok(())
+            }
+            Err(x86_64::structures::paging::mapper::MapToError::PageAlreadyMapped(_)) => {
+                ensure_directory_permissions_unlocked(pml4_phys, page.start_address());
+                Err("PageAlreadyMapped")
+            }
+            Err(_) => Err("Failed to map user page"),
+        }
     }
-
-    Ok(())
 }
 
 /// Ensure that the intermediate page table directories (PML4, PDPT, PD) for the given virtual address
@@ -444,7 +448,7 @@ pub unsafe fn ensure_directory_permissions(pml4_phys: u64, addr: VirtAddr) {
     }
 }
 
-unsafe fn ensure_directory_permissions_unlocked(pml4_phys: u64, addr: VirtAddr) {
+pub(crate) unsafe fn ensure_directory_permissions_unlocked(pml4_phys: u64, addr: VirtAddr) {
     let pml4_virt = VirtAddr::new(pml4_phys + phys_mem_offset());
     let pml4: &mut PageTable = unsafe { &mut *pml4_virt.as_mut_ptr() };
 
@@ -501,6 +505,19 @@ pub fn translate_addr(addr: VirtAddr) -> Option<PhysAddr> {
     let mapper = unsafe { active_page_table() };
     use x86_64::structures::paging::Translate;
     mapper.translate_addr(addr)
+}
+
+/// Translate a virtual page in a targeted PML4 page table.
+pub fn translate_page_in_table(
+    pml4_phys: u64,
+    page: Page<Size4KiB>,
+) -> Option<PhysFrame<Size4KiB>> {
+    let _lock = PAGE_TABLE_LOCK.lock();
+    let pml4_virt = VirtAddr::new(pml4_phys + phys_mem_offset());
+    let pml4: &mut PageTable = unsafe { &mut *pml4_virt.as_mut_ptr() };
+    let mapper = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(phys_mem_offset())) };
+    use x86_64::structures::paging::Translate;
+    mapper.translate_page(page).ok()
 }
 
 /// A frame allocator that wraps our physical frame allocator to implement

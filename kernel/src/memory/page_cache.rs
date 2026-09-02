@@ -365,3 +365,88 @@ pub fn mark_dirty(ino: u64, offset: u64) {
         entry.dirty = true;
     }
 }
+
+/// Sync dirty pages in a virtual memory range `[unmap_start, unmap_end)` for a task's address space.
+pub fn sync_mapped_region(
+    page_table_root: u64,
+    region: &crate::process::task::MappedRegion,
+    unmap_start: u64,
+    unmap_end: u64,
+) {
+    if !region.is_shared {
+        return;
+    }
+    let inode = match region.inode {
+        Some(ref inode) => inode,
+        None => return,
+    };
+    let ino = inode.inode().ino;
+
+    let range_start = core::cmp::max(region.start, unmap_start);
+    let range_end = core::cmp::min(region.start.saturating_add(region.len as u64), unmap_end);
+    if range_start >= range_end {
+        return;
+    }
+
+    let start_page = range_start & !4095;
+    let end_page = (range_end - 1) & !4095;
+
+    for vaddr in (start_page..=end_page).step_by(4096) {
+        let page_offset = vaddr - region.start;
+        let file_offset = region.offset + page_offset;
+        let aligned_file_offset = file_offset & !4095;
+
+        let mut should_flush = false;
+        let mut phys_addr_to_write = None;
+
+        // SAFETY: Walking page table under valid root address.
+        unsafe {
+            if let Some(pte) = get_page_table_entry(page_table_root, VirtAddr::new(vaddr)) {
+                let mut flags = pte.flags();
+                if flags.contains(PageTableFlags::DIRTY) || (region.prot & 2) != 0 {
+                    if let Ok(frame) = pte.frame() {
+                        phys_addr_to_write = Some(frame.start_address().as_u64());
+                        should_flush = true;
+                    }
+                    if flags.contains(PageTableFlags::DIRTY) {
+                        flags.remove(PageTableFlags::DIRTY);
+                        pte.set_addr(pte.addr(), flags);
+                        x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
+                    }
+                }
+            }
+        }
+
+        // Also check if marked dirty in PAGE_CACHE
+        if !should_flush {
+            let cache = PAGE_CACHE.lock();
+            if let Some(entry) = cache.get(&(ino, aligned_file_offset)) {
+                if entry.dirty {
+                    phys_addr_to_write = Some(entry.phys_addr);
+                    should_flush = true;
+                }
+            }
+        }
+
+        if should_flush {
+            if let Some(phys) = phys_addr_to_write {
+                let phys_offset = phys + crate::memory::r#virtual::phys_mem_offset();
+                // SAFETY: phys is a valid allocated physical page frame mapped into virtual memory.
+                let src_slice =
+                    unsafe { core::slice::from_raw_parts(phys_offset as *const u8, 4096) };
+                let size = inode.inode().size;
+                if size > aligned_file_offset {
+                    let write_len = core::cmp::min(4096, (size - aligned_file_offset) as usize);
+                    let _ = inode.write_direct(aligned_file_offset, &src_slice[..write_len]);
+                }
+
+                let mut cache = PAGE_CACHE.lock();
+                if let Some(entry) = cache.get_mut(&(ino, aligned_file_offset)) {
+                    if entry.phys_addr == phys {
+                        entry.dirty = false;
+                    }
+                }
+            }
+        }
+    }
+}

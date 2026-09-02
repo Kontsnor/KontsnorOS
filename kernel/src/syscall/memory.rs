@@ -77,8 +77,8 @@ pub fn sys_mmap(
 
     let is_fixed = (flags & 0x10) != 0;
 
-    // Get current mmap_bump and page table root
-    let (resolved_addr, _page_table_root) = {
+    // Resolve address and register mmap_region atomically under task.address_space.lock()
+    let resolved_addr = {
         let task_arc = match scheduler::get_task_arc(current_pid) {
             Some(t) => t,
             None => return Errno::ESRCH.into(),
@@ -100,6 +100,67 @@ pub fn sys_mmap(
             if end_addr > addr_space.mmap_bump {
                 addr_space.mmap_bump = end_addr;
             }
+
+            // Unmap any existing page table mappings in [addr, end_addr)
+            let page_table_root = addr_space.page_table_root;
+            for r in &addr_space.mmap_regions {
+                if r.is_shared && r.inode.is_some() {
+                    crate::memory::page_cache::sync_mapped_region(
+                        page_table_root,
+                        r,
+                        addr,
+                        end_addr,
+                    );
+                }
+            }
+            use x86_64::structures::paging::{Page, Size4KiB};
+            use x86_64::VirtAddr;
+            let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
+            let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(end_addr - 1));
+            for page in Page::range_inclusive(start_page, end_page) {
+                let result = unsafe {
+                    crate::memory::r#virtual::unmap_user_page_no_shootdown(page_table_root, page)
+                };
+                if let Ok(phys_addr) = result {
+                    crate::memory::physical::deallocate_frame(phys_addr);
+                }
+            }
+
+            // Truncate or remove overlapping regions in mmap_regions
+            let mut new_regions = alloc::vec::Vec::new();
+            for r in addr_space.mmap_regions.iter() {
+                let r_start = r.start;
+                let r_end = r.start + r.len as u64;
+                if r_end <= addr || r_start >= end_addr {
+                    new_regions.push(r.clone());
+                } else {
+                    if r_start < addr {
+                        new_regions.push(crate::process::task::MappedRegion {
+                            start: r_start,
+                            len: (addr - r_start) as usize,
+                            inode: r.inode.clone(),
+                            offset: r.offset,
+                            is_shared: r.is_shared,
+                            prot: r.prot,
+                            pathname: r.pathname.clone(),
+                        });
+                    }
+                    if r_end > end_addr {
+                        let diff = end_addr - r_start;
+                        new_regions.push(crate::process::task::MappedRegion {
+                            start: end_addr,
+                            len: (r_end - end_addr) as usize,
+                            inode: r.inode.clone(),
+                            offset: r.offset + diff,
+                            is_shared: r.is_shared,
+                            prot: r.prot,
+                            pathname: r.pathname.clone(),
+                        });
+                    }
+                }
+            }
+            addr_space.mmap_regions = new_regions;
+
             addr
         } else {
             // If MAP_FIXED is not specified, addr is a hint.
@@ -124,45 +185,48 @@ pub fn sys_mmap(
             };
 
             if hint_ok {
-                let end_addr = addr + aligned_len as u64;
-                if end_addr > addr_space.mmap_bump {
-                    addr_space.mmap_bump = end_addr;
-                }
                 addr
             } else {
-                let current_bump = addr_space.mmap_bump;
-                let next_bump = match current_bump.checked_add(aligned_len as u64) {
-                    Some(b) => b,
-                    None => return Errno::EINVAL.into(),
-                };
-                if next_bump > 0x0000_7FFF_FFFF_FFFF {
-                    return Errno::EINVAL.into();
+                let mut candidate = addr_space.mmap_bump;
+                loop {
+                    let candidate_end = match candidate.checked_add(aligned_len as u64) {
+                        Some(e) => e,
+                        None => return Errno::ENOMEM.into(),
+                    };
+                    if candidate_end > 0x0000_7FFF_0000_0000 {
+                        return Errno::ENOMEM.into();
+                    }
+
+                    let mut overlapping_end: Option<u64> = None;
+                    if candidate < addr_space.brk {
+                        overlapping_end = Some(addr_space.brk);
+                    } else {
+                        for r in &addr_space.mmap_regions {
+                            let r_end = r.start.saturating_add(r.len as u64);
+                            if candidate < r_end && candidate_end > r.start {
+                                overlapping_end =
+                                    Some(core::cmp::max(overlapping_end.unwrap_or(0), r_end));
+                            }
+                        }
+                    }
+
+                    match overlapping_end {
+                        Some(end) => {
+                            candidate = (end + 4095) & !4095;
+                        }
+                        None => {
+                            addr_space.mmap_bump = candidate_end;
+                            break candidate;
+                        }
+                    }
                 }
-                addr_space.mmap_bump = next_bump;
-                current_bump
             }
         };
 
-        (resolved, addr_space.page_table_root)
-    };
-
-    // Unmap any existing overlapping regions/pages ONLY if MAP_FIXED was explicitly requested
-    if is_fixed {
-        let _ = sys_munmap(resolved_addr, aligned_len);
-    }
-
-    // Add to task's mmap_regions
-    {
-        let task_arc = match scheduler::get_task_arc(current_pid) {
-            Some(t) => t,
-            None => return Errno::ESRCH.into(),
-        };
-        let task = task_arc.lock();
-        let mut addr_space = task.address_space.lock();
         addr_space
             .mmap_regions
             .push(crate::process::task::MappedRegion {
-                start: resolved_addr,
+                start: resolved,
                 len: aligned_len,
                 inode: file_desc.as_ref().map(|d| d.inode.clone()),
                 offset: offset as u64,
@@ -170,7 +234,20 @@ pub fn sys_mmap(
                 prot,
                 pathname: file_desc.as_ref().and_then(|d| d.path.clone()),
             });
-    }
+
+        if crate::syscall::DEBUG_SYSCALLS {
+            crate::kprintln!(
+                "[mmap] pid={:?} start={:#x} len={:#x} prot={:#x} total={}",
+                current_pid,
+                resolved,
+                aligned_len,
+                prot,
+                addr_space.mmap_regions.len()
+            );
+        }
+
+        resolved
+    };
 
     resolved_addr as SyscallResult
 }
@@ -194,12 +271,6 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
         Some(t) => t,
         None => return Errno::ESRCH.into(),
     };
-    let page_table_root = {
-        let task = task_arc.lock();
-        let pt_root = task.address_space.lock().page_table_root;
-        pt_root
-    };
-
     let aligned_len = match length.checked_add(4095) {
         Some(len) => len & !4095,
         None => return Errno::EINVAL.into(),
@@ -214,25 +285,39 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
     let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
     let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(end_addr - 1));
 
-    let mut unmapped_count = 0;
-    for page in Page::range_inclusive(start_page, end_page) {
-        let result = unsafe {
-            crate::memory::r#virtual::unmap_user_page_no_shootdown(page_table_root, page)
-        };
-
-        if let Ok(phys_addr) = result {
-            crate::memory::physical::deallocate_frame(phys_addr);
-            unmapped_count += 1;
-        }
-    }
-
-    // unmap and remove/shrink task.mmap_regions
-    {
+    let unmapped_count = {
         let task = task_arc.lock();
         let mut addr_space = task.address_space.lock();
-        let mut new_regions = alloc::vec::Vec::new();
+        let page_table_root = addr_space.page_table_root;
+
         let unmap_start = addr;
         let unmap_end = addr + aligned_len as u64;
+
+        // Sync any shared file-backed regions before unmapping their page table entries
+        for r in &addr_space.mmap_regions {
+            if r.is_shared && r.inode.is_some() {
+                crate::memory::page_cache::sync_mapped_region(
+                    page_table_root,
+                    r,
+                    unmap_start,
+                    unmap_end,
+                );
+            }
+        }
+
+        let mut count = 0;
+        for page in Page::range_inclusive(start_page, end_page) {
+            let result = unsafe {
+                crate::memory::r#virtual::unmap_user_page_no_shootdown(page_table_root, page)
+            };
+
+            if let Ok(phys_addr) = result {
+                crate::memory::physical::deallocate_frame(phys_addr);
+                count += 1;
+            }
+        }
+
+        let mut new_regions = alloc::vec::Vec::new();
 
         for r in addr_space.mmap_regions.iter() {
             let r_start = r.start;
@@ -267,7 +352,8 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
             }
         }
         addr_space.mmap_regions = new_regions;
-    }
+        count
+    };
 
     if unmapped_count > 0 {
         crate::arch::x86_64::smp::shootdown_tlb();
@@ -275,7 +361,10 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
 
     if crate::syscall::DEBUG_SYSCALLS {
         kprintln!(
-            "[syscall] munmap: successfully unmapped {} pages",
+            "[syscall] munmap: pid={:?} addr={:#x} len={:#x} unmapped {} pages",
+            current_pid,
+            addr,
+            aligned_len,
             unmapped_count
         );
     }
@@ -413,16 +502,16 @@ pub fn sys_mprotect(addr: u64, length: usize, prot: i32) -> SyscallResult {
     let mut updated_count = 0;
     for page in Page::range_inclusive(start_page, end_page) {
         let page_addr = page.start_address().as_u64();
-        // Determine is_shared for this page's region
-        let is_shared = {
+        // Determine is_shared and is_file_backed for this page's region
+        let (is_shared, is_file_backed) = {
             let task = task_arc.lock();
             let addr_space = task.address_space.lock();
             addr_space
                 .mmap_regions
                 .iter()
                 .find(|r| page_addr >= r.start && page_addr < r.start + r.len as u64)
-                .map(|r| r.is_shared)
-                .unwrap_or(false)
+                .map(|r| (r.is_shared, r.inode.is_some()))
+                .unwrap_or((false, false))
         };
 
         // Get the PTE for this page
@@ -437,11 +526,11 @@ pub fn sys_mprotect(addr: u64, length: usize, prot: i32) -> SyscallResult {
 
                 // Handle WRITABLE and BIT_9 (COW)
                 if (prot & 2) != 0 {
-                    if is_shared {
+                    if is_shared || !is_file_backed {
                         pte_flags.insert(PageTableFlags::WRITABLE);
                         pte_flags.remove(PageTableFlags::BIT_9);
                     } else {
-                        // Private mapping: if it is already mapped writable, keep it writable
+                        // Private file mapping: if not already writable, keep or mark as COW
                         if !pte_flags.contains(PageTableFlags::WRITABLE) {
                             pte_flags.insert(PageTableFlags::BIT_9);
                         }
@@ -840,5 +929,42 @@ pub fn sys_madvise(addr: u64, length: usize, advice: i32) -> SyscallResult {
         }
     }
 
+    0 // Success
+}
+
+/// `msync(addr, length, flags)` — Synchronize a file with a memory map.
+pub fn sys_msync(addr: u64, length: usize, _flags: i32) -> SyscallResult {
+    use crate::process::scheduler;
+
+    if length == 0 || (addr & 4095) != 0 {
+        return Errno::EINVAL.into();
+    }
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    let task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
+    };
+    let aligned_len = match length.checked_add(4095) {
+        Some(len) => len & !4095,
+        None => return Errno::EINVAL.into(),
+    };
+    let sync_start = addr;
+    let sync_end = match addr.checked_add(aligned_len as u64) {
+        Some(end) => end,
+        None => return Errno::EINVAL.into(),
+    };
+
+    let task = task_arc.lock();
+    let addr_space = task.address_space.lock();
+    let pt_root = addr_space.page_table_root;
+
+    for r in &addr_space.mmap_regions {
+        if r.is_shared && r.inode.is_some() {
+            crate::memory::page_cache::sync_mapped_region(pt_root, r, sync_start, sync_end);
+        }
+    }
     0 // Success
 }

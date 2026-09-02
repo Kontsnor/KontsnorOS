@@ -572,6 +572,18 @@ pub fn sys_rename_with_resolved_paths(resolved_old: String, resolved_new: String
     };
 
     if src_inode_ops.inode().file_type == FileType::Directory {
+        // Fast path: attempt atomic directory entry link transfer without copying trees
+        if let Some(node) = old_parent.unlink_entry(old_name) {
+            let _ = new_parent.rmdir(new_name);
+            if new_parent.link_entry(new_name, node.clone()).is_ok() {
+                crate::fs::vfs::invalidate_dentry(&resolved_old);
+                crate::fs::vfs::invalidate_dentry(&resolved_new);
+                return 0;
+            } else {
+                let _ = old_parent.link_entry(old_name, node);
+            }
+        }
+
         let new_dir = match new_parent
             .mkdir(new_name)
             .or_else(|| new_parent.create(new_name, FileType::Directory))
@@ -598,6 +610,9 @@ pub fn sys_rename_with_resolved_paths(resolved_old: String, resolved_new: String
                         }
                     } else {
                         if let Some(child_dst) = dst.create(&entry.name, entry.file_type) {
+                            let _ = child_dst.set_permissions(child_src.inode().permissions.mode);
+                            let _ =
+                                child_dst.set_owner(child_src.inode().uid, child_src.inode().gid);
                             let file_size = child_src.inode().size as usize;
                             if file_size > 0 {
                                 let mut buf = alloc::vec![0u8; file_size];
@@ -631,16 +646,43 @@ pub fn sys_rename_with_resolved_paths(resolved_old: String, resolved_new: String
         remove_dir_rec(&src_inode_ops);
         let _ = old_parent.rmdir(old_name);
     } else {
+        // Fast path: attempt atomic entry link transfer without copying data (preserves entire inode)
+        if let Some(node) = old_parent.unlink_entry(old_name) {
+            // Remove target if it already exists per POSIX
+            let _ = new_parent.unlink(new_name);
+            if new_parent.link_entry(new_name, node.clone()).is_ok() {
+                crate::fs::vfs::invalidate_dentry(&resolved_old);
+                crate::fs::vfs::invalidate_dentry(&resolved_new);
+                return 0;
+            } else {
+                // If link_entry failed, restore old entry
+                let _ = old_parent.link_entry(old_name, node);
+            }
+        }
+
         let file_size = src_inode_ops.inode().size as usize;
         let mut buf = alloc::vec![0u8; file_size];
         if file_size > 0 {
             let _ = src_inode_ops.read(0, &mut buf);
         }
 
-        let new_inode = match new_parent.create(new_name, FileType::Regular) {
+        let src_mode = src_inode_ops.inode().permissions.mode;
+        let src_uid = src_inode_ops.inode().uid;
+        let src_gid = src_inode_ops.inode().gid;
+        let src_type = src_inode_ops.inode().file_type;
+
+        // If the target already exists, remove it first per POSIX rename semantics
+        if new_parent.lookup(new_name).is_some() {
+            let _ = new_parent.unlink(new_name);
+        }
+
+        let new_inode = match new_parent.create(new_name, src_type) {
             Some(i) => i,
             None => return Errno::ENOSPC.into(),
         };
+        let _ = new_inode.set_permissions(src_mode);
+        let _ = new_inode.set_owner(src_uid, src_gid);
+
         if file_size > 0 {
             let _ = new_inode.write(0, &buf);
         }
@@ -654,10 +696,99 @@ pub fn sys_rename_with_resolved_paths(resolved_old: String, resolved_new: String
 }
 
 /// `link(oldpath, newpath)` — Create a hard link.
-///
-/// KontsnorOS does not support hard links; return EPERM.
-pub fn sys_link(_oldpath: *const u8, _newpath: *const u8) -> SyscallResult {
-    Errno::EPERM.into()
+pub fn sys_link(oldpath: *const u8, newpath: *const u8) -> SyscallResult {
+    sys_linkat(-100, oldpath, -100, newpath, 0)
+}
+
+/// `linkat(olddirfd, oldpath, newdirfd, newpath, flags)` — Create a hard link relative to directory file descriptors.
+pub fn sys_linkat(
+    olddirfd: i32,
+    oldpath: *const u8,
+    newdirfd: i32,
+    newpath: *const u8,
+    flags: i32,
+) -> SyscallResult {
+    if oldpath.is_null() || newpath.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let raw_old = match unsafe { copy_string_from_user(oldpath) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let raw_new = match unsafe { copy_string_from_user(newpath) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved_old = match crate::fs::vfs::resolve_relative_path_at(olddirfd, &raw_old) {
+        Ok(path) => path,
+        Err(e) => return e.into(),
+    };
+    let resolved_new = match crate::fs::vfs::resolve_relative_path_at(newdirfd, &raw_new) {
+        Ok(path) => path,
+        Err(e) => return e.into(),
+    };
+
+    sys_link_with_resolved_paths(resolved_old, resolved_new, flags)
+}
+
+/// Core hardlink logic with already resolved paths.
+pub fn sys_link_with_resolved_paths(
+    resolved_old: String,
+    resolved_new: String,
+    flags: i32,
+) -> SyscallResult {
+    kprintln!(
+        "[syscall] link(\"{}\" -> \"{}\")",
+        resolved_old,
+        resolved_new
+    );
+
+    let follow = (flags & 0x400) != 0; // AT_SYMLINK_FOLLOW
+    let src_inode = match crate::fs::vfs::lookup_follow(&resolved_old, follow) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    // POSIX forbids creating hard links to directories
+    if src_inode.inode().is_dir() {
+        return Errno::EPERM.into();
+    }
+
+    let (new_parent_path, new_name) = crate::fs::path::split_path(&resolved_new);
+    let new_parent = match crate::fs::vfs::lookup(new_parent_path) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    if !new_parent.inode().is_dir() {
+        return Errno::ENOTDIR.into();
+    }
+
+    // Verify write and execute permissions on the target directory
+    if let Err(e) =
+        crate::fs::inode::check_permission(new_parent.inode(), crate::fs::inode::MAY_WRITE)
+    {
+        return e as SyscallResult;
+    }
+    if let Err(e) =
+        crate::fs::inode::check_permission(new_parent.inode(), crate::fs::inode::MAY_EXEC)
+    {
+        return e as SyscallResult;
+    }
+
+    // If destination already exists, return EEXIST per POSIX
+    if new_parent.lookup(new_name).is_some() {
+        return Errno::EEXIST.into();
+    }
+
+    match new_parent.link_entry(new_name, src_inode.clone()) {
+        Ok(()) => {
+            crate::fs::vfs::invalidate_dentry(&resolved_new);
+            0
+        }
+        Err(e) => e as SyscallResult,
+    }
 }
 
 /// `readlink(pathname, buf, bufsize)` — Read the value of a symbolic link.

@@ -69,24 +69,31 @@ impl FileSystem for TmpFs {
 
 /// A tmpfs directory.
 pub struct TmpFsDir {
-    inode: RwLock<Inode>,
+    inode: core::cell::UnsafeCell<Inode>,
     entries: RwLock<BTreeMap<String, Arc<dyn InodeOps>>>,
 }
 
+unsafe impl Sync for TmpFsDir {}
+unsafe impl Send for TmpFsDir {}
+
 impl InodeOps for TmpFsDir {
     fn inode(&self) -> &Inode {
-        unsafe { &*(&*self.inode.read() as *const Inode) }
+        unsafe { &*self.inode.get() }
     }
 
     fn set_permissions(&self, mode: u16) -> Result<(), i32> {
-        self.inode.write().permissions.mode = mode;
+        unsafe {
+            (*self.inode.get()).permissions.mode = mode;
+        }
         Ok(())
     }
 
     fn set_owner(&self, uid: u32, gid: u32) -> Result<(), i32> {
-        let mut inode = self.inode.write();
-        inode.uid = uid;
-        inode.gid = gid;
+        unsafe {
+            let inode = &mut *self.inode.get();
+            inode.uid = uid;
+            inode.gid = gid;
+        }
         Ok(())
     }
 
@@ -97,11 +104,11 @@ impl InodeOps for TmpFsDir {
     fn create(&self, name: &str, file_type: FileType) -> Option<Arc<dyn InodeOps>> {
         let node: Arc<dyn InodeOps> = match file_type {
             FileType::Regular => Arc::new(TmpFsFile {
-                inode: RwLock::new(Inode::new(alloc_ino(), FileType::Regular)),
+                inode: core::cell::UnsafeCell::new(Inode::new(alloc_ino(), FileType::Regular)),
                 data: RwLock::new(Vec::new()),
             }),
             FileType::Directory => Arc::new(TmpFsDir {
-                inode: RwLock::new(Inode::new(alloc_ino(), FileType::Directory)),
+                inode: core::cell::UnsafeCell::new(Inode::new(alloc_ino(), FileType::Directory)),
                 entries: RwLock::new(BTreeMap::new()),
             }),
             _ => return None,
@@ -122,6 +129,15 @@ impl InodeOps for TmpFsDir {
             Some(_) => Ok(()),
             None => Err(-2), // ENOENT
         }
+    }
+
+    fn unlink_entry(&self, name: &str) -> Option<Arc<dyn InodeOps>> {
+        self.entries.write().remove(name)
+    }
+
+    fn link_entry(&self, name: &str, node: Arc<dyn InodeOps>) -> Result<(), i32> {
+        self.entries.write().insert(String::from(name), node);
+        Ok(())
     }
 
     fn rmdir(&self, name: &str) -> Result<(), i32> {
@@ -179,32 +195,31 @@ impl InodeOps for TmpFsDir {
 
 /// A tmpfs regular file — stores data in a `Vec<u8>`.
 struct TmpFsFile {
-    inode: RwLock<Inode>,
+    inode: core::cell::UnsafeCell<Inode>,
     data: RwLock<Vec<u8>>,
 }
 
+unsafe impl Sync for TmpFsFile {}
+unsafe impl Send for TmpFsFile {}
+
 impl InodeOps for TmpFsFile {
     fn inode(&self) -> &Inode {
-        // Note: This returns a reference to the RwLock guard, which
-        // requires some careful handling. For now, we use a simple approach.
-        // In a production kernel, we'd use a different pattern.
-        unsafe {
-            // SAFETY: We hold the lock briefly to get the reference.
-            // This is a simplification; a real implementation would
-            // use interior mutability differently.
-            &*(&*self.inode.read() as *const Inode)
-        }
+        unsafe { &*self.inode.get() }
     }
 
     fn set_permissions(&self, mode: u16) -> Result<(), i32> {
-        self.inode.write().permissions.mode = mode;
+        unsafe {
+            (*self.inode.get()).permissions.mode = mode;
+        }
         Ok(())
     }
 
     fn set_owner(&self, uid: u32, gid: u32) -> Result<(), i32> {
-        let mut inode = self.inode.write();
-        inode.uid = uid;
-        inode.gid = gid;
+        unsafe {
+            let inode = &mut *self.inode.get();
+            inode.uid = uid;
+            inode.gid = gid;
+        }
         Ok(())
     }
 
@@ -235,8 +250,9 @@ impl InodeOps for TmpFsFile {
         data[offset..offset + new_data.len()].copy_from_slice(new_data);
 
         // Update inode size
-        let mut inode = self.inode.write();
-        inode.size = data.len() as u64;
+        unsafe {
+            (*self.inode.get()).size = data.len() as u64;
+        }
 
         Ok(new_data.len())
     }
@@ -244,7 +260,9 @@ impl InodeOps for TmpFsFile {
     fn truncate(&self, size: u64) -> Result<(), i32> {
         let mut data = self.data.write();
         data.resize(size as usize, 0);
-        self.inode.write().size = size;
+        unsafe {
+            (*self.inode.get()).size = size;
+        }
         Ok(())
     }
 }
@@ -252,7 +270,7 @@ impl InodeOps for TmpFsFile {
 /// Create a new tmpfs instance.
 pub fn create_tmpfs() -> Arc<TmpFs> {
     let root = Arc::new(TmpFsDir {
-        inode: RwLock::new(Inode::new(alloc_ino(), FileType::Directory)),
+        inode: core::cell::UnsafeCell::new(Inode::new(alloc_ino(), FileType::Directory)),
         entries: RwLock::new(BTreeMap::new()),
     });
 
@@ -268,7 +286,7 @@ pub fn init() {
 /// Create an anonymous TmpFsFile inode.
 pub fn create_memfd_inode() -> Arc<dyn InodeOps> {
     Arc::new(TmpFsFile {
-        inode: RwLock::new(Inode::new(alloc_ino(), FileType::Regular)),
+        inode: core::cell::UnsafeCell::new(Inode::new(alloc_ino(), FileType::Regular)),
         data: RwLock::new(Vec::new()),
     })
 }

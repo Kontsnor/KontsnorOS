@@ -276,6 +276,16 @@ pub trait InodeOps: Send + Sync {
         Err(-1) // EPERM
     }
 
+    /// Unlink an entry and return the underlying InodeOps (for atomic rename).
+    fn unlink_entry(&self, _name: &str) -> Option<Arc<dyn InodeOps>> {
+        None
+    }
+
+    /// Link an existing InodeOps entry into this directory (for atomic rename).
+    fn link_entry(&self, _name: &str, _node: Arc<dyn InodeOps>) -> Result<(), i32> {
+        Err(-38) // ENOSYS
+    }
+
     /// Create a subdirectory.
     fn mkdir(&self, _name: &str) -> Option<Arc<dyn InodeOps>> {
         None

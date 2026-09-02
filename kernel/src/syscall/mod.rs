@@ -558,6 +558,13 @@ pub fn dispatch(
             arg2 as i32,
             arg3 as *const u8,
         ),
+        265 => fs::sys_linkat(
+            arg0 as i32,
+            arg1 as *const u8,
+            arg2 as i32,
+            arg3 as *const u8,
+            arg4 as i32,
+        ),
         266 => fs::sys_symlinkat(arg0 as *const u8, arg1 as i32, arg2 as *const u8),
         267 => fs::sys_readlinkat(
             arg0 as i32,
@@ -622,6 +629,7 @@ pub fn dispatch(
         11 => memory::sys_munmap(arg0, arg1 as usize),
         12 => memory::sys_brk(arg0),
         25 => memory::sys_mremap(arg0, arg1 as usize, arg2 as usize, arg3 as i32, arg4),
+        26 => memory::sys_msync(arg0, arg1 as usize, arg2 as i32),
         28 => memory::sys_madvise(arg0, arg1 as usize, arg2 as i32),
         // Process
         13 => signal::sys_rt_sigaction(

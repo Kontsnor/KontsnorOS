@@ -102,34 +102,52 @@ impl FileDescription {
 
     /// Read from this file.
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, i32> {
-        let flags = self.flags.lock();
-        if !flags.is_readable() {
+        let is_readable = self.flags.lock().is_readable();
+        if !is_readable {
             return Err(-9); // EBADF
         }
 
-        let mut offset = self.offset.lock();
-        let bytes_read = self.inode.read(*offset, buf)?;
-        *offset += bytes_read as u64;
-        Ok(bytes_read)
+        let file_type = self.inode.inode().file_type;
+        let is_seekable = file_type == crate::fs::inode::FileType::Regular;
+
+        if is_seekable {
+            let mut offset_guard = self.offset.lock();
+            let current_offset = *offset_guard;
+            let bytes_read = self.inode.read(current_offset, buf)?;
+            *offset_guard = current_offset.saturating_add(bytes_read as u64);
+            Ok(bytes_read)
+        } else {
+            // Non-seekable streams (pipes, sockets, character devices/TTYs) do not track or need file offset locking
+            self.inode.read(0, buf)
+        }
     }
 
     /// Write to this file.
     pub fn write(&self, data: &[u8]) -> Result<usize, i32> {
-        let flags = self.flags.lock();
-        if !flags.is_writable() {
+        let (is_writable, is_append) = {
+            let flags = self.flags.lock();
+            (flags.is_writable(), flags.0 & OpenFlags::O_APPEND != 0)
+        };
+        if !is_writable {
             return Err(-9); // EBADF
         }
 
-        let mut offset = self.offset.lock();
+        let file_type = self.inode.inode().file_type;
+        let is_seekable = file_type == crate::fs::inode::FileType::Regular;
 
-        // Handle O_APPEND
-        if flags.0 & OpenFlags::O_APPEND != 0 {
-            *offset = self.inode.inode().size;
+        if is_seekable {
+            let mut offset_guard = self.offset.lock();
+            if is_append {
+                *offset_guard = self.inode.inode().size;
+            }
+            let current_offset = *offset_guard;
+            let bytes_written = self.inode.write(current_offset, data)?;
+            *offset_guard = current_offset.saturating_add(bytes_written as u64);
+            Ok(bytes_written)
+        } else {
+            // Non-seekable streams (pipes, sockets, character devices/TTYs) do not track or need file offset locking
+            self.inode.write(0, data)
         }
-
-        let bytes_written = self.inode.write(*offset, data)?;
-        *offset += bytes_written as u64;
-        Ok(bytes_written)
     }
 
     /// Seek to a new offset.

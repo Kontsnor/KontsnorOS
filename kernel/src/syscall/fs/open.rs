@@ -129,7 +129,8 @@ pub fn sys_open_with_resolved_path(resolved_path: String, flags: i32, _mode: u32
                     } else {
                         0o022
                     };
-                    let file_mode = ((_mode & 0x0FFF) & !umask) as u16;
+                    let mode_val = if _mode == 0 { 0o644 } else { _mode };
+                    let file_mode = ((mode_val & 0x0FFF) & !umask) as u16;
 
                     match parent_inode.create(name, crate::fs::inode::FileType::Regular) {
                         Some(new_i) => {

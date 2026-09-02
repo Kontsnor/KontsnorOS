@@ -121,9 +121,11 @@ find /usr/include/x86_64-linux-musl -type f | while read -r filepath; do
 done
 
 # Copy musl libraries/startup objects
-for libfile in libc.a crt1.o crti.o crtn.o; do
-    echo "write /usr/lib/x86_64-linux-musl/$libfile /usr/lib/$libfile" >> "$CMD_FILE"
-    echo "write /usr/lib/x86_64-linux-musl/$libfile /usr/lib/x86_64-linux-gnu/$libfile" >> "$CMD_FILE"
+for libfile in libc.a libc.so crt1.o crti.o crtn.o Scrt1.o rcrt1.o libm.a libdl.a libpthread.a librt.a libresolv.a libutil.a libxnet.a; do
+    if [ -f "/usr/lib/x86_64-linux-musl/$libfile" ]; then
+        echo "write /usr/lib/x86_64-linux-musl/$libfile /usr/lib/$libfile" >> "$CMD_FILE"
+        echo "write /usr/lib/x86_64-linux-musl/$libfile /usr/lib/x86_64-linux-gnu/$libfile" >> "$CMD_FILE"
+    fi
 done
 
 # Create a sample hello.c
@@ -209,13 +211,16 @@ export CARGO_TARGET_DIR=/tmp/target
 mkdir -p /tmp/target
 export CARGO_BUILD_JOBS=8
 export RUSTC=/usr/bin/rustc
-export RUSTFLAGS="-C linker-flavor=ld.lld -C linker=/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld -C codegen-units=8 -C lto=off -C debuginfo=0 -C opt-level=0"
-export RUSTFLAGS_BOOTSTRAP="-C linker-flavor=ld.lld -C linker=/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld -C codegen-units=8"
-export CARGO_HOST_RUSTFLAGS="-C linker-flavor=ld.lld -C linker=/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld -C codegen-units=8 -C lto=off -C debuginfo=0 -C opt-level=0"
-export HOST_RUSTFLAGS="-C linker-flavor=ld.lld -C linker=/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld -C codegen-units=8 -C lto=off -C debuginfo=0 -C opt-level=0"
-export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld"
+export RUSTFLAGS="-C linker-flavor=ld.lld -C linker=/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld -C codegen-units=8 -C lto=off -C debuginfo=0 -C opt-level=0 -L /lib -L /usr/lib -L /lib/rustlib/x86_64-unknown-linux-musl/lib"
+export RUSTFLAGS_BOOTSTRAP="-C linker-flavor=ld.lld -C linker=/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld -C codegen-units=8 -L /lib -L /usr/lib -L /lib/rustlib/x86_64-unknown-linux-musl/lib"
+export CARGO_HOST_RUSTFLAGS="-C linker-flavor=ld.lld -C linker=/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld -C codegen-units=8 -C lto=off -C debuginfo=0 -C opt-level=0 -L /lib -L /usr/lib -L /lib/rustlib/x86_64-unknown-linux-musl/lib"
+export HOST_RUSTFLAGS="-C linker-flavor=ld.lld -C linker=/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld -C codegen-units=8 -C lto=off -C debuginfo=0 -C opt-level=0 -L /lib -L /usr/lib -L /lib/rustlib/x86_64-unknown-linux-musl/lib"
+export TERM=dumb
+export CARGO_TERM_COLOR=never
+export CARGO_TERM_PROGRESS_WHEN=never
+export LD_LIBRARY_PATH="/lib:/usr/lib"
 export PATH="/usr/bin:/bin:$PATH"
-/usr/bin/cargo build --package kontsnor-kernel --profile fast-build --target x86_64-unknown-linux-musl --offline -j 8 --verbose
+/usr/bin/cargo build --package kontsnor-kernel --profile fast-build --target x86_64-unknown-linux-musl --offline -j 8 --verbose --color never
 STATUS=$?
 echo "Cargo build finished with exit status $STATUS"
 if [ $STATUS -eq 0 ]; then
@@ -246,10 +251,10 @@ if [ -d "$RUST_TOOLCHAIN_DIR" ]; then
     echo "write $RUST_TOOLCHAIN_DIR/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld /lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld" >> "$CMD_FILE"
     echo "write $RUST_TOOLCHAIN_DIR/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld /usr/bin/rust-lld" >> "$CMD_FILE"
 
-    # Create rustc wrapper that guarantees default linker-flavor=ld.lld and codegen-units=8 for ALL compilations (including build.rs)
+    # Create rustc wrapper that guarantees default linker-flavor=ld.lld, codegen-units=8, and -L library paths
     cat << 'EOF' > /tmp/rustc_wrapper.sh
 #!/bin/sh
-exec /usr/bin/rustc_real -C linker-flavor=ld.lld -C linker=/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld -C codegen-units=8 -C lto=off -C debuginfo=0 -C opt-level=0 "$@"
+exec /usr/bin/rustc_real -C linker-flavor=ld.lld -C linker=/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld -C codegen-units=8 -C lto=off -C debuginfo=0 -C opt-level=0 -L /lib -L /usr/lib -L /lib/rustlib/x86_64-unknown-linux-musl/lib "$@"
 EOF
     chmod +x /tmp/rustc_wrapper.sh
     echo "write /tmp/rustc_wrapper.sh /usr/bin/rustc" >> "$CMD_FILE"
@@ -317,8 +322,21 @@ EOF
     if [ -f "/tmp/alpine_libgcc/usr/lib/libgcc_s.so.1" ]; then
         echo "write /tmp/alpine_libgcc/usr/lib/libgcc_s.so.1 /lib/libgcc_s.so.1" >> "$CMD_FILE"
         echo "write /tmp/alpine_libgcc/usr/lib/libgcc_s.so.1 /usr/lib/libgcc_s.so.1" >> "$CMD_FILE"
+        echo "write /tmp/alpine_libgcc/usr/lib/libgcc_s.so.1 /lib/libgcc_s.so" >> "$CMD_FILE"
+        echo "write /tmp/alpine_libgcc/usr/lib/libgcc_s.so.1 /usr/lib/libgcc_s.so" >> "$CMD_FILE"
+        echo "write /tmp/alpine_libgcc/usr/lib/libgcc_s.so.1 /lib/rustlib/x86_64-unknown-linux-musl/lib/libgcc_s.so" >> "$CMD_FILE"
+        echo "write /tmp/alpine_libgcc/usr/lib/libgcc_s.so.1 /lib/rustlib/x86_64-unknown-linux-musl/lib/libgcc_s.so.1" >> "$CMD_FILE"
     fi
     echo "symlink /lib/libc.musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1" >> "$CMD_FILE"
+    echo "symlink /usr/lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1" >> "$CMD_FILE"
+    echo "symlink /usr/lib/libc.so /lib/libc.so" >> "$CMD_FILE"
+    echo "write /usr/lib/x86_64-linux-musl/libc.so /lib/rustlib/x86_64-unknown-linux-musl/lib/libc.so" >> "$CMD_FILE"
+    echo "write /usr/lib/x86_64-linux-musl/libc.a /lib/rustlib/x86_64-unknown-linux-musl/lib/libc.a" >> "$CMD_FILE"
+    for libfile in libm.a libdl.a libpthread.a librt.a libresolv.a libutil.a libxnet.a Scrt1.o rcrt1.o crt1.o crti.o crtn.o; do
+        if [ -f "/usr/lib/x86_64-linux-musl/$libfile" ]; then
+            echo "write /usr/lib/x86_64-linux-musl/$libfile /lib/rustlib/x86_64-unknown-linux-musl/lib/$libfile" >> "$CMD_FILE"
+        fi
+    done
     
     # Copy target stdlib files
     STDLIB_SRC_DIR="$RUST_TOOLCHAIN_DIR/lib/rustlib/x86_64-unknown-linux-musl/lib"
@@ -359,6 +377,9 @@ rustflags = [
     "-C", "lto=off",
     "-C", "debuginfo=0",
     "-C", "opt-level=0",
+    "-L", "/lib",
+    "-L", "/usr/lib",
+    "-L", "/lib/rustlib/x86_64-unknown-linux-musl/lib",
 ]
 
 [host]
@@ -369,6 +390,9 @@ rustflags = [
     "-C", "lto=off",
     "-C", "debuginfo=0",
     "-C", "opt-level=0",
+    "-L", "/lib",
+    "-L", "/usr/lib",
+    "-L", "/lib/rustlib/x86_64-unknown-linux-musl/lib",
 ]
 
 [target.'cfg(all())']
@@ -379,6 +403,9 @@ rustflags = [
     "-C", "lto=off",
     "-C", "debuginfo=0",
     "-C", "opt-level=0",
+    "-L", "/lib",
+    "-L", "/usr/lib",
+    "-L", "/lib/rustlib/x86_64-unknown-linux-musl/lib",
 ]
 
 [target.x86_64-unknown-linux-musl]
@@ -390,6 +417,9 @@ rustflags = [
     "-C", "lto=off",
     "-C", "debuginfo=0",
     "-C", "opt-level=0",
+    "-L", "/lib",
+    "-L", "/usr/lib",
+    "-L", "/lib/rustlib/x86_64-unknown-linux-musl/lib",
 ]
 EOF
 echo "mkdir /src/KontsnorOS/.cargo" >> "$CMD_FILE"

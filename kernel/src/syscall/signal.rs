@@ -342,15 +342,13 @@ fn terminate_group_and_exit(current_pid: crate::process::pid::Pid, exit_code: i3
     };
 
     let mut other_pids = alloc::vec::Vec::new();
-    {
-        let tasks = scheduler::TASKS.read();
-        for slot in tasks.iter() {
-            if let Some(task_arc) = slot {
-                let task = task_arc.lock();
-                if task.tgid == tgid && task.pid != current_pid {
-                    other_pids.push(task.pid);
-                }
-            }
+    let current_pid_val = current_pid.as_u64();
+    let tgid_val = tgid.as_u64();
+    for (p, atom) in scheduler::TASK_TGIDS.iter().enumerate() {
+        if p as u64 != current_pid_val
+            && atom.load(core::sync::atomic::Ordering::Acquire) == tgid_val
+        {
+            other_pids.push(crate::process::pid::Pid::from_raw(p as u64));
         }
     }
 

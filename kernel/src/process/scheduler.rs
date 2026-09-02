@@ -40,6 +40,12 @@ pub(crate) static SCHEDULER: TicketLock<Option<Scheduler>> = TicketLock::new(Non
 /// The global master task table.
 pub(crate) static TASKS: KRwLock<Vec<Option<Arc<spin::Mutex<Task>>>>> = KRwLock::new(Vec::new());
 
+/// Fast, lockless PID-to-TGID mapping to allow cross-thread termination and group queries without taking Task locks.
+pub(crate) static TASK_TGIDS: [core::sync::atomic::AtomicU64; 4096] = {
+    const ZERO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [ZERO; 4096]
+};
+
 /// Dummy CPU contexts to save old registers when the current task has already exited/been reaped.
 static mut DUMMY_CONTEXTS: [super::context::CpuContext; 32] = [super::context::CpuContext {
     rbx: 0,
@@ -133,6 +139,11 @@ impl Scheduler {
                             task.in_queue = false;
                             let priority = task.priority;
                             return Some((pid, priority));
+                        } else {
+                            // Non-ready task in queue (Blocked/Zombie): remove and clear in_queue
+                            queue.remove(i);
+                            task.in_queue = false;
+                            continue;
                         }
                     } else {
                         // Skip locked tasks in this round to prevent permanent queue loss / starvation
@@ -152,6 +163,28 @@ impl Scheduler {
 
         // Check for timed futex expirations
         crate::syscall::process::futex::check_futex_timeouts_locked(self);
+
+        // Every 50 ticks (~0.5s), rescue any runnable tasks not currently in queues
+        if self.ticks_since_boost % 50 == 0 {
+            let tasks = TASKS.read();
+            for task_opt in tasks.iter() {
+                if let Some(task_arc) = task_opt {
+                    if let Some(mut task) = task_arc.try_lock() {
+                        if task.state == TaskState::Ready && !task.is_idle {
+                            if !self.current_cpus.iter().any(|&c| c == Some(task.pid))
+                                && !self.suspending_tasks.iter().any(|&s| s == Some(task.pid))
+                            {
+                                let prio = task.priority as usize;
+                                if !self.queues[prio].iter().any(|&p| p == task.pid) {
+                                    self.queues[prio].push_back(task.pid);
+                                }
+                                task.in_queue = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Periodic priority boost to prevent starvation
         if self.ticks_since_boost >= BOOST_INTERVAL {
@@ -209,6 +242,23 @@ impl Scheduler {
                 self.queues[prio].push_back(pid);
             }
         }
+
+        // Also ensure any stranded ready tasks that are not running or in queue get requeued
+        for task_opt in tasks.iter() {
+            if let Some(task_arc) = task_opt {
+                if let Some(mut task) = task_arc.try_lock() {
+                    if task.state == TaskState::Ready && !task.in_queue && !task.is_idle {
+                        if !self.current_cpus.iter().any(|&c| c == Some(task.pid))
+                            && !self.suspending_tasks.iter().any(|&s| s == Some(task.pid))
+                        {
+                            let prio = task.priority as usize;
+                            self.queues[prio].push_back(task.pid);
+                            task.in_queue = true;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Mark a task as blocked.
@@ -229,11 +279,18 @@ impl Scheduler {
             let mut task = task_arc.lock();
             if task.state == TaskState::Blocked {
                 task.state = TaskState::Ready;
-                if !task.in_queue {
-                    let priority = task.priority as usize;
+                let priority = task.priority as usize;
+                if !self.queues[priority].iter().any(|&p| p == pid) {
                     self.queues[priority].push_back(pid);
-                    task.in_queue = true;
                 }
+                task.in_queue = true;
+                return true;
+            } else if task.state == TaskState::Ready && !task.is_idle {
+                let priority = task.priority as usize;
+                if !self.queues[priority].iter().any(|&p| p == pid) {
+                    self.queues[priority].push_back(pid);
+                }
+                task.in_queue = true;
                 return true;
             }
         }
@@ -249,19 +306,74 @@ impl Scheduler {
         // Drain stale futex registrations (safety net — primary drain is in exit_current_thread).
         crate::syscall::process::futex::futex_drain_pid_locked(pid, self);
 
-        // Re-parent orphan children of the exiting task to PID 1 (INIT)
-        let mut adopted_any = false;
-        let tasks = TASKS.read();
-        for task_opt in tasks.iter() {
-            if let Some(task_arc) = task_opt {
-                let mut other_task = task_arc.lock();
-                if other_task.parent_pid == pid {
-                    other_task.parent_pid = Pid::INIT;
-                    adopted_any = true;
+        let idx = pid.as_u64() as usize;
+        if idx < TASK_TGIDS.len() {
+            TASK_TGIDS[idx].store(0, core::sync::atomic::Ordering::Release);
+        }
+        let mut parent_pid = None;
+        let mut fds_to_drop = Vec::new();
+        let mut is_thread = false;
+        {
+            let tasks = TASKS.read();
+            if let Some(Some(task_arc)) = tasks.get(idx) {
+                let mut task = task_arc.lock();
+                task.state = TaskState::Zombie;
+                task.exit_code = Some(exit_code);
+                parent_pid = Some(task.parent_pid);
+                is_thread = task.tgid != pid;
+
+                let old_fd_table = task.fd_table.clone();
+                task.fd_table = Arc::new(spin::Mutex::new(crate::process::task::FdTable {
+                    entries: Vec::new(),
+                    cloexec: Vec::new(),
+                }));
+                // Only clear fd_table entries if this task was the sole owner of the fd_table
+                // (strong_count == 1 because only old_fd_table holds the last reference after detaching).
+                if Arc::strong_count(&old_fd_table) == 1 {
+                    let mut fd_table = old_fd_table.lock();
+                    fds_to_drop = core::mem::take(&mut fd_table.entries);
+                    fd_table.cloexec.clear();
+                }
+
+                if !is_thread {
+                    let addr_space = task.address_space.clone();
+                    let space = addr_space.lock();
+                    for r in &space.mmap_regions {
+                        if r.is_shared && r.inode.is_some() {
+                            crate::memory::page_cache::sync_mapped_region(
+                                space.page_table_root,
+                                r,
+                                r.start,
+                                r.start.saturating_add(r.len as u64),
+                            );
+                        }
+                    }
                 }
             }
         }
-        drop(tasks);
+
+        if is_thread {
+            // Non-leader threads (CLONE_THREAD) do not have child processes or send SIGCHLD to the parent.
+            // Their task slot in TASKS will be safely reaped after the context switch away in schedule().
+            return fds_to_drop;
+        }
+
+        // Re-parent orphan children of the exiting process leader to PID 1 (INIT)
+        let mut adopted_any = false;
+        {
+            let tasks = TASKS.read();
+            for task_opt in tasks.iter() {
+                if let Some(task_arc) = task_opt {
+                    // Use try_lock to prevent deadlocks with tasks running concurrently on other cores
+                    if let Some(mut other_task) = task_arc.try_lock() {
+                        if other_task.parent_pid == pid {
+                            other_task.parent_pid = Pid::INIT;
+                            adopted_any = true;
+                        }
+                    }
+                }
+            }
+        }
 
         if adopted_any {
             let init_idx = Pid::INIT.as_u64() as usize;
@@ -274,40 +386,6 @@ impl Scheduler {
                 init_wait_queue.wake_all_locked(self);
                 self.wake_task(Pid::INIT);
             }
-            drop(tasks);
-        }
-
-        let idx = pid.as_u64() as usize;
-        let mut parent_pid = None;
-        let mut fds_to_drop = Vec::new();
-        let mut is_thread = false;
-        let tasks = TASKS.read();
-        if let Some(Some(task_arc)) = tasks.get(idx) {
-            let mut task = task_arc.lock();
-            task.state = TaskState::Zombie;
-            task.exit_code = Some(exit_code);
-            parent_pid = Some(task.parent_pid);
-            is_thread = task.tgid != pid;
-
-            let old_fd_table = task.fd_table.clone();
-            task.fd_table = Arc::new(spin::Mutex::new(crate::process::task::FdTable {
-                entries: Vec::new(),
-                cloexec: Vec::new(),
-            }));
-            // Only clear fd_table entries if this task was the sole owner of the fd_table
-            // (strong_count == 1 because only old_fd_table holds the last reference after detaching).
-            if Arc::strong_count(&old_fd_table) == 1 {
-                let mut fd_table = old_fd_table.lock();
-                fds_to_drop = core::mem::take(&mut fd_table.entries);
-                fd_table.cloexec.clear();
-            }
-        }
-        drop(tasks); // Drop TASKS read lock before calling wake_task to keep correct order
-
-        if is_thread {
-            // Non-leader threads (CLONE_THREAD) do not send SIGCHLD to the parent process.
-            // Their task slot in TASKS will be safely reaped after the context switch away in schedule().
-            return fds_to_drop;
         }
 
         if let Some(parent) = parent_pid {
@@ -318,16 +396,22 @@ impl Scheduler {
             let parent_idx = parent.as_u64() as usize;
             let tasks = TASKS.read();
             if let Some(Some(parent_task_arc)) = tasks.get(parent_idx) {
-                // Clone the child wait queue Arc to avoid holding a lock borrow
-                let child_wait_queue = {
-                    let parent_task = parent_task_arc.lock();
-                    parent_task.child_wait_queue.clone()
+                let (child_wait_queue, pending_unblocked) = {
+                    let mut parent_task = parent_task_arc.lock();
+                    parent_task.pending_signals |= 1 << (17 - 1);
+                    let unblocked = parent_task.pending_signals & !parent_task.blocked_signals;
+                    if parent_task.state == TaskState::Blocked {
+                        parent_task.state = TaskState::Ready;
+                        if !parent_task.in_queue {
+                            let priority = parent_task.priority as usize;
+                            self.queues[priority].push_back(parent);
+                            parent_task.in_queue = true;
+                        }
+                    }
+                    (parent_task.child_wait_queue.clone(), unblocked)
                 };
 
                 child_wait_queue.wake_all_locked(self);
-
-                let mut parent_task = parent_task_arc.lock();
-                parent_task.pending_signals |= 1 << (17 - 1);
 
                 // Scan current_cpus to find which core (if any) is running the parent task
                 let mut parent_core = None;
@@ -339,21 +423,9 @@ impl Scheduler {
                 }
 
                 if let Some(core_id) = parent_core {
-                    let pending_unblocked =
-                        parent_task.pending_signals & !parent_task.blocked_signals;
                     unsafe {
                         crate::syscall::CPU_SCRATCHES[core_id].signals_pending =
                             if pending_unblocked != 0 { 1 } else { 0 };
-                    }
-                }
-
-                // Wake parent task from blocked state if it was waiting
-                if parent_task.state == TaskState::Blocked {
-                    parent_task.state = TaskState::Ready;
-                    if !parent_task.in_queue {
-                        let priority = parent_task.priority as usize;
-                        self.queues[priority].push_back(parent);
-                        parent_task.in_queue = true;
                     }
                 }
             }
@@ -374,8 +446,13 @@ impl Scheduler {
     /// Add a task to this scheduler instance.
     pub fn add_task(&mut self, task: Task) {
         let pid = task.pid;
+        let tgid = task.tgid;
         let priority = task.priority as usize;
         let idx = pid.as_u64() as usize;
+
+        if idx < TASK_TGIDS.len() {
+            TASK_TGIDS[idx].store(tgid.as_u64(), core::sync::atomic::Ordering::Release);
+        }
 
         let task_arc = Arc::new(spin::Mutex::new(task));
         task_arc.lock().in_queue = true;
@@ -395,12 +472,14 @@ impl Scheduler {
 #[unsafe(naked)]
 extern "C" fn idle_trampoline() -> ! {
     core::arch::naked_asm!(
-        "call {}",
+        "call {unlock}",
         "1:",
         "sti",
         "hlt",
+        "call {sched}",
         "jmp 1b",
-        sym scheduler_unlock_after_switch,
+        unlock = sym scheduler_unlock_after_switch,
+        sched = sym schedule,
     );
 }
 
@@ -718,6 +797,9 @@ pub fn schedule() {
             if let Some(slot) = tasks_write.get_mut(idx) {
                 slot.take();
             }
+            if idx < TASK_TGIDS.len() {
+                TASK_TGIDS[idx].store(0, core::sync::atomic::Ordering::Release);
+            }
         }
     });
 }
@@ -759,11 +841,15 @@ pub unsafe extern "C" fn scheduler_unlock_after_switch() {
             }
         }
         SCHEDULER.force_unlock();
+        x86_64::instructions::interrupts::enable();
 
         if let Some(idx) = zombie_to_reap {
             let mut tasks_write = TASKS.write();
             if let Some(slot) = tasks_write.get_mut(idx) {
                 slot.take();
+            }
+            if idx < TASK_TGIDS.len() {
+                TASK_TGIDS[idx].store(0, core::sync::atomic::Ordering::Release);
             }
         }
     }
@@ -774,7 +860,12 @@ pub fn set_bootstrap_thread(task: Task) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         if let Some(ref mut scheduler) = *SCHEDULER.lock() {
             let pid = task.pid;
+            let tgid = task.tgid;
             let idx = pid.as_u64() as usize;
+
+            if idx < TASK_TGIDS.len() {
+                TASK_TGIDS[idx].store(tgid.as_u64(), core::sync::atomic::Ordering::Release);
+            }
 
             let task_arc = Arc::new(spin::Mutex::new(task));
             task_arc.lock().state = TaskState::Running;

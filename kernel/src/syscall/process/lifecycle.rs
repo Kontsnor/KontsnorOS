@@ -337,6 +337,7 @@ pub fn sys_execve(
     // Read the ELF binary header (first 64KB)
     let file_size = inode.inode().size as usize;
     if file_size == 0 {
+        crate::kprintln!("[syscall] execve: file_size is 0 for {}", path);
         return Errno::ENOEXEC.into();
     }
 
@@ -344,7 +345,14 @@ pub fn sys_execve(
     let mut elf_buf = alloc::vec![0u8; header_read_size];
     match inode.read(0, &mut elf_buf) {
         Ok(_) => {}
-        Err(e) => return e as SyscallResult,
+        Err(e) => {
+            crate::kprintln!(
+                "[syscall] execve: failed to read header for {}: {}",
+                path,
+                e
+            );
+            return e as SyscallResult;
+        }
     }
 
     let mut path = path;
@@ -446,7 +454,10 @@ pub fn sys_execve(
     // Parse the ELF
     let elf_info = match crate::process::elf::parse_elf(&elf_buf, elf_total_size) {
         Ok(e) => e,
-        Err(_) => return Errno::ENOEXEC.into(),
+        Err(e) => {
+            crate::kprintln!("[syscall] execve: parse_elf failed for {}: {:?}", path, e);
+            return Errno::ENOEXEC.into();
+        }
     };
 
     // Create a fresh user page table
@@ -493,6 +504,7 @@ pub fn sys_execve(
 
         let interp_size = interp_inode.inode().size as usize;
         if interp_size == 0 {
+            crate::kprintln!("[syscall] execve: interp_size is 0 for {}", interp_path);
             return Errno::ENOEXEC.into();
         }
         let interp_header_size = core::cmp::min(interp_size, 65536);
@@ -504,7 +516,14 @@ pub fn sys_execve(
 
         let interp_info = match crate::process::elf::parse_elf(&interp_elf_buf, interp_size) {
             Ok(e) => e,
-            Err(_) => return Errno::ENOEXEC.into(),
+            Err(e) => {
+                crate::kprintln!(
+                    "[syscall] execve: interp parse_elf failed for {}: {:?}",
+                    interp_path,
+                    e
+                );
+                return Errno::ENOEXEC.into();
+            }
         };
 
         interpreter_base = 0x0000_7FFF_F7F0_0000;
@@ -601,20 +620,15 @@ pub fn sys_execve(
         if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
             let tgid = task_arc.lock().tgid;
 
-            // Terminate other threads in the same thread group
+            // Terminate other threads in the same thread group without taking Task locks
             let mut other_pids = alloc::vec::Vec::new();
-            {
-                let tasks = scheduler::TASKS.read();
-                for slot in tasks.iter() {
-                    if let Some(other_arc) = slot {
-                        if Arc::ptr_eq(other_arc, &task_arc) {
-                            continue;
-                        }
-                        let other = other_arc.lock();
-                        if other.tgid == tgid {
-                            other_pids.push(other.pid);
-                        }
-                    }
+            let current_pid_val = current_pid.as_u64();
+            let tgid_val = tgid.as_u64();
+            for (p, atom) in scheduler::TASK_TGIDS.iter().enumerate() {
+                if p as u64 != current_pid_val
+                    && atom.load(core::sync::atomic::Ordering::Acquire) == tgid_val
+                {
+                    other_pids.push(crate::process::pid::Pid::from_raw(p as u64));
                 }
             }
 
@@ -786,17 +800,15 @@ pub fn sys_exit_group(status: i32) -> SyscallResult {
         return Errno::ESRCH.into();
     };
 
-    // Get all other tasks sharing the same tgid
+    // Get all other tasks sharing the same tgid without taking Task locks
     let mut other_pids = alloc::vec::Vec::new();
-    {
-        let tasks = scheduler::TASKS.read();
-        for slot in tasks.iter() {
-            if let Some(task_arc) = slot {
-                let task = task_arc.lock();
-                if task.tgid == tgid && task.pid != current_pid {
-                    other_pids.push(task.pid);
-                }
-            }
+    let current_pid_val = current_pid.as_u64();
+    let tgid_val = tgid.as_u64();
+    for (p, atom) in scheduler::TASK_TGIDS.iter().enumerate() {
+        if p as u64 != current_pid_val
+            && atom.load(core::sync::atomic::Ordering::Acquire) == tgid_val
+        {
+            other_pids.push(crate::process::pid::Pid::from_raw(p as u64));
         }
     }
 
@@ -881,27 +893,31 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
             let mut has_children = false;
             for slot in tasks.iter() {
                 if let Some(task_arc) = slot {
-                    let task = task_arc.lock();
-                    let is_child = task.parent_pid == current_pid;
-                    let matches_pid = pid == -1 || task.pid.as_u64() as i32 == pid;
-                    // CLONE_THREAD tasks (threads, not process leaders) are never
-                    // wait4-able from an external process.  They are reaped by
-                    // the thread-group leader via pthread_join / futex, not wait4.
-                    let is_process_leader = task.tgid == task.pid;
-                    if is_child && matches_pid && is_process_leader {
-                        has_children = true;
-                        if task.state == TaskState::Zombie {
-                            let (total_f, alloc_f, free_f) = crate::memory::physical::stats();
-                            crate::kprintln!(
-                                "[syscall] wait4: found zombie child PID {}, free_mem={}MB/{}MB (alloc_frames={})",
-                                task.pid,
-                                (free_f * 4096) / (1024 * 1024),
-                                (total_f * 4096) / (1024 * 1024),
-                                alloc_f
-                            );
-                            found = Some((task.pid, task.exit_code.unwrap_or(0)));
-                            break;
+                    if let Some(task) = task_arc.try_lock() {
+                        let is_child = task.parent_pid == current_pid;
+                        let matches_pid = pid == -1 || task.pid.as_u64() as i32 == pid;
+                        // CLONE_THREAD tasks (threads, not process leaders) are never
+                        // wait4-able from an external process.  They are reaped by
+                        // the thread-group leader via pthread_join / futex, not wait4.
+                        let is_process_leader = task.tgid == task.pid;
+                        if is_child && matches_pid && is_process_leader {
+                            has_children = true;
+                            if task.state == TaskState::Zombie {
+                                let (total_f, alloc_f, free_f) = crate::memory::physical::stats();
+                                crate::kprintln!(
+                                    "[syscall] wait4: found zombie child PID {}, free_mem={}MB/{}MB (alloc_frames={})",
+                                    task.pid,
+                                    (free_f * 4096) / (1024 * 1024),
+                                    (total_f * 4096) / (1024 * 1024),
+                                    alloc_f
+                                );
+                                found = Some((task.pid, task.exit_code.unwrap_or(0)));
+                                break;
+                            }
                         }
+                    } else {
+                        // Task is active on another core; assume runnable child
+                        has_children = true;
                     }
                 }
             }
@@ -915,6 +931,9 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
                     slot.take();
                 }
                 drop(tasks_write);
+                if idx < scheduler::TASK_TGIDS.len() {
+                    scheduler::TASK_TGIDS[idx].store(0, core::sync::atomic::Ordering::Release);
+                }
 
                 Some(Ok((child_pid, exit_code)))
             } else if !has_children {

@@ -137,6 +137,16 @@ impl Drop for AddressSpace {
         if self.page_table_root != 0
             && self.page_table_root != crate::memory::r#virtual::kernel_pml4_phys()
         {
+            for r in &self.mmap_regions {
+                if r.is_shared && r.inode.is_some() {
+                    crate::memory::page_cache::sync_mapped_region(
+                        self.page_table_root,
+                        r,
+                        r.start,
+                        r.start.saturating_add(r.len as u64),
+                    );
+                }
+            }
             let _ = crate::memory::r#virtual::free_user_page_table(self.page_table_root);
         }
     }

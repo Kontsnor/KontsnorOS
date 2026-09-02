@@ -184,13 +184,11 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut CpuContext, _new_ctx: *co
         "mov [rdi + 0x50], rax",
         // Save FPU/SSE state (XMM0-XMM15, MXCSR, FPU control words)
         "fxsave64 [rdi + 0x70]",
-
         // ── Restore new context ────────────────────────────────────
         // rsi = new_ctx pointer
 
         // Restore FPU/SSE state before register clobbers
         "fxrstor64 [rsi + 0x70]",
-
         // 1. Read all values from [rsi] while still in the current address space
         // where [rsi] is guaranteed to be mapped.
         "mov rbx, [rsi + 0x00]",

@@ -244,6 +244,11 @@ impl From<u32> for SegmentFlags {
 pub fn parse_elf(data: &[u8], total_file_size: usize) -> Result<ElfInfo, ElfError> {
     // Check minimum size for ELF header
     if data.len() < core::mem::size_of::<Elf64Header>() {
+        crate::kprintln!(
+            "[parse_elf] data.len() < Elf64Header ({} < {})",
+            data.len(),
+            core::mem::size_of::<Elf64Header>()
+        );
         return Err(ElfError::FileTooSmall);
     }
 
@@ -252,27 +257,33 @@ pub fn parse_elf(data: &[u8], total_file_size: usize) -> Result<ElfInfo, ElfErro
 
     // Validate ELF magic number
     if header.e_ident[0..4] != ELF_MAGIC {
+        crate::kprintln!("[parse_elf] invalid magic: {:?}", &header.e_ident[0..4]);
         return Err(ElfError::InvalidMagic);
     }
 
     // Must be 64-bit
     if header.e_ident[4] != ELFCLASS64 {
+        crate::kprintln!("[parse_elf] not 64-bit: {}", header.e_ident[4]);
         return Err(ElfError::Not64Bit);
     }
 
     // Must be little-endian
     if header.e_ident[5] != ELFDATA2LSB {
+        crate::kprintln!("[parse_elf] not little-endian: {}", header.e_ident[5]);
         return Err(ElfError::WrongEndian);
     }
 
     // Must be an executable or shared object (PIE)
     let e_type = header.e_type;
     if e_type != ET_EXEC && e_type != ET_DYN {
+        crate::kprintln!("[parse_elf] unexpected e_type: {}", e_type);
         return Err(ElfError::NotExecutable);
     }
 
     // Must target x86_64
-    if header.e_machine != EM_X86_64 {
+    let e_machine = header.e_machine;
+    if e_machine != EM_X86_64 {
+        crate::kprintln!("[parse_elf] unexpected e_machine: {}", e_machine);
         return Err(ElfError::WrongArchitecture);
     }
 
@@ -285,6 +296,11 @@ pub fn parse_elf(data: &[u8], total_file_size: usize) -> Result<ElfInfo, ElfErro
     // Validate program header table fits in the file
     let ph_end = ph_offset + ph_entry_size * ph_count;
     if ph_end > data.len() {
+        crate::kprintln!(
+            "[parse_elf] ph_end > data.len() ({} > {})",
+            ph_end,
+            data.len()
+        );
         return Err(ElfError::FileTooSmall);
     }
 
@@ -308,11 +324,24 @@ pub fn parse_elf(data: &[u8], total_file_size: usize) -> Result<ElfInfo, ElfErro
 
                 // Validate segment fits in the file
                 if (file_offset + file_size) as usize > total_file_size {
+                    crate::kprintln!(
+                        "[parse_elf] segment {}: offset + file_size > total_file_size ({} + {} > {})",
+                        i,
+                        file_offset,
+                        file_size,
+                        total_file_size
+                    );
                     return Err(ElfError::InvalidSegment);
                 }
 
                 // Memory size must be >= file size
                 if mem_size < file_size {
+                    crate::kprintln!(
+                        "[parse_elf] segment {}: mem_size < file_size ({} < {})",
+                        i,
+                        mem_size,
+                        file_size
+                    );
                     return Err(ElfError::InvalidSegment);
                 }
 

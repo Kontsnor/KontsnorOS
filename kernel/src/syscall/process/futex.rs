@@ -36,33 +36,87 @@ struct FutexWaiter {
     deadline: Option<u64>,
 }
 
-static FUTEX_QUEUES: TicketLock<BTreeMap<u64, VecDeque<FutexWaiter>>> =
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FutexKey {
+    /// 0 for process-shared mappings, or `tgid` for private process mappings
+    pub space_id: u64,
+    /// User virtual address
+    pub uaddr: u64,
+}
+
+impl FutexKey {
+    pub const fn new(space_id: u64, uaddr: u64) -> Self {
+        Self { space_id, uaddr }
+    }
+}
+
+pub fn get_futex_key(current_pid: Pid, uaddr: u64, op: i32) -> FutexKey {
+    let is_private = (op & FUTEX_PRIVATE_FLAG) != 0;
+    if is_private {
+        let tgid = if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+            task_arc.lock().tgid.as_u64()
+        } else {
+            0
+        };
+        FutexKey::new(tgid, uaddr)
+    } else {
+        // Non-private futex shared across tasks or processes:
+        // Key by the physical memory address, matching Linux semantics!
+        let phys = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(uaddr));
+        if let Some(phys_addr) = phys {
+            FutexKey::new(0, phys_addr.as_u64())
+        } else {
+            FutexKey::new(0, uaddr)
+        }
+    }
+}
+
+static FUTEX_QUEUES: TicketLock<BTreeMap<FutexKey, VecDeque<FutexWaiter>>> =
     TicketLock::new(BTreeMap::new());
 
 /// Wake futex waiters from the scheduler/kernel without re-locking SCHEDULER.
 pub fn futex_wake_locked(
+    space_id: u64,
     uaddr: u64,
     val: i32,
     bitset: u32,
     sched: &mut crate::process::scheduler::Scheduler,
 ) -> i32 {
+    let val_to_wake = if val < 0 { i32::MAX } else { val };
+    let mut keys_to_wake = alloc::vec![FutexKey::new(space_id, uaddr)];
+    if let Some(phys) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(uaddr)) {
+        let phys_key = FutexKey::new(0, phys.as_u64());
+        if !keys_to_wake.contains(&phys_key) {
+            keys_to_wake.push(phys_key);
+        }
+    }
+    let virt_shared_key = FutexKey::new(0, uaddr);
+    if !keys_to_wake.contains(&virt_shared_key) {
+        keys_to_wake.push(virt_shared_key);
+    }
+
     let mut queues = FUTEX_QUEUES.lock();
     let mut woken = 0;
 
-    if let Some(queue) = queues.get_mut(&uaddr) {
-        let mut i = 0;
-        while woken < val && i < queue.len() {
-            if (queue[i].bitset & bitset) != 0 {
-                let waiter = queue.remove(i).unwrap();
-                if sched.wake_task(waiter.pid) {
-                    woken += 1;
-                }
-            } else {
-                i += 1;
-            }
+    for key in keys_to_wake {
+        if woken >= val_to_wake {
+            break;
         }
-        if queue.is_empty() {
-            queues.remove(&uaddr);
+        if let Some(queue) = queues.get_mut(&key) {
+            let mut i = 0;
+            while woken < val_to_wake && i < queue.len() {
+                if (queue[i].bitset & bitset) != 0 {
+                    let waiter = queue.remove(i).unwrap();
+                    if sched.wake_task(waiter.pid) {
+                        woken += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            if queue.is_empty() {
+                queues.remove(&key);
+            }
         }
     }
     woken
@@ -100,6 +154,7 @@ pub(crate) fn futex_drain_pid_locked(
 /// `sys_set_tid_address`, which already validated the pointer at registration
 /// time.  We still perform a basic canonical-address range check.
 pub(crate) fn clear_child_tid_wake_locked(
+    space_id: u64,
     uaddr: u64,
     sched: &mut crate::process::scheduler::Scheduler,
 ) {
@@ -113,8 +168,8 @@ pub(crate) fn clear_child_tid_wake_locked(
     unsafe {
         (uaddr as *mut i32).write_volatile(0);
     }
-    // Wake one waiter (the pthread_join caller) on this futex word.
-    futex_wake_locked(uaddr, 1, 0xffff_ffff, sched);
+    // Wake all waiters on this futex word.
+    futex_wake_locked(space_id, uaddr, i32::MAX, 0xffff_ffff, sched);
 }
 
 /// Scan futex queues and wake any waiters whose deadlines have expired.
@@ -123,7 +178,7 @@ pub fn check_futex_timeouts_locked(sched: &mut crate::process::scheduler::Schedu
     let mut queues = FUTEX_QUEUES.lock();
     let mut empty_keys = alloc::vec::Vec::new();
 
-    for (&uaddr, queue) in queues.iter_mut() {
+    for (&key, queue) in queues.iter_mut() {
         let mut i = 0;
         while i < queue.len() {
             if let Some(dl) = queue[i].deadline {
@@ -136,7 +191,7 @@ pub fn check_futex_timeouts_locked(sched: &mut crate::process::scheduler::Schedu
             i += 1;
         }
         if queue.is_empty() {
-            empty_keys.push(uaddr);
+            empty_keys.push(key);
         }
     }
 
@@ -238,6 +293,8 @@ pub fn sys_futex(
                 return Errno::EAGAIN.into();
             }
 
+            let key = get_futex_key(current_pid, uaddr as u64, op);
+
             {
                 let mut queues = FUTEX_QUEUES.lock();
 
@@ -247,7 +304,7 @@ pub fn sys_futex(
                 }
 
                 queues
-                    .entry(uaddr as u64)
+                    .entry(key)
                     .or_insert_with(VecDeque::new)
                     .push_back(FutexWaiter {
                         pid: current_pid,
@@ -273,10 +330,10 @@ pub fn sys_futex(
             // When unblocked, ensure this task is removed from FUTEX_QUEUES under all conditions
             {
                 let mut queues = FUTEX_QUEUES.lock();
-                if let Some(queue) = queues.get_mut(&(uaddr as u64)) {
+                if let Some(queue) = queues.get_mut(&key) {
                     queue.retain(|w| w.pid != current_pid);
                     if queue.is_empty() {
-                        queues.remove(&(uaddr as u64));
+                        queues.remove(&key);
                     }
                 }
             }
@@ -310,22 +367,65 @@ pub fn sys_futex(
             } else {
                 0xffff_ffff
             };
+            let val_to_wake = if val < 0 { i32::MAX } else { val };
+
+            let key = get_futex_key(current_pid, uaddr as u64, op);
+            let mut keys_to_wake = alloc::vec![key];
+            if key.space_id != 0 {
+                if let Some(phys) =
+                    crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(uaddr as u64))
+                {
+                    let phys_key = FutexKey::new(0, phys.as_u64());
+                    if !keys_to_wake.contains(&phys_key) {
+                        keys_to_wake.push(phys_key);
+                    }
+                }
+                let virt_shared_key = FutexKey::new(0, uaddr as u64);
+                if !keys_to_wake.contains(&virt_shared_key) {
+                    keys_to_wake.push(virt_shared_key);
+                }
+            } else {
+                if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+                    let tgid = task_arc.lock().tgid.as_u64();
+                    let priv_key = FutexKey::new(tgid, uaddr as u64);
+                    if !keys_to_wake.contains(&priv_key) {
+                        keys_to_wake.push(priv_key);
+                    }
+                }
+                if let Some(phys) =
+                    crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(uaddr as u64))
+                {
+                    let phys_key = FutexKey::new(0, phys.as_u64());
+                    if !keys_to_wake.contains(&phys_key) {
+                        keys_to_wake.push(phys_key);
+                    }
+                }
+                let virt_shared_key = FutexKey::new(0, uaddr as u64);
+                if !keys_to_wake.contains(&virt_shared_key) {
+                    keys_to_wake.push(virt_shared_key);
+                }
+            }
 
             let pids_to_wake = {
                 let mut queues = FUTEX_QUEUES.lock();
                 let mut pids = alloc::vec::Vec::new();
-                if let Some(queue) = queues.get_mut(&(uaddr as u64)) {
-                    let mut i = 0;
-                    while i < queue.len() && (pids.len() as i32) < val {
-                        if (queue[i].bitset & bitset) != 0 {
-                            let waiter = queue.remove(i).unwrap();
-                            pids.push(waiter.pid);
-                        } else {
-                            i += 1;
-                        }
+                for k in keys_to_wake {
+                    if (pids.len() as i32) >= val_to_wake {
+                        break;
                     }
-                    if queue.is_empty() {
-                        queues.remove(&(uaddr as u64));
+                    if let Some(queue) = queues.get_mut(&k) {
+                        let mut i = 0;
+                        while i < queue.len() && (pids.len() as i32) < val_to_wake {
+                            if (queue[i].bitset & bitset) != 0 {
+                                let waiter = queue.remove(i).unwrap();
+                                pids.push(waiter.pid);
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        if queue.is_empty() {
+                            queues.remove(&k);
+                        }
                     }
                 }
                 pids
@@ -358,8 +458,12 @@ pub fn sys_futex(
                 return Errno::EFAULT.into();
             }
 
-            let num_to_wake = val;
-            let num_to_requeue = timeout as i32; // In requeue ops, timeout arg holds val2
+            let num_to_wake = if val < 0 { i32::MAX } else { val };
+            let num_to_requeue = if (timeout as i32) < 0 {
+                i32::MAX
+            } else {
+                timeout as i32
+            };
 
             if cmd == 4 {
                 // SAFETY: uaddr is validated before match
@@ -368,6 +472,9 @@ pub fn sys_futex(
                     return Errno::EAGAIN.into();
                 }
             }
+
+            let key1 = get_futex_key(current_pid, uaddr as u64, op);
+            let key2 = get_futex_key(current_pid, uaddr2 as u64, op);
 
             let pids_to_wake = {
                 let mut queues = FUTEX_QUEUES.lock();
@@ -380,17 +487,16 @@ pub fn sys_futex(
                 }
 
                 let mut pids = alloc::vec::Vec::new();
-                if let Some(mut queue) = queues.remove(&(uaddr as u64)) {
+                if let Some(mut queue) = queues.remove(&key1) {
                     // 1. Wake up to num_to_wake waiters
                     while (pids.len() as i32) < num_to_wake && !queue.is_empty() {
                         let waiter = queue.pop_front().unwrap();
                         pids.push(waiter.pid);
                     }
 
-                    // 2. Requeue up to num_to_requeue remaining waiters to uaddr2
+                    // 2. Requeue up to num_to_requeue remaining waiters to key2
                     if !queue.is_empty() {
-                        let target_queue =
-                            queues.entry(uaddr2 as u64).or_insert_with(VecDeque::new);
+                        let target_queue = queues.entry(key2).or_insert_with(VecDeque::new);
 
                         let mut requeued = 0;
                         while requeued < num_to_requeue && !queue.is_empty() {
@@ -399,9 +505,9 @@ pub fn sys_futex(
                             requeued += 1;
                         }
 
-                        // If any waiters still remain, put them back into uaddr queue
+                        // If any waiters still remain, put them back into key1 queue
                         if !queue.is_empty() {
-                            queues.insert(uaddr as u64, queue);
+                            queues.insert(key1, queue);
                         }
                     }
                 }
@@ -437,21 +543,21 @@ pub fn dump_futex_waiters() {
     }
     crate::kprint!("[monitor] futex: ");
     let mut first_queue = true;
-    for (&uaddr, queue) in queues.iter() {
+    for (&key, queue) in queues.iter() {
         if !first_queue {
             crate::kprint!(" | ");
         }
         first_queue = false;
-        crate::kprint!("{:#x}: [", uaddr);
+        crate::kprint!("{}:{:#x}: [", key.space_id, key.uaddr);
         let mut first = true;
         for waiter in queue.iter() {
             if !first {
                 crate::kprint!(", ");
             }
             first = false;
-            let val = if crate::syscall::validation::validate_user_ptr(uaddr as *const u8, 4) {
+            let val = if crate::syscall::validation::validate_user_ptr(key.uaddr as *const u8, 4) {
                 // SAFETY: validate_user_ptr verified memory location bounds
-                unsafe { core::ptr::read_volatile(uaddr as *const i32) }
+                unsafe { core::ptr::read_volatile(key.uaddr as *const i32) }
             } else {
                 -999
             };

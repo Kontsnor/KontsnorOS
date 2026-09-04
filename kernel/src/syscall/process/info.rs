@@ -16,6 +16,7 @@
 //! Process system information, resource limits, and time syscalls.
 
 use super::super::{Errno, SyscallResult};
+use crate::process::scheduler;
 use crate::syscall::validation::{validate_user_ptr, validate_user_ptr_write};
 
 /// Linux `uname` struct (sys/utsname.h), each field is 65 bytes.
@@ -662,29 +663,48 @@ pub fn sys_sched_getaffinity(_pid: i32, cpusetsize: usize, mask: *mut u8) -> Sys
     8
 }
 
-/// `set_robust_list(head, len)` — Stub returning 0.
+/// `set_robust_list(head, len)` — Set robust futex list head.
 pub fn sys_set_robust_list(head: *const u8, len: usize) -> SyscallResult {
     if !head.is_null() {
         if !validate_user_ptr(head, len) {
             return Errno::EFAULT.into();
         }
     }
+    if let Some(pid) = scheduler::current_pid() {
+        if let Some(task_arc) = scheduler::get_task_arc(pid) {
+            let mut task = task_arc.lock();
+            task.robust_list_head = head as u64;
+            task.robust_list_len = len;
+        }
+    }
     0
 }
 
-/// `get_robust_list(pid, head_ptr, len_ptr)` — Stub returning 0.
-pub fn sys_get_robust_list(
-    _pid: i32,
-    head_ptr: *mut *mut u8,
-    len_ptr: *mut usize,
-) -> SyscallResult {
+/// `get_robust_list(pid, head_ptr, len_ptr)` — Get robust futex list head.
+pub fn sys_get_robust_list(pid: i32, head_ptr: *mut *mut u8, len_ptr: *mut usize) -> SyscallResult {
+    let target_pid = if pid == 0 {
+        match scheduler::current_pid() {
+            Some(p) => p,
+            None => return Errno::ESRCH.into(),
+        }
+    } else {
+        crate::process::pid::Pid::from_raw(pid as u64)
+    };
+
+    let (head, len) = if let Some(task_arc) = scheduler::get_task_arc(target_pid) {
+        let task = task_arc.lock();
+        (task.robust_list_head, task.robust_list_len)
+    } else {
+        return Errno::ESRCH.into();
+    };
+
     if !head_ptr.is_null() {
         if validate_user_ptr_write(head_ptr as *mut u8, core::mem::size_of::<*mut u8>()).is_err() {
             return Errno::EFAULT.into();
         }
         // SAFETY: The pointer was validated using validate_user_ptr_write and is safe to write.
         unsafe {
-            head_ptr.write(core::ptr::null_mut());
+            head_ptr.write(head as *mut u8);
         }
     }
     if !len_ptr.is_null() {
@@ -693,7 +713,7 @@ pub fn sys_get_robust_list(
         }
         // SAFETY: The pointer was validated using validate_user_ptr_write and is safe to write.
         unsafe {
-            len_ptr.write(0);
+            len_ptr.write(len);
         }
     }
     0

@@ -249,6 +249,10 @@ pub struct Task {
     pub cmdline: Vec<String>,
     /// File mode creation mask (umask)
     pub umask: u32,
+    /// Robust futex list head address
+    pub robust_list_head: u64,
+    /// Robust futex list length
+    pub robust_list_len: usize,
 }
 
 impl Task {
@@ -320,6 +324,8 @@ impl Task {
             rlimit_nofile_max: 4096,
             cmdline: Vec::new(),
             umask: 0o022,
+            robust_list_head: 0,
+            robust_list_len: 0,
         }
     }
 

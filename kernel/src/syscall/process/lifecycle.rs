@@ -834,9 +834,12 @@ pub fn sys_exit_group(status: i32) -> SyscallResult {
 
             // Fire clear_child_tid for forcibly-killed threads
             if let Some(task_arc) = scheduler::get_task_arc(pid) {
-                let ctid = task_arc.lock().clear_child_tid;
+                let task = task_arc.lock();
+                let ctid = task.clear_child_tid;
+                let tgid = task.tgid.as_u64();
+                drop(task);
                 if let Some(uaddr) = ctid {
-                    crate::syscall::process::futex::clear_child_tid_wake_locked(uaddr, sched);
+                    crate::syscall::process::futex::clear_child_tid_wake_locked(tgid, uaddr, sched);
                 }
             }
 

@@ -17,3 +17,4 @@
 
 pub mod logger;
 pub mod ring_buffer;
+pub mod self_host_stubs;

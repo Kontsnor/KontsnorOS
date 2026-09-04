@@ -211,7 +211,7 @@ export CARGO_TARGET_DIR=/tmp/target
 mkdir -p /tmp/target
 export CARGO_BUILD_JOBS=8
 export RUSTC=/usr/bin/rustc
-export RUSTFLAGS="-C linker-flavor=ld.lld -C linker=/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld -C codegen-units=8 -C lto=off -C debuginfo=0 -C opt-level=0 -L /lib -L /usr/lib -L /lib/rustlib/x86_64-unknown-linux-musl/lib"
+export RUSTFLAGS="-C linker-flavor=ld.lld -C linker=/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld -C codegen-units=8 -C lto=off -C debuginfo=0 -C opt-level=0 -C link-self-contained=no -L /lib -L /usr/lib -L /lib/rustlib/x86_64-unknown-linux-musl/lib"
 export RUSTFLAGS_BOOTSTRAP="-C linker-flavor=ld.lld -C linker=/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld -C codegen-units=8 -L /lib -L /usr/lib -L /lib/rustlib/x86_64-unknown-linux-musl/lib"
 export CARGO_HOST_RUSTFLAGS="-C linker-flavor=ld.lld -C linker=/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld -C codegen-units=8 -C lto=off -C debuginfo=0 -C opt-level=0 -L /lib -L /usr/lib -L /lib/rustlib/x86_64-unknown-linux-musl/lib"
 export HOST_RUSTFLAGS="-C linker-flavor=ld.lld -C linker=/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld -C codegen-units=8 -C lto=off -C debuginfo=0 -C opt-level=0 -L /lib -L /usr/lib -L /lib/rustlib/x86_64-unknown-linux-musl/lib"

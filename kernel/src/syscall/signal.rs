@@ -268,35 +268,44 @@ pub fn sys_rt_sigprocmask(
         Some(t) => t,
         None => return Errno::ESRCH.into(),
     };
-    let mut task = task_arc.lock();
+    let new_set = if !set.is_null() {
+        Some(unsafe { core::ptr::read(set) })
+    } else {
+        None
+    };
+
+    let (old_blocked, pending_unblocked) = {
+        let mut task = task_arc.lock();
+        let old = task.blocked_signals;
+        if let Some(new_mask) = new_set {
+            match how {
+                0 => {
+                    // SIG_BLOCK
+                    task.blocked_signals |= new_mask;
+                }
+                1 => {
+                    // SIG_UNBLOCK
+                    task.blocked_signals &= !new_mask;
+                }
+                2 => {
+                    // SIG_SETMASK
+                    task.blocked_signals = new_mask;
+                }
+                _ => return Errno::EINVAL.into(),
+            }
+            // SIGKILL (9) and SIGSTOP (19) cannot be blocked
+            task.blocked_signals &= !((1 << 8) | (1 << 18));
+        }
+        let pending = task.pending_signals & !task.blocked_signals;
+        (old, pending)
+    };
 
     if !oldset.is_null() {
         unsafe {
-            core::ptr::write(oldset, task.blocked_signals);
+            core::ptr::write(oldset, old_blocked);
         }
-    }
-    if !set.is_null() {
-        let new_set = unsafe { core::ptr::read(set) };
-        match how {
-            0 => {
-                // SIG_BLOCK
-                task.blocked_signals |= new_set;
-            }
-            1 => {
-                // SIG_UNBLOCK
-                task.blocked_signals &= !new_set;
-            }
-            2 => {
-                // SIG_SETMASK
-                task.blocked_signals = new_set;
-            }
-            _ => return Errno::EINVAL.into(),
-        }
-        // SIGKILL (9) and SIGSTOP (19) cannot be blocked
-        task.blocked_signals &= !((1 << 8) | (1 << 18));
     }
 
-    let pending_unblocked = task.pending_signals & !task.blocked_signals;
     let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
     unsafe {
         if apic_id < 32 {

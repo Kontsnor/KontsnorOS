@@ -322,13 +322,22 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
         crate::process::scheduler::current_pid()
             .and_then(|pid| crate::process::scheduler::get_task_arc(pid))
             .map(|task_arc| {
-                let task = task_arc.lock();
-                let addr_space = task.address_space.lock();
-                addr_space.mmap_regions.iter().any(|r| {
-                    fault_vaddr >= r.start
-                        && fault_vaddr < r.start + r.len as u64
-                        && (r.prot & 2) != 0
-                })
+                if let Some(task) = task_arc.try_lock() {
+                    if let Some(addr_space) = task.address_space.try_lock() {
+                        addr_space.mmap_regions.iter().any(|r| {
+                            fault_vaddr >= r.start
+                                && fault_vaddr < r.start + r.len as u64
+                                && (r.prot & 2) != 0
+                        })
+                    } else {
+                        // Address space locked on this core; default to allowing write (CoW / demand paging)
+                        true
+                    }
+                } else {
+                    // Task already locked on this core by current thread!
+                    // Prevent self-deadlock and allow write check to succeed
+                    true
+                }
             })
             .unwrap_or(false)
     } else {

@@ -352,6 +352,16 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
             }
         }
         addr_space.mmap_regions = new_regions;
+        if unmap_end >= addr_space.mmap_bump && addr < 0x0000_7000_0000_0000 {
+            let highest_remaining = addr_space
+                .mmap_regions
+                .iter()
+                .filter(|r| r.start >= 0x0000_5000_0000_0000 && r.start < 0x0000_7000_0000_0000)
+                .map(|r| r.start + r.len as u64)
+                .max()
+                .unwrap_or(0x0000_5000_0000_0000);
+            addr_space.mmap_bump = core::cmp::max(0x0000_5000_0000_0000, highest_remaining);
+        }
         count
     };
 

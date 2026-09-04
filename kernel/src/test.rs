@@ -1951,8 +1951,11 @@ fn test_futex_bitset_and_cleartid() {
                 (ctid as *mut u32).write_volatile(0);
             }
         }
+        let child_tgid = task_child.tgid.as_u64();
         crate::process::lifecycle::run_with_scheduler_lock(|sched| {
-            crate::syscall::process::futex::futex_wake_locked(ctid, 1, 0xffffffff, sched);
+            crate::syscall::process::futex::futex_wake_locked(
+                child_tgid, ctid, 1, 0xffffffff, sched,
+            );
         });
     }
 

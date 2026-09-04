@@ -334,14 +334,82 @@ pub fn cleanup_address_space() {
 /// Exits the currently running task.
 pub fn exit_current_thread(exit_code: i32) -> ! {
     let mut clear_ctid = None;
-    if let Some(current_pid) = scheduler::current_pid() {
+    let mut current_tgid = 0;
+    let mut robust_head = 0;
+    let current_pid_opt = scheduler::current_pid();
+    if let Some(current_pid) = current_pid_opt {
         if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
             let mut task = task_arc.lock();
             clear_ctid = task.clear_child_tid;
+            current_tgid = task.tgid.as_u64();
+            robust_head = task.robust_list_head;
             let fd_table = task.fd_table.clone();
             if Arc::strong_count(&fd_table) == 1 {
                 fd_table.lock().entries.clear();
             }
+        }
+    }
+
+    // Process robust futex list before exit to unblock waiters on robust mutexes
+    if robust_head != 0 {
+        if crate::syscall::validation::validate_user_ptr(robust_head as *const u8, 24) {
+            // SAFETY: Memory is validated and readable.
+            let next_ptr = unsafe { (robust_head as *const u64).read_volatile() };
+            let futex_offset = unsafe { ((robust_head + 8) as *const i64).read_volatile() };
+            let pending_ptr = unsafe { ((robust_head + 16) as *const u64).read_volatile() };
+
+            let tid_val = current_pid_opt.map(|p| p.as_u64() as u32).unwrap_or(0);
+
+            run_with_scheduler_lock(|sched| {
+                let handle_entry =
+                    |entry: u64, sched: &mut crate::process::scheduler::Scheduler| {
+                        if entry == 0 || entry == robust_head {
+                            return;
+                        }
+                        let futex_addr = (entry as i64).wrapping_add(futex_offset) as u64;
+                        if crate::syscall::validation::validate_user_ptr_write(
+                            futex_addr as *mut u8,
+                            4,
+                        )
+                        .is_ok()
+                        {
+                            let futex_ptr = futex_addr as *mut u32;
+                            // SAFETY: Validated writable user pointer.
+                            let val = unsafe { futex_ptr.read_volatile() };
+                            if (val & 0x3fff_ffff) == tid_val {
+                                let new_val = (val & 0x8000_0000) | 0x4000_0000; // FUTEX_OWNER_DIED
+                                                                                 // SAFETY: Validated user memory pointer.
+                                unsafe {
+                                    futex_ptr.write_volatile(new_val);
+                                }
+                                crate::syscall::process::futex::futex_wake_locked(
+                                    current_tgid,
+                                    futex_addr,
+                                    1,
+                                    0xffff_ffff,
+                                    sched,
+                                );
+                            }
+                        }
+                    };
+
+                if pending_ptr != 0 {
+                    handle_entry(pending_ptr, sched);
+                }
+
+                let mut curr = next_ptr;
+                let mut count = 0;
+                while curr != 0 && curr != robust_head && count < 1000 {
+                    if crate::syscall::validation::validate_user_ptr(curr as *const u8, 8) {
+                        handle_entry(curr, sched);
+                        // SAFETY: Validated user memory pointer.
+                        curr = unsafe { (curr as *const u64).read_volatile() };
+                        count += 1;
+                    } else {
+                        break;
+                    }
+                }
+            });
         }
     }
 
@@ -353,7 +421,13 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
             }
         }
         run_with_scheduler_lock(|sched| {
-            crate::syscall::process::futex::futex_wake_locked(ctid, 1, 0xffffffff, sched);
+            crate::syscall::process::futex::futex_wake_locked(
+                current_tgid,
+                ctid,
+                i32::MAX,
+                0xffffffff,
+                sched,
+            );
         });
     }
 

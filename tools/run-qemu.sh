@@ -72,7 +72,7 @@ qemu-system-x86_64 \
     -drive format=raw,file="$DISK_IMG",index=1,media=disk \
     -serial stdio \
     -display none \
-    -m 5G \
+    -m 4G \
     -qmp unix:/tmp/qmp-kontsnor.sock,server,nowait \
     $ACCEL_OPTS \
     -no-reboot \

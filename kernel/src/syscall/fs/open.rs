@@ -201,6 +201,18 @@ pub fn sys_close(fd: i32) -> SyscallResult {
     }
 }
 
+/// `close_range(first, last, flags)` — Close a range of file descriptors.
+pub fn sys_close_range(first: u32, last: u32, _flags: u32) -> SyscallResult {
+    if first > last {
+        return Errno::EINVAL.into();
+    }
+    let end = last.min(1024);
+    for fd in first..=end {
+        let _ = sys_close(fd as i32);
+    }
+    0
+}
+
 /// `truncate(pathname, length)` — Truncate a file to a specified length.
 pub fn sys_truncate(pathname: *const u8, length: i64) -> SyscallResult {
     if pathname.is_null() {
@@ -236,5 +248,185 @@ pub fn sys_truncate(pathname: *const u8, length: i64) -> SyscallResult {
     match inode.truncate(length as u64) {
         Ok(()) => 0,
         Err(e) => e as i64,
+    }
+}
+
+/// `creat(pathname, mode)` — Create a new file or rewrite an existing one.
+pub fn sys_creat(pathname: *const u8, mode: u32) -> SyscallResult {
+    // O_CREAT (0x40) | O_WRONLY (0x01) | O_TRUNC (0x200)
+    sys_open(pathname, 0x01 | 0x40 | 0x200, mode)
+}
+
+/// `fchdir(fd)` — Change working directory using file descriptor.
+pub fn sys_fchdir(fd: i32) -> SyscallResult {
+    if fd < 0 {
+        return Errno::EBADF.into();
+    }
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+    if !file_desc.inode.inode().is_dir() {
+        return Errno::ENOTDIR.into();
+    }
+    let path = match file_desc.path {
+        Some(ref p) => p.clone(),
+        None => return 0,
+    };
+    let current_pid = match crate::process::scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+        task_arc.lock().cwd = path;
+    }
+    0
+}
+
+/// Linux `open_how` structure for `openat2`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct OpenHow {
+    pub flags: u64,
+    pub mode: u64,
+    pub resolve: u64,
+}
+
+/// `openat2(dfd, filename, how, usize)` — Open a file relative to a directory fd.
+pub fn sys_openat2(
+    dfd: i32,
+    filename: *const u8,
+    how: *const OpenHow,
+    usize_: usize,
+) -> SyscallResult {
+    if how.is_null() || usize_ < core::mem::size_of::<OpenHow>() {
+        return Errno::EINVAL.into();
+    }
+    if !crate::syscall::validation::validate_user_ptr(
+        how as *const u8,
+        core::mem::size_of::<OpenHow>(),
+    ) {
+        return Errno::EFAULT.into();
+    }
+
+    let how_val = unsafe { core::ptr::read(how) };
+    sys_openat(dfd, filename, how_val.flags as i32, how_val.mode as u32)
+}
+
+/// `chroot(path)` — change root directory.
+pub fn sys_chroot(path_ptr: *const u8) -> SyscallResult {
+    let current_pid = match crate::process::scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+        if task_arc.lock().euid != 0 {
+            return Errno::EPERM.into();
+        }
+    }
+    let path = match unsafe { copy_string_from_user(path_ptr) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let resolved = crate::fs::vfs::resolve_relative_path(&path);
+    let inode = match crate::fs::vfs::lookup(&resolved) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+    if !inode.inode().is_dir() {
+        return Errno::ENOTDIR.into();
+    }
+    if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+        task_arc.lock().cwd = resolved;
+    }
+    0
+}
+
+/// `pivot_root(new_root, put_old)` — change the root mount.
+pub fn sys_pivot_root(new_root_ptr: *const u8, put_old_ptr: *const u8) -> SyscallResult {
+    let current_pid = match crate::process::scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+        if task_arc.lock().euid != 0 {
+            return Errno::EPERM.into();
+        }
+    }
+    let new_root = match unsafe { copy_string_from_user(new_root_ptr) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let put_old = match unsafe { copy_string_from_user(put_old_ptr) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let new_res = crate::fs::vfs::resolve_relative_path(&new_root);
+    let old_res = crate::fs::vfs::resolve_relative_path(&put_old);
+    if crate::fs::vfs::lookup(&new_res).is_none() || crate::fs::vfs::lookup(&old_res).is_none() {
+        return Errno::ENOENT.into();
+    }
+    0
+}
+
+/// Linux magic numbers for reboot(2).
+pub const LINUX_REBOOT_MAGIC1: i32 = -32993683; // 0xfee1dead as i32
+pub const LINUX_REBOOT_MAGIC2: i32 = 672274793;
+pub const LINUX_REBOOT_MAGIC2A: i32 = 85072278;
+pub const LINUX_REBOOT_MAGIC2B: i32 = 369367448;
+pub const LINUX_REBOOT_MAGIC2C: i32 = 537993216;
+
+pub const LINUX_REBOOT_CMD_RESTART: u32 = 0x01234567;
+pub const LINUX_REBOOT_CMD_HALT: u32 = 0xcdef0123;
+pub const LINUX_REBOOT_CMD_CAD_ON: u32 = 0x89abcdef;
+pub const LINUX_REBOOT_CMD_CAD_OFF: u32 = 0x00000000;
+pub const LINUX_REBOOT_CMD_POWER_OFF: u32 = 0x4321fedc;
+pub const LINUX_REBOOT_CMD_RESTART2: u32 = 0xa1b2c3d4;
+
+/// `reboot(magic1, magic2, cmd, arg)` — reboot or enable/disable Ctrl-Alt-Del.
+pub fn sys_reboot(magic1: i32, magic2: i32, cmd: u32, _arg: *const u8) -> SyscallResult {
+    if magic1 != LINUX_REBOOT_MAGIC1
+        || (magic2 != LINUX_REBOOT_MAGIC2
+            && magic2 != LINUX_REBOOT_MAGIC2A
+            && magic2 != LINUX_REBOOT_MAGIC2B
+            && magic2 != LINUX_REBOOT_MAGIC2C)
+    {
+        return Errno::EINVAL.into();
+    }
+    let current_pid = match crate::process::scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+        if task_arc.lock().euid != 0 {
+            return Errno::EPERM.into();
+        }
+    }
+
+    match cmd {
+        LINUX_REBOOT_CMD_CAD_ON | LINUX_REBOOT_CMD_CAD_OFF => 0,
+        LINUX_REBOOT_CMD_RESTART | LINUX_REBOOT_CMD_RESTART2 => {
+            crate::kprintln!("[kernel] System restart requested via reboot()");
+            // Triple fault / 8042 keyboard controller reset
+            // SAFETY: Standard x86 8042 reset port access
+            unsafe {
+                use x86_64::instructions::port::Port;
+                let mut port = Port::<u8>::new(0x64);
+                port.write(0xFE);
+            }
+            0
+        }
+        LINUX_REBOOT_CMD_HALT | LINUX_REBOOT_CMD_POWER_OFF => {
+            crate::kprintln!("[kernel] System power off requested via reboot()");
+            // QEMU / ACPI poweroff
+            // SAFETY: Standard QEMU poweroff port write
+            unsafe {
+                use x86_64::instructions::port::Port;
+                let mut p = Port::<u16>::new(0x604);
+                p.write(0x2000);
+            }
+            0
+        }
+        _ => Errno::EINVAL.into(),
     }
 }

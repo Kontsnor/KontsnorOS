@@ -105,6 +105,10 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
             child_task.gid = parent_task.gid;
             child_task.euid = parent_task.euid;
             child_task.egid = parent_task.egid;
+            child_task.suid = parent_task.suid;
+            child_task.sgid = parent_task.sgid;
+            child_task.groups = parent_task.groups.clone();
+            child_task.sid = parent_task.sid;
             child_task.pgid = parent_task.pgid;
             child_task.rlimit_nofile_cur = parent_task.rlimit_nofile_cur;
             child_task.rlimit_nofile_max = parent_task.rlimit_nofile_max;
@@ -150,14 +154,18 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
     debug_assert_eq!(child_context.r14, 0);
     debug_assert_eq!(child_context.r15, 0);
 
-    crate::kprintln!("[syscall] fork debug: rip = {:#x}, rsp = {:#x}, cr3 = {:#x}, fs_base = {:#x}, gs_base = {:#x}", 
-        child_context.rip, child_context.rsp, child_context.cr3, child_context.fs_base, child_context.kernel_gs_base);
+    if crate::syscall::DEBUG_SYSCALLS {
+        crate::kprintln!("[syscall] fork debug: rip = {:#x}, rsp = {:#x}, cr3 = {:#x}, fs_base = {:#x}, gs_base = {:#x}", 
+            child_context.rip, child_context.rsp, child_context.cr3, child_context.fs_base, child_context.kernel_gs_base);
+    }
 
     child_task.context = child_context;
 
     scheduler::add_task(child_task);
 
-    kprintln!("[syscall] fork() -> parent returns child PID {}", child_pid);
+    if crate::syscall::DEBUG_SYSCALLS {
+        kprintln!("[syscall] fork() -> parent returns child PID {}", child_pid);
+    }
     child_pid.as_u64() as SyscallResult
 }
 
@@ -313,12 +321,14 @@ pub fn sys_execve(
         None => return Errno::EFAULT.into(),
     };
 
-    kprintln!(
-        "[syscall] execve(\"{}\") with {} args, {} env vars",
-        path,
-        argv.len(),
-        envp.len()
-    );
+    if crate::syscall::DEBUG_SYSCALLS {
+        kprintln!(
+            "[syscall] execve(\"{}\") with {} args, {} env vars",
+            path,
+            argv.len(),
+            envp.len()
+        );
+    }
 
     // Look up the file in the VFS
     let inode = match crate::fs::vfs::lookup_follow(&path, true) {
@@ -759,10 +769,12 @@ pub fn sys_execve(
         }
     };
 
-    kprintln!(
-        "[syscall] execve: loading OK, entry={:#x}, jumping to Ring 3...",
-        entry
-    );
+    if crate::syscall::DEBUG_SYSCALLS {
+        kprintln!(
+            "[syscall] execve: loading OK, entry={:#x}, jumping to Ring 3...",
+            entry
+        );
+    }
 
     // Clear the active CPU FS_BASE register to prevent inheriting parent's TLS
     x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(0));
@@ -906,14 +918,17 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
                         if is_child && matches_pid && is_process_leader {
                             has_children = true;
                             if task.state == TaskState::Zombie {
-                                let (total_f, alloc_f, free_f) = crate::memory::physical::stats();
-                                crate::kprintln!(
-                                    "[syscall] wait4: found zombie child PID {}, free_mem={}MB/{}MB (alloc_frames={})",
-                                    task.pid,
-                                    (free_f * 4096) / (1024 * 1024),
-                                    (total_f * 4096) / (1024 * 1024),
-                                    alloc_f
-                                );
+                                if crate::syscall::DEBUG_SYSCALLS {
+                                    let (total_f, alloc_f, free_f) =
+                                        crate::memory::physical::stats();
+                                    crate::kprintln!(
+                                        "[syscall] wait4: found zombie child PID {}, free_mem={}MB/{}MB (alloc_frames={})",
+                                        task.pid,
+                                        (free_f * 4096) / (1024 * 1024),
+                                        (total_f * 4096) / (1024 * 1024),
+                                        alloc_f
+                                    );
+                                }
                                 found = Some((task.pid, task.exit_code.unwrap_or(0)));
                                 break;
                             }
@@ -993,6 +1008,84 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
             }
         }
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SigInfo {
+    pub si_signo: i32,
+    pub si_errno: i32,
+    pub si_code: i32,
+    pub si_pid: i32,
+    pub si_uid: u32,
+    pub si_status: i32,
+    pub _pad: [u8; 104],
+}
+
+impl Default for SigInfo {
+    fn default() -> Self {
+        Self {
+            si_signo: 0,
+            si_errno: 0,
+            si_code: 0,
+            si_pid: 0,
+            si_uid: 0,
+            si_status: 0,
+            _pad: [0u8; 104],
+        }
+    }
+}
+
+/// `waitid(which, id, infop, options, ru)` — Wait for process to change state.
+pub fn sys_waitid(
+    which: i32,
+    id: i32,
+    infop: *mut SigInfo,
+    options: i32,
+    _ru: *mut u8,
+) -> SyscallResult {
+    let pid = match which {
+        0 => -1,  // P_ALL
+        1 => id,  // P_PID
+        2 => -id, // P_PGID
+        _ => return Errno::EINVAL.into(),
+    };
+
+    let mut wstatus = 0i32;
+    let ret = sys_wait4(
+        pid,
+        &mut wstatus as *mut i32,
+        options,
+        core::ptr::null_mut(),
+    );
+    if ret < 0 {
+        return ret;
+    }
+
+    if !infop.is_null() {
+        if validate_user_ptr_write(infop as *mut u8, core::mem::size_of::<SigInfo>()).is_err() {
+            return Errno::EFAULT.into();
+        }
+        let info = SigInfo {
+            si_signo: 17, // SIGCHLD
+            si_errno: 0,
+            si_code: 1, // CLD_EXITED
+            si_pid: ret as i32,
+            si_uid: 0,
+            si_status: (wstatus >> 8) & 0xFF,
+            _pad: [0u8; 104],
+        };
+        // SAFETY: Pointer validated with validate_user_ptr_write.
+        unsafe {
+            core::ptr::write(infop, info);
+        }
+    }
+    0
+}
+
+/// `vfork()` — Create a child process and block parent.
+pub fn sys_vfork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
+    sys_fork(regs)
 }
 
 /// `brk(addr)` — Set the program break (end of data segment / heap top).
@@ -1245,6 +1338,10 @@ pub fn sys_clone(
             child_task.gid = parent_task.gid;
             child_task.euid = parent_task.euid;
             child_task.egid = parent_task.egid;
+            child_task.suid = parent_task.suid;
+            child_task.sgid = parent_task.sgid;
+            child_task.groups = parent_task.groups.clone();
+            child_task.sid = parent_task.sid;
             child_task.pgid = parent_task.pgid;
             child_task.rlimit_nofile_cur = parent_task.rlimit_nofile_cur;
             child_task.rlimit_nofile_max = parent_task.rlimit_nofile_max;
@@ -1298,22 +1395,43 @@ pub fn sys_clone(
 
     unsafe {
         let child_regs = &*child_regs_ptr;
-        crate::kprintln!(
-            "[syscall] clone debug: child_pid = {}, ctx.rip = {:#x}, ctx.rsp = {:#x}, ctx.cr3 = {:#x}, regs.rip = {:#x}, regs.rsp = {:#x}, regs.rax = {:#x}",
-            child_pid,
-            child_context.rip,
-            child_context.rsp,
-            child_context.cr3,
-            child_regs.rip,
-            child_regs.rsp,
-            child_regs.rax
-        );
+        if crate::syscall::DEBUG_SYSCALLS {
+            crate::kprintln!(
+                "[syscall] clone debug: child_pid = {}, ctx.rip = {:#x}, ctx.rsp = {:#x}, ctx.cr3 = {:#x}, regs.rip = {:#x}, regs.rsp = {:#x}, regs.rax = {:#x}",
+                child_pid,
+                child_context.rip,
+                child_context.rsp,
+                child_context.cr3,
+                child_regs.rip,
+                child_regs.rsp,
+                child_regs.rax
+            );
+        }
     }
 
-    if flags & 0x00100000 != 0 && !parent_tidptr.is_null() {
+    if flags & 0x00001000 != 0 && !parent_tidptr.is_null() {
         if validate_user_ptr_write(parent_tidptr as *mut u8, core::mem::size_of::<i32>()).is_err() {
             return Errno::EFAULT.into();
         }
+        let pidfd = Arc::new(crate::fs::pidfd::PidFd::new(child_pid.as_u64()));
+        let fd = match crate::process::fd::current_task_alloc_fd_with_flags(
+            pidfd,
+            crate::fs::file::OpenFlags(
+                crate::fs::file::OpenFlags::O_RDWR | crate::fs::file::OpenFlags::O_CLOEXEC,
+            ),
+        ) {
+            Some(fd) => fd as i32,
+            None => return Errno::EMFILE.into(),
+        };
+        // SAFETY: Pointer was validated above
+        unsafe {
+            parent_tidptr.write_volatile(fd);
+        }
+    } else if flags & 0x00100000 != 0 && !parent_tidptr.is_null() {
+        if validate_user_ptr_write(parent_tidptr as *mut u8, core::mem::size_of::<i32>()).is_err() {
+            return Errno::EFAULT.into();
+        }
+        // SAFETY: Pointer was validated above
         unsafe {
             parent_tidptr.write_volatile(child_pid.as_u64() as i32);
         }
@@ -1322,6 +1440,7 @@ pub fn sys_clone(
         if validate_user_ptr_write(child_tidptr as *mut u8, core::mem::size_of::<i32>()).is_err() {
             return Errno::EFAULT.into();
         }
+        // SAFETY: Pointer was validated above
         unsafe {
             child_tidptr.write_volatile(child_pid.as_u64() as i32);
         }
@@ -1329,9 +1448,83 @@ pub fn sys_clone(
 
     scheduler::add_task(child_task);
 
-    kprintln!(
-        "[syscall] clone() -> parent returns child PID {}",
-        child_pid
-    );
+    if crate::syscall::DEBUG_SYSCALLS {
+        kprintln!(
+            "[syscall] clone() -> parent returns child PID {}",
+            child_pid
+        );
+    }
     child_pid.as_u64() as SyscallResult
+}
+
+/// Linux `clone_args` structure for `clone3`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CloneArgs {
+    pub flags: u64,
+    pub pidfd: u64,
+    pub child_tid: u64,
+    pub parent_tid: u64,
+    pub exit_signal: u64,
+    pub stack: u64,
+    pub stack_size: u64,
+    pub tls: u64,
+    pub set_tid: u64,
+    pub set_tid_size: u64,
+    pub cgroup: u64,
+}
+
+/// `clone3(cl_args, size)` — create a child process using extended arguments.
+pub fn sys_clone3(
+    args_ptr: *const CloneArgs,
+    size: usize,
+    regs: *mut crate::syscall::SavedRegisters,
+) -> SyscallResult {
+    if size < 64 || size > 4096 {
+        return Errno::EINVAL.into();
+    }
+    if args_ptr.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if !crate::syscall::validation::validate_user_ptr(args_ptr as *const u8, size) {
+        return Errno::EFAULT.into();
+    }
+
+    // SAFETY: Pointer validated above
+    let args = unsafe { core::ptr::read_volatile(args_ptr) };
+
+    if args.exit_signal & !0xff != 0 {
+        return Errno::EINVAL.into();
+    }
+
+    let flags = args.flags | (args.exit_signal & 0xff);
+    let child_stack = if args.stack != 0 {
+        if args.stack_size != 0 {
+            match args.stack.checked_add(args.stack_size) {
+                Some(top) => top,
+                None => return Errno::EINVAL.into(),
+            }
+        } else {
+            args.stack
+        }
+    } else {
+        0
+    };
+
+    let parent_tidptr = if (args.flags & 0x00001000) != 0 {
+        args.pidfd as *mut i32
+    } else {
+        args.parent_tid as *mut i32
+    };
+    let child_tidptr = args.child_tid as *mut i32;
+    let newtls = args.tls;
+
+    sys_clone(
+        flags,
+        child_stack,
+        parent_tidptr,
+        child_tidptr,
+        newtls,
+        regs,
+    )
 }

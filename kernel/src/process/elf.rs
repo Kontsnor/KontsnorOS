@@ -470,7 +470,7 @@ pub fn construct_user_stack(
         total_str_bytes = total_str_bytes.saturating_add(arg.as_bytes().len() + 1);
     }
 
-    let auxv_count = 13usize;
+    let auxv_count = 15usize;
     let ptrs_size = 8 + (argv.len() * 8) + 8 + (envp.len() * 8) + 8 + (auxv_count * 16);
     let required_bytes = 16 + total_str_bytes + ptrs_size + 16; // 16 for AT_RANDOM, 16 for alignment
 
@@ -516,7 +516,9 @@ pub fn construct_user_stack(
     }
     argv_vaddrs.reverse();
 
-    // Auxiliary vector entries required by musl-libc
+    let execfn_vaddr = argv_vaddrs.first().copied().unwrap_or(0);
+
+    // Auxiliary vector entries required by musl-libc and glibc
     let auxv = [
         (3u64, phdr),             // AT_PHDR
         (4u64, phent),            // AT_PHENT
@@ -528,8 +530,10 @@ pub fn construct_user_stack(
         (12u64, 0),               // AT_EUID
         (13u64, 0),               // AT_GID
         (14u64, 0),               // AT_EGID
+        (17u64, 100),             // AT_CLKTCK
         (23u64, 0),               // AT_SECURE
         (25u64, random_vaddr),    // AT_RANDOM
+        (31u64, execfn_vaddr),    // AT_EXECFN
         (0u64, 0),                // AT_NULL
     ];
 

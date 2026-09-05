@@ -18,6 +18,8 @@
 use super::{Errno, SyscallResult};
 use crate::kprintln;
 
+pub const DEBUG_SIGNALS: bool = false;
+
 /// Standard POSIX signals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -444,7 +446,8 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
         return;
     } else if action.sa_handler == 0 {
         // SIG_DFL
-        if sig == 17 || sig == 18 || sig == 28 {
+        // SIGCHLD (17), SIGCONT (18), SIGTSTP (20), SIGTTIN (21), SIGTTOU (22), SIGURG (23), SIGWINCH (28)
+        if sig == 17 || sig == 18 || sig == 20 || sig == 21 || sig == 22 || sig == 23 || sig == 28 {
             return;
         }
         kprintln!(
@@ -511,12 +514,14 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
             (*regs).rdi = sig as u64;
         }
 
-        kprintln!(
-            "[signal] Delivered signal {} to custom handler at {:#x}, trampoline user stack: {:#x}",
-            sig,
-            action.sa_handler,
-            new_user_sp
-        );
+        if DEBUG_SIGNALS {
+            kprintln!(
+                "[signal] Delivered signal {} to custom handler at {:#x}, trampoline user stack: {:#x}",
+                sig,
+                action.sa_handler,
+                new_user_sp
+            );
+        }
     }
 }
 
@@ -570,12 +575,105 @@ pub fn sys_rt_sigreturn(regs: *mut super::SavedRegisters) -> SyscallResult {
             }
         }
 
-        kprintln!(
-            "[signal] sys_rt_sigreturn: restored execution context to RIP={:#x}, RSP={:#x}",
-            frame.rip,
-            frame.rsp
-        );
+        if DEBUG_SIGNALS {
+            kprintln!(
+                "[signal] sys_rt_sigreturn: restored execution context to RIP={:#x}, RSP={:#x}",
+                frame.rip,
+                frame.rsp
+            );
+        }
 
         (*regs).rax as SyscallResult
     }
+}
+
+/// `rt_sigsuspend(unewset, sigsetsize)` — Temporarily replace signal mask and suspend process.
+pub fn sys_rt_sigsuspend(unewset: *const u64, sigsetsize: usize) -> SyscallResult {
+    if sigsetsize != 8 || unewset.is_null() {
+        return Errno::EINVAL.into();
+    }
+    if !crate::syscall::validation::validate_user_ptr(unewset as *const u8, 8) {
+        return Errno::EFAULT.into();
+    }
+    let new_mask = unsafe { core::ptr::read(unewset) };
+    let current_pid = match crate::process::scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+        let mut task = task_arc.lock();
+        task.blocked_signals = new_mask & !((1 << 8) | (1 << 18));
+    }
+    crate::process::scheduler::yield_now();
+    Errno::EINTR.into()
+}
+
+/// `rt_sigpending(uset, sigsetsize)` — Examine pending signals.
+pub fn sys_rt_sigpending(uset: *mut u64, sigsetsize: usize) -> SyscallResult {
+    if sigsetsize != 8 || uset.is_null() {
+        return Errno::EINVAL.into();
+    }
+    if crate::syscall::validation::validate_user_ptr_write(uset as *mut u8, 8).is_err() {
+        return Errno::EFAULT.into();
+    }
+    let current_pid = match crate::process::scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    let pending = if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+        let task = task_arc.lock();
+        task.pending_signals & task.blocked_signals
+    } else {
+        0
+    };
+    unsafe {
+        core::ptr::write(uset, pending);
+    }
+    0
+}
+
+/// `rt_sigtimedwait(uthese, uinfo, uts, sigsetsize)` — Synchronously wait for queued signals.
+pub fn sys_rt_sigtimedwait(
+    uthese: *const u64,
+    _uinfo: *mut u8,
+    _uts: *const u8,
+    sigsetsize: usize,
+) -> SyscallResult {
+    if sigsetsize != 8 || uthese.is_null() {
+        return Errno::EINVAL.into();
+    }
+    if !crate::syscall::validation::validate_user_ptr(uthese as *const u8, 8) {
+        return Errno::EFAULT.into();
+    }
+    let these = unsafe { core::ptr::read(uthese) };
+    let current_pid = match crate::process::scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+        let mut task = task_arc.lock();
+        let ready = task.pending_signals & these;
+        if ready != 0 {
+            let sig = ready.trailing_zeros() + 1;
+            task.pending_signals &= !(1 << (sig - 1));
+            return sig as SyscallResult;
+        }
+    }
+    Errno::EAGAIN.into()
+}
+
+/// `rt_sigqueueinfo(pid, sig, uinfo)` — Queue a signal and data.
+pub fn sys_rt_sigqueueinfo(pid: i32, sig: i32, _uinfo: *const u8) -> SyscallResult {
+    sys_kill(pid, sig)
+}
+
+/// `rt_tgsigqueueinfo(tgid, tid, sig, uinfo)` — Queue a signal and data to a thread.
+pub fn sys_rt_tgsigqueueinfo(_tgid: i32, tid: i32, sig: i32, _uinfo: *const u8) -> SyscallResult {
+    sys_kill(tid, sig)
+}
+
+/// `pause()` — Wait for signal.
+pub fn sys_pause() -> SyscallResult {
+    crate::process::scheduler::yield_now();
+    Errno::EINTR.into()
 }

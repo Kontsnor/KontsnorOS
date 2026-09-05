@@ -263,3 +263,39 @@ pub fn current_task_dup2_fd(oldfd: i32, newfd: i32) -> Option<i32> {
     fd_table.cloexec[newfd_idx] = false; // dup2 clears close-on-exec
     Some(newfd)
 }
+
+/// Duplicate an existing file descriptor `oldfd` onto `newfd` with cloexec flag (dup3).
+pub fn current_task_dup3_fd(oldfd: i32, newfd: i32, cloexec: bool) -> Option<i32> {
+    if oldfd < 0 || newfd < 0 || oldfd == newfd {
+        return None;
+    }
+    let current_pid = scheduler::current_pid()?;
+    let task_arc = scheduler::get_task_arc(current_pid)?;
+
+    let task = task_arc.lock();
+    if newfd as u64 >= task.rlimit_nofile_cur {
+        return None;
+    }
+    let mut fd_table = task.fd_table.lock();
+    let file_desc = fd_table.entries.get(oldfd as usize)?.as_ref().cloned()?;
+    *file_desc.ref_count.lock() += 1;
+
+    let newfd_idx = newfd as usize;
+    if newfd_idx >= fd_table.entries.len() {
+        fd_table.entries.resize(newfd_idx + 1, None);
+    }
+    if newfd_idx >= fd_table.cloexec.len() {
+        fd_table.cloexec.resize(newfd_idx + 1, false);
+    }
+
+    if let Some(ref old_desc) = fd_table.entries[newfd_idx] {
+        let mut rc = old_desc.ref_count.lock();
+        if *rc > 0 {
+            *rc -= 1;
+        }
+    }
+
+    fd_table.entries[newfd_idx] = Some(file_desc);
+    fd_table.cloexec[newfd_idx] = cloexec;
+    Some(newfd)
+}

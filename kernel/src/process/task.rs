@@ -237,6 +237,14 @@ pub struct Task {
     pub euid: u32,
     /// Effective Group ID
     pub egid: u32,
+    /// Saved set-user-ID
+    pub suid: u32,
+    /// Saved set-group-ID
+    pub sgid: u32,
+    /// Supplementary group IDs
+    pub groups: Vec<u32>,
+    /// Session ID
+    pub sid: u64,
     /// Registered user-space address to be cleared when thread exits (CLONE_CHILD_CLEARTID)
     pub clear_child_tid: Option<u64>,
     /// Alternate signal stack.
@@ -253,6 +261,12 @@ pub struct Task {
     pub robust_list_head: u64,
     /// Robust futex list length
     pub robust_list_len: usize,
+    /// Restartable sequence registration address
+    pub rseq: Option<u64>,
+    /// Restartable sequence size
+    pub rseq_len: u32,
+    /// Restartable sequence signature
+    pub rseq_sig: u32,
 }
 
 impl Task {
@@ -318,6 +332,10 @@ impl Task {
             gid: 0,
             euid: 0,
             egid: 0,
+            suid: 0,
+            sgid: 0,
+            groups: Vec::new(),
+            sid: pid.as_u64(),
             clear_child_tid: None,
             sigaltstack: None,
             rlimit_nofile_cur: 1024,
@@ -326,6 +344,9 @@ impl Task {
             umask: 0o022,
             robust_list_head: 0,
             robust_list_len: 0,
+            rseq: None,
+            rseq_len: 0,
+            rseq_sig: 0,
         }
     }
 

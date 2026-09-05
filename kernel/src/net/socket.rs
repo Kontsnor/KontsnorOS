@@ -340,7 +340,9 @@ pub fn find_tcp_connection(
             // TCP
             if s_lock.local_port == Some(local_port)
                 && s_lock.remote_port == Some(remote_port)
-                && s_lock.local_addr == Some(local_ip)
+                && (s_lock.local_addr == Some(local_ip)
+                    || s_lock.local_addr == Some(Ipv4Addr::UNSPECIFIED)
+                    || s_lock.local_addr.is_none())
                 && s_lock.remote_addr == Some(remote_ip)
             {
                 return Some(s.clone());

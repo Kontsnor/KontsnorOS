@@ -222,3 +222,493 @@ pub fn sys_gettid() -> SyscallResult {
         None => 0,
     }
 }
+
+/// `getpgrp()` — Get process group ID of calling process.
+pub fn sys_getpgrp() -> SyscallResult {
+    sys_getpgid(0)
+}
+
+/// `getgroups(size, list)` — Get list of supplementary group IDs.
+pub fn sys_getgroups(size: i32, list: *mut u32) -> SyscallResult {
+    if size < 0 {
+        return Errno::EINVAL.into();
+    }
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    let task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
+    };
+    let task = task_arc.lock();
+    let count = if task.groups.is_empty() {
+        1
+    } else {
+        task.groups.len()
+    };
+
+    if size == 0 {
+        return count as SyscallResult;
+    }
+
+    if (size as usize) < count {
+        return Errno::EINVAL.into();
+    }
+    if list.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if super::super::validation::validate_user_ptr_write(
+        list as *mut u8,
+        count * core::mem::size_of::<u32>(),
+    )
+    .is_err()
+    {
+        return Errno::EFAULT.into();
+    }
+
+    // SAFETY: The user pointer was validated with validate_user_ptr_write for count * sizeof(u32).
+    unsafe {
+        if task.groups.is_empty() {
+            core::ptr::write(list, task.gid);
+        } else {
+            for (idx, &g) in task.groups.iter().enumerate() {
+                core::ptr::write(list.add(idx), g);
+            }
+        }
+    }
+    count as SyscallResult
+}
+
+/// `setgroups(size, list)` — Set list of supplementary group IDs.
+pub fn sys_setgroups(size: usize, list: *const u32) -> SyscallResult {
+    if size > 32 {
+        return Errno::EINVAL.into();
+    }
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    let task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
+    };
+    let mut task = task_arc.lock();
+    if task.euid != 0 {
+        return Errno::EPERM.into();
+    }
+
+    if size == 0 {
+        task.groups.clear();
+        return 0;
+    }
+    if list.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if !super::super::validation::validate_user_ptr(
+        list as *const u8,
+        size * core::mem::size_of::<u32>(),
+    ) {
+        return Errno::EFAULT.into();
+    }
+
+    let mut new_groups = alloc::vec::Vec::with_capacity(size);
+    // SAFETY: The pointer was validated with validate_user_ptr for size * sizeof(u32).
+    unsafe {
+        for i in 0..size {
+            new_groups.push(core::ptr::read(list.add(i)));
+        }
+    }
+    task.groups = new_groups;
+    0
+}
+
+/// `getresuid(ruid, euid, suid)` — Get real, effective, and saved user IDs.
+pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> SyscallResult {
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    let task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
+    };
+    let task = task_arc.lock();
+
+    if !ruid.is_null() {
+        if super::super::validation::validate_user_ptr_write(
+            ruid as *mut u8,
+            core::mem::size_of::<u32>(),
+        )
+        .is_err()
+        {
+            return Errno::EFAULT.into();
+        }
+        // SAFETY: Pointer validated with validate_user_ptr_write.
+        unsafe { core::ptr::write(ruid, task.uid) };
+    }
+    if !euid.is_null() {
+        if super::super::validation::validate_user_ptr_write(
+            euid as *mut u8,
+            core::mem::size_of::<u32>(),
+        )
+        .is_err()
+        {
+            return Errno::EFAULT.into();
+        }
+        // SAFETY: Pointer validated with validate_user_ptr_write.
+        unsafe { core::ptr::write(euid, task.euid) };
+    }
+    if !suid.is_null() {
+        if super::super::validation::validate_user_ptr_write(
+            suid as *mut u8,
+            core::mem::size_of::<u32>(),
+        )
+        .is_err()
+        {
+            return Errno::EFAULT.into();
+        }
+        // SAFETY: Pointer validated with validate_user_ptr_write.
+        unsafe { core::ptr::write(suid, task.suid) };
+    }
+    0
+}
+
+/// `setresuid(ruid, euid, suid)` — Set real, effective, and saved user IDs.
+pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> SyscallResult {
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    let task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
+    };
+    let mut task = task_arc.lock();
+
+    // Check permissions
+    if task.euid != 0 {
+        if ruid != u32::MAX && ruid != task.uid && ruid != task.euid && ruid != task.suid {
+            return Errno::EPERM.into();
+        }
+        if euid != u32::MAX && euid != task.uid && euid != task.euid && euid != task.suid {
+            return Errno::EPERM.into();
+        }
+        if suid != u32::MAX && suid != task.uid && suid != task.euid && suid != task.suid {
+            return Errno::EPERM.into();
+        }
+    }
+
+    if ruid != u32::MAX {
+        task.uid = ruid;
+    }
+    if euid != u32::MAX {
+        task.euid = euid;
+    }
+    if suid != u32::MAX {
+        task.suid = suid;
+    }
+    0
+}
+
+/// `getresgid(rgid, egid, sgid)` — Get real, effective, and saved group IDs.
+pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> SyscallResult {
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    let task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
+    };
+    let task = task_arc.lock();
+
+    if !rgid.is_null() {
+        if super::super::validation::validate_user_ptr_write(
+            rgid as *mut u8,
+            core::mem::size_of::<u32>(),
+        )
+        .is_err()
+        {
+            return Errno::EFAULT.into();
+        }
+        // SAFETY: Pointer validated with validate_user_ptr_write.
+        unsafe { core::ptr::write(rgid, task.gid) };
+    }
+    if !egid.is_null() {
+        if super::super::validation::validate_user_ptr_write(
+            egid as *mut u8,
+            core::mem::size_of::<u32>(),
+        )
+        .is_err()
+        {
+            return Errno::EFAULT.into();
+        }
+        // SAFETY: Pointer validated with validate_user_ptr_write.
+        unsafe { core::ptr::write(egid, task.egid) };
+    }
+    if !sgid.is_null() {
+        if super::super::validation::validate_user_ptr_write(
+            sgid as *mut u8,
+            core::mem::size_of::<u32>(),
+        )
+        .is_err()
+        {
+            return Errno::EFAULT.into();
+        }
+        // SAFETY: Pointer validated with validate_user_ptr_write.
+        unsafe { core::ptr::write(sgid, task.sgid) };
+    }
+    0
+}
+
+/// `setresgid(rgid, egid, sgid)` — Set real, effective, and saved group IDs.
+pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> SyscallResult {
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    let task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
+    };
+    let mut task = task_arc.lock();
+
+    // Check permissions
+    if task.euid != 0 {
+        if rgid != u32::MAX && rgid != task.gid && rgid != task.egid && rgid != task.sgid {
+            return Errno::EPERM.into();
+        }
+        if egid != u32::MAX && egid != task.gid && egid != task.egid && egid != task.sgid {
+            return Errno::EPERM.into();
+        }
+        if sgid != u32::MAX && sgid != task.gid && sgid != task.egid && sgid != task.sgid {
+            return Errno::EPERM.into();
+        }
+    }
+
+    if rgid != u32::MAX {
+        task.gid = rgid;
+    }
+    if egid != u32::MAX {
+        task.egid = egid;
+    }
+    if sgid != u32::MAX {
+        task.sgid = sgid;
+    }
+    0
+}
+
+/// `setreuid(ruid, euid)` — Set real and/or effective user ID.
+pub fn sys_setreuid(ruid: u32, euid: u32) -> SyscallResult {
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    let task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
+    };
+    let mut task = task_arc.lock();
+
+    if task.euid != 0 {
+        if ruid != u32::MAX && ruid != task.uid && ruid != task.euid {
+            return Errno::EPERM.into();
+        }
+        if euid != u32::MAX && euid != task.uid && euid != task.euid && euid != task.suid {
+            return Errno::EPERM.into();
+        }
+    }
+
+    if ruid != u32::MAX {
+        task.uid = ruid;
+    }
+    if euid != u32::MAX {
+        task.euid = euid;
+    }
+    0
+}
+
+/// `setregid(rgid, egid)` — Set real and/or effective group ID.
+pub fn sys_setregid(rgid: u32, egid: u32) -> SyscallResult {
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    let task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
+    };
+    let mut task = task_arc.lock();
+
+    if task.euid != 0 {
+        if rgid != u32::MAX && rgid != task.gid && rgid != task.egid {
+            return Errno::EPERM.into();
+        }
+        if egid != u32::MAX && egid != task.gid && egid != task.egid && egid != task.sgid {
+            return Errno::EPERM.into();
+        }
+    }
+
+    if rgid != u32::MAX {
+        task.gid = rgid;
+    }
+    if egid != u32::MAX {
+        task.egid = egid;
+    }
+    0
+}
+
+/// `getsid(pid)` — Get process session ID.
+pub fn sys_getsid(pid: i32) -> SyscallResult {
+    let target_pid = if pid == 0 {
+        match scheduler::current_pid() {
+            Some(p) => p,
+            None => return Errno::ESRCH.into(),
+        }
+    } else {
+        Pid::from_raw(pid as u64)
+    };
+
+    if let Some(task_arc) = scheduler::get_task_arc(target_pid) {
+        let task = task_arc.lock();
+        task.sid as SyscallResult
+    } else {
+        Errno::ESRCH.into()
+    }
+}
+
+/// Linux capability structures
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CapUserHeader {
+    pub version: u32,
+    pub pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CapUserData {
+    pub effective: u32,
+    pub permitted: u32,
+    pub inheritable: u32,
+}
+
+pub const LINUX_CAPABILITY_VERSION_1: u32 = 0x19980330;
+pub const LINUX_CAPABILITY_VERSION_2: u32 = 0x20071026;
+pub const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
+
+/// `capget(hdrp, datap)` — Get process capabilities.
+pub fn sys_capget(hdrp: *mut CapUserHeader, datap: *mut CapUserData) -> SyscallResult {
+    if hdrp.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if super::super::validation::validate_user_ptr_write(
+        hdrp as *mut u8,
+        core::mem::size_of::<CapUserHeader>(),
+    )
+    .is_err()
+    {
+        return Errno::EFAULT.into();
+    }
+
+    let header = unsafe { core::ptr::read(hdrp) };
+    if header.version != LINUX_CAPABILITY_VERSION_1
+        && header.version != LINUX_CAPABILITY_VERSION_2
+        && header.version != LINUX_CAPABILITY_VERSION_3
+    {
+        // Indicate preferred version in header
+        unsafe {
+            (*hdrp).version = LINUX_CAPABILITY_VERSION_3;
+        }
+        return Errno::EINVAL.into();
+    }
+
+    if datap.is_null() {
+        return 0;
+    }
+
+    let entries = if header.version == LINUX_CAPABILITY_VERSION_1 {
+        1
+    } else {
+        2
+    };
+
+    if super::super::validation::validate_user_ptr_write(
+        datap as *mut u8,
+        entries * core::mem::size_of::<CapUserData>(),
+    )
+    .is_err()
+    {
+        return Errno::EFAULT.into();
+    }
+
+    let is_root = sys_geteuid() == 0;
+    let cap_val = if is_root { 0xFFFF_FFFF } else { 0 };
+
+    // SAFETY: Pointers validated with validate_user_ptr_write for required entries.
+    unsafe {
+        for i in 0..entries {
+            core::ptr::write(
+                datap.add(i),
+                CapUserData {
+                    effective: cap_val,
+                    permitted: cap_val,
+                    inheritable: 0,
+                },
+            );
+        }
+    }
+    0
+}
+
+/// `capset(hdrp, datap)` — Set process capabilities.
+pub fn sys_capset(hdrp: *const CapUserHeader, datap: *const CapUserData) -> SyscallResult {
+    if hdrp.is_null() || datap.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if !super::super::validation::validate_user_ptr(
+        hdrp as *const u8,
+        core::mem::size_of::<CapUserHeader>(),
+    ) {
+        return Errno::EFAULT.into();
+    }
+
+    let header = unsafe { core::ptr::read(hdrp) };
+    if header.version != LINUX_CAPABILITY_VERSION_1
+        && header.version != LINUX_CAPABILITY_VERSION_2
+        && header.version != LINUX_CAPABILITY_VERSION_3
+    {
+        return Errno::EINVAL.into();
+    }
+
+    let entries = if header.version == LINUX_CAPABILITY_VERSION_1 {
+        1
+    } else {
+        2
+    };
+
+    if !super::super::validation::validate_user_ptr(
+        datap as *const u8,
+        entries * core::mem::size_of::<CapUserData>(),
+    ) {
+        return Errno::EFAULT.into();
+    }
+
+    // Unprivileged users cannot raise capabilities
+    if sys_geteuid() != 0 {
+        return Errno::EPERM.into();
+    }
+
+    0
+}
+
+/// `setfsuid(fsuid)` — Set filesystem UID. Returns previous fsuid.
+pub fn sys_setfsuid(_fsuid: u32) -> SyscallResult {
+    sys_getuid()
+}
+
+/// `setfsgid(fsgid)` — Set filesystem GID. Returns previous fsgid.
+pub fn sys_setfsgid(_fsgid: u32) -> SyscallResult {
+    sys_getgid()
+}

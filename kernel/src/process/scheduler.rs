@@ -34,6 +34,8 @@ const TIME_QUANTUM: u64 = 10;
 /// Number of ticks between priority boosts (prevents starvation).
 const BOOST_INTERVAL: u64 = 1000;
 
+pub const DEBUG_SCHEDULER: bool = false;
+
 /// The global scheduler instance.
 pub(crate) static SCHEDULER: TicketLock<Option<Scheduler>> = TicketLock::new(None);
 
@@ -543,7 +545,9 @@ pub fn add_task(task: Task) {
             scheduler.add_task(task);
         }
     });
-    kprintln!("[scheduler] Added task: PID {} ({})", pid, name);
+    if DEBUG_SCHEDULER {
+        kprintln!("[scheduler] Added task: PID {} ({})", pid, name);
+    }
 }
 
 /// Called on each timer tick.

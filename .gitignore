@@ -7,6 +7,7 @@ rust_out
 bios.img
 uefi.img
 disk.img
+disk*.img
 
 # Logs
 *.log
@@ -28,5 +29,6 @@ busybox
 
 # User space binaries
 tools/init
+tools/init-ubuntu
 tcc-build/
 

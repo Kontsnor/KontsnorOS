@@ -43,8 +43,30 @@ static PHYS_MEM_OFFSET: AtomicU64 = AtomicU64::new(0);
 /// The kernel's active PML4 page table root physical address.
 static KERNEL_PML4_PHYS: AtomicU64 = AtomicU64::new(0);
 
+/// Bitmap representing which PML4 entries in the lower half (0..256) are mapped by the kernel/bootloader.
+static KERNEL_LOWER_ENTRIES_MASK: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Check if a PML4 entry index belongs to kernel space (entries 256..512 or lower-half kernel mappings 1..256).
+pub fn is_kernel_pml4_entry(i: usize) -> bool {
+    if i == 0 {
+        return false;
+    }
+    if i >= 256 {
+        return true;
+    }
+    let word = KERNEL_LOWER_ENTRIES_MASK[i / 64].load(Ordering::Relaxed);
+    (word & (1u64 << (i % 64))) != 0
+}
+
 /// Global lock to serialize page table modifications across SMP cores.
 pub static PAGE_TABLE_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+pub const DEBUG_VIRTUAL: bool = false;
 
 /// Initialize the virtual memory manager.
 ///
@@ -57,10 +79,22 @@ pub fn init(phys_mem_offset: u64) {
     }
     PHYS_MEM_OFFSET.store(phys_mem_offset, Ordering::SeqCst);
     let (level_4_table_frame, _) = Cr3::read();
-    KERNEL_PML4_PHYS.store(
-        level_4_table_frame.start_address().as_u64(),
-        Ordering::SeqCst,
-    );
+    let pml4_phys = level_4_table_frame.start_address().as_u64();
+    KERNEL_PML4_PHYS.store(pml4_phys, Ordering::SeqCst);
+
+    let pml4_virt = VirtAddr::new(pml4_phys + phys_mem_offset);
+    let pml4: &PageTable = unsafe { &*pml4_virt.as_ptr() };
+
+    for i in 1..256 {
+        if !pml4[i].is_unused() {
+            crate::kprintln!(
+                "[virtual] Detected kernel mapping at PML4 index {}: {:?}",
+                i,
+                pml4[i]
+            );
+            KERNEL_LOWER_ENTRIES_MASK[i / 64].fetch_or(1u64 << (i % 64), Ordering::SeqCst);
+        }
+    }
 }
 
 /// Get the physical memory offset.
@@ -193,30 +227,21 @@ fn create_user_page_table_unlocked() -> Result<u64, &'static str> {
     // Clear the table first to avoid any garbage mappings
     new_pml4.zero();
 
-    // Copy kernel mappings (entries 256 to 511) from the active PML4
-    let (active_pml4_frame, _) = Cr3::read();
-    let active_pml4_virt =
-        VirtAddr::new(active_pml4_frame.start_address().as_u64() + phys_mem_offset());
-    let active_pml4: &PageTable = unsafe { &*active_pml4_virt.as_ptr() };
+    // Copy kernel mappings from the pristine initial kernel PML4
+    let kernel_pml4_virt = VirtAddr::new(kernel_pml4_phys() + phys_mem_offset());
+    let kernel_pml4: &PageTable = unsafe { &*kernel_pml4_virt.as_ptr() };
 
+    // Kernel higher-half mappings (entries 256 to 511)
     for i in 256..512 {
-        new_pml4[i] = active_pml4[i].clone();
+        new_pml4[i] = kernel_pml4[i].clone();
     }
 
-    // Clone kernel code / data (PML4 index 1: 0x80_0000_0000)
-    new_pml4[1] = active_pml4[1].clone();
-
-    // Copy the physical memory mapping PML4 entry (which resides in the lower half)
-    let pml4_index = (phys_mem_offset() >> 39) & 0x1FF;
-    if pml4_index < 256 && pml4_index != 1 {
-        return Err("Physical memory mapping overlaps user space");
+    // Lower-half kernel mappings (e.g. kernel code/data, bootloader structures)
+    for i in 0..256 {
+        if is_kernel_pml4_entry(i) {
+            new_pml4[i] = kernel_pml4[i].clone();
+        }
     }
-    crate::kprintln!(
-        "[virtual] User PML4: cloning index {}, entry: {:?}",
-        pml4_index,
-        active_pml4[pml4_index as usize]
-    );
-    new_pml4[pml4_index as usize] = active_pml4[pml4_index as usize].clone();
 
     Ok(pml4_phys)
 }
@@ -238,11 +263,9 @@ pub fn clone_parent_page_table(
     let child_pml4_virt = VirtAddr::new(child_pml4_phys + phys_mem_offset());
     let child_pml4: &mut PageTable = unsafe { &mut *child_pml4_virt.as_mut_ptr() };
 
-    let pml4_index = (phys_mem_offset() >> 39) & 0x1FF;
-
-    // 2. Deep-clone only user-space PML4 entries (0..256), skipping kernel PML4 index 1
+    // 2. Deep-clone only user-space PML4 entries (0..256), skipping kernel PML4 entries
     for i in 0..256 {
-        if i == 1 || i == pml4_index as usize {
+        if is_kernel_pml4_entry(i) {
             continue;
         }
 
@@ -619,7 +642,7 @@ pub fn free_user_page_table(pml4_phys: u64) -> Result<(), &'static str> {
     let mut freed_pages = 0usize;
 
     for i in 0..256 {
-        if i == 1 || i == pml4_index as usize {
+        if is_kernel_pml4_entry(i) {
             continue;
         }
         let pml4_entry = &pml4[i];
@@ -689,11 +712,13 @@ pub fn free_user_page_table(pml4_phys: u64) -> Result<(), &'static str> {
 
     super::physical::deallocate_frame(pml4_phys);
 
-    crate::kprintln!(
-        "[virtual] free_user_page_table({:#x}): freed {} physical pages",
-        pml4_phys,
-        freed_pages
-    );
+    if DEBUG_VIRTUAL {
+        crate::kprintln!(
+            "[virtual] free_user_page_table({:#x}): freed {} physical pages",
+            pml4_phys,
+            freed_pages
+        );
+    }
 
     // Broadcast TLB shootdown to notify other CPU cores
     crate::arch::x86_64::smp::shootdown_tlb();

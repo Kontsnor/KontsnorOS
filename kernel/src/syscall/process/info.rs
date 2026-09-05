@@ -30,6 +30,11 @@ struct UtsName {
     domainname: [u8; 65],
 }
 
+static HOSTNAME: spin::Mutex<alloc::string::String> =
+    spin::Mutex::new(alloc::string::String::new());
+static DOMAINNAME: spin::Mutex<alloc::string::String> =
+    spin::Mutex::new(alloc::string::String::new());
+
 /// `uname(buf)` — Write kernel identity information into a `utsname` struct.
 pub fn sys_uname(buf: *mut u8) -> SyscallResult {
     if buf.is_null() {
@@ -57,11 +62,25 @@ pub fn sys_uname(buf: *mut u8) -> SyscallResult {
     }
 
     fill(&mut u.sysname, b"Linux");
-    fill(&mut u.nodename, b"kontsnoros");
+    {
+        let h = HOSTNAME.lock();
+        if h.is_empty() {
+            fill(&mut u.nodename, b"kontsnoros");
+        } else {
+            fill(&mut u.nodename, h.as_bytes());
+        }
+    }
     fill(&mut u.release, b"6.1.0-KontsnorOS");
     fill(&mut u.version, b"#1 SMP");
     fill(&mut u.machine, b"x86_64");
-    fill(&mut u.domainname, b"(none)");
+    {
+        let d = DOMAINNAME.lock();
+        if d.is_empty() {
+            fill(&mut u.domainname, b"(none)");
+        } else {
+            fill(&mut u.domainname, d.as_bytes());
+        }
+    }
 
     unsafe {
         core::ptr::write(buf as *mut UtsName, u);
@@ -71,9 +90,10 @@ pub fn sys_uname(buf: *mut u8) -> SyscallResult {
 
 /// `timeval` struct used by `gettimeofday`.
 #[repr(C)]
-struct TimeVal {
-    tv_sec: i64,
-    tv_usec: i64,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TimeVal {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
 }
 
 /// `timezone` struct used by `gettimeofday`.
@@ -209,6 +229,20 @@ pub fn sys_nanosleep(req: *const u8, rem: *mut u8) -> SyscallResult {
         }
     }
     0
+}
+
+/// `time(tloc)` — Get time in seconds since the Epoch.
+pub fn sys_time(tloc: *mut i64) -> SyscallResult {
+    let sec = (1782158506 + get_monotonic_ns() / 1_000_000_000) as i64;
+    if !tloc.is_null() {
+        if validate_user_ptr_write(tloc as *mut u8, core::mem::size_of::<i64>()).is_err() {
+            return Errno::EFAULT.into();
+        }
+        unsafe {
+            core::ptr::write(tloc, sec);
+        }
+    }
+    sec
 }
 
 /// `tms` struct used by `times`.
@@ -717,4 +751,459 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: *mut *mut u8, len_ptr: *mut usize
         }
     }
     0
+}
+
+/// `sched_setaffinity(pid, cpusetsize, mask)` — Set CPU affinity mask.
+pub fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> SyscallResult {
+    if cpusetsize == 0 || mask.is_null() {
+        return Errno::EINVAL.into();
+    }
+    if !validate_user_ptr(mask, cpusetsize.min(8)) {
+        return Errno::EFAULT.into();
+    }
+    let target_pid = if pid == 0 {
+        match scheduler::current_pid() {
+            Some(p) => p,
+            None => return Errno::ESRCH.into(),
+        }
+    } else {
+        crate::process::pid::Pid::from_raw(pid as u64)
+    };
+    if scheduler::get_task_arc(target_pid).is_none() {
+        return Errno::ESRCH.into();
+    }
+    0
+}
+
+/// `sched_getparam(pid, param)` — Get scheduling parameters.
+pub fn sys_sched_getparam(pid: i32, param: *mut i32) -> SyscallResult {
+    if param.is_null() {
+        return Errno::EINVAL.into();
+    }
+    if validate_user_ptr_write(param as *mut u8, core::mem::size_of::<i32>()).is_err() {
+        return Errno::EFAULT.into();
+    }
+    let target_pid = if pid == 0 {
+        match scheduler::current_pid() {
+            Some(p) => p,
+            None => return Errno::ESRCH.into(),
+        }
+    } else {
+        crate::process::pid::Pid::from_raw(pid as u64)
+    };
+    if scheduler::get_task_arc(target_pid).is_none() {
+        return Errno::ESRCH.into();
+    }
+    // SAFETY: Pointer validated with validate_user_ptr_write.
+    unsafe { core::ptr::write(param, 0) };
+    0
+}
+
+/// `sched_setparam(pid, param)` — Set scheduling parameters.
+pub fn sys_sched_setparam(pid: i32, param: *const i32) -> SyscallResult {
+    if param.is_null() {
+        return Errno::EINVAL.into();
+    }
+    if !validate_user_ptr(param as *const u8, core::mem::size_of::<i32>()) {
+        return Errno::EFAULT.into();
+    }
+    let target_pid = if pid == 0 {
+        match scheduler::current_pid() {
+            Some(p) => p,
+            None => return Errno::ESRCH.into(),
+        }
+    } else {
+        crate::process::pid::Pid::from_raw(pid as u64)
+    };
+    if scheduler::get_task_arc(target_pid).is_none() {
+        return Errno::ESRCH.into();
+    }
+    let prio = unsafe { core::ptr::read(param) };
+    if prio != 0 {
+        return Errno::EINVAL.into();
+    }
+    0
+}
+
+/// `sched_getscheduler(pid)` — Get scheduling policy.
+pub fn sys_sched_getscheduler(pid: i32) -> SyscallResult {
+    let target_pid = if pid == 0 {
+        match scheduler::current_pid() {
+            Some(p) => p,
+            None => return Errno::ESRCH.into(),
+        }
+    } else {
+        crate::process::pid::Pid::from_raw(pid as u64)
+    };
+    if scheduler::get_task_arc(target_pid).is_none() {
+        return Errno::ESRCH.into();
+    }
+    0 // SCHED_OTHER (standard round-robin / time sharing)
+}
+
+/// `sched_setscheduler(pid, policy, param)` — Set scheduling policy and parameters.
+pub fn sys_sched_setscheduler(pid: i32, policy: i32, param: *const i32) -> SyscallResult {
+    if policy != 0 {
+        return Errno::EINVAL.into();
+    }
+    sys_sched_setparam(pid, param)
+}
+
+/// `sched_get_priority_max(policy)` — Get maximum priority value.
+pub fn sys_sched_get_priority_max(policy: i32) -> SyscallResult {
+    if policy != 0 {
+        return Errno::EINVAL.into();
+    }
+    0
+}
+
+/// `sched_get_priority_min(policy)` — Get minimum priority value.
+pub fn sys_sched_get_priority_min(policy: i32) -> SyscallResult {
+    if policy != 0 {
+        return Errno::EINVAL.into();
+    }
+    0
+}
+
+/// `sched_rr_get_interval(pid, tp)` — Get the SCHED_RR interval for the named process.
+pub fn sys_sched_rr_get_interval(pid: i32, tp: *mut u8) -> SyscallResult {
+    if tp.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if validate_user_ptr_write(tp, core::mem::size_of::<TimeSpec>()).is_err() {
+        return Errno::EFAULT.into();
+    }
+    let target_pid = if pid == 0 {
+        match scheduler::current_pid() {
+            Some(p) => p,
+            None => return Errno::ESRCH.into(),
+        }
+    } else {
+        crate::process::pid::Pid::from_raw(pid as u64)
+    };
+    if scheduler::get_task_arc(target_pid).is_none() {
+        return Errno::ESRCH.into();
+    }
+    // KontsnorOS scheduler quantum is 10 milliseconds (10,000,000 ns)
+    let ts = TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 10_000_000,
+    };
+    // SAFETY: Pointer validated with validate_user_ptr_write.
+    unsafe { core::ptr::write(tp as *mut TimeSpec, ts) };
+    0
+}
+
+/// `getpriority(which, who)` — Get program scheduling priority.
+pub fn sys_getpriority(_which: i32, _who: i32) -> SyscallResult {
+    20 // Return nice value 0 (represented as 20 - nice in kernel ABI)
+}
+
+/// `setpriority(which, who, nice)` — Set program scheduling priority.
+pub fn sys_setpriority(_which: i32, _who: i32, _nice: i32) -> SyscallResult {
+    0
+}
+
+/// `rusage` struct for getrusage
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RUsage {
+    pub ru_utime: TimeVal,
+    pub ru_stime: TimeVal,
+    pub ru_maxrss: i64,
+    pub ru_ixrss: i64,
+    pub ru_idrss: i64,
+    pub ru_isrss: i64,
+    pub ru_minflt: i64,
+    pub ru_majflt: i64,
+    pub ru_nswap: i64,
+    pub ru_inblock: i64,
+    pub ru_oublock: i64,
+    pub ru_msgsnd: i64,
+    pub ru_msgrcv: i64,
+    pub ru_nsignals: i64,
+    pub ru_nvcsw: i64,
+    pub ru_nivcsw: i64,
+}
+
+/// `getrusage(who, usage)` — Get resource usage.
+pub fn sys_getrusage(who: i32, usage: *mut u8) -> SyscallResult {
+    if usage.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if validate_user_ptr_write(usage, core::mem::size_of::<RUsage>()).is_err() {
+        return Errno::EFAULT.into();
+    }
+
+    if who != 0 && who != -1 && who != 1 {
+        // RUSAGE_SELF (0), RUSAGE_CHILDREN (-1), RUSAGE_THREAD (1)
+        return Errno::EINVAL.into();
+    }
+
+    let cpu_ticks = if let Some(pid) = scheduler::current_pid() {
+        if let Some(task_arc) = scheduler::get_task_arc(pid) {
+            task_arc.lock().cpu_ticks
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    let total_us = cpu_ticks * 10_000;
+    let mut ru = RUsage::default();
+    ru.ru_utime = TimeVal {
+        tv_sec: (total_us / 1_000_000) as i64,
+        tv_usec: (total_us % 1_000_000) as i64,
+    };
+    ru.ru_stime = TimeVal {
+        tv_sec: (total_us / 2_000_000) as i64,
+        tv_usec: ((total_us / 2) % 1_000_000) as i64,
+    };
+    ru.ru_maxrss = 4096; // 4 MiB baseline
+
+    // SAFETY: Pointer validated with validate_user_ptr_write.
+    unsafe {
+        core::ptr::write(usage as *mut RUsage, ru);
+    }
+    0
+}
+
+/// `getcpu(cpup, nodep, unused)` — Determine CPU and NUMA node on which the calling thread is running.
+pub fn sys_getcpu(cpup: *mut u32, nodep: *mut u32, _unused: *mut u8) -> SyscallResult {
+    let lapic_id = crate::arch::x86_64::smp::current_lapic_id();
+    if !cpup.is_null() {
+        if validate_user_ptr_write(cpup as *mut u8, core::mem::size_of::<u32>()).is_err() {
+            return Errno::EFAULT.into();
+        }
+        // SAFETY: Pointer validated with validate_user_ptr_write.
+        unsafe { core::ptr::write(cpup, lapic_id as u32) };
+    }
+    if !nodep.is_null() {
+        if validate_user_ptr_write(nodep as *mut u8, core::mem::size_of::<u32>()).is_err() {
+            return Errno::EFAULT.into();
+        }
+        // SAFETY: Pointer validated with validate_user_ptr_write.
+        unsafe { core::ptr::write(nodep, 0) };
+    }
+    0
+}
+
+/// `personality(persona)` — Set the process execution domain.
+pub fn sys_personality(persona: u64) -> SyscallResult {
+    if persona == 0xFFFF_FFFF {
+        return 0; // Return current personality: PER_LINUX (0)
+    }
+    0
+}
+
+/// `clock_getres(clock_id, res)` — Find the resolution (precision) of the specified clock.
+pub fn sys_clock_getres(clock_id: i32, res: *mut u8) -> SyscallResult {
+    if clock_id < 0 || clock_id > 11 {
+        return Errno::EINVAL.into();
+    }
+    if !res.is_null() {
+        if validate_user_ptr_write(res, core::mem::size_of::<TimeSpec>()).is_err() {
+            return Errno::EFAULT.into();
+        }
+        // KontsnorOS clock resolution is 1 nanosecond (LAPIC/HPET timer backed)
+        let ts = TimeSpec {
+            tv_sec: 0,
+            tv_nsec: 1,
+        };
+        // SAFETY: Pointer validated with validate_user_ptr_write.
+        unsafe { core::ptr::write(res as *mut TimeSpec, ts) };
+    }
+    0
+}
+
+/// `clock_nanosleep(clock_id, flags, req, rem)` — High-resolution sleep with a specified clock.
+pub fn sys_clock_nanosleep(
+    clock_id: i32,
+    _flags: i32,
+    req: *const u8,
+    rem: *mut u8,
+) -> SyscallResult {
+    if clock_id < 0 || clock_id > 11 {
+        return Errno::EINVAL.into();
+    }
+    sys_nanosleep(req, rem)
+}
+
+/// `clock_settime(clock_id, tp)` — Set the specified clock.
+pub fn sys_clock_settime(clock_id: i32, tp: *const u8) -> SyscallResult {
+    if clock_id < 0 || clock_id > 11 {
+        return Errno::EINVAL.into();
+    }
+    if tp.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if !validate_user_ptr(tp, core::mem::size_of::<TimeSpec>()) {
+        return Errno::EFAULT.into();
+    }
+    if crate::syscall::process::sys_geteuid() != 0 {
+        return Errno::EPERM.into();
+    }
+    0
+}
+
+/// ITimerVal struct
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ITimerVal {
+    pub it_interval: TimeVal,
+    pub it_value: TimeVal,
+}
+
+/// `getitimer(which, curr_value)` — Get value of an interval timer.
+pub fn sys_getitimer(which: i32, curr_value: *mut u8) -> SyscallResult {
+    if which < 0 || which > 2 {
+        return Errno::EINVAL.into();
+    }
+    if curr_value.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if validate_user_ptr_write(curr_value, core::mem::size_of::<ITimerVal>()).is_err() {
+        return Errno::EFAULT.into();
+    }
+    // Return disarmed timer
+    let it = ITimerVal::default();
+    // SAFETY: Pointer validated with validate_user_ptr_write.
+    unsafe { core::ptr::write(curr_value as *mut ITimerVal, it) };
+    0
+}
+
+/// `setitimer(which, new_value, old_value)` — Set value of an interval timer.
+pub fn sys_setitimer(which: i32, new_value: *const u8, old_value: *mut u8) -> SyscallResult {
+    if which < 0 || which > 2 {
+        return Errno::EINVAL.into();
+    }
+    if new_value.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if !validate_user_ptr(new_value, core::mem::size_of::<ITimerVal>()) {
+        return Errno::EFAULT.into();
+    }
+    if !old_value.is_null() {
+        let _ = sys_getitimer(which, old_value);
+    }
+    0
+}
+
+/// `alarm(seconds)` — Set an alarm clock for delivery of a signal.
+pub fn sys_alarm(_seconds: u32) -> SyscallResult {
+    0 // Return 0 (no previous alarm was scheduled)
+}
+
+/// `sethostname(name, len)` — set system host name.
+pub fn sys_sethostname(name: *const u8, len: usize) -> SyscallResult {
+    if len > 64 {
+        return Errno::EINVAL.into();
+    }
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+        if task_arc.lock().euid != 0 {
+            return Errno::EPERM.into();
+        }
+    }
+    if !validate_user_ptr(name, len) {
+        return Errno::EFAULT.into();
+    }
+    // SAFETY: Pointer and length validated above
+    let bytes = unsafe { core::slice::from_raw_parts(name, len) };
+    let s = alloc::string::String::from_utf8_lossy(bytes).into_owned();
+    *HOSTNAME.lock() = s;
+    0
+}
+
+/// `setdomainname(name, len)` — set system NIS domain name.
+pub fn sys_setdomainname(name: *const u8, len: usize) -> SyscallResult {
+    if len > 64 {
+        return Errno::EINVAL.into();
+    }
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+        if task_arc.lock().euid != 0 {
+            return Errno::EPERM.into();
+        }
+    }
+    if !validate_user_ptr(name, len) {
+        return Errno::EFAULT.into();
+    }
+    // SAFETY: Pointer and length validated above
+    let bytes = unsafe { core::slice::from_raw_parts(name, len) };
+    let s = alloc::string::String::from_utf8_lossy(bytes).into_owned();
+    *DOMAINNAME.lock() = s;
+    0
+}
+
+/// Linux `rseq` structure.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Rseq {
+    pub cpu_id_start: u32,
+    pub cpu_id: u32,
+    pub rseq_cs: u64,
+    pub flags: u32,
+    pub node_id: u32,
+    pub mm_cid: u32,
+}
+
+pub const RSEQ_FLAG_UNREGISTER: i32 = 1;
+
+/// `rseq(rseq, rseq_len, flags, sig)` — register/unregister restartable sequence.
+pub fn sys_rseq(rseq_ptr: *mut Rseq, rseq_len: u32, flags: i32, sig: u32) -> SyscallResult {
+    if rseq_len != 32 {
+        return Errno::EINVAL.into();
+    }
+    if (rseq_ptr as usize) % 32 != 0 {
+        return Errno::EINVAL.into();
+    }
+    if (flags & !RSEQ_FLAG_UNREGISTER) != 0 {
+        return Errno::EINVAL.into();
+    }
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    let task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
+    };
+    let mut task = task_arc.lock();
+
+    if (flags & RSEQ_FLAG_UNREGISTER) != 0 {
+        match task.rseq {
+            Some(registered) if registered == (rseq_ptr as u64) && task.rseq_sig == sig => {
+                task.rseq = None;
+                task.rseq_len = 0;
+                task.rseq_sig = 0;
+                0
+            }
+            _ => Errno::EINVAL.into(),
+        }
+    } else {
+        if task.rseq.is_some() {
+            return Errno::EBUSY.into();
+        }
+        if validate_user_ptr_write(rseq_ptr as *mut u8, 32).is_err() {
+            return Errno::EFAULT.into();
+        }
+        // Write CPU ID 0 to cpu_id_start and cpu_id
+        // SAFETY: Pointer is validated and 32-byte aligned
+        unsafe {
+            (*rseq_ptr).cpu_id_start = 0;
+            (*rseq_ptr).cpu_id = 0;
+        }
+        task.rseq = Some(rseq_ptr as u64);
+        task.rseq_len = rseq_len;
+        task.rseq_sig = sig;
+        0
+    }
 }

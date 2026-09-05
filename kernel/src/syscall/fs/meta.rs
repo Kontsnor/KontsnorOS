@@ -23,6 +23,7 @@ use crate::syscall::validation::{
     copy_string_from_user, validate_user_ptr, validate_user_ptr_write,
 };
 use alloc::string::String;
+use alloc::sync::Arc;
 
 #[repr(C)]
 struct LinuxDirent64 {
@@ -546,11 +547,13 @@ pub fn sys_rename(oldpath: *const u8, newpath: *const u8) -> SyscallResult {
 }
 
 pub fn sys_rename_with_resolved_paths(resolved_old: String, resolved_new: String) -> SyscallResult {
-    kprintln!(
-        "[syscall] rename(\"{}\" -> \"{}\")",
-        resolved_old,
-        resolved_new
-    );
+    if crate::syscall::DEBUG_SYSCALLS {
+        kprintln!(
+            "[syscall] rename(\"{}\" -> \"{}\")",
+            resolved_old,
+            resolved_new
+        );
+    }
 
     // Split paths into parent + name
     let (old_parent_path, old_name) = crate::fs::path::split_path(&resolved_old);
@@ -738,11 +741,13 @@ pub fn sys_link_with_resolved_paths(
     resolved_new: String,
     flags: i32,
 ) -> SyscallResult {
-    kprintln!(
-        "[syscall] link(\"{}\" -> \"{}\")",
-        resolved_old,
-        resolved_new
-    );
+    if crate::syscall::DEBUG_SYSCALLS {
+        kprintln!(
+            "[syscall] link(\"{}\" -> \"{}\")",
+            resolved_old,
+            resolved_new
+        );
+    }
 
     let follow = (flags & 0x400) != 0; // AT_SYMLINK_FOLLOW
     let src_inode = match crate::fs::vfs::lookup_follow(&resolved_old, follow) {
@@ -1053,6 +1058,181 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, timeout: i32) -> SyscallResult {
         if timeout_ticks.is_some() {
             crate::fs::epoll::remove_sleep_timeout(current_pid);
         }
+    }
+}
+
+/// `pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)` — Synchronous I/O multiplexing.
+pub fn sys_pselect6(
+    nfds: i32,
+    readfds: *mut u64,
+    writefds: *mut u64,
+    exceptfds: *mut u64,
+    timeout: *const TimeSpec,
+    _sigmask: *const u8,
+) -> SyscallResult {
+    if nfds < 0 || nfds > 1024 {
+        return Errno::EINVAL.into();
+    }
+    if nfds == 0 && readfds.is_null() && writefds.is_null() && exceptfds.is_null() {
+        if !timeout.is_null() {
+            if !validate_user_ptr(timeout as *const u8, core::mem::size_of::<TimeSpec>()) {
+                return Errno::EFAULT.into();
+            }
+            let ts = unsafe { *timeout };
+            let ms = (ts.tv_sec * 1000).saturating_add(ts.tv_nsec / 1_000_000);
+            if ms > 0 {
+                let ticks = ((ms as u64) + 9) / 10;
+                let start = crate::arch::x86_64::interrupts::timer_ticks();
+                while crate::arch::x86_64::interrupts::timer_ticks() < start + ticks {
+                    crate::process::scheduler::yield_now();
+                }
+            }
+        }
+        return 0;
+    }
+
+    let num_words = ((nfds as usize) + 63) / 64;
+    let byte_size = num_words * 8;
+
+    let mut in_read = [0u64; 16];
+    let mut in_write = [0u64; 16];
+    let mut in_except = [0u64; 16];
+
+    if !readfds.is_null() {
+        if validate_user_ptr_write(readfds as *mut u8, byte_size).is_err() {
+            return Errno::EFAULT.into();
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(readfds, in_read.as_mut_ptr(), num_words);
+        }
+    }
+    if !writefds.is_null() {
+        if validate_user_ptr_write(writefds as *mut u8, byte_size).is_err() {
+            return Errno::EFAULT.into();
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(writefds, in_write.as_mut_ptr(), num_words);
+        }
+    }
+    if !exceptfds.is_null() {
+        if validate_user_ptr_write(exceptfds as *mut u8, byte_size).is_err() {
+            return Errno::EFAULT.into();
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(exceptfds, in_except.as_mut_ptr(), num_words);
+        }
+    }
+
+    let timeout_ms = if !timeout.is_null() {
+        if !validate_user_ptr(timeout as *const u8, core::mem::size_of::<TimeSpec>()) {
+            return Errno::EFAULT.into();
+        }
+        let ts = unsafe { *timeout };
+        Some((ts.tv_sec * 1000).saturating_add(ts.tv_nsec / 1_000_000))
+    } else {
+        None
+    };
+
+    let start_ticks = crate::arch::x86_64::interrupts::timer_ticks();
+    let timeout_ticks = timeout_ms.map(|ms| if ms > 0 { ((ms as u64) + 9) / 10 } else { 0 });
+
+    loop {
+        let mut out_read = [0u64; 16];
+        let mut out_write = [0u64; 16];
+        let mut out_except = [0u64; 16];
+        let mut total_ready = 0i64;
+
+        for fd in 0..nfds {
+            let word_idx = (fd as usize) / 64;
+            let bit_idx = (fd as usize) % 64;
+            let mask = 1u64 << bit_idx;
+
+            let check_read = (in_read[word_idx] & mask) != 0;
+            let check_write = (in_write[word_idx] & mask) != 0;
+            let check_except = (in_except[word_idx] & mask) != 0;
+
+            if !check_read && !check_write && !check_except {
+                continue;
+            }
+
+            if let Some(inode) = proc_fd::current_task_read_fd(fd) {
+                let mut events = 0u32;
+                if check_read {
+                    events |= 0x0001;
+                } // POLLIN
+                if check_write {
+                    events |= 0x0004;
+                } // POLLOUT
+                if check_except {
+                    events |= 0x0002;
+                } // POLLPRI
+
+                let revents = inode.poll(events);
+                if check_read
+                    && (revents & 0x0001 != 0 || revents & 0x0010 != 0 || revents & 0x0008 != 0)
+                {
+                    out_read[word_idx] |= mask;
+                    total_ready += 1;
+                }
+                if check_write && (revents & 0x0004 != 0) {
+                    out_write[word_idx] |= mask;
+                    total_ready += 1;
+                }
+                if check_except && (revents & 0x0002 != 0) {
+                    out_except[word_idx] |= mask;
+                    total_ready += 1;
+                }
+            } else {
+                return Errno::EBADF.into();
+            }
+        }
+
+        if total_ready > 0 || timeout_ticks == Some(0) {
+            unsafe {
+                if !readfds.is_null() {
+                    core::ptr::copy_nonoverlapping(out_read.as_ptr(), readfds, num_words);
+                }
+                if !writefds.is_null() {
+                    core::ptr::copy_nonoverlapping(out_write.as_ptr(), writefds, num_words);
+                }
+                if !exceptfds.is_null() {
+                    core::ptr::copy_nonoverlapping(out_except.as_ptr(), exceptfds, num_words);
+                }
+            }
+            return total_ready;
+        }
+
+        if let Some(limit) = timeout_ticks {
+            let current = crate::arch::x86_64::interrupts::timer_ticks();
+            if current >= start_ticks + limit {
+                unsafe {
+                    if !readfds.is_null() {
+                        core::ptr::write_bytes(readfds, 0, num_words);
+                    }
+                    if !writefds.is_null() {
+                        core::ptr::write_bytes(writefds, 0, num_words);
+                    }
+                    if !exceptfds.is_null() {
+                        core::ptr::write_bytes(exceptfds, 0, num_words);
+                    }
+                }
+                return 0;
+            }
+        }
+
+        let current_pid = match crate::process::scheduler::current_pid() {
+            Some(p) => p,
+            None => return Errno::ESRCH.into(),
+        };
+        if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+            let task = task_arc.lock();
+            let unblocked = task.pending_signals & !task.blocked_signals;
+            if unblocked != 0 {
+                return Errno::EINTR.into();
+            }
+        }
+
+        crate::process::scheduler::yield_now();
     }
 }
 
@@ -1708,5 +1888,636 @@ pub fn sys_utime(filename: *const u8, times: *const UTimeBuf) -> SyscallResult {
     match inode_ops.set_times(atime, mtime) {
         Ok(_) => 0,
         Err(e) => e as SyscallResult,
+    }
+}
+
+/// `renameat2(olddirfd, oldpath, newdirfd, newpath, flags)` — Rename relative to directory fds with flags.
+pub fn sys_renameat2(
+    olddirfd: i32,
+    oldpath: *const u8,
+    newdirfd: i32,
+    newpath: *const u8,
+    flags: u32,
+) -> SyscallResult {
+    const RENAME_NOREPLACE: u32 = 1;
+    const RENAME_EXCHANGE: u32 = 2;
+    const RENAME_WHITEOUT: u32 = 4;
+
+    if (flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT)) != 0 {
+        return Errno::EINVAL.into();
+    }
+    if (flags & (RENAME_NOREPLACE | RENAME_EXCHANGE)) == (RENAME_NOREPLACE | RENAME_EXCHANGE) {
+        return Errno::EINVAL.into();
+    }
+
+    if oldpath.is_null() || newpath.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let raw_old = match unsafe { copy_string_from_user(oldpath) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    let raw_new = match unsafe { copy_string_from_user(newpath) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    let resolved_old = match crate::fs::vfs::resolve_relative_path_at(olddirfd, &raw_old) {
+        Ok(path) => path,
+        Err(e) => return e.into(),
+    };
+    let resolved_new = match crate::fs::vfs::resolve_relative_path_at(newdirfd, &raw_new) {
+        Ok(path) => path,
+        Err(e) => return e.into(),
+    };
+
+    if (flags & RENAME_NOREPLACE) != 0
+        && crate::fs::vfs::lookup_follow(&resolved_new, false).is_some()
+    {
+        return Errno::EEXIST.into();
+    }
+
+    sys_rename_with_resolved_paths(resolved_old, resolved_new)
+}
+
+/// Linux statx timestamp layout
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StatxTimestamp {
+    pub tv_sec: i64,
+    pub tv_nsec: u32,
+    pub __reserved: i32,
+}
+
+/// Linux statx structure layout (x86_64 ABI compatible)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StatX {
+    pub stx_mask: u32,
+    pub stx_blksize: u32,
+    pub stx_attributes: u64,
+    pub stx_nlink: u32,
+    pub stx_uid: u32,
+    pub stx_gid: u32,
+    pub stx_mode: u16,
+    pub __spare0: [u16; 1],
+    pub stx_ino: u64,
+    pub stx_size: u64,
+    pub stx_blocks: u64,
+    pub stx_attributes_mask: u64,
+    pub stx_atime: StatxTimestamp,
+    pub stx_btime: StatxTimestamp,
+    pub stx_ctime: StatxTimestamp,
+    pub stx_mtime: StatxTimestamp,
+    pub stx_rdev_major: u32,
+    pub stx_rdev_minor: u32,
+    pub stx_dev_major: u32,
+    pub stx_dev_minor: u32,
+    pub stx_mnt_id: u64,
+    pub stx_dio_mem_align: u32,
+    pub stx_dio_offset_align: u32,
+    pub __spare2: [u64; 12],
+}
+
+fn populate_statx(inode_ops: &dyn crate::fs::inode::InodeOps) -> StatX {
+    let stat = populate_stat(inode_ops);
+    let mut sx = StatX::default();
+    sx.stx_mask = 0x07ff; // STATX_BASIC_STATS
+    sx.stx_blksize = stat.st_blksize as u32;
+    sx.stx_nlink = stat.st_nlink as u32;
+    sx.stx_uid = stat.st_uid;
+    sx.stx_gid = stat.st_gid;
+    sx.stx_mode = stat.st_mode as u16;
+    sx.stx_ino = stat.st_ino;
+    sx.stx_size = stat.st_size as u64;
+    sx.stx_blocks = stat.st_blocks as u64;
+    sx.stx_atime = StatxTimestamp {
+        tv_sec: stat.st_atime,
+        tv_nsec: stat.st_atime_nsec as u32,
+        __reserved: 0,
+    };
+    sx.stx_mtime = StatxTimestamp {
+        tv_sec: stat.st_mtime,
+        tv_nsec: stat.st_mtime_nsec as u32,
+        __reserved: 0,
+    };
+    sx.stx_ctime = StatxTimestamp {
+        tv_sec: stat.st_ctime,
+        tv_nsec: stat.st_ctime_nsec as u32,
+        __reserved: 0,
+    };
+    sx.stx_btime = sx.stx_ctime;
+    sx.stx_rdev_major = ((stat.st_rdev >> 8) & 0xfff) as u32;
+    sx.stx_rdev_minor = (stat.st_rdev & 0xff) as u32;
+    sx
+}
+
+/// `statx(dfd, pathname, flags, mask, statxbuf)` — Extended file status.
+pub fn sys_statx(
+    dfd: i32,
+    pathname: *const u8,
+    flags: i32,
+    _mask: u32,
+    statxbuf: *mut StatX,
+) -> SyscallResult {
+    if statxbuf.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if validate_user_ptr_write(statxbuf as *mut u8, core::mem::size_of::<StatX>()).is_err() {
+        return Errno::EFAULT.into();
+    }
+
+    let is_empty_path = (flags & 0x1000) != 0; // AT_EMPTY_PATH = 0x1000
+    let raw_path = if !pathname.is_null() {
+        unsafe { copy_string_from_user(pathname) }
+    } else {
+        None
+    };
+
+    let inode_ops = if is_empty_path && (raw_path.as_deref() == Some("") || raw_path.is_none()) {
+        if dfd < 0 {
+            return Errno::EBADF.into();
+        }
+        match proc_fd::current_task_read_fd(dfd) {
+            Some(i) => i,
+            None => return Errno::EBADF.into(),
+        }
+    } else {
+        let raw = match raw_path {
+            Some(p) => p,
+            None => return Errno::EFAULT.into(),
+        };
+        let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw) {
+            Ok(path) => path,
+            Err(e) => return e.into(),
+        };
+        let follow_last = (flags & 0x100) == 0; // AT_SYMLINK_NOFOLLOW = 0x100
+        match crate::fs::vfs::lookup_follow(&resolved_path, follow_last) {
+            Some(i) => i,
+            None => return Errno::ENOENT.into(),
+        }
+    };
+
+    let sx = populate_statx(inode_ops.as_ref());
+    unsafe {
+        statxbuf.write(sx);
+    }
+    0
+}
+
+/// `fdatasync(fd)` — Synchronize a file's in-core state with storage device.
+pub fn sys_fdatasync(fd: i32) -> SyscallResult {
+    crate::syscall::fs::sys_fsync(fd)
+}
+
+/// `select(nfds, readfds, writefds, exceptfds, timeout)` — Synchronous I/O multiplexing.
+pub fn sys_select(
+    nfds: i32,
+    readfds: *mut u64,
+    writefds: *mut u64,
+    exceptfds: *mut u64,
+    timeout: *const TimeVal,
+) -> SyscallResult {
+    let ts = if !timeout.is_null() {
+        if !validate_user_ptr(timeout as *const u8, core::mem::size_of::<TimeVal>()) {
+            return Errno::EFAULT.into();
+        }
+        let tv = unsafe { core::ptr::read(timeout) };
+        if tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1_000_000 {
+            return Errno::EINVAL.into();
+        }
+        Some(TimeSpec {
+            tv_sec: tv.tv_sec,
+            tv_nsec: tv.tv_usec * 1000,
+        })
+    } else {
+        None
+    };
+
+    let ts_ptr = match ts.as_ref() {
+        Some(t) => t as *const TimeSpec,
+        None => core::ptr::null(),
+    };
+
+    sys_pselect6(
+        nfds,
+        readfds,
+        writefds,
+        exceptfds,
+        ts_ptr,
+        core::ptr::null(),
+    )
+}
+
+/// `ppoll(fds, nfds, tmo_p, sigmask, sigsetsize)` — Wait for some event on a file descriptor.
+pub fn sys_ppoll(
+    fds: *mut u8,
+    nfds: u64,
+    tmo_p: *const TimeSpec,
+    _sigmask: *const u8,
+    _sigsetsize: usize,
+) -> SyscallResult {
+    let timeout_ms = if !tmo_p.is_null() {
+        if !validate_user_ptr(tmo_p as *const u8, core::mem::size_of::<TimeSpec>()) {
+            return Errno::EFAULT.into();
+        }
+        let ts = unsafe { core::ptr::read(tmo_p) };
+        if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+            return Errno::EINVAL.into();
+        }
+        (ts.tv_sec * 1000).saturating_add((ts.tv_nsec + 999_999) / 1_000_000) as i32
+    } else {
+        -1
+    };
+
+    sys_poll(fds, nfds, timeout_ms)
+}
+
+/// `epoll_create(size)` — Open an epoll file descriptor.
+pub fn sys_epoll_create(size: i32) -> SyscallResult {
+    if size <= 0 {
+        return Errno::EINVAL.into();
+    }
+    crate::fs::epoll::sys_epoll_create1(0)
+}
+
+/// `epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)` — Wait for an I/O event on an epoll file descriptor.
+pub fn sys_epoll_pwait(
+    epfd: i32,
+    events: *mut crate::fs::epoll::EpollEvent,
+    maxevents: i32,
+    timeout: i32,
+    _sigmask: *const u8,
+    _sigsetsize: usize,
+) -> SyscallResult {
+    crate::fs::epoll::sys_epoll_wait(epfd, events, maxevents, timeout)
+}
+
+/// `epoll_pwait2(epfd, events, maxevents, timeout_ts, sigmask, sigsetsize)` — Wait for an I/O event on an epoll file descriptor with nanosecond resolution.
+pub fn sys_epoll_pwait2(
+    epfd: i32,
+    events: *mut crate::fs::epoll::EpollEvent,
+    maxevents: i32,
+    timeout_ts: *const TimeSpec,
+    _sigmask: *const u8,
+    _sigsetsize: usize,
+) -> SyscallResult {
+    let timeout_ms = if !timeout_ts.is_null() {
+        if !validate_user_ptr(timeout_ts as *const u8, core::mem::size_of::<TimeSpec>()) {
+            return Errno::EFAULT.into();
+        }
+        let ts = unsafe { core::ptr::read(timeout_ts) };
+        if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+            return Errno::EINVAL.into();
+        }
+        (ts.tv_sec * 1000).saturating_add((ts.tv_nsec + 999_999) / 1_000_000) as i32
+    } else {
+        -1
+    };
+    crate::fs::epoll::sys_epoll_wait(epfd, events, maxevents, timeout_ms)
+}
+
+// ── Extended Attributes (xattrs) ─────────────────────────────────────
+
+fn resolve_xattr_path(
+    path: *const u8,
+    follow: bool,
+) -> Result<Arc<dyn crate::fs::inode::InodeOps>, i64> {
+    let raw = match unsafe { crate::syscall::validation::copy_string_from_user(path) } {
+        Some(p) => p,
+        None => return Err(-14), // EFAULT
+    };
+    let resolved = crate::fs::vfs::resolve_relative_path(&raw);
+    match crate::fs::vfs::lookup_follow(&resolved, follow) {
+        Some(i) => Ok(i),
+        None => Err(-2), // ENOENT
+    }
+}
+
+pub fn sys_getxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *mut u8,
+    size: usize,
+) -> SyscallResult {
+    let inode = match resolve_xattr_path(path, true) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let name_str = match unsafe { crate::syscall::validation::copy_string_from_user(name) } {
+        Some(n) => n,
+        None => return Errno::EFAULT.into(),
+    };
+    let ino = inode.inode().ino;
+    let data = match crate::fs::xattr::get_xattr(ino, &name_str) {
+        Some(d) => d,
+        None => return -61, // ENODATA
+    };
+
+    if size == 0 {
+        return data.len() as SyscallResult;
+    }
+    if size < data.len() {
+        return -34; // ERANGE
+    }
+    if value.is_null() || validate_user_ptr_write(value, data.len()).is_err() {
+        return Errno::EFAULT.into();
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(data.as_ptr(), value, data.len());
+    }
+    data.len() as SyscallResult
+}
+
+pub fn sys_lgetxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *mut u8,
+    size: usize,
+) -> SyscallResult {
+    let inode = match resolve_xattr_path(path, false) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let name_str = match unsafe { crate::syscall::validation::copy_string_from_user(name) } {
+        Some(n) => n,
+        None => return Errno::EFAULT.into(),
+    };
+    let ino = inode.inode().ino;
+    let data = match crate::fs::xattr::get_xattr(ino, &name_str) {
+        Some(d) => d,
+        None => return -61, // ENODATA
+    };
+
+    if size == 0 {
+        return data.len() as SyscallResult;
+    }
+    if size < data.len() {
+        return -34; // ERANGE
+    }
+    if value.is_null() || validate_user_ptr_write(value, data.len()).is_err() {
+        return Errno::EFAULT.into();
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(data.as_ptr(), value, data.len());
+    }
+    data.len() as SyscallResult
+}
+
+pub fn sys_fgetxattr(fd: i32, name: *const u8, value: *mut u8, size: usize) -> SyscallResult {
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+    let name_str = match unsafe { crate::syscall::validation::copy_string_from_user(name) } {
+        Some(n) => n,
+        None => return Errno::EFAULT.into(),
+    };
+    let ino = file_desc.inode.inode().ino;
+    let data = match crate::fs::xattr::get_xattr(ino, &name_str) {
+        Some(d) => d,
+        None => return -61, // ENODATA
+    };
+
+    if size == 0 {
+        return data.len() as SyscallResult;
+    }
+    if size < data.len() {
+        return -34; // ERANGE
+    }
+    if value.is_null() || validate_user_ptr_write(value, data.len()).is_err() {
+        return Errno::EFAULT.into();
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(data.as_ptr(), value, data.len());
+    }
+    data.len() as SyscallResult
+}
+
+pub fn sys_setxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: i32,
+) -> SyscallResult {
+    let inode = match resolve_xattr_path(path, true) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let name_str = match unsafe { crate::syscall::validation::copy_string_from_user(name) } {
+        Some(n) => n,
+        None => return Errno::EFAULT.into(),
+    };
+    if size > 65536 {
+        return Errno::E2BIG.into();
+    }
+    let val_bytes = if size > 0 {
+        if value.is_null() || !validate_user_ptr(value, size) {
+            return Errno::EFAULT.into();
+        }
+        let mut buf = alloc::vec![0u8; size];
+        unsafe {
+            core::ptr::copy_nonoverlapping(value, buf.as_mut_ptr(), size);
+        }
+        buf
+    } else {
+        alloc::vec::Vec::new()
+    };
+
+    let ino = inode.inode().ino;
+    match crate::fs::xattr::set_xattr(ino, &name_str, &val_bytes, flags) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+pub fn sys_lsetxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: i32,
+) -> SyscallResult {
+    let inode = match resolve_xattr_path(path, false) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let name_str = match unsafe { crate::syscall::validation::copy_string_from_user(name) } {
+        Some(n) => n,
+        None => return Errno::EFAULT.into(),
+    };
+    if size > 65536 {
+        return Errno::E2BIG.into();
+    }
+    let val_bytes = if size > 0 {
+        if value.is_null() || !validate_user_ptr(value, size) {
+            return Errno::EFAULT.into();
+        }
+        let mut buf = alloc::vec![0u8; size];
+        unsafe {
+            core::ptr::copy_nonoverlapping(value, buf.as_mut_ptr(), size);
+        }
+        buf
+    } else {
+        alloc::vec::Vec::new()
+    };
+
+    let ino = inode.inode().ino;
+    match crate::fs::xattr::set_xattr(ino, &name_str, &val_bytes, flags) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+pub fn sys_fsetxattr(
+    fd: i32,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: i32,
+) -> SyscallResult {
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+    let name_str = match unsafe { crate::syscall::validation::copy_string_from_user(name) } {
+        Some(n) => n,
+        None => return Errno::EFAULT.into(),
+    };
+    if size > 65536 {
+        return Errno::E2BIG.into();
+    }
+    let val_bytes = if size > 0 {
+        if value.is_null() || !validate_user_ptr(value, size) {
+            return Errno::EFAULT.into();
+        }
+        let mut buf = alloc::vec![0u8; size];
+        unsafe {
+            core::ptr::copy_nonoverlapping(value, buf.as_mut_ptr(), size);
+        }
+        buf
+    } else {
+        alloc::vec::Vec::new()
+    };
+
+    let ino = file_desc.inode.inode().ino;
+    match crate::fs::xattr::set_xattr(ino, &name_str, &val_bytes, flags) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+pub fn sys_listxattr(path: *const u8, list: *mut u8, size: usize) -> SyscallResult {
+    let inode = match resolve_xattr_path(path, true) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let ino = inode.inode().ino;
+    let names = crate::fs::xattr::list_xattr(ino);
+    if size == 0 {
+        return names.len() as SyscallResult;
+    }
+    if size < names.len() {
+        return -34; // ERANGE
+    }
+    if list.is_null() || validate_user_ptr_write(list, names.len()).is_err() {
+        return Errno::EFAULT.into();
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(names.as_ptr(), list, names.len());
+    }
+    names.len() as SyscallResult
+}
+
+pub fn sys_llistxattr(path: *const u8, list: *mut u8, size: usize) -> SyscallResult {
+    let inode = match resolve_xattr_path(path, false) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let ino = inode.inode().ino;
+    let names = crate::fs::xattr::list_xattr(ino);
+    if size == 0 {
+        return names.len() as SyscallResult;
+    }
+    if size < names.len() {
+        return -34; // ERANGE
+    }
+    if list.is_null() || validate_user_ptr_write(list, names.len()).is_err() {
+        return Errno::EFAULT.into();
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(names.as_ptr(), list, names.len());
+    }
+    names.len() as SyscallResult
+}
+
+pub fn sys_flistxattr(fd: i32, list: *mut u8, size: usize) -> SyscallResult {
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+    let ino = file_desc.inode.inode().ino;
+    let names = crate::fs::xattr::list_xattr(ino);
+    if size == 0 {
+        return names.len() as SyscallResult;
+    }
+    if size < names.len() {
+        return -34; // ERANGE
+    }
+    if list.is_null() || validate_user_ptr_write(list, names.len()).is_err() {
+        return Errno::EFAULT.into();
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(names.as_ptr(), list, names.len());
+    }
+    names.len() as SyscallResult
+}
+
+pub fn sys_removexattr(path: *const u8, name: *const u8) -> SyscallResult {
+    let inode = match resolve_xattr_path(path, true) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let name_str = match unsafe { crate::syscall::validation::copy_string_from_user(name) } {
+        Some(n) => n,
+        None => return Errno::EFAULT.into(),
+    };
+    let ino = inode.inode().ino;
+    match crate::fs::xattr::remove_xattr(ino, &name_str) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+pub fn sys_lremovexattr(path: *const u8, name: *const u8) -> SyscallResult {
+    let inode = match resolve_xattr_path(path, false) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let name_str = match unsafe { crate::syscall::validation::copy_string_from_user(name) } {
+        Some(n) => n,
+        None => return Errno::EFAULT.into(),
+    };
+    let ino = inode.inode().ino;
+    match crate::fs::xattr::remove_xattr(ino, &name_str) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+pub fn sys_fremovexattr(fd: i32, name: *const u8) -> SyscallResult {
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+    let name_str = match unsafe { crate::syscall::validation::copy_string_from_user(name) } {
+        Some(n) => n,
+        None => return Errno::EFAULT.into(),
+    };
+    let ino = file_desc.inode.inode().ino;
+    match crate::fs::xattr::remove_xattr(ino, &name_str) {
+        Ok(()) => 0,
+        Err(e) => e,
     }
 }

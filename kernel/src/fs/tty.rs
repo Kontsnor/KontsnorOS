@@ -260,7 +260,15 @@ impl InodeOps for DevStdin {
                 ) {
                     return Err(-14); // EFAULT
                 }
-                let pgid = *TTY_FOREGROUND_PGID.lock() as i32;
+                let mut pgid_lock = TTY_FOREGROUND_PGID.lock();
+                if *pgid_lock == 0 {
+                    if let Some(pid) = crate::process::scheduler::current_pid() {
+                        if let Some(task) = crate::process::scheduler::get_task_arc(pid) {
+                            *pgid_lock = task.lock().pgid;
+                        }
+                    }
+                }
+                let pgid = *pgid_lock as i32;
                 unsafe {
                     core::ptr::write(arg as *mut i32, pgid);
                 }

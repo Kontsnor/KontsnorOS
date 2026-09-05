@@ -567,3 +567,149 @@ pub fn dump_futex_waiters() {
     }
     crate::kprintln!();
 }
+
+/// Linux `futex_waitv` structure.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FutexWaitv {
+    pub val: u64,
+    pub uaddr: u64,
+    pub flags: u32,
+    pub __reserved: u32,
+}
+
+pub const FUTEX_32: u32 = 2;
+
+/// `futex_waitv(waiters, nr_futexes, flags, timeout, clockid)` — Wait on a list of futexes.
+pub fn sys_futex_waitv(
+    waiters_ptr: *const FutexWaitv,
+    nr_futexes: u32,
+    flags: u32,
+    timeout_ptr: *const Timespec,
+    _clockid: i32,
+) -> SyscallResult {
+    if nr_futexes == 0 || nr_futexes > 128 || flags != 0 {
+        return Errno::EINVAL.into();
+    }
+    if waiters_ptr.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let total_size = match (nr_futexes as usize).checked_mul(core::mem::size_of::<FutexWaitv>()) {
+        Some(s) => s,
+        None => return Errno::EINVAL.into(),
+    };
+    if !crate::syscall::validation::validate_user_ptr(waiters_ptr as *const u8, total_size) {
+        return Errno::EFAULT.into();
+    }
+
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+
+    let deadline = if !timeout_ptr.is_null() {
+        if !crate::syscall::validation::validate_user_ptr(
+            timeout_ptr as *const u8,
+            core::mem::size_of::<Timespec>(),
+        ) {
+            return Errno::EFAULT.into();
+        }
+        // SAFETY: Pointer validated with validate_user_ptr
+        let ts = unsafe { core::ptr::read_volatile(timeout_ptr) };
+        if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+            return Errno::EINVAL.into();
+        }
+        let current_ticks = crate::arch::x86_64::interrupts::timer_ticks();
+        let timeout_ticks = (ts.tv_sec as u64)
+            .saturating_mul(100)
+            .saturating_add((ts.tv_nsec as u64) / 10_000_000);
+        Some(current_ticks.saturating_add(timeout_ticks))
+    } else {
+        None
+    };
+
+    // SAFETY: Pointer and length verified above
+    let waiters = unsafe { core::slice::from_raw_parts(waiters_ptr, nr_futexes as usize) };
+
+    // Validate all futexes and check their current values
+    for w in waiters.iter() {
+        if w.__reserved != 0 {
+            return Errno::EINVAL.into();
+        }
+        if w.uaddr == 0 || (w.uaddr & 3) != 0 {
+            return Errno::EINVAL.into();
+        }
+        if !crate::syscall::validation::validate_user_ptr(w.uaddr as *const u8, 4) {
+            return Errno::EFAULT.into();
+        }
+        // SAFETY: Address validated with validate_user_ptr
+        let current_val = unsafe { core::ptr::read_volatile(w.uaddr as *const u32) };
+        if current_val != (w.val as u32) {
+            return -(Errno::EAGAIN as i64);
+        }
+    }
+
+    // If deadline already passed (0 timeout)
+    if let Some(dl) = deadline {
+        if dl <= crate::arch::x86_64::interrupts::timer_ticks() {
+            return -(Errno::ETIMEDOUT as i64);
+        }
+    }
+
+    // Register waiters across all futex queues
+    let mut keys = alloc::vec::Vec::with_capacity(nr_futexes as usize);
+    {
+        let mut queues = FUTEX_QUEUES.lock();
+        for w in waiters.iter() {
+            let key = get_futex_key(current_pid, w.uaddr, w.flags as i32);
+            keys.push(key);
+            let waiter = FutexWaiter {
+                pid: current_pid,
+                bitset: 0xffff_ffff,
+                deadline,
+            };
+            queues
+                .entry(key)
+                .or_insert_with(VecDeque::new)
+                .push_back(waiter);
+        }
+    }
+
+    // Block current task
+    if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+        task_arc.lock().state = TaskState::Blocked;
+    }
+    scheduler::yield_now();
+
+    // After wakeup, remove this task from all registered queues
+    {
+        let mut queues = FUTEX_QUEUES.lock();
+        for key in &keys {
+            if let Some(queue) = queues.get_mut(key) {
+                queue.retain(|w| w.pid != current_pid);
+                if queue.is_empty() {
+                    queues.remove(key);
+                }
+            }
+        }
+    }
+
+    // Check which futex changed value
+    for (i, w) in waiters.iter().enumerate() {
+        if crate::syscall::validation::validate_user_ptr(w.uaddr as *const u8, 4) {
+            // SAFETY: Address verified
+            let current_val = unsafe { core::ptr::read_volatile(w.uaddr as *const u32) };
+            if current_val != (w.val as u32) {
+                return i as SyscallResult;
+            }
+        }
+    }
+
+    if let Some(dl) = deadline {
+        if crate::arch::x86_64::interrupts::timer_ticks() >= dl {
+            return -(Errno::ETIMEDOUT as i64);
+        }
+    }
+
+    0 // First futex woken
+}

@@ -40,22 +40,70 @@ fn get_socket(fd: i32) -> Option<Arc<Mutex<Socket>>> {
     file_desc.inode.as_socket()
 }
 
+static NEXT_EPHEMERAL_PORT: core::sync::atomic::AtomicU16 =
+    core::sync::atomic::AtomicU16::new(49152);
+
+/// Allocate a dynamic ephemeral port in range [49152, 65000].
+pub fn alloc_ephemeral_port() -> u16 {
+    let port = NEXT_EPHEMERAL_PORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if !(49152..=65000).contains(&port) {
+        NEXT_EPHEMERAL_PORT.store(49152, core::sync::atomic::Ordering::Relaxed);
+        49152
+    } else {
+        port
+    }
+}
+
 /// `socket(domain, type, protocol)` — create an endpoint for communication.
 pub fn sys_socket(domain: i32, sock_type: i32, protocol: i32) -> SyscallResult {
+    let nonblock = (sock_type & 0x800) != 0;
+    let cloexec = (sock_type & 0x80000) != 0;
+    let base_type = sock_type & !(0x800 | 0x80000);
+
+    // Support AF_UNIX / AF_LOCAL (1)
+    if domain == 1 {
+        let (end_a, _end_b) = crate::fs::pipe::make_socketpair(nonblock);
+        let mut open_flags = OpenFlags(OpenFlags::O_RDWR);
+        if nonblock {
+            open_flags.0 |= OpenFlags::O_NONBLOCK;
+        }
+        if cloexec {
+            open_flags.0 |= OpenFlags::O_CLOEXEC;
+        }
+        return match proc_fd::current_task_alloc_fd_with_flags(end_a, open_flags) {
+            Some(fd) => fd as SyscallResult,
+            None => Errno::EMFILE.into(),
+        };
+    }
+
+    // AF_NETLINK (16) -> return EAFNOSUPPORT so glibc gracefully falls back
+    if domain == 16 {
+        return -97; // EAFNOSUPPORT
+    }
+
     if domain != 2 {
         // Only support AF_INET (2)
-        return Errno::EINVAL.into();
+        return -97; // EAFNOSUPPORT
     }
-    if sock_type != 1 && sock_type != 2 {
-        // Support SOCK_STREAM (1) and SOCK_DGRAM (2)
+
+    if base_type != 1 && base_type != 2 && base_type != 3 {
+        // Support SOCK_STREAM (1), SOCK_DGRAM (2), SOCK_RAW (3)
         return Errno::EINVAL.into();
     }
 
-    let socket = Arc::new(Mutex::new(Socket::new(domain, sock_type, protocol)));
+    let socket = Arc::new(Mutex::new(Socket::new(domain, base_type, protocol)));
     crate::net::socket::register_socket(socket.clone());
 
+    let mut open_flags = OpenFlags(OpenFlags::O_RDWR);
+    if nonblock {
+        open_flags.0 |= OpenFlags::O_NONBLOCK;
+    }
+    if cloexec {
+        open_flags.0 |= OpenFlags::O_CLOEXEC;
+    }
+
     let inode = Arc::new(SocketInode::new(socket));
-    match proc_fd::current_task_alloc_fd_with_flags(inode, OpenFlags(OpenFlags::O_RDWR)) {
+    match proc_fd::current_task_alloc_fd_with_flags(inode, open_flags) {
         Some(fd) => fd as SyscallResult,
         None => Errno::EMFILE.into(),
     }
@@ -147,10 +195,17 @@ pub fn sys_connect(fd: i32, addr_ptr: *const SockAddrIn, addrlen: u32) -> Syscal
 
         // For TCP, choose local bindings if not yet set
         if sock.local_port.is_none() {
-            sock.local_port = Some((50000 + fd) as u16);
+            sock.local_port = Some(alloc_ephemeral_port());
         }
         if sock.local_addr.is_none() {
-            sock.local_addr = Some(Ipv4Addr::LOCALHOST);
+            let ip = if remote_ip.is_loopback() {
+                Ipv4Addr::LOCALHOST
+            } else {
+                crate::net::interface::get_first_ethernet_interface()
+                    .map(|(ip, _)| ip)
+                    .unwrap_or(Ipv4Addr::new(10, 0, 2, 15))
+            };
+            sock.local_addr = Some(ip);
         }
 
         // Transmit TCP SYN
@@ -229,6 +284,22 @@ pub fn sys_listen(fd: i32, backlog: i32) -> SyscallResult {
 
 /// `accept(fd, addr_ptr, addrlen_ptr)` — accept a connection on a socket.
 pub fn sys_accept(fd: i32, addr_ptr: *mut SockAddrIn, addrlen_ptr: *mut u32) -> SyscallResult {
+    sys_accept4(fd, addr_ptr, addrlen_ptr, 0)
+}
+
+/// `accept4(fd, addr_ptr, addrlen_ptr, flags)` — accept a connection on a socket with flags.
+pub fn sys_accept4(
+    fd: i32,
+    addr_ptr: *mut SockAddrIn,
+    addrlen_ptr: *mut u32,
+    flags: i32,
+) -> SyscallResult {
+    let sock_nonblock = 0x800;
+    let sock_cloexec = 0x80000;
+    if (flags & !(sock_nonblock | sock_cloexec)) != 0 {
+        return Errno::EINVAL.into();
+    }
+
     let socket = match get_socket(fd) {
         Some(s) => s,
         None => return Errno::EBADF.into(),
@@ -244,6 +315,9 @@ pub fn sys_accept(fd: i32, addr_ptr: *mut SockAddrIn, addrlen_ptr: *mut u32) -> 
 
             if !sock.tcp_backlog.is_empty() {
                 break sock.tcp_backlog.remove(0);
+            }
+            if (flags & sock_nonblock) != 0 {
+                return Errno::EAGAIN.into();
             }
             wq = sock.wait_queue.clone();
         }
@@ -279,8 +353,13 @@ pub fn sys_accept(fd: i32, addr_ptr: *mut SockAddrIn, addrlen_ptr: *mut u32) -> 
 
     drop(child_sock);
 
+    let mut open_flags = OpenFlags::O_RDWR;
+    if (flags & sock_cloexec) != 0 {
+        open_flags |= OpenFlags::O_CLOEXEC;
+    }
+
     let inode = Arc::new(SocketInode::new(child));
-    match proc_fd::current_task_alloc_fd_with_flags(inode, OpenFlags(OpenFlags::O_RDWR)) {
+    match proc_fd::current_task_alloc_fd_with_flags(inode, OpenFlags(open_flags)) {
         Some(new_fd) => new_fd as SyscallResult,
         None => Errno::EMFILE.into(),
     }
@@ -336,11 +415,24 @@ pub fn sys_sendto(
             let remote_port = u16::from_be(addr.sin_port);
 
             let (sock_type, local_ip, local_port) = {
-                let sock = socket.lock();
+                let mut sock = socket.lock();
+                if sock.local_port.is_none() {
+                    sock.local_port = Some(alloc_ephemeral_port());
+                }
+                if sock.local_addr.is_none() {
+                    let ip = if remote_ip.is_loopback() {
+                        Ipv4Addr::LOCALHOST
+                    } else {
+                        crate::net::interface::get_first_ethernet_interface()
+                            .map(|(ip, _)| ip)
+                            .unwrap_or(Ipv4Addr::new(10, 0, 2, 15))
+                    };
+                    sock.local_addr = Some(ip);
+                }
                 (
                     sock.sock_type,
-                    sock.local_addr.unwrap_or(Ipv4Addr::LOCALHOST),
-                    sock.local_port.unwrap_or(50000),
+                    sock.local_addr.unwrap(),
+                    sock.local_port.unwrap(),
                 )
             };
             if sock_type == 2 {
@@ -704,4 +796,302 @@ pub fn sys_socketpair(domain: i32, sock_type: i32, _protocol: i32, sv: *mut i32)
     }
 
     0
+}
+
+/// POSIX `iovec` structure.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct IoVec {
+    pub iov_base: *mut u8,
+    pub iov_len: usize,
+}
+
+/// POSIX `msghdr` structure.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Msghdr {
+    pub msg_name: *mut u8,
+    pub msg_namelen: u32,
+    pub msg_iov: *mut IoVec,
+    pub msg_iovlen: usize,
+    pub msg_control: *mut u8,
+    pub msg_controllen: usize,
+    pub msg_flags: i32,
+}
+
+/// Linux `mmsghdr` structure.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MMsghdr {
+    pub msg_hdr: Msghdr,
+    pub msg_len: u32,
+}
+
+/// `sendmsg(fd, msg, flags)` — send a message on a socket.
+pub fn sys_sendmsg(fd: i32, msg_ptr: *const Msghdr, flags: i32) -> SyscallResult {
+    if msg_ptr.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if !validate_user_ptr(msg_ptr as *const u8, core::mem::size_of::<Msghdr>()) {
+        return Errno::EFAULT.into();
+    }
+
+    // SAFETY: Validated user pointer
+    let msg = unsafe { core::ptr::read_volatile(msg_ptr) };
+
+    if msg.msg_iovlen == 0 || msg.msg_iovlen > 1024 {
+        return Errno::EINVAL.into();
+    }
+    let iov_total_size = match msg.msg_iovlen.checked_mul(core::mem::size_of::<IoVec>()) {
+        Some(sz) => sz,
+        None => return Errno::EINVAL.into(),
+    };
+    if !validate_user_ptr(msg.msg_iov as *const u8, iov_total_size) {
+        return Errno::EFAULT.into();
+    }
+
+    // SAFETY: Pointer and length validated
+    let iovecs = unsafe { core::slice::from_raw_parts(msg.msg_iov, msg.msg_iovlen) };
+
+    let mut total_len = 0usize;
+    for iov in iovecs {
+        total_len = match total_len.checked_add(iov.iov_len) {
+            Some(l) => l,
+            None => return Errno::EINVAL.into(),
+        };
+        if iov.iov_len > 0 && !validate_user_ptr(iov.iov_base as *const u8, iov.iov_len) {
+            return Errno::EFAULT.into();
+        }
+    }
+
+    if total_len == 0 {
+        return 0;
+    }
+
+    let mut buf = alloc::vec::Vec::with_capacity(total_len.min(65536));
+    for iov in iovecs {
+        if iov.iov_len > 0 {
+            let chunk_len = iov.iov_len.min(65536 - buf.len());
+            // SAFETY: Memory bounds validated above
+            let slice =
+                unsafe { core::slice::from_raw_parts(iov.iov_base as *const u8, chunk_len) };
+            buf.extend_from_slice(slice);
+            if buf.len() >= 65536 {
+                break;
+            }
+        }
+    }
+
+    let addr_ptr = if !msg.msg_name.is_null() && msg.msg_namelen >= 16 {
+        if !validate_user_ptr(
+            msg.msg_name as *const u8,
+            core::mem::size_of::<SockAddrIn>(),
+        ) {
+            return Errno::EFAULT.into();
+        }
+        msg.msg_name as *const SockAddrIn
+    } else {
+        core::ptr::null()
+    };
+
+    sys_sendto(
+        fd,
+        buf.as_ptr(),
+        buf.len(),
+        flags,
+        addr_ptr,
+        msg.msg_namelen,
+    )
+}
+
+/// `recvmsg(fd, msg, flags)` — receive a message from a socket.
+pub fn sys_recvmsg(fd: i32, msg_ptr: *mut Msghdr, flags: i32) -> SyscallResult {
+    if msg_ptr.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if crate::syscall::fs::validate_user_ptr_write(
+        msg_ptr as *mut u8,
+        core::mem::size_of::<Msghdr>(),
+    )
+    .is_err()
+    {
+        return Errno::EFAULT.into();
+    }
+
+    // SAFETY: Validated for write access
+    let mut msg = unsafe { core::ptr::read_volatile(msg_ptr) };
+
+    if msg.msg_iovlen == 0 || msg.msg_iovlen > 1024 {
+        return Errno::EINVAL.into();
+    }
+    let iov_total_size = match msg.msg_iovlen.checked_mul(core::mem::size_of::<IoVec>()) {
+        Some(sz) => sz,
+        None => return Errno::EINVAL.into(),
+    };
+    if crate::syscall::fs::validate_user_ptr_write(msg.msg_iov as *mut u8, iov_total_size).is_err()
+    {
+        return Errno::EFAULT.into();
+    }
+
+    // SAFETY: Pointer and length validated
+    let iovecs = unsafe { core::slice::from_raw_parts_mut(msg.msg_iov, msg.msg_iovlen) };
+
+    let mut total_cap = 0usize;
+    for iov in iovecs.iter() {
+        total_cap = match total_cap.checked_add(iov.iov_len) {
+            Some(c) => c,
+            None => return Errno::EINVAL.into(),
+        };
+        if iov.iov_len > 0
+            && crate::syscall::fs::validate_user_ptr_write(iov.iov_base, iov.iov_len).is_err()
+        {
+            return Errno::EFAULT.into();
+        }
+    }
+
+    if total_cap == 0 {
+        return 0;
+    }
+
+    let mut buf = alloc::vec![0u8; total_cap.min(65536)];
+    let mut src_addr = SockAddrIn {
+        sin_family: 0,
+        sin_port: 0,
+        sin_addr: [0; 4],
+        sin_zero: [0; 8],
+    };
+    let mut src_addr_len = 16u32;
+
+    let ret = sys_recvfrom(
+        fd,
+        buf.as_mut_ptr(),
+        buf.len(),
+        flags,
+        &mut src_addr as *mut SockAddrIn,
+        &mut src_addr_len as *mut u32,
+    );
+
+    if ret < 0 {
+        return ret;
+    }
+
+    let bytes_received = ret as usize;
+    let mut bytes_copied = 0usize;
+
+    for iov in iovecs.iter_mut() {
+        if bytes_copied >= bytes_received {
+            break;
+        }
+        let to_copy = (bytes_received - bytes_copied).min(iov.iov_len);
+        if to_copy > 0 {
+            // SAFETY: Destination validated with validate_user_ptr_write
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    buf.as_ptr().add(bytes_copied),
+                    iov.iov_base,
+                    to_copy,
+                );
+            }
+            bytes_copied += to_copy;
+        }
+    }
+
+    if !msg.msg_name.is_null() && msg.msg_namelen >= 16 {
+        if crate::syscall::fs::validate_user_ptr_write(
+            msg.msg_name,
+            core::mem::size_of::<SockAddrIn>(),
+        )
+        .is_ok()
+        {
+            // SAFETY: Target validated
+            unsafe {
+                core::ptr::write(msg.msg_name as *mut SockAddrIn, src_addr);
+            }
+            msg.msg_namelen = 16;
+        }
+    }
+
+    msg.msg_flags = 0;
+    // SAFETY: msg_ptr validated
+    unsafe {
+        core::ptr::write(msg_ptr, msg);
+    }
+
+    ret
+}
+
+/// `sendmmsg(fd, msgvec, vlen, flags)` — send multiple messages on a socket.
+pub fn sys_sendmmsg(fd: i32, msgvec: *mut MMsghdr, vlen: u32, flags: i32) -> SyscallResult {
+    if vlen == 0 {
+        return 0;
+    }
+    if msgvec.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let total_size = match (vlen as usize).checked_mul(core::mem::size_of::<MMsghdr>()) {
+        Some(sz) => sz,
+        None => return Errno::EINVAL.into(),
+    };
+    if crate::syscall::fs::validate_user_ptr_write(msgvec as *mut u8, total_size).is_err() {
+        return Errno::EFAULT.into();
+    }
+
+    // SAFETY: msgvec validated above
+    let mmsgs = unsafe { core::slice::from_raw_parts_mut(msgvec, vlen as usize) };
+    let mut count = 0u32;
+
+    for m in mmsgs.iter_mut() {
+        let res = sys_sendmsg(fd, &m.msg_hdr as *const Msghdr, flags);
+        if res < 0 {
+            if count == 0 {
+                return res;
+            }
+            break;
+        }
+        m.msg_len = res as u32;
+        count += 1;
+    }
+
+    count as SyscallResult
+}
+
+/// `recvmmsg(fd, msgvec, vlen, flags, timeout)` — receive multiple messages on a socket.
+pub fn sys_recvmmsg(
+    fd: i32,
+    msgvec: *mut MMsghdr,
+    vlen: u32,
+    flags: i32,
+    _timeout: *const crate::syscall::fs::TimeSpec,
+) -> SyscallResult {
+    if vlen == 0 {
+        return 0;
+    }
+    if msgvec.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let total_size = match (vlen as usize).checked_mul(core::mem::size_of::<MMsghdr>()) {
+        Some(sz) => sz,
+        None => return Errno::EINVAL.into(),
+    };
+    if crate::syscall::fs::validate_user_ptr_write(msgvec as *mut u8, total_size).is_err() {
+        return Errno::EFAULT.into();
+    }
+
+    // SAFETY: msgvec validated above
+    let mmsgs = unsafe { core::slice::from_raw_parts_mut(msgvec, vlen as usize) };
+    let mut count = 0u32;
+
+    for m in mmsgs.iter_mut() {
+        let res = sys_recvmsg(fd, &mut m.msg_hdr as *mut Msghdr, flags);
+        if res < 0 {
+            if count == 0 {
+                return res;
+            }
+            break;
+        }
+        m.msg_len = res as u32;
+        count += 1;
+    }
+
+    count as SyscallResult
 }

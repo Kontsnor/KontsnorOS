@@ -332,6 +332,9 @@ pub trait InodeOps: Send + Sync {
     fn as_eventfd(&self) -> Option<&crate::fs::eventfd::EventFd> {
         None
     }
+    fn as_pidfd(&self) -> Option<&crate::fs::pidfd::PidFd> {
+        None
+    }
 }
 
 /// Helper function to check if a given inode's open file description in the current task has O_NONBLOCK set.

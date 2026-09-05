@@ -253,9 +253,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         crate::fs::pty::start_pty_io_loop();
 
         // Spawn Ring 3 user init from ext RAM disk as PID 1
-        let init_path = "/sbin/init";
-        kprintln!("[boot] Spawning Ring 3 → Ring 3 init: {}...", init_path);
-        if let Some(inode) = fs::vfs::lookup(init_path) {
+        let init_candidates = ["/sbin/init", "/usr/sbin/init", "/init", "/bin/init"];
+        let mut init_target = None;
+        for &candidate in &init_candidates {
+            if let Some(inode) = fs::vfs::lookup(candidate) {
+                init_target = Some((candidate, inode));
+                break;
+            }
+        }
+
+        if let Some((init_path, inode)) = init_target {
+            kprintln!("[boot] Spawning Ring 3 → Ring 3 init: {}...", init_path);
             let size = inode.inode().size as usize;
             let mut buf = alloc::vec![0u8; size];
             match inode.read(0, &mut buf) {
@@ -294,7 +302,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 }
             }
         } else {
-            kprintln!("[boot] {} not found on mounted ext disk!", init_path);
+            kprintln!("[boot] No init binary found on mounted ext disk!");
         }
 
         // Spawn freestanding network test binary

@@ -278,7 +278,7 @@ pub fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
     };
 
     let is_pipe = file_desc.inode.inode().file_type == crate::fs::inode::FileType::Pipe;
-    if is_pipe {
+    if is_pipe && crate::syscall::DEBUG_SYSCALLS {
         let pid_str = crate::process::scheduler::current_pid()
             .map(|p| p.as_u64())
             .unwrap_or(0);
@@ -306,19 +306,12 @@ pub fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
             Ok(0) => break,
             Ok(n) => {
                 total_written += n;
-                if fd == 1 || fd == 2 {
-                    if let Ok(s) = core::str::from_utf8(&temp_buf[..n]) {
-                        crate::kprint!("{}", s);
-                    } else {
-                        crate::kprint!("{:?}", &temp_buf[..n]);
-                    }
-                }
                 if n < chunk_size {
                     break;
                 }
             }
             Err(e) => {
-                if is_pipe {
+                if is_pipe && crate::syscall::DEBUG_SYSCALLS {
                     crate::kprintln!(
                         "[syscall] sys_write on pipe fd {} failed with error {}",
                         fd,
@@ -393,7 +386,7 @@ pub fn sys_dup2(oldfd: i32, newfd: i32) -> SyscallResult {
     let is_pipe = proc_fd::current_task_read_fd(oldfd)
         .map(|i| i.inode().file_type == crate::fs::inode::FileType::Pipe)
         .unwrap_or(false);
-    if is_pipe {
+    if is_pipe && crate::syscall::DEBUG_SYSCALLS {
         let pid_str = crate::process::scheduler::current_pid()
             .map(|p| p.as_u64())
             .unwrap_or(0);
@@ -516,12 +509,14 @@ pub fn sys_pipe2(pipefds: *mut i32, flags: i32) -> SyscallResult {
         pipefds.add(1).write(fd1);
     }
 
-    kprintln!(
-        "[syscall] pipe2(flags={:#x}) -> fds: [{}, {}]",
-        flags,
-        fd0,
-        fd1
-    );
+    if crate::syscall::DEBUG_SYSCALLS {
+        kprintln!(
+            "[syscall] pipe2(flags={:#x}) -> fds: [{}, {}]",
+            flags,
+            fd0,
+            fd1
+        );
+    }
     0 // Success
 }
 
@@ -534,11 +529,13 @@ pub fn sys_memfd_create(name_ptr: *const u8, flags: u32) -> SyscallResult {
         }
     };
 
-    kprintln!(
-        "[syscall] memfd_create(name=\"{}\", flags={:#x})",
-        name,
-        flags
-    );
+    if crate::syscall::DEBUG_SYSCALLS {
+        kprintln!(
+            "[syscall] memfd_create(name=\"{}\", flags={:#x})",
+            name,
+            flags
+        );
+    }
 
     const MFD_CLOEXEC: u32 = 0x0001;
     const MFD_ALLOW_SEALING: u32 = 0x0002;
@@ -612,13 +609,15 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                 fd_table.cloexec[new_fd as usize] = false;
             }
 
-            kprintln!(
-                "[syscall] fcntl(fd={}, cmd={}, arg={}) -> {}",
-                fd,
-                cmd,
-                arg,
-                new_fd
-            );
+            if crate::syscall::DEBUG_SYSCALLS {
+                kprintln!(
+                    "[syscall] fcntl(fd={}, cmd={}, arg={}) -> {}",
+                    fd,
+                    cmd,
+                    arg,
+                    new_fd
+                );
+            }
             new_fd as i64
         }
         1 => {
@@ -851,12 +850,14 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             }
         }
         _ => {
-            kprintln!(
-                "[syscall] fcntl(fd={}, cmd={}, arg={}) -> ENOSYS",
-                fd,
-                cmd,
-                arg
-            );
+            if crate::syscall::DEBUG_SYSCALLS {
+                kprintln!(
+                    "[syscall] fcntl(fd={}, cmd={}, arg={}) -> ENOSYS",
+                    fd,
+                    cmd,
+                    arg
+                );
+            }
             Errno::ENOSYS.into()
         }
     }
@@ -1148,5 +1149,261 @@ pub fn sys_ftruncate(fd: i32, length: i64) -> SyscallResult {
     match file_desc.inode.truncate(length as u64) {
         Ok(()) => 0,
         Err(e) => e as i64,
+    }
+}
+
+/// `dup3(oldfd, newfd, flags)` — Duplicate a file descriptor onto newfd with flags.
+pub fn sys_dup3(oldfd: i32, newfd: i32, flags: i32) -> SyscallResult {
+    if oldfd < 0 || newfd < 0 || oldfd == newfd {
+        return Errno::EINVAL.into();
+    }
+    let cloexec_flag = 0x80000; // O_CLOEXEC
+    if (flags & !cloexec_flag) != 0 {
+        return Errno::EINVAL.into();
+    }
+    let cloexec = (flags & cloexec_flag) != 0;
+    match proc_fd::current_task_dup3_fd(oldfd, newfd, cloexec) {
+        Some(fd) => fd as SyscallResult,
+        None => Errno::EBADF.into(),
+    }
+}
+
+/// `sendfile(out_fd, in_fd, offset, count)` — Transfer data between file descriptors.
+pub fn sys_sendfile(out_fd: i32, in_fd: i32, offset_ptr: *mut i64, count: usize) -> SyscallResult {
+    if out_fd < 0 || in_fd < 0 {
+        return Errno::EBADF.into();
+    }
+    let in_desc = match proc_fd::current_task_get_file_desc(in_fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+    let out_desc = match proc_fd::current_task_get_file_desc(out_fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+
+    let mut current_offset = if !offset_ptr.is_null() {
+        if validate_user_ptr_write(offset_ptr as *mut u8, core::mem::size_of::<i64>()).is_err() {
+            return Errno::EFAULT.into();
+        }
+        let off = unsafe { core::ptr::read(offset_ptr) };
+        if off < 0 {
+            return Errno::EINVAL.into();
+        }
+        off as u64
+    } else {
+        *in_desc.offset.lock()
+    };
+
+    let orig_in_offset = *in_desc.offset.lock();
+    if !offset_ptr.is_null() {
+        *in_desc.offset.lock() = current_offset;
+    }
+
+    let mut total_sent = 0usize;
+    let mut chunk = [0u8; 16384];
+
+    while total_sent < count {
+        let to_read = (count - total_sent).min(chunk.len());
+        let nread = match in_desc.read(&mut chunk[..to_read]) {
+            Ok(n) => n,
+            Err(e) => {
+                if total_sent > 0 {
+                    break;
+                } else {
+                    return e as SyscallResult;
+                }
+            }
+        };
+        if nread == 0 {
+            break; // EOF
+        }
+
+        let nwritten = match out_desc.write(&chunk[..nread]) {
+            Ok(n) => n,
+            Err(e) => {
+                if total_sent > 0 {
+                    break;
+                } else {
+                    return e as SyscallResult;
+                }
+            }
+        };
+
+        total_sent += nwritten;
+        if nwritten < nread {
+            break;
+        }
+    }
+
+    if !offset_ptr.is_null() {
+        let final_off = *in_desc.offset.lock();
+        *in_desc.offset.lock() = orig_in_offset;
+        unsafe {
+            core::ptr::write(offset_ptr, final_off as i64);
+        }
+    }
+
+    total_sent as SyscallResult
+}
+
+/// `fallocate(fd, mode, offset, len)` — Manipulate file space.
+pub fn sys_fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> SyscallResult {
+    if fd < 0 {
+        return Errno::EBADF.into();
+    }
+    if offset < 0 || len <= 0 {
+        return Errno::EINVAL.into();
+    }
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+    let flags = file_desc.flags.lock();
+    if !flags.is_writable() {
+        return Errno::EBADF.into();
+    }
+    drop(flags);
+
+    let target_size = (offset as u64).saturating_add(len as u64);
+    let current_size = file_desc.inode.inode().size;
+    if mode == 0 && target_size > current_size {
+        if let Err(e) = file_desc.inode.truncate(target_size) {
+            return e as SyscallResult;
+        }
+    }
+    0
+}
+
+/// `readahead(fd, offset, count)` — Initiate file readahead into page cache.
+pub fn sys_readahead(fd: i32, offset: i64, _count: usize) -> SyscallResult {
+    if fd < 0 {
+        return Errno::EBADF.into();
+    }
+    if offset < 0 {
+        return Errno::EINVAL.into();
+    }
+    if proc_fd::current_task_get_file_desc(fd).is_none() {
+        return Errno::EBADF.into();
+    }
+    0
+}
+
+/// `syncfs(fd)` — Synchronize file system containing file.
+pub fn sys_syncfs(fd: i32) -> SyscallResult {
+    if fd < 0 {
+        return Errno::EBADF.into();
+    }
+    if proc_fd::current_task_get_file_desc(fd).is_none() {
+        return Errno::EBADF.into();
+    }
+    crate::fs::vfs::sync_all();
+    0
+}
+
+/// `sync_file_range(fd, offset, nbytes, flags)` — Sync a file segment with disk.
+pub fn sys_sync_file_range(fd: i32, offset: i64, nbytes: i64, _flags: u32) -> SyscallResult {
+    if fd < 0 {
+        return Errno::EBADF.into();
+    }
+    if offset < 0 || nbytes < 0 {
+        return Errno::EINVAL.into();
+    }
+    sys_fsync(fd)
+}
+
+/// `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)` — Copy a range of data between two files.
+pub fn sys_copy_file_range(
+    fd_in: i32,
+    off_in: *mut i64,
+    fd_out: i32,
+    _off_out: *mut i64,
+    len: usize,
+    _flags: u32,
+) -> SyscallResult {
+    sys_sendfile(fd_out, fd_in, off_in, len)
+}
+
+/// `splice(fd_in, off_in, fd_out, off_out, len, flags)` — Splice data to/from a pipe.
+pub fn sys_splice(
+    fd_in: i32,
+    off_in: *mut i64,
+    fd_out: i32,
+    _off_out: *mut i64,
+    len: usize,
+    _flags: u32,
+) -> SyscallResult {
+    sys_sendfile(fd_out, fd_in, off_in, len)
+}
+
+/// `tee(fd_in, fd_out, len, flags)` — Duplicating pipe content.
+pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, _flags: u32) -> SyscallResult {
+    sys_sendfile(fd_out, fd_in, core::ptr::null_mut(), len)
+}
+
+/// `vmsplice(fd, iov, nr_segs, flags)` — Splice user pages into a pipe.
+pub fn sys_vmsplice(fd: i32, iov: *const IoVec, nr_segs: usize, _flags: u32) -> SyscallResult {
+    sys_writev(fd, iov, nr_segs as i32)
+}
+
+/// `preadv(fd, iov, iovcnt, offset)` — Read data into multiple buffers at an offset.
+pub fn sys_preadv(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64) -> SyscallResult {
+    if offset < 0 {
+        return Errno::EINVAL.into();
+    }
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+    let orig = *file_desc.offset.lock();
+    *file_desc.offset.lock() = offset as u64;
+    let ret = sys_readv(fd, iov, iovcnt);
+    *file_desc.offset.lock() = orig;
+    ret
+}
+
+/// `pwritev(fd, iov, iovcnt, offset)` — Write data from multiple buffers at an offset.
+pub fn sys_pwritev(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64) -> SyscallResult {
+    if offset < 0 {
+        return Errno::EINVAL.into();
+    }
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+    let orig = *file_desc.offset.lock();
+    *file_desc.offset.lock() = offset as u64;
+    let ret = sys_writev(fd, iov, iovcnt);
+    *file_desc.offset.lock() = orig;
+    ret
+}
+
+/// `preadv2(fd, iov, iovcnt, offset, flags)` — Read data into multiple buffers with flags.
+pub fn sys_preadv2(
+    fd: i32,
+    iov: *const IoVec,
+    iovcnt: i32,
+    offset: i64,
+    _flags: i32,
+) -> SyscallResult {
+    if offset == -1 {
+        sys_readv(fd, iov, iovcnt)
+    } else {
+        sys_preadv(fd, iov, iovcnt, offset)
+    }
+}
+
+/// `pwritev2(fd, iov, iovcnt, offset, flags)` — Write data from multiple buffers with flags.
+pub fn sys_pwritev2(
+    fd: i32,
+    iov: *const IoVec,
+    iovcnt: i32,
+    offset: i64,
+    _flags: i32,
+) -> SyscallResult {
+    if offset == -1 {
+        sys_writev(fd, iov, iovcnt)
+    } else {
+        sys_pwritev(fd, iov, iovcnt, offset)
     }
 }

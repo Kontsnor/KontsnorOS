@@ -41,7 +41,9 @@ pub mod eventfd;
 pub mod ext;
 pub mod file;
 pub mod inode;
+pub mod inotify;
 pub mod path;
+pub mod pidfd;
 pub mod pipe;
 pub mod procfs;
 pub mod pty;
@@ -52,6 +54,7 @@ pub mod timerfd;
 pub mod tmpfs;
 pub mod tty;
 pub mod vfs;
+pub mod xattr;
 
 /// Initialize the Virtual File System.
 pub fn init() {

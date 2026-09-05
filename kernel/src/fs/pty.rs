@@ -342,7 +342,15 @@ impl InodeOps for PtySlave {
                 ) {
                     return Err(-14); // EFAULT
                 }
-                let pgid = *self.shared.foreground_pgid.lock() as i32;
+                let mut pgid_lock = self.shared.foreground_pgid.lock();
+                if *pgid_lock == 0 {
+                    if let Some(pid) = crate::process::scheduler::current_pid() {
+                        if let Some(task) = crate::process::scheduler::get_task_arc(pid) {
+                            *pgid_lock = task.lock().pgid;
+                        }
+                    }
+                }
+                let pgid = *pgid_lock as i32;
                 unsafe {
                     core::ptr::write(arg as *mut i32, pgid);
                 }
@@ -466,11 +474,15 @@ fn pty_flusher_thread() {
     }
 }
 
+pub const DEBUG_PTY_ROUTER: bool = false;
+
 fn pty_router_thread() {
     loop {
         // Poll serial input for QEMU stdio
         if let Some(ch) = crate::arch::x86_64::serial::try_read_byte() {
-            crate::kprintln!("[pty_router] serial byte: '{}' ({:#x})", ch as char, ch);
+            if DEBUG_PTY_ROUTER {
+                crate::kprintln!("[pty_router] serial byte: '{}' ({:#x})", ch as char, ch);
+            }
             let mut byte = ch;
             if byte == b'\r' {
                 byte = b'\n';

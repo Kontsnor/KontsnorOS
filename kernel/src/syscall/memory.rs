@@ -978,3 +978,71 @@ pub fn sys_msync(addr: u64, length: usize, _flags: i32) -> SyscallResult {
     }
     0 // Success
 }
+
+/// `mincore(addr, length, vec)` — determine whether pages are resident in memory.
+pub fn sys_mincore(addr: u64, length: usize, vec: *mut u8) -> SyscallResult {
+    if (addr & 4095) != 0 || length == 0 {
+        return Errno::EINVAL.into();
+    }
+    if vec.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let pages = match length.checked_add(4095) {
+        Some(l) => l / 4096,
+        None => return Errno::EINVAL.into(),
+    };
+    if crate::syscall::validation::validate_user_ptr_write(vec, pages).is_err() {
+        return Errno::EFAULT.into();
+    }
+
+    // In KontsnorOS, all mapped user pages are resident in physical RAM.
+    // Each byte in vec has LSB set to 1 if the page is resident.
+    // SAFETY: Validated user buffer write
+    unsafe {
+        core::ptr::write_bytes(vec, 1, pages);
+    }
+    0
+}
+
+/// `mlock(addr, len)` — lock memory into RAM.
+pub fn sys_mlock(addr: u64, len: usize) -> SyscallResult {
+    if len == 0 {
+        return 0;
+    }
+    if addr > 0x0000_7FFF_FFFF_FFFF {
+        return Errno::ENOMEM.into();
+    }
+    0
+}
+
+/// `munlock(addr, len)` — unlock memory.
+pub fn sys_munlock(addr: u64, len: usize) -> SyscallResult {
+    if len == 0 {
+        return 0;
+    }
+    if addr > 0x0000_7FFF_FFFF_FFFF {
+        return Errno::ENOMEM.into();
+    }
+    0
+}
+
+/// `mlockall(flags)` — lock all current or future memory mappings.
+pub fn sys_mlockall(flags: i32) -> SyscallResult {
+    if (flags & !7) != 0 || flags == 0 {
+        return Errno::EINVAL.into();
+    }
+    0
+}
+
+/// `munlockall()` — unlock all memory mappings.
+pub fn sys_munlockall() -> SyscallResult {
+    0
+}
+
+/// `mlock2(addr, len, flags)` — lock memory with flags.
+pub fn sys_mlock2(addr: u64, len: usize, flags: i32) -> SyscallResult {
+    if (flags & !1) != 0 {
+        return Errno::EINVAL.into();
+    }
+    sys_mlock(addr, len)
+}

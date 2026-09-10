@@ -174,6 +174,8 @@ pub const PORT_NTP: u16 = 123;
 /// Build a UDP datagram.
 pub fn build_datagram(
     buf: &mut [u8],
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
     src_port: u16,
     dst_port: u16,
     payload: &[u8],
@@ -186,8 +188,16 @@ pub fn build_datagram(
     buf[0..2].copy_from_slice(&src_port.to_be_bytes());
     buf[2..4].copy_from_slice(&dst_port.to_be_bytes());
     buf[4..6].copy_from_slice(&(total_len as u16).to_be_bytes());
-    buf[6..8].copy_from_slice(&[0, 0]); // Checksum (optional for IPv4)
+    buf[6..8].copy_from_slice(&[0, 0]); // Zero for checksum computation
     buf[8..8 + payload.len()].copy_from_slice(payload);
+
+    let checksum = super::ipv4::compute_transport_checksum(
+        src_ip,
+        dst_ip,
+        super::ipv4::PROTO_UDP,
+        &buf[..total_len],
+    );
+    buf[6..8].copy_from_slice(&checksum.to_be_bytes());
 
     Some(total_len)
 }

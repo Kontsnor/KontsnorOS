@@ -45,8 +45,8 @@ use x86_64::VirtAddr;
 /// stack overflows.
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
-/// Size of the interrupt stack (32 KiB).
-const INTERRUPT_STACK_SIZE: usize = 4096 * 8;
+/// Size of the interrupt stack (64 KiB).
+const INTERRUPT_STACK_SIZE: usize = 64 * 1024;
 
 /// Stack used for double fault handling.
 ///

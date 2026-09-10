@@ -293,6 +293,12 @@ pub fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
     let mut total_written = 0;
     let mut temp_buf = [0u8; 4096];
 
+    // Whether this fd is a regular file (seekable). For regular files POSIX
+    // requires write() to write all requested bytes; short writes must be
+    // retried internally. For non-seekable streams (pipes, sockets, TTYs)
+    // short writes are expected and we must not retry.
+    let is_regular = file_desc.inode.inode().file_type == crate::fs::inode::FileType::Regular;
+
     while total_written < count {
         let chunk_size = core::cmp::min(count - total_written, 4096);
         unsafe {
@@ -306,7 +312,12 @@ pub fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
             Ok(0) => break,
             Ok(n) => {
                 total_written += n;
-                if n < chunk_size {
+                // For non-seekable streams a short write signals the caller
+                // to stop. For regular files we must keep looping so that
+                // the full count is delivered — otherwise page-cache lock
+                // drop/reacquire inside write_page_cache would silently
+                // truncate writes, corrupting files.
+                if n < chunk_size && !is_regular {
                     break;
                 }
             }
@@ -994,12 +1005,27 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: i32) -> SyscallResult {
     unsafe {
         core::ptr::copy_nonoverlapping(iov, local_iov.as_mut_ptr(), iovcnt as usize);
     }
+    crate::kprintln!(
+        "[writev] fd={}, iovcnt={}, iov[0]=({:p}, {}), iov[1]=({:p}, {})",
+        fd,
+        iovcnt,
+        local_iov[0].iov_base,
+        local_iov[0].iov_len,
+        if iovcnt > 1 {
+            local_iov[1].iov_base
+        } else {
+            core::ptr::null()
+        },
+        if iovcnt > 1 { local_iov[1].iov_len } else { 0 }
+    );
     let mut total_written = 0;
-    for io in local_iov {
+    for (idx, io) in local_iov.iter().enumerate() {
         if io.iov_len == 0 {
             continue;
         }
+        crate::kprintln!("[writev] writing chunk {}: len={}", idx, io.iov_len);
         let ret = sys_write(fd, io.iov_base, io.iov_len);
+        crate::kprintln!("[writev] chunk {} returned {}", idx, ret);
         if ret < 0 {
             if total_written > 0 {
                 break;
@@ -1008,6 +1034,7 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: i32) -> SyscallResult {
         }
         total_written += ret;
     }
+    crate::kprintln!("[writev] finished total_written={}", total_written);
     total_written
 }
 

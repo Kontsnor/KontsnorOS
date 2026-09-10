@@ -34,8 +34,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::inode::{DirEntry, FileType, Inode, InodeOps};
 use super::vfs::FileSystem;
 
+/// Filesystem device ID for in-memory tmpfs.
+pub const TMPFS_DEV_ID: u64 = 2;
+
 /// Counter for generating unique inode numbers.
-static NEXT_INO: AtomicU64 = AtomicU64::new(100);
+/// Starts at 0x1000_0000_0000_0000 so tmpfs inodes never collide with block device filesystems (e.g. ext2).
+static NEXT_INO: AtomicU64 = AtomicU64::new(0x1000_0000_0000_0000);
 
 fn alloc_ino() -> u64 {
     NEXT_INO.fetch_add(1, Ordering::Relaxed)
@@ -104,11 +108,15 @@ impl InodeOps for TmpFsDir {
     fn create(&self, name: &str, file_type: FileType) -> Option<Arc<dyn InodeOps>> {
         let node: Arc<dyn InodeOps> = match file_type {
             FileType::Regular => Arc::new(TmpFsFile {
-                inode: core::cell::UnsafeCell::new(Inode::new(alloc_ino(), FileType::Regular)),
+                inode: core::cell::UnsafeCell::new(
+                    Inode::new(alloc_ino(), FileType::Regular).with_dev(TMPFS_DEV_ID),
+                ),
                 data: RwLock::new(Vec::new()),
             }),
             FileType::Directory => Arc::new(TmpFsDir {
-                inode: core::cell::UnsafeCell::new(Inode::new(alloc_ino(), FileType::Directory)),
+                inode: core::cell::UnsafeCell::new(
+                    Inode::new(alloc_ino(), FileType::Directory).with_dev(TMPFS_DEV_ID),
+                ),
                 entries: RwLock::new(BTreeMap::new()),
             }),
             _ => return None,
@@ -270,7 +278,9 @@ impl InodeOps for TmpFsFile {
 /// Create a new tmpfs instance.
 pub fn create_tmpfs() -> Arc<TmpFs> {
     let root = Arc::new(TmpFsDir {
-        inode: core::cell::UnsafeCell::new(Inode::new(alloc_ino(), FileType::Directory)),
+        inode: core::cell::UnsafeCell::new(
+            Inode::new(alloc_ino(), FileType::Directory).with_dev(TMPFS_DEV_ID),
+        ),
         entries: RwLock::new(BTreeMap::new()),
     });
 
@@ -286,7 +296,9 @@ pub fn init() {
 /// Create an anonymous TmpFsFile inode.
 pub fn create_memfd_inode() -> Arc<dyn InodeOps> {
     Arc::new(TmpFsFile {
-        inode: core::cell::UnsafeCell::new(Inode::new(alloc_ino(), FileType::Regular)),
+        inode: core::cell::UnsafeCell::new(
+            Inode::new(alloc_ino(), FileType::Regular).with_dev(TMPFS_DEV_ID),
+        ),
         data: RwLock::new(Vec::new()),
     })
 }

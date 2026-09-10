@@ -270,7 +270,7 @@ pub fn sys_futex(
                     let is_realtime =
                         (op & FUTEX_CLOCK_REALTIME) != 0 || target_ns >= 1_000_000_000_000_000_000;
                     let current_now_ns = if is_realtime {
-                        1782158506u64 * 1_000_000_000 + (current_ticks * 10_000_000)
+                        crate::syscall::process::info::boot_realtime_sec() * 1_000_000_000 + (current_ticks * 10_000_000)
                     } else {
                         current_ticks * 10_000_000
                     };

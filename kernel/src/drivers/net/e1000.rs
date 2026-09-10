@@ -288,6 +288,20 @@ pub unsafe fn init(bus: u8, device: u8, function: u8) {
         }
     }
 
+    // Re-enable memory space, I/O, and bus mastering in PCI configuration space after hardware reset
+    let cmd = crate::drivers::bus::pci::read_config(bus, device, function, 0x04);
+    crate::drivers::bus::pci::write_config(bus, device, function, 0x04, cmd | 0x07);
+
+    let intr_line =
+        (crate::drivers::bus::pci::read_config(bus, device, function, 0x3C) & 0xFF) as u8;
+    if intr_line > 0 && intr_line < 32 {
+        crate::arch::x86_64::apic::ioapic_set_routing(
+            intr_line,
+            crate::arch::x86_64::interrupts::InterruptIndex::Network as u8,
+            crate::arch::x86_64::apic::get_lapic_id(),
+        );
+    }
+
     e1000.write_reg(REG_CTRL, e1000.read_reg(REG_CTRL) | (1 << 6)); // SLU
 
     let ral = e1000.read_reg(REG_RAL);
@@ -374,20 +388,24 @@ pub fn send_packet(data: &[u8]) -> Result<(), DriverError> {
 
 /// Handle interrupt triggered by the e1000 controller.
 pub fn handle_interrupt() {
-    let dev_lock = E1000_INSTANCE.lock();
-    if let Some(ref dev) = *dev_lock {
-        let mut inner = dev.inner.lock();
-        let cause = inner.read_reg(REG_ICR);
-        if cause & (0x80 | 0x40) != 0 {
-            let mut buf = [0u8; 2048];
-            while let Ok(len) = inner.recv_packet(&mut buf) {
-                if len > 0 {
-                    // Pass to the network stack!
-                    crate::net::ethernet::handle_packet(&buf[..len]);
-                } else {
-                    break;
+    let mut packets = alloc::vec::Vec::new();
+    if let Some(dev_lock) = E1000_INSTANCE.try_lock() {
+        if let Some(ref dev) = *dev_lock {
+            if let Some(mut inner) = dev.inner.try_lock() {
+                let _cause = inner.read_reg(REG_ICR);
+                let mut buf = [0u8; 2048];
+                while let Ok(len) = inner.recv_packet(&mut buf) {
+                    if len > 0 {
+                        packets.push(buf[..len].to_vec());
+                    } else {
+                        break;
+                    }
                 }
             }
         }
+    }
+
+    for packet in packets {
+        crate::net::ethernet::handle_packet(&packet);
     }
 }

@@ -116,6 +116,8 @@ pub struct Inode {
     pub ctime: u64,
     /// Device ID (for device files).
     pub rdev: u64,
+    /// Filesystem device ID (unique per mounted filesystem).
+    pub dev: u64,
 }
 
 impl Inode {
@@ -139,7 +141,14 @@ impl Inode {
             mtime: 0,
             ctime: 0,
             rdev: 0,
+            dev: 0,
         }
+    }
+
+    /// Set the filesystem device ID.
+    pub const fn with_dev(mut self, dev: u64) -> Self {
+        self.dev = dev;
+        self
     }
 
     /// Check if this inode is a directory.

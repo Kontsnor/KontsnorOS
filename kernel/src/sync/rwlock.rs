@@ -18,19 +18,34 @@
 //! Allows multiple concurrent readers OR a single exclusive writer.
 //! Disables interrupts while held and cooperatively services TLB shootdowns
 //! during spin waits to prevent SMP deadlocks.
+//!
+//! ## Writer Priority / Starvation Prevention
+//!
+//! A `writer_pending` flag is set as soon as a writer begins waiting. While
+//! the flag is set, new reader acquisitions spin without incrementing the
+//! reader count. This gives writers bounded wait time regardless of how many
+//! concurrent readers arrive, preventing the classic reader-starvation-of-writers
+//! problem common in naive shared-count rwlocks.
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicI64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 /// A reader-writer lock.
 ///
 /// - Positive count = number of active readers
 /// - Zero = unlocked
 /// - -1 = locked by a writer
+///
+/// A `writer_pending` flag prevents new readers from acquiring the lock
+/// while a writer is waiting, eliminating writer starvation under heavy
+/// concurrent read workloads (e.g., the global `TASKS` table under SMP).
 pub struct KRwLock<T> {
     /// Lock state: >0 = readers, 0 = free, -1 = writer.
     state: AtomicI64,
+    /// Set to `true` while a writer is waiting or holding the lock.
+    /// New readers must spin when this is set, giving the writer priority.
+    writer_pending: AtomicBool,
     /// The protected data.
     data: UnsafeCell<T>,
 }
@@ -44,11 +59,15 @@ impl<T> KRwLock<T> {
     pub const fn new(data: T) -> Self {
         Self {
             state: AtomicI64::new(0),
+            writer_pending: AtomicBool::new(false),
             data: UnsafeCell::new(data),
         }
     }
 
     /// Acquire a read lock.
+    ///
+    /// Spins while a writer is pending or active, then atomically
+    /// increments the reader count.
     pub fn read(&self) -> KRwLockReadGuard<'_, T> {
         let interrupts_enabled = x86_64::instructions::interrupts::are_enabled();
         if interrupts_enabled {
@@ -56,6 +75,16 @@ impl<T> KRwLock<T> {
         }
 
         loop {
+            // Respect writer priority: spin while a writer is pending or active.
+            if self.writer_pending.load(Ordering::Acquire) {
+                if crate::arch::x86_64::smp::has_pending_tlb_shootdown() {
+                    x86_64::instructions::tlb::flush_all();
+                    crate::arch::x86_64::smp::tlb_shootdown_ack();
+                }
+                core::hint::spin_loop();
+                continue;
+            }
+
             let state = self.state.load(Ordering::Relaxed);
             if state >= 0 {
                 if self
@@ -78,11 +107,18 @@ impl<T> KRwLock<T> {
     }
 
     /// Acquire a write lock.
+    ///
+    /// Sets `writer_pending` before spinning so that new readers back off,
+    /// then waits until the reader count drops to zero before acquiring.
     pub fn write(&self) -> KRwLockWriteGuard<'_, T> {
         let interrupts_enabled = x86_64::instructions::interrupts::are_enabled();
         if interrupts_enabled {
             x86_64::instructions::interrupts::disable();
         }
+
+        // Signal to incoming readers that a writer wants the lock.
+        // This prevents starvation by blocking new readers from entering.
+        self.writer_pending.store(true, Ordering::Release);
 
         while self
             .state
@@ -96,6 +132,7 @@ impl<T> KRwLock<T> {
             core::hint::spin_loop();
         }
 
+        // Lock acquired; the guard's Drop will clear writer_pending.
         KRwLockWriteGuard {
             lock: self,
             interrupts_enabled,
@@ -146,7 +183,9 @@ impl<T> DerefMut for KRwLockWriteGuard<'_, T> {
 
 impl<T> Drop for KRwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
+        // Release the write lock and clear writer_pending so readers can proceed.
         self.lock.state.store(0, Ordering::Release);
+        self.lock.writer_pending.store(false, Ordering::Release);
         if self.interrupts_enabled {
             x86_64::instructions::interrupts::enable();
         }

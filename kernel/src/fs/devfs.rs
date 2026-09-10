@@ -171,6 +171,9 @@ impl InodeOps for DevRandom {
     }
 }
 
+/// Filesystem device ID for devfs.
+pub const DEVFS_DEV_ID: u64 = 3;
+
 /// Create a new devfs instance.
 pub fn create_devfs() -> Arc<DevFs> {
     let mut entries = BTreeMap::new();
@@ -179,34 +182,34 @@ pub fn create_devfs() -> Arc<DevFs> {
     entries.insert(
         String::from("null"),
         Arc::new(DevNull {
-            inode: Inode::new(2, FileType::CharDevice),
+            inode: Inode::new(2, FileType::CharDevice).with_dev(DEVFS_DEV_ID),
         }) as Arc<dyn InodeOps>,
     );
 
     entries.insert(
         String::from("zero"),
         Arc::new(DevZero {
-            inode: Inode::new(3, FileType::CharDevice),
+            inode: Inode::new(3, FileType::CharDevice).with_dev(DEVFS_DEV_ID),
         }) as Arc<dyn InodeOps>,
     );
 
     entries.insert(
         String::from("random"),
         Arc::new(DevRandom {
-            inode: Inode::new(16, FileType::CharDevice),
+            inode: Inode::new(16, FileType::CharDevice).with_dev(DEVFS_DEV_ID),
         }) as Arc<dyn InodeOps>,
     );
 
     entries.insert(
         String::from("urandom"),
         Arc::new(DevRandom {
-            inode: Inode::new(17, FileType::CharDevice),
+            inode: Inode::new(17, FileType::CharDevice).with_dev(DEVFS_DEV_ID),
         }) as Arc<dyn InodeOps>,
     );
 
     // Create /dev/pts directory
     let pts = Arc::new(DevFsDir {
-        inode: Inode::new(14, FileType::Directory),
+        inode: Inode::new(14, FileType::Directory).with_dev(DEVFS_DEV_ID),
         entries: RwLock::new(BTreeMap::new()),
     });
     *PTS_DIR.write() = Some(pts.clone());
@@ -217,12 +220,12 @@ pub fn create_devfs() -> Arc<DevFs> {
     entries.insert(
         String::from("ptmx"),
         Arc::new(DevPtmxDummy {
-            inode: Inode::new(15, FileType::CharDevice),
+            inode: Inode::new(15, FileType::CharDevice).with_dev(DEVFS_DEV_ID),
         }) as Arc<dyn InodeOps>,
     );
 
     let root = Arc::new(DevFsDir {
-        inode: Inode::new(1, FileType::Directory),
+        inode: Inode::new(1, FileType::Directory).with_dev(DEVFS_DEV_ID),
         entries: RwLock::new(entries),
     });
 

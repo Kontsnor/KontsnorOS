@@ -140,6 +140,24 @@ impl Scheduler {
                             queue.remove(i);
                             task.in_queue = false;
                             let priority = task.priority;
+                            // Increment the per-priority pick counter.
+                            match priority {
+                                super::task::Priority::RealTime => crate::fs::kstats::KSTATS
+                                    .sched_picks_rt
+                                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+                                super::task::Priority::High => crate::fs::kstats::KSTATS
+                                    .sched_picks_high
+                                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+                                super::task::Priority::Normal => crate::fs::kstats::KSTATS
+                                    .sched_picks_normal
+                                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+                                super::task::Priority::Low => crate::fs::kstats::KSTATS
+                                    .sched_picks_low
+                                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+                                super::task::Priority::Idle => crate::fs::kstats::KSTATS
+                                    .sched_picks_idle
+                                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+                            };
                             return Some((pid, priority));
                         } else {
                             // Non-ready task in queue (Blocked/Zombie): remove and clear in_queue
@@ -499,13 +517,13 @@ pub fn init() {
         let mut idle_task = Task::idle();
         idle_task.is_idle = true;
 
-        // Allocate a unique kernel stack for each core's idle task (32 KiB)
-        let layout = alloc::alloc::Layout::from_size_align(32768, 16).unwrap();
+        // Allocate a unique kernel stack for each core's idle task
+        let layout = alloc::alloc::Layout::from_size_align(super::KERNEL_STACK_SIZE, 16).unwrap();
         let stack_base = unsafe { alloc::alloc::alloc(layout) } as u64;
         idle_task.kernel_stack_base = stack_base;
-        idle_task.kernel_stack_size = 32768;
+        idle_task.kernel_stack_size = super::KERNEL_STACK_SIZE;
 
-        let stack_top = stack_base + 32768;
+        let stack_top = stack_base + super::KERNEL_STACK_SIZE as u64;
         let stack_top_aligned = stack_top & !0xF;
 
         let mut context = super::context::CpuContext::new(
@@ -733,6 +751,9 @@ pub fn schedule() {
 
         scheduler.current_cpus[apic_id] = Some(next_pid);
         scheduler.context_switches += 1;
+        crate::fs::kstats::KSTATS
+            .context_switches
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
         // Update CPU-local scratch space with the new PID and pending signals
         unsafe {

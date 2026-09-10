@@ -123,6 +123,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     arch::x86_64::interrupts::init_pics();
     kprintln!("[boot] PIC initialized.");
 
+    kprintln!("[boot] Reading CMOS RTC for wall-clock base...");
+    crate::syscall::process::info::init_boot_time();
+
     kprintln!("[boot] Enabling SSE and FSGSBASE...");
     unsafe {
         arch::x86_64::boot::enable_sse();
@@ -255,12 +258,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Spawn Ring 3 user init from ext RAM disk as PID 1
         let init_candidates = ["/sbin/init", "/usr/sbin/init", "/init", "/bin/init"];
         let mut init_target = None;
-        for &candidate in &init_candidates {
-            if let Some(inode) = fs::vfs::lookup(candidate) {
-                init_target = Some((candidate, inode));
-                break;
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            for &candidate in &init_candidates {
+                if let Some(inode) = fs::vfs::lookup(candidate) {
+                    init_target = Some((candidate, inode));
+                    break;
+                }
             }
-        }
+        });
 
         if let Some((init_path, inode)) = init_target {
             kprintln!("[boot] Spawning Ring 3 → Ring 3 init: {}...", init_path);

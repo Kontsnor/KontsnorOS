@@ -373,11 +373,17 @@ pub extern "C" fn syscall_dispatch_rust(regs: *mut SavedRegisters, syscall_num: 
         );
     }
 
+    let current_pid_val = crate::process::scheduler::current_pid()
+        .map(|p| p.as_u64())
+        .unwrap_or(0);
+    let _ = current_pid_val;
+
     let res = dispatch(regs, syscall_num, arg0, arg1, arg2, arg3, arg4, arg5);
+
+
 
     if DEBUG_SYSCALLS {
         crate::kprintln!("[debug syscall {} ret] res={}", syscall_num, res);
-
         if syscall_num == 16 {
             let user_rsp = unsafe { (*regs).rsp };
             let mut words_after = [0u64; 8];
@@ -1017,7 +1023,7 @@ pub fn dispatch(
         164 => 0, // settimeofday
         167 => 0, // swapon
         168 => 0, // swapoff
-        169 => fs::sys_reboot(arg0 as i32, arg1 as i32, arg2 as u32, arg3 as *const u8),
+        169 => fs::sys_reboot(arg0 as u32, arg1 as u32, arg2 as u32, arg3 as *const u8),
         170 => process::sys_sethostname(arg0 as *const u8, arg1 as usize),
         171 => process::sys_setdomainname(arg0 as *const u8, arg1 as usize),
         172 => 0,                       // iopl
@@ -1037,7 +1043,8 @@ pub fn dispatch(
         254 => fs::sys_inotify_add_watch(arg0 as i32, arg1 as *const u8, arg2 as u32),
         255 => fs::sys_inotify_rm_watch(arg0 as i32, arg1 as i32),
         256 => 0, // migrate_pages
-        272 => 0, // unshare
+        272 => process::sys_unshare(arg0),
+
         279 => 0, // move_pages
         294 => fs::sys_inotify_init1(arg0 as i32),
         298 => -(Errno::ENODEV as i64),     // perf_event_open
@@ -1137,6 +1144,11 @@ pub fn dispatch(
             arg2 as u32,
             arg3 as i32,
         ),
+
+        // Landlock security subsystem (not implemented -> clean ENOSYS)
+        444 => -(Errno::ENOSYS as i64), // landlock_create_ruleset
+        445 => -(Errno::ENOSYS as i64), // landlock_add_rule
+        446 => -(Errno::ENOSYS as i64), // landlock_restrict_self
 
         _ => {
             kprintln!("[syscall] Unknown syscall: {}", syscall_num);

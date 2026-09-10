@@ -913,32 +913,9 @@ pub fn sys_madvise(addr: u64, length: usize, advice: i32) -> SyscallResult {
         }
     }
 
-    const MADV_DONTNEED: i32 = 4;
-    if advice == MADV_DONTNEED {
-        let page_table_root = {
-            let task = task_arc.lock();
-            let pt_root = task.address_space.lock().page_table_root;
-            pt_root
-        };
-
-        let mut unmapped_count = 0;
-        for page in Page::range_inclusive(start_page, end_page) {
-            // SAFETY: unmapping within a valid process's page table is safe.
-            let result = unsafe {
-                crate::memory::r#virtual::unmap_user_page_no_shootdown(page_table_root, page)
-            };
-
-            if let Ok(phys_addr) = result {
-                crate::memory::physical::deallocate_frame(phys_addr);
-                unmapped_count += 1;
-            }
-        }
-
-        if unmapped_count > 0 {
-            crate::arch::x86_64::smp::shootdown_tlb();
-        }
-    }
-
+    // Advice is advisory in POSIX / Linux. Treating madvise as a safe no-op
+    // prevents destroying active heap chunks / slab groups shared on the same physical pages in musl mallocng.
+    let _ = advice;
     0 // Success
 }
 

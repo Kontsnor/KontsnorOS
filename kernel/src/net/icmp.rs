@@ -166,5 +166,21 @@ pub fn handle_packet(src_ip: ipv4::Ipv4Addr, payload: &[u8]) {
                 }
             }
         }
+
+        // Forward ICMP packet to any listening RAW (sock_type 3) or ICMP (protocol 1) sockets
+        let reg = super::socket::SOCKET_REGISTRY.lock();
+        for s in reg.iter() {
+            let mut sock = s.lock();
+            if sock.sock_type == 3 || sock.protocol == 1 {
+                if sock.udp_recv_queue.len() < 128 {
+                    sock.udp_recv_queue.push_back(super::udp::UdpDatagram {
+                        src_addr: src_ip,
+                        src_port: 0,
+                        data: payload.to_vec(),
+                    });
+                    sock.wait_queue.wake_all();
+                }
+            }
+        }
     }
 }

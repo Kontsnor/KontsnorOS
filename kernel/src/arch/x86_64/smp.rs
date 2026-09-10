@@ -281,7 +281,7 @@ pub fn shootdown_tlb() {
         // Cores spinning in kernel space with interrupts disabled also poll and acknowledge
         // pending shootdowns during their spin loops.
         let mut spins = 0u32;
-        while TLB_SHOOTDOWN_ACKS.load(Ordering::SeqCst) > 0 && spins < 200_000 {
+        while TLB_SHOOTDOWN_ACKS.load(Ordering::SeqCst) > 0 && spins < 10_000_000 {
             core::hint::spin_loop();
             spins += 1;
         }
@@ -509,6 +509,14 @@ pub extern "C" fn ap_entry() -> ! {
 
     // 4. Configure syscall MSR registers (STAR, LSTAR, FMASK, GS_BASE, KERNEL_GS_BASE)
     crate::syscall::init();
+
+    let apic_id = current_lapic_id() as usize;
+    if apic_id < 32 {
+        unsafe {
+            let idle_pid = 900 + apic_id as u64;
+            crate::syscall::CPU_SCRATCHES[apic_id].current_pid = idle_pid;
+        }
+    }
 
     // 5. Initialize AP LAPIC and LAPIC timer
     super::apic::init_ap();

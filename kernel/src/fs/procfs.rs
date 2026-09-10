@@ -23,6 +23,7 @@
 //! - `/proc/version` — kernel version string
 //! - `/proc/meminfo` — memory statistics
 //! - `/proc/uptime` — system uptime
+//! - `/proc/mounts` — active filesystem mount table
 
 use alloc::format;
 use alloc::string::String;
@@ -32,6 +33,7 @@ use alloc::vec::Vec;
 
 use super::inode::{DirEntry, FileType, Inode, InodeOps};
 use super::vfs::FileSystem;
+use crate::process::pid::Pid;
 
 /// The procfs filesystem.
 pub struct ProcFs {
@@ -61,10 +63,29 @@ impl InodeOps for ProcFsDir {
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn InodeOps>> {
         if name == "self" {
-            return Some(Arc::new(ProcFsSelfDir {
+            return Some(Arc::new(ProcFsProcessDir {
+                target_pid: None,
                 inode: Inode::new(100, FileType::Directory),
             }));
         }
+
+        if let Ok(pid_val) = name.parse::<u64>() {
+            let caller_ns_id = crate::process::scheduler::current_pid()
+                .and_then(crate::process::scheduler::get_task_arc)
+                .map(|t| t.lock().pid_ns_id)
+                .unwrap_or(0);
+            let target_pid = Pid::from_raw(pid_val);
+            if let Some(task_arc) = crate::process::scheduler::get_task_arc(target_pid) {
+                let task = task_arc.lock();
+                if caller_ns_id == 0 || task.pid_ns_id == caller_ns_id {
+                    return Some(Arc::new(ProcFsProcessDir {
+                        target_pid: Some(target_pid),
+                        inode: Inode::new(1000 + pid_val, FileType::Directory),
+                    }));
+                }
+            }
+        }
+
         self.entries
             .iter()
             .find(|(n, _)| n == name)
@@ -89,6 +110,29 @@ impl InodeOps for ProcFsDir {
                 file_type: FileType::Directory,
             },
         ];
+
+        let caller_ns_id = crate::process::scheduler::current_pid()
+            .and_then(crate::process::scheduler::get_task_arc)
+            .map(|t| t.lock().pid_ns_id)
+            .unwrap_or(0);
+
+        {
+            let tasks = crate::process::scheduler::TASKS.read();
+            for slot in tasks.iter() {
+                if let Some(task_arc) = slot {
+                    let task = task_arc.lock();
+                    if caller_ns_id != 0 && task.pid_ns_id != caller_ns_id {
+                        continue;
+                    }
+                    let pid_val = task.pid.as_u64();
+                    result.push(DirEntry {
+                        name: format!("{}", pid_val),
+                        ino: 1000 + pid_val,
+                        file_type: FileType::Directory,
+                    });
+                }
+            }
+        }
 
         for (name, node) in &self.entries {
             result.push(DirEntry {
@@ -178,10 +222,17 @@ fn gen_uptime() -> String {
 fn gen_tasks() -> String {
     let mut out = String::new();
     out.push_str("PID  PPID  STATE    NAME\n");
+    let caller_ns_id = crate::process::scheduler::current_pid()
+        .and_then(crate::process::scheduler::get_task_arc)
+        .map(|t| t.lock().pid_ns_id)
+        .unwrap_or(0);
     let tasks = crate::process::scheduler::TASKS.read();
     for slot in tasks.iter() {
         if let Some(task_arc) = slot {
             let task = task_arc.lock();
+            if caller_ns_id != 0 && task.pid_ns_id != caller_ns_id {
+                continue;
+            }
             let state_str = match task.state {
                 crate::process::task::TaskState::Ready => "Ready",
                 crate::process::task::TaskState::Running => "Running",
@@ -196,6 +247,76 @@ fn gen_tasks() -> String {
                 task.name
             ));
         }
+    }
+    out
+}
+
+/// Generate `/proc/kstats` content — kernel performance counters.
+fn gen_kstats() -> String {
+    crate::fs::kstats::render()
+}
+
+/// Generate `/proc/mounts` content.
+///
+/// Reads the current task's mount namespace (or the global initial namespace
+/// as a fallback) and formats each entry in the standard Linux
+/// `/proc/mounts` format:
+///
+/// ```text
+/// <device> <mountpoint> <fstype> <options> <dump> <pass>
+/// ```
+///
+/// This is the file pacman reads (via `/etc/mtab -> /proc/mounts`) to
+/// determine which filesystems are mounted before committing a transaction.
+fn gen_mounts() -> String {
+    // Prefer the current task's private namespace; fall back to the global one.
+    let mounts: alloc::vec::Vec<(String, String)> = {
+        let task_ns = crate::process::scheduler::current_pid()
+            .and_then(crate::process::scheduler::get_task_arc)
+            .map(|t| {
+                let task = t.lock();
+                let ns = task.fs_ctx.read().mount_ns.clone();
+                ns
+            });
+
+        if let Some(ns_arc) = task_ns {
+            ns_arc
+                .read()
+                .mounts
+                .iter()
+                .map(|(path, fs)| (path.clone(), String::from(fs.name())))
+                .collect()
+        } else {
+            crate::fs::namespace::INITIAL_MOUNT_NS
+                .read()
+                .mounts
+                .iter()
+                .map(|(path, fs)| (path.clone(), String::from(fs.name())))
+                .collect()
+        }
+    };
+
+    let mut out = String::new();
+    // Always emit a root entry so pacman finds at least one mount point.
+    let mut has_root = false;
+    for (mountpoint, fsname) in &mounts {
+        let mp = if mountpoint.is_empty() { "/" } else { mountpoint.as_str() };
+        if mp == "/" {
+            has_root = true;
+        }
+        // Device name: use "none" for virtual filesystems, otherwise the fs name.
+        let device = match fsname.as_str() {
+            "ext2" | "ext4" => "/dev/vda",
+            _ => "none",
+        };
+        out.push_str(&format!(
+            "{} {} {} rw,relatime 0 0\n",
+            device, mp, fsname
+        ));
+    }
+    if !has_root {
+        // Guarantee a root entry so pacman's mount-point check never fails.
+        out.push_str("/dev/vda / ext2 rw,relatime 0 0\n");
     }
     out
 }
@@ -238,6 +359,20 @@ pub fn create_procfs() -> Arc<ProcFs> {
                 generator: gen_cpuinfo,
             }) as Arc<dyn InodeOps>,
         ),
+        (
+            String::from("kstats"),
+            Arc::new(ProcFile {
+                inode: Inode::new(55, FileType::Regular),
+                generator: gen_kstats,
+            }) as Arc<dyn InodeOps>,
+        ),
+        (
+            String::from("mounts"),
+            Arc::new(ProcFile {
+                inode: Inode::new(56, FileType::Regular),
+                generator: gen_mounts,
+            }) as Arc<dyn InodeOps>,
+        ),
     ];
 
     let root = Arc::new(ProcFsDir {
@@ -254,46 +389,63 @@ pub fn init() {
     super::vfs::mount(String::from("/proc"), procfs);
 }
 
-/// Special `/proc/self` directory.
-struct ProcFsSelfDir {
+fn resolve_target_task(
+    target_pid: Option<Pid>,
+) -> Option<(Arc<spin::Mutex<crate::process::task::Task>>, Pid)> {
+    let pid = target_pid.or_else(|| crate::process::scheduler::current_pid())?;
+    let task_arc = crate::process::scheduler::get_task_arc(pid)?;
+    Some((task_arc, pid))
+}
+
+/// Special `/proc/self` or `/proc/<pid>` directory.
+struct ProcFsProcessDir {
+    target_pid: Option<Pid>,
     inode: Inode,
 }
 
-impl InodeOps for ProcFsSelfDir {
+impl InodeOps for ProcFsProcessDir {
     fn inode(&self) -> &Inode {
         &self.inode
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn InodeOps>> {
+        let base_ino = self.inode.ino;
         if name == "exe" {
-            return Some(Arc::new(ProcFsSelfExe {
-                inode: Inode::new(101, FileType::Symlink),
+            return Some(Arc::new(ProcFsProcessExe {
+                target_pid: self.target_pid,
+                inode: Inode::new(base_ino * 10 + 1, FileType::Symlink),
             }));
         }
         if name == "fd" {
-            return Some(Arc::new(ProcFsSelfFdDir {
-                inode: Inode::new(102, FileType::Directory),
+            return Some(Arc::new(ProcFsProcessFdDir {
+                target_pid: self.target_pid,
+                parent_ino: base_ino,
+                inode: Inode::new(base_ino * 10 + 2, FileType::Directory),
             }));
         }
         if name == "maps" {
-            return Some(Arc::new(ProcFsSelfMaps {
-                inode: Inode::new(103, FileType::Regular),
+            return Some(Arc::new(ProcFsProcessMaps {
+                target_pid: self.target_pid,
+                inode: Inode::new(base_ino * 10 + 3, FileType::Regular),
             }));
         }
         if name == "status" {
-            return Some(Arc::new(ProcFsSelfStatus {
-                inode: Inode::new(104, FileType::Regular),
+            return Some(Arc::new(ProcFsProcessStatus {
+                target_pid: self.target_pid,
+                inode: Inode::new(base_ino * 10 + 4, FileType::Regular),
             }));
         }
         if name == "cmdline" {
-            return Some(Arc::new(ProcFsSelfCmdline {
-                inode: Inode::new(105, FileType::Regular),
+            return Some(Arc::new(ProcFsProcessCmdline {
+                target_pid: self.target_pid,
+                inode: Inode::new(base_ino * 10 + 5, FileType::Regular),
             }));
         }
         None
     }
 
     fn readdir(&self) -> Vec<DirEntry> {
+        let base_ino = self.inode.ino;
         vec![
             DirEntry {
                 name: String::from("."),
@@ -307,39 +459,41 @@ impl InodeOps for ProcFsSelfDir {
             },
             DirEntry {
                 name: String::from("exe"),
-                ino: 101,
+                ino: base_ino * 10 + 1,
                 file_type: FileType::Symlink,
             },
             DirEntry {
                 name: String::from("fd"),
-                ino: 102,
+                ino: base_ino * 10 + 2,
                 file_type: FileType::Directory,
             },
             DirEntry {
                 name: String::from("maps"),
-                ino: 103,
+                ino: base_ino * 10 + 3,
                 file_type: FileType::Regular,
             },
             DirEntry {
                 name: String::from("status"),
-                ino: 104,
+                ino: base_ino * 10 + 4,
                 file_type: FileType::Regular,
             },
             DirEntry {
                 name: String::from("cmdline"),
-                ino: 105,
+                ino: base_ino * 10 + 5,
                 file_type: FileType::Regular,
             },
         ]
     }
 }
 
-/// Special `/proc/self/fd` directory.
-struct ProcFsSelfFdDir {
+/// Special `/proc/self/fd` or `/proc/<pid>/fd` directory.
+struct ProcFsProcessFdDir {
+    target_pid: Option<Pid>,
+    parent_ino: u64,
     inode: Inode,
 }
 
-impl InodeOps for ProcFsSelfFdDir {
+impl InodeOps for ProcFsProcessFdDir {
     fn inode(&self) -> &Inode {
         &self.inode
     }
@@ -349,15 +503,14 @@ impl InodeOps for ProcFsSelfFdDir {
         if fd < 0 {
             return None;
         }
-        // Verify fd is open in current task
-        let current_pid = crate::process::scheduler::current_pid()?;
-        let task_arc = crate::process::scheduler::get_task_arc(current_pid)?;
+        let (task_arc, _) = resolve_target_task(self.target_pid)?;
         let task = task_arc.lock();
         let fd_table = task.fd_table.lock();
         let _ = fd_table.entries.get(fd as usize)?.as_ref()?;
-        Some(Arc::new(ProcFsSelfFdLink {
+        Some(Arc::new(ProcFsProcessFdLink {
+            target_pid: self.target_pid,
             fd,
-            inode: Inode::new(1000 + fd as u64, FileType::Symlink),
+            inode: Inode::new(self.inode.ino * 100 + fd as u64, FileType::Symlink),
         }))
     }
 
@@ -370,44 +523,43 @@ impl InodeOps for ProcFsSelfFdDir {
             },
             DirEntry {
                 name: String::from(".."),
-                ino: 100, // /proc/self inode is 100
+                ino: self.parent_ino,
                 file_type: FileType::Directory,
             },
         ];
 
-        if let Some(current_pid) = crate::process::scheduler::current_pid() {
-            if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
-                let task = task_arc.lock();
-                let fd_table = task.fd_table.lock();
-                for (i, entry) in fd_table.entries.iter().enumerate() {
-                    if entry.is_some() {
-                        result.push(DirEntry {
-                            name: format!("{}", i),
-                            ino: 1000 + i as u64,
-                            file_type: FileType::Symlink,
-                        });
-                    }
+        if let Some((task_arc, _)) = resolve_target_task(self.target_pid) {
+            let task = task_arc.lock();
+            let fd_table = task.fd_table.lock();
+            for (i, entry) in fd_table.entries.iter().enumerate() {
+                if entry.is_some() {
+                    result.push(DirEntry {
+                        name: format!("{}", i),
+                        ino: self.inode.ino * 100 + i as u64,
+                        file_type: FileType::Symlink,
+                    });
                 }
             }
         }
+
         result
     }
 }
 
-/// Special `/proc/self/fd/N` symlink.
-struct ProcFsSelfFdLink {
+/// Special `/proc/self/fd/<fd>` symlink.
+struct ProcFsProcessFdLink {
+    target_pid: Option<Pid>,
     fd: i32,
     inode: Inode,
 }
 
-impl InodeOps for ProcFsSelfFdLink {
+impl InodeOps for ProcFsProcessFdLink {
     fn inode(&self) -> &Inode {
         &self.inode
     }
 
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
-        let current_pid = crate::process::scheduler::current_pid().ok_or(-3)?; // ESRCH
-        let task_arc = crate::process::scheduler::get_task_arc(current_pid).ok_or(-3)?;
+        let (task_arc, _) = resolve_target_task(self.target_pid).ok_or(-3)?; // ESRCH
         let task = task_arc.lock();
         let fd_table = task.fd_table.lock();
         let file_desc = fd_table
@@ -457,23 +609,20 @@ impl InodeOps for ProcFsSelfFdLink {
     }
 }
 
-/// Special `/proc/self/exe` symlink.
-struct ProcFsSelfExe {
+/// Special `/proc/self/exe` or `/proc/<pid>/exe` symlink.
+struct ProcFsProcessExe {
+    target_pid: Option<Pid>,
     inode: Inode,
 }
 
-impl InodeOps for ProcFsSelfExe {
+impl InodeOps for ProcFsProcessExe {
     fn inode(&self) -> &Inode {
         &self.inode
     }
 
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
-        let exe_path = if let Some(pid) = crate::process::scheduler::current_pid() {
-            if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
-                task_arc.lock().name.clone()
-            } else {
-                String::from("/bin/sh")
-            }
+        let exe_path = if let Some((task_arc, _)) = resolve_target_task(self.target_pid) {
+            task_arc.lock().name.clone()
         } else {
             String::from("/bin/sh")
         };
@@ -493,19 +642,19 @@ impl InodeOps for ProcFsSelfExe {
     }
 }
 
-/// Special `/proc/self/maps` file.
-struct ProcFsSelfMaps {
+/// Special `/proc/self/maps` or `/proc/<pid>/maps` file.
+struct ProcFsProcessMaps {
+    target_pid: Option<Pid>,
     inode: Inode,
 }
 
-impl InodeOps for ProcFsSelfMaps {
+impl InodeOps for ProcFsProcessMaps {
     fn inode(&self) -> &Inode {
         &self.inode
     }
 
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
-        let current_pid = crate::process::scheduler::current_pid().ok_or(-3)?; // ESRCH
-        let task_arc = crate::process::scheduler::get_task_arc(current_pid).ok_or(-3)?;
+        let (task_arc, _) = resolve_target_task(self.target_pid).ok_or(-3)?; // ESRCH
         let mut regions = {
             let task = task_arc.lock();
             let addr_space = task.address_space.lock();
@@ -556,20 +705,19 @@ impl InodeOps for ProcFsSelfMaps {
     }
 }
 
-/// Special `/proc/self/status` file.
-struct ProcFsSelfStatus {
+/// Special `/proc/self/status` or `/proc/<pid>/status` file.
+struct ProcFsProcessStatus {
+    target_pid: Option<Pid>,
     inode: Inode,
 }
 
-impl InodeOps for ProcFsSelfStatus {
+impl InodeOps for ProcFsProcessStatus {
     fn inode(&self) -> &Inode {
         &self.inode
     }
 
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
-        let current_pid = crate::process::scheduler::current_pid().ok_or(-3)?; // ESRCH
-        let task_arc = crate::process::scheduler::get_task_arc(current_pid).ok_or(-3)?;
-
+        let (task_arc, resolved_pid) = resolve_target_task(self.target_pid).ok_or(-3)?; // ESRCH
         let (name, ppid, tgid, state, vmsize, vmrss) = {
             let task = task_arc.lock();
             let name = task.name.clone();
@@ -610,7 +758,7 @@ impl InodeOps for ProcFsSelfStatus {
 
         let content = format!(
             "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nThreads:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\n",
-            name, state, tgid, current_pid.as_u64(), ppid, threads, vmsize, vmrss
+            name, state, tgid, resolved_pid.as_u64(), ppid, threads, vmsize, vmrss
         );
 
         let bytes = content.as_bytes();
@@ -628,19 +776,19 @@ impl InodeOps for ProcFsSelfStatus {
     }
 }
 
-/// Special `/proc/self/cmdline` file.
-struct ProcFsSelfCmdline {
+/// Special `/proc/self/cmdline` or `/proc/<pid>/cmdline` file.
+struct ProcFsProcessCmdline {
+    target_pid: Option<Pid>,
     inode: Inode,
 }
 
-impl InodeOps for ProcFsSelfCmdline {
+impl InodeOps for ProcFsProcessCmdline {
     fn inode(&self) -> &Inode {
         &self.inode
     }
 
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
-        let current_pid = crate::process::scheduler::current_pid().ok_or(-3)?; // ESRCH
-        let task_arc = crate::process::scheduler::get_task_arc(current_pid).ok_or(-3)?;
+        let (task_arc, _) = resolve_target_task(self.target_pid).ok_or(-3)?; // ESRCH
 
         let cmdline_bytes = {
             let task = task_arc.lock();

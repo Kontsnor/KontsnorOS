@@ -25,11 +25,11 @@ use spin::Mutex;
 
 use crate::fs::inode::{DirEntry, FileType, Inode, InodeOps};
 
-const PIPE_BUF_SIZE: usize = 8192;
+const PIPE_BUF_SIZE: usize = 65536;
 
 /// Circular queue for pipe data.
 struct PipeBuffer {
-    data: [u8; PIPE_BUF_SIZE],
+    data: Vec<u8>,
     read_pos: usize,
     write_pos: usize,
     len: usize,
@@ -38,7 +38,7 @@ struct PipeBuffer {
 impl PipeBuffer {
     fn new() -> Self {
         Self {
-            data: [0u8; PIPE_BUF_SIZE],
+            data: alloc::vec![0u8; PIPE_BUF_SIZE],
             read_pos: 0,
             write_pos: 0,
             len: 0,
@@ -139,6 +139,13 @@ impl InodeOps for PipeReader {
                 return Err(-11); // EAGAIN / EWOULDBLOCK
             }
 
+            // Pre-check before blocking: re-evaluate if data arrived or writers closed
+            if !self.state.buffer.lock().is_empty()
+                || self.state.writers.load(Ordering::SeqCst) == 0
+            {
+                continue;
+            }
+
             // Sleep on wait queue until data is written or writers close
             self.state.wait_queue.wait();
         }
@@ -237,6 +244,12 @@ impl InodeOps for PipeWriter {
                     } else {
                         return Err(-11); // EAGAIN
                     }
+                }
+                // Pre-check before blocking: re-evaluate if space freed or readers closed
+                if !self.state.buffer.lock().is_full()
+                    || self.state.readers.load(Ordering::SeqCst) == 0
+                {
+                    continue;
                 }
                 // Sleep on wait queue until space is freed or readers close
                 self.state.wait_queue.wait();

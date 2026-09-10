@@ -46,6 +46,7 @@ use alloc::vec::Vec;
 use super::context::CpuContext;
 use super::pid::Pid;
 use crate::fs::file::{FileDescription, OpenFlags};
+use crate::fs::namespace::{FsContext, UtsNamespace, INITIAL_PID_NS_ID};
 
 /// The state of a task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +166,7 @@ pub struct FdTable {
 /// - CPU register context (for context switching)
 /// - Memory management info (page table root, kernel stack)
 /// - File descriptor table (up to 64 open files)
+#[repr(C)]
 pub struct Task {
     /// Unique process identifier.
     pub pid: Pid,
@@ -267,6 +269,25 @@ pub struct Task {
     pub rseq_len: u32,
     /// Restartable sequence signature
     pub rseq_sig: u32,
+    /// Per-task filesystem context (jail root + mount namespace).
+    ///
+    /// Shared with siblings until `unshare(CLONE_NEWNS)` is called.
+    /// Protected by `RwLock` so readers of `root` pay minimal contention.
+    pub fs_ctx: Arc<spin::RwLock<FsContext>>,
+    /// Per-task UTS namespace (hostname / domainname).
+    ///
+    /// Cloned on `fork`; independently mutable after `unshare(CLONE_NEWUTS)`.
+    pub uts_ns: UtsNamespace,
+    /// PID namespace identifier.
+    ///
+    /// Processes share a PID namespace with their siblings unless
+    /// `clone(CLONE_NEWPID)` or `unshare(CLONE_NEWPID)` + fork is used.
+    /// Signals, `wait4`, and `/proc` enumeration are restricted to tasks
+    /// within the same `pid_ns_id`.
+    pub pid_ns_id: u64,
+    /// Pending PID namespace ID for subsequent children created via fork/clone.
+    /// Set when the task calls unshare(CLONE_NEWPID).
+    pub child_pid_ns_id: Option<u64>,
 }
 
 impl Task {
@@ -296,7 +317,10 @@ impl Task {
             name,
             state: TaskState::Ready,
             priority: Priority::default(),
-            context: CpuContext::default(),
+            context: CpuContext {
+                cr3: page_table_root,
+                ..CpuContext::default()
+            },
             address_space: Arc::new(spin::Mutex::new(AddressSpace {
                 page_table_root,
                 brk: 0,
@@ -347,12 +371,21 @@ impl Task {
             rseq: None,
             rseq_len: 0,
             rseq_sig: 0,
+            // Share the global mount namespace; per-task isolation happens via
+            // unshare(CLONE_NEWNS) / chroot which fork the namespace/root.
+            fs_ctx: Arc::new(spin::RwLock::new(FsContext::new_initial(
+                crate::fs::namespace::INITIAL_MOUNT_NS.clone(),
+            ))),
+            uts_ns: UtsNamespace::default_ns(),
+            pid_ns_id: INITIAL_PID_NS_ID,
+            child_pid_ns_id: None,
         }
     }
 
     /// Create the kernel idle task (PID 0).
     pub fn idle() -> Self {
-        let mut task = Self::new(Pid::IDLE, String::from("idle"), 0);
+        let kernel_pml4 = crate::memory::r#virtual::kernel_pml4_phys();
+        let mut task = Self::new(Pid::IDLE, String::from("idle"), kernel_pml4);
         task.priority = Priority::Idle;
         task.is_idle = true;
         task

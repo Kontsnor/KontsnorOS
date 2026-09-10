@@ -567,6 +567,11 @@ impl ExtInode {
 
     /// Truncate file size to 0.
     pub fn truncate_file(&self, size: u64) -> Result<(), i32> {
+        crate::memory::page_cache::page_cache_truncate_inode(
+            crate::fs::ext::EXT_DEV_ID,
+            self.ino as u64,
+            size,
+        );
         if size == 0 {
             let mut raw = self.raw.lock();
             let mut vfs = self.vfs_inode.write();
@@ -759,7 +764,11 @@ impl ExtInode {
             dest_slice[page_offset..page_offset + bytes_to_write]
                 .copy_from_slice(&buf[written_bytes..written_bytes + bytes_to_write]);
 
-            crate::memory::page_cache::mark_dirty(self.ino as u64, file_block_offset);
+            crate::memory::page_cache::mark_dirty(
+                crate::fs::ext::EXT_DEV_ID,
+                self.ino as u64,
+                file_block_offset,
+            );
 
             written_bytes += bytes_to_write;
             current_offset += bytes_to_write as u64;

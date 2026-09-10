@@ -29,8 +29,9 @@ use super::task::Task;
 pub fn spawn_kernel_thread(name: alloc::string::String, entry_point: fn()) -> Pid {
     let pid = pid::allocate();
 
-    // Allocate kernel stack (32 KiB)
-    let layout = alloc::alloc::Layout::from_size_align(32768, 16).unwrap();
+    // Allocate kernel stack
+    let layout =
+        alloc::alloc::Layout::from_size_align(crate::process::KERNEL_STACK_SIZE, 16).unwrap();
     // SAFETY: Layout is valid (non-zero size, power of 2 alignment) and memory is checked for allocation.
     let stack_base = unsafe { alloc::alloc::alloc(layout) } as u64;
 
@@ -40,10 +41,10 @@ pub fn spawn_kernel_thread(name: alloc::string::String, entry_point: fn()) -> Pi
 
     let mut task = Task::new(pid, name, cr3_val);
     task.kernel_stack_base = stack_base;
-    task.kernel_stack_size = 32768;
+    task.kernel_stack_size = crate::process::KERNEL_STACK_SIZE;
 
     // Prepare the initial stack: R12 will hold the entry_point, and RIP will point to thread_trampoline!
-    let stack_top = stack_base + 32768;
+    let stack_top = stack_base + crate::process::KERNEL_STACK_SIZE as u64;
     let stack_top_aligned = stack_top & !0xF;
 
     let mut context = CpuContext::new(
@@ -83,13 +84,20 @@ pub fn spawn_user_process_with_pid(name: alloc::string::String, elf_data: &[u8],
     let elf_info =
         elf::parse_elf(elf_data, elf_data.len()).expect("Failed to parse user process ELF");
 
+    let min_vaddr = elf_info.segments.iter().map(|s| s.vaddr).min().unwrap_or(0);
+    let main_bias = if elf_info.is_pie || min_vaddr == 0 {
+        elf::USER_SPACE_BASE
+    } else {
+        0u64
+    };
+
     // Create new user PML4 page table (clones kernel mappings)
     let page_table_root = crate::memory::r#virtual::create_user_page_table()
         .expect("Failed to create user page table");
 
     // Map loadable segments
     for segment in &elf_info.segments {
-        let vaddr = segment.vaddr;
+        let vaddr = segment.vaddr + main_bias;
         let mem_size = segment.mem_size;
         let file_offset = segment.file_offset;
         let file_size = segment.file_size;
@@ -173,8 +181,8 @@ pub fn spawn_user_process_with_pid(name: alloc::string::String, elf_data: &[u8],
     let init_stack = elf::construct_user_stack(
         &default_argv,
         &default_envp,
-        elf_info.entry_point,
-        elf_info.phdr,
+        elf_info.entry_point + main_bias,
+        elf_info.phdr + main_bias,
         elf_info.phnum,
         elf_info.phent,
         0, // interpreter_base is 0 for statically linked spawned user processes
@@ -219,7 +227,7 @@ pub fn spawn_user_process_with_pid(name: alloc::string::String, elf_data: &[u8],
     // Calculate initial program break (brk) dynamically from loaded ELF segment boundaries
     let mut max_vaddr = 0;
     for segment in &elf_info.segments {
-        let end = segment.vaddr + segment.mem_size;
+        let end = segment.vaddr + main_bias + segment.mem_size;
         if end > max_vaddr {
             max_vaddr = end;
         }
@@ -230,15 +238,16 @@ pub fn spawn_user_process_with_pid(name: alloc::string::String, elf_data: &[u8],
     let mut task = Task::new(pid, name, page_table_root);
     task.address_space.lock().brk = initial_brk;
 
-    // Allocate kernel stack (32 KiB)
-    let kernel_stack_layout = alloc::alloc::Layout::from_size_align(32768, 16).unwrap();
+    // Allocate kernel stack
+    let kernel_stack_layout =
+        alloc::alloc::Layout::from_size_align(crate::process::KERNEL_STACK_SIZE, 16).unwrap();
     // SAFETY: Layout parameters are non-zero size and power-of-two alignment.
     let kernel_stack_base = unsafe { alloc::alloc::alloc(kernel_stack_layout) } as u64;
     task.kernel_stack_base = kernel_stack_base;
-    task.kernel_stack_size = 32768;
+    task.kernel_stack_size = crate::process::KERNEL_STACK_SIZE;
 
     // Set up CpuContext to start at user_process_trampoline
-    let kernel_stack_top = kernel_stack_base + 32768;
+    let kernel_stack_top = kernel_stack_base + crate::process::KERNEL_STACK_SIZE as u64;
     let kernel_stack_top_aligned = kernel_stack_top & !0xF;
 
     let mut context = CpuContext::new(
@@ -248,7 +257,7 @@ pub fn spawn_user_process_with_pid(name: alloc::string::String, elf_data: &[u8],
     );
 
     // Store user program parameters in callee-saved registers for the trampoline
-    context.r12 = elf_info.entry_point;
+    context.r12 = elf_info.entry_point + main_bias;
     context.r13 = user_sp; // User stack pointer (16-byte aligned)
     context.r14 = page_table_root;
     context.r14 = page_table_root;
@@ -324,8 +333,8 @@ pub fn cleanup_address_space() {
             mmap_bump: 0,
             mmap_regions: alloc::vec::Vec::new(),
         }));
-        // Update context CR3 to 0 (kernel task) or kernel PML4
-        task.context.cr3 = 0;
+        // Update context CR3 to kernel PML4
+        task.context.cr3 = kernel_pml4;
         old
     };
     drop(old_address_space);

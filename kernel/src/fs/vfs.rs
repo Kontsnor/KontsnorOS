@@ -162,6 +162,14 @@ impl Vfs {
         }
     }
 
+    /// Collect the current mount table as (mountpoint, fs_name) pairs.
+    pub fn get_mount_list(&self) -> Vec<(String, String)> {
+        self.mounts
+            .values()
+            .map(|e| (e.path.clone(), String::from(e.filesystem.name())))
+            .collect()
+    }
+
     /// Find the filesystem that handles the given path.
     ///
     /// Returns the filesystem and the remaining path within it.
@@ -313,19 +321,28 @@ pub fn init() {
 }
 
 /// Mount a filesystem at the given path.
+/// Also updates the initial (global) mount namespace so per-task namespace
+/// lookups see the same mount table from boot.
 pub fn mount(path: String, filesystem: Arc<dyn FileSystem>) {
+    // Update the legacy VFS instance
     if let Some(ref mut vfs) = *VFS.write() {
-        vfs.mount(path, filesystem);
+        vfs.mount(path.clone(), filesystem.clone());
     }
+    // Also update the global mount namespace used by per-task resolution
+    crate::fs::namespace::global_mount(path, filesystem);
 }
 
 /// Unmount the filesystem at the given path.
+/// Also removes the entry from the initial (global) mount namespace.
 pub fn unmount(path: &str) -> bool {
-    if let Some(ref mut vfs) = *VFS.write() {
+    let in_vfs = if let Some(ref mut vfs) = *VFS.write() {
         vfs.unmount(path)
     } else {
         false
-    }
+    };
+    // Keep the global namespace in sync
+    let in_ns = crate::fs::namespace::global_unmount(path);
+    in_vfs || in_ns
 }
 
 /// Lookup an inode by path.
@@ -358,22 +375,70 @@ pub fn invalidate_dentry(path: &str) {
 }
 
 /// Helper to resolve a user-supplied path to an absolute, normalized path
-/// based on the current task's working directory.
+/// based on the current task's working directory and filesystem jail root.
+///
+/// If the task has a non-"/" `fs_ctx.root`, path resolution is clamped so
+/// that `..` traversal cannot escape the jail boundary.
 pub fn resolve_relative_path(path: &str) -> String {
-    if path.starts_with('/') {
-        crate::fs::path::normalize(path)
-    } else {
-        // Retrieve current task's cwd
-        let cwd = if let Some(pid) = crate::process::scheduler::current_pid() {
-            if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
-                task_arc.lock().cwd.clone()
+    // Retrieve current task's cwd and jail root
+    let (cwd, jail_root) = if let Some(pid) = crate::process::scheduler::current_pid() {
+        // Skip fs_ctx access for kernel bootstrap threads (PID 0–2) which may
+        // not yet have a fully-initialized or stable fs_ctx Arc during early boot.
+        // Also use try_lock() to avoid blocking on a lock already held by an
+        // interrupted context.
+        if pid.as_u64() <= 2 {
+            (
+                alloc::string::String::from("/"),
+                alloc::string::String::from("/"),
+            )
+        } else if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+            if let Some(task) = task_arc.try_lock() {
+                let root = task.fs_ctx.read().root.clone();
+                (task.cwd.clone(), root)
             } else {
-                alloc::string::String::from("/")
+                (
+                    alloc::string::String::from("/"),
+                    alloc::string::String::from("/"),
+                )
             }
         } else {
-            alloc::string::String::from("/")
+            (
+                alloc::string::String::from("/"),
+                alloc::string::String::from("/"),
+            )
+        }
+    } else {
+        (
+            alloc::string::String::from("/"),
+            alloc::string::String::from("/"),
+        )
+    };
+
+    if jail_root == "/" {
+        // Fast path: no jail active, behaviour identical to before.
+        if path.starts_with('/') {
+            crate::fs::path::normalize(path)
+        } else {
+            crate::fs::path::normalize(&crate::fs::path::join(&cwd, path))
+        }
+    } else {
+        // If the path already has the jail_root prefix (e.g. from an earlier resolution),
+        // don't prepend jail_root again.
+        if path == jail_root || path.starts_with(&alloc::format!("{}/", jail_root)) {
+            return crate::fs::path::normalize_jailed(path, &jail_root);
+        }
+
+        // Jail path: prepend the jail root to absolute paths, then clamp.
+        let full_path = if path.starts_with('/') {
+            if path == "/" {
+                jail_root.clone()
+            } else {
+                alloc::format!("{}{}", jail_root, path)
+            }
+        } else {
+            crate::fs::path::join(&cwd, path)
         };
-        crate::fs::path::normalize(&crate::fs::path::join(&cwd, path))
+        crate::fs::path::normalize_jailed(&full_path, &jail_root)
     }
 }
 
@@ -402,5 +467,6 @@ pub fn resolve_relative_path_at(dfd: i32, path: &str) -> Result<String, Errno> {
 /// Helper to get the current real-world timestamp in seconds.
 pub fn current_time_sec() -> u32 {
     let ticks = crate::arch::x86_64::interrupts::timer_ticks();
-    (1782158506 + (ticks / 100)) as u32
+    let boot_sec = crate::syscall::process::info::boot_realtime_sec();
+    (boot_sec + (ticks / 100)) as u32
 }

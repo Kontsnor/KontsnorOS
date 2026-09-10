@@ -202,6 +202,45 @@ pub fn internet_checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// Compute TCP/UDP checksum with IPv4 pseudo-header (RFC 793, RFC 768).
+pub fn compute_transport_checksum(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    protocol: u8,
+    segment: &[u8],
+) -> u16 {
+    let mut sum: u32 = 0;
+
+    // Pseudo-header:
+    sum += u16::from_be_bytes([src_ip.octets[0], src_ip.octets[1]]) as u32;
+    sum += u16::from_be_bytes([src_ip.octets[2], src_ip.octets[3]]) as u32;
+    sum += u16::from_be_bytes([dst_ip.octets[0], dst_ip.octets[1]]) as u32;
+    sum += u16::from_be_bytes([dst_ip.octets[2], dst_ip.octets[3]]) as u32;
+    sum += protocol as u32;
+    sum += segment.len() as u32;
+
+    // Segment data:
+    let mut i = 0;
+    while i + 1 < segment.len() {
+        sum += u16::from_be_bytes([segment[i], segment[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < segment.len() {
+        sum += (segment[i] as u32) << 8;
+    }
+
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    let csum = !(sum as u16);
+    if csum == 0 {
+        0xFFFF
+    } else {
+        csum
+    }
+}
+
 /// A routing table entry.
 #[derive(Debug, Clone)]
 pub struct RouteEntry {
@@ -400,8 +439,15 @@ pub fn send_packet(
     if dst_mac.is_none() {
         super::arp::send_request(next_hop);
         let start_ticks = crate::arch::x86_64::interrupts::timer_ticks();
-        while dst_mac.is_none() && crate::arch::x86_64::interrupts::timer_ticks() - start_ticks < 5
+        let mut last_req = start_ticks;
+        while dst_mac.is_none() && crate::arch::x86_64::interrupts::timer_ticks() - start_ticks < 50
         {
+            crate::drivers::net::e1000::handle_interrupt();
+            let now = crate::arch::x86_64::interrupts::timer_ticks();
+            if now - last_req >= 10 {
+                super::arp::send_request(next_hop);
+                last_req = now;
+            }
             core::hint::spin_loop();
             dst_mac = super::arp::lookup(next_hop);
         }

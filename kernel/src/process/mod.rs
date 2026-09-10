@@ -36,6 +36,9 @@ pub use binaries::create_net_test_elf;
 pub use binaries::{hello_elf, net_test_elf, shell_elf};
 pub use lifecycle::{spawn_kernel_thread, spawn_user_process, spawn_user_process_with_pid};
 
+/// Size of the per-task kernel stack in bytes (128 KiB).
+pub const KERNEL_STACK_SIZE: usize = 131_072;
+
 /// Initialize the process management subsystem.
 pub fn init() {
     pid::init();

@@ -75,13 +75,10 @@ pub fn lapic_eoi() {
 
 /// Read the current Local APIC ID.
 pub fn get_lapic_id() -> u8 {
-    if LAPIC_BASE.load(Ordering::Relaxed) == 0 {
-        return 0;
-    }
-    unsafe {
-        // APIC ID is in bits 24-31 of the ID register
-        (lapic_read(LAPIC_REG_ID) >> 24) as u8
-    }
+    // Read the Initial APIC ID directly via CPUID leaf 1 (EBX[31:24]).
+    // This is safe, lockless, non-memory-accessing, and cannot page-fault under any page table.
+    let cpuid = core::arch::x86_64::__cpuid(1);
+    (cpuid.ebx >> 24) as u8
 }
 
 // ── I/O APIC Helper Functions ───────────────────────────────────────
@@ -180,12 +177,29 @@ pub fn init() {
     let ioapic_virt = ioapic_phys + phys_offset();
     IOAPIC_BASE.store(ioapic_virt, Ordering::SeqCst);
 
-    kprintln!(
-        "[apic] I/O APIC ID {} base physical: {:#x}, virtual: {:#x}",
-        madt_info.io_apics[0].id,
-        ioapic_phys,
-        ioapic_virt
-    );
+    // Ensure LAPIC and I/O APIC physical MMIO addresses are mapped at their higher-half virtual addresses
+    {
+        use x86_64::structures::paging::mapper::Mapper;
+        use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
+        use x86_64::{PhysAddr, VirtAddr};
+
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+        let lapic_page = Page::<Size4KiB>::containing_address(VirtAddr::new(lapic_virt));
+        let lapic_frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(lapic_phys));
+        let ioapic_page = Page::<Size4KiB>::containing_address(VirtAddr::new(ioapic_virt));
+        let ioapic_frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(ioapic_phys));
+
+        // SAFETY: Mapping LAPIC and I/O APIC physical MMIO addresses into higher-half virtual space is required for hardware interrupt routing.
+        unsafe {
+            let mut mapper = crate::memory::r#virtual::active_page_table();
+            if mapper.translate_page(lapic_page).is_err() {
+                let _ = crate::memory::r#virtual::map_page(lapic_page, lapic_frame, flags);
+            }
+            if mapper.translate_page(ioapic_page).is_err() {
+                let _ = crate::memory::r#virtual::map_page(ioapic_page, ioapic_frame, flags);
+            }
+        }
+    }
 
     // 4. Initialize Local APIC on the BSP (Bootstrap Processor)
     unsafe {

@@ -300,6 +300,10 @@ impl ExtInode {
     /// Implement VFS unlink.
     pub fn unlink_dir_entry(&self, name: &str) -> Result<(), i32> {
         let child_ino = self.remove_directory_entry(name).map_err(|_| -2)?; // ENOENT
+        crate::memory::page_cache::page_cache_invalidate_inode(
+            crate::fs::ext::EXT_DEV_ID,
+            child_ino as u64,
+        );
         self.fs
             .decrement_links_count(child_ino, false)
             .map_err(|_| -5)?; // EIO

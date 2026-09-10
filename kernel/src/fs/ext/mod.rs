@@ -34,6 +34,9 @@ pub use types::{
     Superblock,
 };
 
+/// Filesystem device ID for primary ext block filesystem.
+pub const EXT_DEV_ID: u64 = 1;
+
 /// Helper to count free bits (zeros) in a bitmap buffer.
 pub(crate) fn count_free_bits(bitmap: &[u8], total_count: u32) -> u32 {
     let mut count = 0;
@@ -800,6 +803,7 @@ impl ExtFileSystem {
         };
 
         let mut inode = Inode::new(ino as u64, file_type);
+        inode.dev = EXT_DEV_ID;
         inode.size = i_size as u64;
         inode.permissions = FilePermissions::new(i_mode);
         inode.nlink = i_links_count as u32;
@@ -996,17 +1000,7 @@ impl FileSystem for ExtFileSystem {
             None => return,
         };
 
-        let mut dirty_inodes = ::alloc::vec::Vec::new();
-        {
-            let cache = crate::memory::page_cache::PAGE_CACHE.lock();
-            for (key, entry) in cache.iter() {
-                if entry.dirty {
-                    dirty_inodes.push(key.0);
-                }
-            }
-        }
-        dirty_inodes.sort_unstable();
-        dirty_inodes.dedup();
+        let dirty_inodes = crate::memory::page_cache::dirty_inodes_for_dev(EXT_DEV_ID);
 
         for ino in dirty_inodes {
             if let Ok(inode) = self_arc.get_inode(ino as u32) {

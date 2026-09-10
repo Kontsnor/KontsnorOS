@@ -130,29 +130,22 @@ pub fn remove_sleep_timeout(pid: crate::process::pid::Pid) {
 }
 
 pub fn check_sleep_timeouts() {
-    let mut timeouts = SLEEP_TIMEOUTS.lock();
     let current_ticks = crate::arch::x86_64::interrupts::timer_ticks();
-    let mut pids_to_wake = Vec::new();
-    timeouts.retain(|&(pid, expire_ticks)| {
-        if current_ticks >= expire_ticks {
-            pids_to_wake.push(pid);
-            false
-        } else {
-            true
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(mut sched_lock) = crate::process::scheduler::SCHEDULER.try_lock() {
+            if let Some(ref mut sched) = *sched_lock {
+                let mut timeouts = SLEEP_TIMEOUTS.lock();
+                timeouts.retain(|&(pid, expire_ticks)| {
+                    if current_ticks >= expire_ticks {
+                        sched.wake_task(pid);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
         }
     });
-    drop(timeouts);
-    if !pids_to_wake.is_empty() {
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            if let Some(mut sched_lock) = crate::process::scheduler::SCHEDULER.try_lock() {
-                if let Some(ref mut sched) = *sched_lock {
-                    for pid in pids_to_wake {
-                        sched.wake_task(pid);
-                    }
-                }
-            }
-        });
-    }
 }
 
 /// `sys_epoll_create1(flags)` — Create an epoll instance.

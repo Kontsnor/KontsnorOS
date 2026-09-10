@@ -35,6 +35,7 @@
 
 use crate::kprintln;
 pub mod cgroupfs;
+pub mod dcache;
 pub mod devfs;
 pub mod epoll;
 pub mod eventfd;
@@ -42,6 +43,8 @@ pub mod ext;
 pub mod file;
 pub mod inode;
 pub mod inotify;
+pub mod kstats;
+pub mod namespace;
 pub mod path;
 pub mod pidfd;
 pub mod pipe;

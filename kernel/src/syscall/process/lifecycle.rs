@@ -114,6 +114,28 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
             child_task.rlimit_nofile_max = parent_task.rlimit_nofile_max;
             child_task.cmdline = parent_task.cmdline.clone();
             child_task.umask = parent_task.umask;
+
+            // Inherit filesystem context: child shares the parent's mount namespace
+            // (and jail root) via Arc clone.  On unshare(CLONE_NEWNS) the child
+            // will replace its Arc with a private deep-cloned MountNamespace.
+            child_task.fs_ctx = Arc::new(spin::RwLock::new(parent_task.fs_ctx.read().fork()));
+
+            // Clone UTS namespace so child can independently change its hostname
+            // after unshare(CLONE_NEWUTS).
+            child_task.uts_ns = parent_task.uts_ns.clone();
+
+            // Inherit the parent's PID namespace, or enter the unshared PID
+            // namespace if parent previously called unshare(CLONE_NEWPID).
+            if let Some(new_pid_ns) = parent_task.child_pid_ns_id {
+                child_task.pid_ns_id = new_pid_ns;
+                crate::kprintln!(
+                    "[namespace] Forked child PID {} entered new PID namespace {}",
+                    child_pid.as_u64(),
+                    child_task.pid_ns_id
+                );
+            } else {
+                child_task.pid_ns_id = parent_task.pid_ns_id;
+            }
         } else {
             return Errno::ESRCH.into();
         }
@@ -121,18 +143,20 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
     child_task.pending_signals = 0; // Fork clears pending signals
     child_task.parent_pid = current_pid;
 
-    // Allocate a 32 KiB kernel stack for the child
-    let layout = alloc::alloc::Layout::from_size_align(32768, 16).unwrap();
+    // Allocate a kernel stack for the child
+    let layout =
+        alloc::alloc::Layout::from_size_align(crate::process::KERNEL_STACK_SIZE, 16).unwrap();
     let kstack_base = unsafe { alloc::alloc::alloc(layout) } as u64;
     if kstack_base == 0 {
         return Errno::ENOMEM.into();
     }
     child_task.kernel_stack_base = kstack_base;
-    child_task.kernel_stack_size = 32768;
+    child_task.kernel_stack_size = crate::process::KERNEL_STACK_SIZE;
 
     // Copy the parent's SavedRegisters to the top of the child's kernel stack.
     // SavedRegisters size is 128 bytes, which is 16-byte aligned.
-    let child_regs_ptr = (kstack_base + 32768 - 128) as *mut crate::syscall::SavedRegisters;
+    let child_regs_ptr = (kstack_base + crate::process::KERNEL_STACK_SIZE as u64 - 128)
+        as *mut crate::syscall::SavedRegisters;
     unsafe {
         core::ptr::write(child_regs_ptr, *regs);
     }
@@ -481,11 +505,18 @@ pub fn sys_execve(
 
     let mut exec_mmap_regions = alloc::vec::Vec::new();
 
+    let min_vaddr = elf_info.segments.iter().map(|s| s.vaddr).min().unwrap_or(0);
+    let main_bias = if elf_info.is_pie || min_vaddr == 0 {
+        crate::process::elf::USER_SPACE_BASE
+    } else {
+        0u64
+    };
+
     let main_max_vaddr = match map_elf_segments(
         new_page_table,
         &elf_info.segments,
         &active_inode,
-        0,
+        main_bias,
         &mut exec_mmap_regions,
         Some(&path),
     ) {
@@ -495,7 +526,7 @@ pub fn sys_execve(
 
     let initial_brk = (main_max_vaddr + 4095) & !4095;
 
-    let mut entry = elf_info.entry_point;
+    let mut entry = elf_info.entry_point + main_bias;
     let mut interpreter_base = 0;
     if let Some(ref interp_path) = elf_info.interpreter {
         let interp_inode = match crate::fs::vfs::lookup_follow(interp_path, true) {
@@ -570,8 +601,8 @@ pub fn sys_execve(
     let init_stack = match crate::process::elf::construct_user_stack(
         &argv,
         &envp,
-        elf_info.entry_point,
-        elf_info.phdr,
+        elf_info.entry_point + main_bias,
+        elf_info.phdr + main_bias,
         elf_info.phnum,
         elf_info.phent,
         interpreter_base,
@@ -793,13 +824,21 @@ pub fn sys_execve(
 
 /// `exit(status)` — Terminate the calling process.
 pub fn sys_exit(status: i32) -> SyscallResult {
-    // kprintln!("[syscall] exit(status={})", status);
+    crate::kprintln!(
+        "[process exit] PID {:?} exiting with status {}",
+        scheduler::current_pid(),
+        status
+    );
     crate::process::scheduler::exit_current_thread(status);
 }
 
 /// `exit_group(status)` — Terminate all threads in the thread group.
 pub fn sys_exit_group(status: i32) -> SyscallResult {
-    // kprintln!("[syscall] exit_group(status={})", status);
+    crate::kprintln!(
+        "[process exit_group] PID {:?} exiting with status {}",
+        scheduler::current_pid(),
+        status
+    );
 
     let current_pid = match scheduler::current_pid() {
         Some(p) => p,
@@ -1262,7 +1301,8 @@ pub fn sys_clone(
             None => return Errno::ESRCH.into(),
         };
 
-    let child_page_table = if flags & 0x00000100 != 0 {
+    let is_clone_vm = flags & 0x00000100 != 0;
+    let child_page_table = if is_clone_vm {
         // CLONE_VM: share page tables
         parent_cr3
     } else {
@@ -1276,11 +1316,7 @@ pub fn sys_clone(
     let mut child_task = Task::new(
         child_pid,
         alloc::format!("clone:{}", child_pid),
-        if flags & 0x00000100 != 0 {
-            0
-        } else {
-            child_page_table
-        },
+        if is_clone_vm { 0 } else { child_page_table },
     );
 
     if flags & 0x00200000 != 0 {
@@ -1347,6 +1383,48 @@ pub fn sys_clone(
             child_task.rlimit_nofile_max = parent_task.rlimit_nofile_max;
             child_task.cmdline = parent_task.cmdline.clone();
             child_task.umask = parent_task.umask;
+
+            // ── Namespace propagation for clone() ─────────────────────────────
+
+            // CLONE_NEWNS: child gets a private copy of the mount namespace.
+            if flags & CLONE_NEWNS != 0 {
+                let new_ns = parent_task.fs_ctx.read().mount_ns.read().fork();
+                child_task.fs_ctx = Arc::new(spin::RwLock::new(
+                    crate::fs::namespace::FsContext::new_initial(alloc::sync::Arc::new(
+                        spin::RwLock::new(new_ns),
+                    )),
+                ));
+                child_task.fs_ctx.write().root = parent_task.fs_ctx.read().root.clone();
+            } else {
+                // Shared mount namespace (Arc clone).
+                child_task.fs_ctx = Arc::new(spin::RwLock::new(parent_task.fs_ctx.read().fork()));
+            }
+
+            // CLONE_NEWUTS: child gets its own UTS namespace copy.
+            // Since uts_ns is Clone the child always starts with parent's values;
+            // after CLONE_NEWUTS, sethostname() will not affect the parent.
+            child_task.uts_ns = parent_task.uts_ns.clone();
+
+            // CLONE_NEWPID: child becomes the init of a new PID namespace.
+            // We assign a fresh pid_ns_id; the child is still visible to the host
+            // with its real PID, but kill/wait4/procfs are restricted by pid_ns_id.
+            if flags & CLONE_NEWPID != 0 {
+                child_task.pid_ns_id = crate::fs::namespace::alloc_pid_ns_id();
+                crate::kprintln!(
+                    "[namespace] PID {} entered new PID namespace {}",
+                    child_pid.as_u64(),
+                    child_task.pid_ns_id
+                );
+            } else if let Some(new_pid_ns) = parent_task.child_pid_ns_id {
+                child_task.pid_ns_id = new_pid_ns;
+                crate::kprintln!(
+                    "[namespace] Cloned child PID {} entered new PID namespace {}",
+                    child_pid.as_u64(),
+                    child_task.pid_ns_id
+                );
+            } else {
+                child_task.pid_ns_id = parent_task.pid_ns_id;
+            }
         } else {
             return Errno::ESRCH.into();
         }
@@ -1354,15 +1432,17 @@ pub fn sys_clone(
     child_task.pending_signals = 0;
     child_task.parent_pid = current_pid;
 
-    let layout = alloc::alloc::Layout::from_size_align(32768, 16).unwrap();
+    let layout =
+        alloc::alloc::Layout::from_size_align(crate::process::KERNEL_STACK_SIZE, 16).unwrap();
     let kstack_base = unsafe { alloc::alloc::alloc(layout) } as u64;
     if kstack_base == 0 {
         return Errno::ENOMEM.into();
     }
     child_task.kernel_stack_base = kstack_base;
-    child_task.kernel_stack_size = 32768;
+    child_task.kernel_stack_size = crate::process::KERNEL_STACK_SIZE;
 
-    let child_regs_ptr = (kstack_base + 32768 - 128) as *mut crate::syscall::SavedRegisters;
+    let child_regs_ptr = (kstack_base + crate::process::KERNEL_STACK_SIZE as u64 - 128)
+        as *mut crate::syscall::SavedRegisters;
     unsafe {
         core::ptr::write(child_regs_ptr, *regs);
         if child_stack != 0 {
@@ -1527,4 +1607,108 @@ pub fn sys_clone3(
         newtls,
         regs,
     )
+}
+
+// ── Namespace Flags ───────────────────────────────────────────────────────────
+
+/// Linux `clone` flag: give the process a private copy of its mount namespace.
+pub const CLONE_NEWNS: u64 = 0x0002_0000;
+/// Linux `clone` flag: give the process a private UTS namespace.
+pub const CLONE_NEWUTS: u64 = 0x0400_0000;
+/// Linux `clone` flag: give the process a new PID namespace.
+pub const CLONE_NEWPID: u64 = 0x2000_0000;
+
+/// `unshare(flags)` — Disassociate parts of the process execution context.
+///
+/// Supported flags:
+///
+/// - **`CLONE_NEWNS`** (`0x00020000`): Create a private copy of the current
+///   mount namespace.  Future `mount(2)` / `umount2(2)` calls will only affect
+///   this task's namespace, not any peer that still shares the old one.
+///
+/// - **`CLONE_NEWUTS`** (`0x04000000`): Create a private UTS namespace so that
+///   `sethostname(2)` / `setdomainname(2)` only affect this task.
+///
+/// - **`CLONE_NEWPID`** (`0x20000000`): Create a new PID namespace for subsequent
+///   children created by this task via `fork(2)` or `clone(2)`.
+///
+/// Requires `euid == 0` for `CLONE_NEWNS` and `CLONE_NEWPID` (as on Linux).
+/// Returns 0 on success, or a negative errno.
+pub fn sys_unshare(flags: u64) -> SyscallResult {
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+
+    let task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(a) => a,
+        None => return Errno::ESRCH.into(),
+    };
+
+    // ── CLONE_NEWNS: private mount namespace ──────────────────────────────────
+    if (flags & CLONE_NEWNS) != 0 {
+        // Require root for mount namespace creation (Linux behaviour).
+        if task_arc.lock().euid != 0 {
+            return Errno::EPERM.into();
+        }
+
+        // Fork the current MountNamespace into a private clone.
+        let new_ns = {
+            let task = task_arc.lock();
+            let old_ns = task.fs_ctx.read().mount_ns.read().fork();
+            alloc::sync::Arc::new(spin::RwLock::new(old_ns))
+        };
+
+        // Install the new private namespace on this task.
+        {
+            let task = task_arc.lock();
+            task.fs_ctx.write().mount_ns = new_ns;
+        }
+
+        crate::kprintln!(
+            "[namespace] PID {} unshared mount namespace",
+            current_pid.as_u64()
+        );
+    }
+
+    // ── CLONE_NEWUTS: private UTS namespace ───────────────────────────────────
+    if (flags & CLONE_NEWUTS) != 0 {
+        // UTS namespace cloning just duplicates the current hostname/domainname
+        // into the task — since uts_ns is already per-task (Clone), the task
+        // already owns its own copy.  We just log for visibility.
+        //
+        // A subsequent sethostname() call will modify task.uts_ns.hostname
+        // without touching any sibling's UTS state (handled in sys_sethostname).
+        crate::kprintln!(
+            "[namespace] PID {} unshared UTS namespace (hostname=\"{}\")",
+            current_pid.as_u64(),
+            task_arc.lock().uts_ns.hostname
+        );
+    }
+
+    // ── CLONE_NEWPID: new PID namespace for subsequent children ───────────────
+    if (flags & CLONE_NEWPID) != 0 {
+        if task_arc.lock().euid != 0 {
+            return Errno::EPERM.into();
+        }
+
+        let new_pid_ns = crate::fs::namespace::alloc_pid_ns_id();
+        task_arc.lock().child_pid_ns_id = Some(new_pid_ns);
+
+        crate::kprintln!(
+            "[namespace] PID {} unshared PID namespace (future children will be in PID ns {})",
+            current_pid.as_u64(),
+            new_pid_ns
+        );
+    }
+
+    // Ignore unknown/unsupported flags and return success (Linux behaviour for
+    // unrecognised but harmless flags is EINVAL; we are lenient here to avoid
+    // breaking container runtimes that OR in extra flags).
+    let supported = CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWPID;
+    if (flags & !supported) != 0 {
+        return Errno::EINVAL.into();
+    }
+
+    0
 }

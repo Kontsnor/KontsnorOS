@@ -379,12 +379,16 @@ pub fn deliver_signal_to_pgrp(pgid: u64, sig: i32) {
     if sig < 1 || sig > 64 || pgid == 0 {
         return;
     }
+    let caller_ns_id = scheduler::current_pid()
+        .and_then(scheduler::get_task_arc)
+        .map(|t| t.lock().pid_ns_id)
+        .unwrap_or(0);
     let tasks = scheduler::TASKS.read();
     let mut pids = alloc::vec::Vec::new();
     for task_opt in tasks.iter() {
         if let Some(task_arc) = task_opt {
             let task = task_arc.lock();
-            if task.pgid == pgid {
+            if (caller_ns_id == 0 || task.pid_ns_id == caller_ns_id) && task.pgid == pgid {
                 pids.push(task.pid);
             }
         }

@@ -58,6 +58,46 @@ pub fn normalize(path: &str) -> String {
     result
 }
 
+/// Normalize `path` while ensuring it never escapes `root`.
+///
+/// This is the jail-aware variant used by the VFS path resolver when a task
+/// has a non-`"/"` `FsContext::root`.  A `..` component that would pop above
+/// `root_components` is silently clamped, making `chroot` escapes impossible
+/// via repeated `../` traversal.
+///
+/// Both `path` and `root` must be absolute (`/`-prefixed) strings; `root`
+/// should already be normalized.
+pub fn normalize_jailed(path: &str, root: &str) -> String {
+    // Build the root component stack so we know the minimum depth.
+    let root_parts: Vec<&str> = root.split('/').filter(|s| !s.is_empty()).collect();
+    let root_depth = root_parts.len();
+
+    let mut components: Vec<&str> = Vec::new();
+
+    for component in path.split('/') {
+        match component {
+            "" | "." => continue,
+            ".." => {
+                // Only pop if we have more components than the root floor.
+                if components.len() > root_depth {
+                    components.pop();
+                }
+                // If already at root floor, the `..` is silently discarded.
+            }
+            name => components.push(name),
+        }
+    }
+
+    // Ensure components at least contains the root floor.
+    if components.len() < root_depth {
+        components = root_parts;
+    }
+
+    let mut result = String::from("/");
+    result.push_str(&components.join("/"));
+    result
+}
+
 /// Split a path into its parent directory and final component.
 ///
 /// # Examples

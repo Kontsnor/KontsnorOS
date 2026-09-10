@@ -106,12 +106,8 @@ lazy_static! {
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         }
 
-        // Page fault uses a separate IST stack
-        unsafe {
-            idt.page_fault
-                .set_handler_fn(page_fault_handler)
-                .set_stack_index(gdt::PAGE_FAULT_IST_INDEX);
-        }
+        // Page fault runs on the kernel stack (TSS RSP0 on Ring 3 entry)
+        idt.page_fault.set_handler_fn(page_fault_handler);
 
         // ── Hardware Interrupts (APIC) ─────────────────────────────
         idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
@@ -212,11 +208,10 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) {
-    let active_gs = unsafe { x86_64::registers::model_specific::Msr::new(0xC0000101).read() };
     let is_user = stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3;
-    let swap_needed = is_user || (active_gs < 0xFFFF800000000000);
+    let swap_needed = is_user;
     if swap_needed {
-        // SAFETY: Swap to kernel GS base if entering from user space or if user GS is active
+        // SAFETY: Swap to kernel GS base if entering from user space
         unsafe {
             core::arch::asm!("swapgs", options(nostack, preserves_flags));
         }
@@ -252,11 +247,9 @@ extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) -> ! {
-    let active_gs = unsafe { x86_64::registers::model_specific::Msr::new(0xC0000101).read() };
-    let swap_needed = (stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3)
-        || (active_gs < 0xFFFF800000000000);
+    let swap_needed = stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3;
     if swap_needed {
-        // SAFETY: Swap to kernel GS base if entering from user space or if user GS is active
+        // SAFETY: Swap to kernel GS base if entering from user space
         unsafe {
             core::arch::asm!("swapgs", options(nostack, preserves_flags));
         }
@@ -272,11 +265,9 @@ extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
-    let active_gs = unsafe { x86_64::registers::model_specific::Msr::new(0xC0000101).read() };
-    let swap_needed = (stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3)
-        || (active_gs < 0xFFFF800000000000);
+    let swap_needed = stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3;
     if swap_needed {
-        // SAFETY: Swap to kernel GS base if entering from user space or if user GS is active
+        // SAFETY: Swap to kernel GS base if entering from user space
         unsafe {
             core::arch::asm!("swapgs", options(nostack, preserves_flags));
         }
@@ -390,21 +381,16 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                                 if !pt_entry.is_unused() {
                                     let mut flags = pt_entry.flags();
                                     if flags.contains(PageTableFlags::BIT_9) {
-                                        // This is a Copy-on-Write page!
+                                        // This is a Copy-on-Write page! (_pt_lock already held from line 344)
                                         if let Ok(old_frame) = pt_entry.frame() {
                                             let old_phys = old_frame.start_address().as_u64();
                                             let idx = (old_phys / 4096) as usize;
 
                                             use core::sync::atomic::Ordering;
-                                            let is_sole_owner = crate::memory::physical::FRAME_REFS
+                                            let ref_count = crate::memory::physical::FRAME_REFS
                                                 [idx]
-                                                .compare_exchange(
-                                                    1,
-                                                    1,
-                                                    Ordering::SeqCst,
-                                                    Ordering::SeqCst,
-                                                )
-                                                .is_ok();
+                                                .load(Ordering::SeqCst);
+                                            let is_sole_owner = ref_count <= 1;
 
                                             if is_sole_owner {
                                                 // Not shared anymore! Mark as writable directly
@@ -414,10 +400,6 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
 
                                                 // Flush local TLB for this virtual address
                                                 x86_64::instructions::tlb::flush(fault_addr);
-                                                let ref_count = crate::memory::physical::FRAME_REFS
-                                                    [idx]
-                                                    .load(Ordering::SeqCst);
-                                                kprintln!("[debug pf] CoW sole owner resolved at vaddr {:#x}, refcount={}", fault_addr.as_u64(), ref_count);
                                                 return; // Fault resolved!
                                             } else {
                                                 // Shared page! Allocate a new page frame, copy contents, and map writable
@@ -435,40 +417,18 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                                                         );
                                                     }
 
-                                                    // Decrement old frame's reference count
-                                                    crate::memory::physical::decrement_ref(
+                                                    flags.remove(PageTableFlags::BIT_9);
+                                                    flags.insert(PageTableFlags::WRITABLE);
+                                                    pt_entry
+                                                        .set_addr(PhysAddr::new(new_phys), flags);
+
+                                                    // Decrement old frame's reference count now that pt_entry points to new_phys
+                                                    crate::memory::physical::deallocate_frame(
                                                         old_phys,
                                                     );
 
-                                                    // Re-verify that pt_entry still points to old_phys before writing
-                                                    if let Ok(current_frame) = pt_entry.frame() {
-                                                        if current_frame.start_address().as_u64()
-                                                            == old_phys
-                                                        {
-                                                            flags.remove(PageTableFlags::BIT_9);
-                                                            flags.insert(PageTableFlags::WRITABLE);
-                                                            pt_entry.set_addr(
-                                                                PhysAddr::new(new_phys),
-                                                                flags,
-                                                            );
-
-                                                            // Flush local TLB for this virtual address
-                                                            x86_64::instructions::tlb::flush(
-                                                                fault_addr,
-                                                            );
-                                                        } else {
-                                                            // Another core already handled the page fault, deallocate the new frame
-                                                            crate::memory::physical::deallocate_frame(new_phys);
-                                                        }
-                                                    } else {
-                                                        crate::memory::physical::deallocate_frame(
-                                                            new_phys,
-                                                        );
-                                                    }
-                                                    let ref_count =
-                                                        crate::memory::physical::FRAME_REFS[idx]
-                                                            .load(Ordering::SeqCst);
-                                                    kprintln!("[debug pf] CoW shared resolved at vaddr {:#x}, refcount of old was {}, now {}", fault_addr.as_u64(), ref_count + 1, ref_count);
+                                                    // Flush local TLB for this virtual address
+                                                    x86_64::instructions::tlb::flush(fault_addr);
                                                     return; // Fault resolved!
                                                 }
                                             }
@@ -501,12 +461,8 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
     if !error_code.contains(x86_64::structures::idt::PageFaultErrorCode::PROTECTION_VIOLATION)
         && fault_addr.as_u64() < 0x0000_8000_0000_0000
     {
-        kprintln!("[debug pf] start for vaddr {:#x}", fault_addr.as_u64());
         let resolved = crate::process::scheduler::current_pid()
-            .and_then(|pid| {
-                kprintln!("[debug pf] pid={}", pid.as_u64());
-                crate::process::scheduler::get_task_arc(pid)
-            })
+            .and_then(|pid| crate::process::scheduler::get_task_arc(pid))
             .and_then(|task_arc| {
                 let fault_vaddr = fault_addr.as_u64();
                 let address_space_arc = {
@@ -553,10 +509,8 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
 
                 let is_shared = region.is_shared;
 
-                kprintln!("[debug pf] checking inode for vaddr={:#x}", page_vaddr);
                 let (phys, do_cow) = match region.inode {
                     Some(ref inode) => {
-                        kprintln!("[debug pf] file-backed page");
                         let file_offset = region.offset + page_offset;
                         match crate::memory::page_cache::get_or_create_page(inode, file_offset) {
                             Ok(p) => {
@@ -569,20 +523,16 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                         }
                     }
                     None => {
-                        kprintln!("[debug pf] anon page: calling allocate_frame");
                         match crate::memory::physical::allocate_frame() {
                             Some(p) => {
-                                kprintln!("[debug pf] allocated frame {:#x}", p);
                                 let dest =
                                     (p + crate::memory::r#virtual::phys_mem_offset()) as *mut u8;
                                 unsafe {
                                     core::ptr::write_bytes(dest, 0, 4096);
                                 }
-                                kprintln!("[debug pf] zeroed frame");
                                 (p, false)
                             }
                             None => {
-                                kprintln!("[debug pf] allocate_frame returned None (ENOMEM)!");
                                 return Some(Err((-12, page_vaddr))); // ENOMEM
                             }
                         }
@@ -593,19 +543,8 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                     let mut flags = page_flags;
                     flags.remove(PageTableFlags::WRITABLE);
                     flags.insert(PageTableFlags::BIT_9);
-                    kprintln!(
-                        "[debug pf] phys={:#x}, do_cow = true, flags before={:?}, after={:?}",
-                        phys,
-                        page_flags,
-                        flags
-                    );
                     flags
                 } else {
-                    kprintln!(
-                        "[debug pf] phys={:#x}, do_cow = false, flags={:?}",
-                        phys,
-                        page_flags
-                    );
                     page_flags
                 };
 
@@ -613,17 +552,14 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
 
                 unsafe {
                     if region.inode.is_some() {
-                        kprintln!("[debug pf] incrementing ref count");
                         crate::memory::physical::increment_ref(phys);
                     }
 
-                    kprintln!("[debug pf] ensure directory permissions");
                     crate::memory::r#virtual::ensure_directory_permissions(
                         page_table_root,
                         VirtAddr::new(page_vaddr),
                     );
 
-                    kprintln!("[debug pf] mapping user page");
                     match crate::memory::r#virtual::map_user_page_no_shootdown(
                         page_table_root,
                         page,
@@ -642,7 +578,6 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                             return Some(Ok(()));
                         }
                         Err(_e) => {
-                            kprintln!("[debug pf] map_user_page failed!");
                             if region.inode.is_some() {
                                 crate::memory::physical::decrement_ref(phys);
                             } else {
@@ -654,19 +589,17 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
 
                     let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
                     let active_cr3 = cr3_frame.start_address().as_u64();
-                    if active_cr3 != page_table_root && active_cr3 != 0 {
-                        let _ = crate::memory::r#virtual::map_user_page_no_shootdown(
+                    if active_cr3 != page_table_root {
+                        crate::kprintln!(
+                            "[WARN pf] active_cr3 {:#x} != page_table_root {:#x} (pid {:?})",
                             active_cr3,
-                            page,
-                            frame,
-                            actual_flags,
+                            page_table_root,
+                            crate::process::scheduler::current_pid()
                         );
                     }
                 }
 
-                kprintln!("[debug pf] flushing TLB");
                 x86_64::instructions::tlb::flush(VirtAddr::new(page_vaddr));
-                kprintln!("[debug pf] done successfully");
                 Some(Ok(()))
             });
 
@@ -768,6 +701,9 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     // Check sleep timeouts and active timerfds
     crate::fs::timerfd::check_timers();
     crate::fs::epoll::check_sleep_timeouts();
+
+    // Poll network interface for incoming packets
+    crate::drivers::net::e1000::handle_interrupt();
 
     // Acknowledge the timer interrupt to the Local APIC
     super::apic::lapic_eoi();

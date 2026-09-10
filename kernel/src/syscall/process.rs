@@ -39,5 +39,5 @@ pub use info::{
 };
 pub use lifecycle::{
     sys_arch_prctl, sys_brk, sys_clone, sys_clone3, sys_execve, sys_exit, sys_exit_group, sys_fork,
-    sys_prctl, sys_sched_yield, sys_set_tid_address, sys_vfork, sys_wait4, sys_waitid,
+    sys_prctl, sys_sched_yield, sys_set_tid_address, sys_unshare, sys_vfork, sys_wait4, sys_waitid,
 };

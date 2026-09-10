@@ -314,6 +314,12 @@ pub fn sys_openat2(
 }
 
 /// `chroot(path)` — change root directory.
+///
+/// Sets the task's filesystem jail root so that all subsequent absolute path
+/// lookups are interpreted relative to `path` and `..` traversal is clamped
+/// at this boundary.
+///
+/// Requires `euid == 0`.
 pub fn sys_chroot(path_ptr: *const u8) -> SyscallResult {
     let current_pid = match crate::process::scheduler::current_pid() {
         Some(p) => p,
@@ -336,13 +342,27 @@ pub fn sys_chroot(path_ptr: *const u8) -> SyscallResult {
     if !inode.inode().is_dir() {
         return Errno::ENOTDIR.into();
     }
+    // Update the jail root so that future path resolution is clamped here.
+    // Also update cwd to be "/" (relative to the new root).
     if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
-        task_arc.lock().cwd = resolved;
+        let mut task = task_arc.lock();
+        task.fs_ctx.write().root = resolved.clone();
+        // After chroot, cwd is "/" inside the new root (= resolved on the host).
+        task.cwd = resolved;
     }
     0
 }
 
 /// `pivot_root(new_root, put_old)` — change the root mount.
+///
+/// Atomically swaps the mount namespace entries so that `new_root` becomes
+/// the new root mount (`/`) and the old root is moved to `put_old`.
+///
+/// The task must have a **private** mount namespace (obtained by calling
+/// `unshare(CLONE_NEWNS)` first); otherwise `EINVAL` is returned.
+///
+/// After `pivot_root`, the caller should `umount2(put_old, MNT_DETACH)` to
+/// fully unhook the host root from the container's view.
 pub fn sys_pivot_root(new_root_ptr: *const u8, put_old_ptr: *const u8) -> SyscallResult {
     let current_pid = match crate::process::scheduler::current_pid() {
         Some(p) => p,
@@ -361,20 +381,83 @@ pub fn sys_pivot_root(new_root_ptr: *const u8, put_old_ptr: *const u8) -> Syscal
         Some(p) => p,
         None => return Errno::EFAULT.into(),
     };
+
     let new_res = crate::fs::vfs::resolve_relative_path(&new_root);
     let old_res = crate::fs::vfs::resolve_relative_path(&put_old);
+
+    // Validate that both paths exist.
     if crate::fs::vfs::lookup(&new_res).is_none() || crate::fs::vfs::lookup(&old_res).is_none() {
         return Errno::ENOENT.into();
     }
+
+    // Retrieve the task's mount namespace Arc.
+    let (ns_arc, initial_ns_id) = match crate::process::scheduler::get_task_arc(current_pid) {
+        Some(task_arc) => {
+            let task = task_arc.lock();
+            let ns_arc = task.fs_ctx.read().mount_ns.clone();
+            let initial_id = crate::fs::namespace::INITIAL_MOUNT_NS.read().id;
+            (ns_arc, initial_id)
+        }
+        None => return Errno::ESRCH.into(),
+    };
+
+    // Refuse to operate on the shared global namespace — the task must have
+    // already called unshare(CLONE_NEWNS) to get a private namespace.
+    if ns_arc.read().id == initial_ns_id {
+        return Errno::EINVAL.into();
+    }
+
+    {
+        let mut ns = ns_arc.write();
+
+        // Retrieve the filesystem that is currently mounted at new_root.
+        let new_root_fs = match ns.mounts.get(&new_res).cloned() {
+            Some(fs) => fs,
+            None => {
+                // new_root is a directory but not a distinct mount point.
+                // Bind it to itself (mount the underlying FS at put_old).
+                // Fall through with the root FS.
+                match ns.mounts.get("/").cloned() {
+                    Some(fs) => fs,
+                    None => return Errno::EINVAL.into(),
+                }
+            }
+        };
+
+        // The current root FS.
+        let old_root_fs = match ns.mounts.get("/").cloned() {
+            Some(fs) => fs,
+            None => return Errno::EINVAL.into(),
+        };
+
+        // Move the old root to put_old, install new_root as the new root.
+        ns.mounts.remove("/");
+        ns.mounts.remove(&new_res);
+        ns.mounts.insert(old_res.clone(), old_root_fs);
+        ns.mounts.insert(String::from("/"), new_root_fs);
+    }
+
+    // Update the task's jail root and cwd to the new root.
+    if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+        let mut task = task_arc.lock();
+        task.fs_ctx.write().root = String::from("/");
+        task.cwd = String::from("/");
+    }
+
+    crate::kprintln!(
+        "[namespace] pivot_root: {} -> /, old root at {}",
+        new_res,
+        old_res
+    );
     0
 }
 
 /// Linux magic numbers for reboot(2).
-pub const LINUX_REBOOT_MAGIC1: i32 = -32993683; // 0xfee1dead as i32
-pub const LINUX_REBOOT_MAGIC2: i32 = 672274793;
-pub const LINUX_REBOOT_MAGIC2A: i32 = 85072278;
-pub const LINUX_REBOOT_MAGIC2B: i32 = 369367448;
-pub const LINUX_REBOOT_MAGIC2C: i32 = 537993216;
+pub const LINUX_REBOOT_MAGIC1: u32 = 0xfee1dead;
+pub const LINUX_REBOOT_MAGIC2: u32 = 672274793;
+pub const LINUX_REBOOT_MAGIC2A: u32 = 85072278;
+pub const LINUX_REBOOT_MAGIC2B: u32 = 369367448;
+pub const LINUX_REBOOT_MAGIC2C: u32 = 537993216;
 
 pub const LINUX_REBOOT_CMD_RESTART: u32 = 0x01234567;
 pub const LINUX_REBOOT_CMD_HALT: u32 = 0xcdef0123;
@@ -384,7 +467,7 @@ pub const LINUX_REBOOT_CMD_POWER_OFF: u32 = 0x4321fedc;
 pub const LINUX_REBOOT_CMD_RESTART2: u32 = 0xa1b2c3d4;
 
 /// `reboot(magic1, magic2, cmd, arg)` — reboot or enable/disable Ctrl-Alt-Del.
-pub fn sys_reboot(magic1: i32, magic2: i32, cmd: u32, _arg: *const u8) -> SyscallResult {
+pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: *const u8) -> SyscallResult {
     if magic1 != LINUX_REBOOT_MAGIC1
         || (magic2 != LINUX_REBOOT_MAGIC2
             && magic2 != LINUX_REBOOT_MAGIC2A
@@ -418,12 +501,19 @@ pub fn sys_reboot(magic1: i32, magic2: i32, cmd: u32, _arg: *const u8) -> Syscal
         }
         LINUX_REBOOT_CMD_HALT | LINUX_REBOOT_CMD_POWER_OFF => {
             crate::kprintln!("[kernel] System power off requested via reboot()");
-            // QEMU / ACPI poweroff
-            // SAFETY: Standard QEMU poweroff port write
+            // Allow pending PTY router and serial queues to drain to console
+            for _ in 0..100 {
+                crate::process::scheduler::yield_now();
+            }
+            // QEMU / ACPI poweroff & ISA debug exit
+            // SAFETY: Standard QEMU poweroff and debug-exit port write
             unsafe {
                 use x86_64::instructions::port::Port;
                 let mut p = Port::<u16>::new(0x604);
                 p.write(0x2000);
+
+                let mut debug_exit = Port::<u32>::new(0xf4);
+                debug_exit.write(0x10); // QEMU exit code 33 ((0x10 << 1) | 1)
             }
             0
         }

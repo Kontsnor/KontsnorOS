@@ -156,9 +156,28 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> SyscallResult {
         Some(t) => t,
         None => return 0,
     };
-    let cwd = task_arc.lock().cwd.clone();
+    let (cwd, jail_root) = {
+        let task = task_arc.lock();
+        let jail = task.fs_ctx.read().root.clone();
+        (task.cwd.clone(), jail)
+    };
 
-    let cwd_bytes = cwd.as_bytes();
+    let jail_str = jail_root.as_str();
+    let display_cwd = if jail_str == "/" {
+        cwd
+    } else if cwd == jail_str {
+        alloc::string::String::from("/")
+    } else if let Some(stripped) = cwd.strip_prefix(jail_str) {
+        if stripped.starts_with('/') {
+            alloc::string::String::from(stripped)
+        } else {
+            alloc::format!("/{}", stripped)
+        }
+    } else {
+        alloc::string::String::from("/")
+    };
+
+    let cwd_bytes = display_cwd.as_bytes();
     if cwd_bytes.len() + 1 > size {
         return Errno::EINVAL.into(); // buffer too small
     }
@@ -213,7 +232,7 @@ fn populate_stat(inode_ops: &dyn crate::fs::inode::InodeOps) -> LinuxStat {
     let mode = file_type_to_st_mode(inode.file_type) | (inode.permissions.mode as u32);
 
     LinuxStat {
-        st_dev: 0,
+        st_dev: inode.dev,
         st_ino: inode.ino,
         st_nlink: inode.nlink as u64,
         st_mode: mode,
@@ -957,9 +976,32 @@ struct PollFd {
 }
 
 /// `poll(fds, nfds, timeout)` — Wait for events on file descriptors.
+struct PollWaitGuard {
+    wq: alloc::sync::Arc<crate::sync::wait_queue::WaitQueue>,
+}
+
+impl PollWaitGuard {
+    fn new() -> Self {
+        let wq = alloc::sync::Arc::new(crate::sync::wait_queue::WaitQueue::new());
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            crate::fs::epoll::EPOLL_WAIT_QUEUES.lock().push(wq.clone());
+        });
+        Self { wq }
+    }
+}
+
+impl Drop for PollWaitGuard {
+    fn drop(&mut self) {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut wqs = crate::fs::epoll::EPOLL_WAIT_QUEUES.lock();
+            wqs.retain(|w| !alloc::sync::Arc::ptr_eq(w, &self.wq));
+        });
+    }
+}
+
+/// `poll(fds, nfds, timeout)` — Wait for events on file descriptors.
 ///
-/// Stub: marks all fds as having POLLIN|POLLOUT ready and returns immediately.
-/// A real implementation would block in the scheduler until events fire.
+/// Marks ready fds and blocks until events occur, timeout expires, or a signal is caught.
 pub fn sys_poll(fds: *mut u8, nfds: u64, timeout: i32) -> SyscallResult {
     if fds.is_null() || nfds == 0 {
         return 0;
@@ -983,6 +1025,8 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, timeout: i32) -> SyscallResult {
     } else {
         None
     };
+
+    let mut poll_guard: Option<PollWaitGuard> = None;
 
     loop {
         let mut ready = 0i64;
@@ -1041,20 +1085,12 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, timeout: i32) -> SyscallResult {
             }
         }
 
-        // Sleep on wait queue with timeout instead of burning CPU in yield_now()
+        // Sleep on wait queue registered in EPOLL_WAIT_QUEUES with timeout
         if let Some(limit) = timeout_ticks {
             crate::fs::epoll::add_sleep_timeout(current_pid, start_ticks + limit);
         }
-        if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
-            let wait_queue = {
-                let mut task = task_arc.lock();
-                task.state = crate::process::task::TaskState::Blocked;
-                task.child_wait_queue.clone()
-            };
-            wait_queue.register(current_pid);
-            crate::process::scheduler::schedule();
-            wait_queue.remove(current_pid);
-        }
+        let guard = poll_guard.get_or_insert_with(PollWaitGuard::new);
+        guard.wq.wait();
         if timeout_ticks.is_some() {
             crate::fs::epoll::remove_sleep_timeout(current_pid);
         }
@@ -1135,6 +1171,8 @@ pub fn sys_pselect6(
 
     let start_ticks = crate::arch::x86_64::interrupts::timer_ticks();
     let timeout_ticks = timeout_ms.map(|ms| if ms > 0 { ((ms as u64) + 9) / 10 } else { 0 });
+
+    let mut pselect_guard: Option<PollWaitGuard> = None;
 
     loop {
         let mut out_read = [0u64; 16];
@@ -1232,7 +1270,14 @@ pub fn sys_pselect6(
             }
         }
 
-        crate::process::scheduler::yield_now();
+        if let Some(limit) = timeout_ticks {
+            crate::fs::epoll::add_sleep_timeout(current_pid, start_ticks + limit);
+        }
+        let guard = pselect_guard.get_or_insert_with(PollWaitGuard::new);
+        guard.wq.wait();
+        if timeout_ticks.is_some() {
+            crate::fs::epoll::remove_sleep_timeout(current_pid);
+        }
     }
 }
 
@@ -1617,7 +1662,38 @@ pub fn sys_mount(
         _ => return Errno::EINVAL.into(),
     };
 
-    crate::fs::vfs::mount(target_path, fs_instance);
+    // If the calling task has a private mount namespace, insert into it.
+    // Otherwise, fall through to the global VFS.
+    let has_private_ns = if let Some(pid) = crate::process::scheduler::current_pid() {
+        if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+            let task = task_arc.lock();
+            let ns_id = task.fs_ctx.read().mount_ns.read().id;
+            let initial_id = crate::fs::namespace::INITIAL_MOUNT_NS.read().id;
+            ns_id != initial_id
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if has_private_ns {
+        // Mount into the task's private namespace only.
+        if let Some(pid) = crate::process::scheduler::current_pid() {
+            if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+                let task = task_arc.lock();
+                task.fs_ctx
+                    .read()
+                    .mount_ns
+                    .write()
+                    .mounts
+                    .insert(target_path, fs_instance);
+            }
+        }
+    } else {
+        // Global mount (boot-time or non-containerised process).
+        crate::fs::vfs::mount(target_path, fs_instance);
+    }
     0
 }
 
@@ -1631,6 +1707,40 @@ pub fn sys_umount2(target: *const u8, _flags: i32) -> SyscallResult {
         None => return Errno::EFAULT.into(),
     };
     let target_path = crate::fs::vfs::resolve_relative_path(&target_raw);
+
+    // Operate on private namespace if the task has one.
+    let has_private_ns = if let Some(pid) = crate::process::scheduler::current_pid() {
+        if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+            let task = task_arc.lock();
+            let ns_id = task.fs_ctx.read().mount_ns.read().id;
+            let initial_id = crate::fs::namespace::INITIAL_MOUNT_NS.read().id;
+            ns_id != initial_id
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if has_private_ns {
+        if let Some(pid) = crate::process::scheduler::current_pid() {
+            if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+                let task = task_arc.lock();
+                let removed = task
+                    .fs_ctx
+                    .read()
+                    .mount_ns
+                    .write()
+                    .mounts
+                    .remove(&target_path)
+                    .is_some();
+                if removed {
+                    return 0;
+                }
+            }
+        }
+        return Errno::EINVAL.into();
+    }
 
     if crate::fs::vfs::unmount(&target_path) {
         0

@@ -257,11 +257,14 @@ pub fn init() {
 /// Build a TCP packet into a buffer.
 pub fn build_tcp_packet(
     buf: &mut [u8],
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
     src_port: u16,
     dst_port: u16,
     seq: u32,
     ack: u32,
     flags: u16,
+    window: u16,
     payload: &[u8],
 ) -> Option<usize> {
     let header_len = 20;
@@ -278,7 +281,7 @@ pub fn build_tcp_packet(
         seq_num: seq.to_be(),
         ack_num: ack.to_be(),
         data_offset_flags: data_offset_flags.to_be(),
-        window: (65535u16).to_be(),
+        window: window.to_be(),
         checksum: 0,
         urgent_ptr: 0,
     };
@@ -288,7 +291,12 @@ pub fn build_tcp_packet(
     buf[0..20].copy_from_slice(header_bytes);
     buf[20..total_len].copy_from_slice(payload);
 
-    let checksum = super::ipv4::internet_checksum(&buf[..total_len]);
+    let checksum = super::ipv4::compute_transport_checksum(
+        src_ip,
+        dst_ip,
+        super::ipv4::PROTO_TCP,
+        &buf[..total_len],
+    );
     buf[16..18].copy_from_slice(&checksum.to_be_bytes());
 
     Some(total_len)
@@ -302,6 +310,17 @@ pub fn handle_packet(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, payload: &[u8]) {
         let seq = header.seq_num_host();
         let ack = header.ack_num_host();
         let flags = header.flags();
+
+        // crate::kprintln!(
+        //     "[tcp::handle_packet] {}:{} -> {}:{}, flags={:#x}, seq={}, ack={}",
+        //     src_ip,
+        //     src_port,
+        //     dst_ip,
+        //     dst_port,
+        //     flags,
+        //     seq,
+        //     ack
+        // );
 
         if let Some(sock_arc) =
             super::socket::find_tcp_connection(dst_ip, dst_port, src_ip, src_port)
@@ -320,15 +339,18 @@ pub fn handle_packet(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, payload: &[u8]) {
                     tcp_payload,
                 )
             };
-            if let Some((reply_seq, reply_ack, reply_flags)) = reply {
+            if let Some((reply_seq, reply_ack, reply_flags, reply_wnd)) = reply {
                 let mut tcp_buf = [0u8; 128];
                 if let Some(tcp_len) = build_tcp_packet(
                     &mut tcp_buf,
+                    dst_ip,
+                    src_ip,
                     dst_port,
                     src_port,
                     reply_seq,
                     reply_ack,
                     reply_flags,
+                    reply_wnd,
                     &[],
                 ) {
                     let _ = super::ipv4::send_packet(
@@ -356,6 +378,7 @@ pub fn handle_packet(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, payload: &[u8]) {
                         child_sock.local_port = Some(dst_port);
                         child_sock.remote_addr = Some(src_ip);
                         child_sock.remote_port = Some(src_port);
+                        child_sock.had_remote_addr = true;
                         child_sock.tcp_state = TcpState::SynReceived;
                         child_sock.tcp_rcv_nxt = seq.wrapping_add(1);
                         child_sock.tcp_snd_nxt = 1000;
@@ -374,11 +397,14 @@ pub fn handle_packet(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, payload: &[u8]) {
                     let mut tcp_buf = [0u8; 128];
                     if let Some(tcp_len) = build_tcp_packet(
                         &mut tcp_buf,
+                        dst_ip,
+                        src_ip,
                         dst_port,
                         src_port,
                         child_snd_nxt,
                         child_rcv_nxt,
                         TCP_SYN | TCP_ACK,
+                        65535,
                         &[],
                     ) {
                         let _ = super::ipv4::send_packet(
@@ -404,16 +430,30 @@ fn process_segment(
     ack: u32,
     flags: u16,
     payload: &[u8],
-) -> Option<(u32, u32, u16)> {
+) -> Option<(u32, u32, u16, u16)> {
+    // Helper: compute the current receive window based on how full tcp_recv_buf is.
+    // We cap it at 65535. When the buffer is at the hard limit we advertise 0.
+    let rcv_wnd = |buf_len: usize| -> u16 {
+        const MAX_BUF: usize = 65536;
+        (MAX_BUF.saturating_sub(buf_len) as u32).min(65535) as u16
+    };
+
     let mut reply = None;
     match sock.tcp_state {
         TcpState::SynSent => {
-            if (flags & TCP_SYN != 0) && (flags & TCP_ACK != 0) {
+            if flags & TCP_RST != 0 {
+                // Connection refused by remote.
+                sock.so_error = 111; // ECONNREFUSED
+                sock.tcp_state = TcpState::Closed;
+                sock.wait_queue.wake_all();
+            } else if (flags & TCP_SYN != 0) && (flags & TCP_ACK != 0) {
                 sock.tcp_rcv_nxt = seq.wrapping_add(1);
                 sock.tcp_snd_una = ack;
+                sock.so_error = 0;
                 sock.tcp_state = TcpState::Established;
 
-                reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK));
+                let wnd = rcv_wnd(sock.tcp_recv_buf.len());
+                reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK, wnd));
                 sock.wait_queue.wake_all();
             }
         }
@@ -425,30 +465,76 @@ fn process_segment(
             }
         }
         TcpState::Established => {
+            if flags & TCP_RST != 0 {
+                sock.so_error = 104; // ECONNRESET
+                sock.tcp_state = TcpState::Closed;
+                sock.wait_queue.wake_all();
+                return None;
+            }
             if flags & TCP_ACK != 0 {
                 sock.tcp_snd_una = ack;
             }
 
             if !payload.is_empty() {
+                const MAX_BUF: usize = 65536;
                 if seq == sock.tcp_rcv_nxt {
-                    let max_buf_limit = 65536;
-                    if sock.tcp_recv_buf.len() + payload.len() <= max_buf_limit {
+                    // In-order segment.
+                    if sock.tcp_recv_buf.len() + payload.len() <= MAX_BUF {
                         sock.tcp_recv_buf.extend_from_slice(payload);
                         sock.tcp_rcv_nxt = seq.wrapping_add(payload.len() as u32);
 
-                        reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK));
+                        // Drain any now-consecutive out-of-order segments.
+                        loop {
+                            // BTreeMap is ordered; peek the smallest key.
+                            let next_seq = sock.tcp_rcv_nxt;
+                            if let Some(ooo_payload) = sock.tcp_ooo_queue.remove(&next_seq) {
+                                if sock.tcp_recv_buf.len() + ooo_payload.len() <= MAX_BUF {
+                                    sock.tcp_recv_buf.extend_from_slice(&ooo_payload);
+                                    sock.tcp_rcv_nxt =
+                                        next_seq.wrapping_add(ooo_payload.len() as u32);
+                                } else {
+                                    // No space; put it back and stop draining.
+                                    sock.tcp_ooo_queue.insert(next_seq, ooo_payload);
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+
+                        let wnd = rcv_wnd(sock.tcp_recv_buf.len());
+                        reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK, wnd));
                         sock.wait_queue.wake_all();
                     } else {
-                        reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK));
+                        // Buffer full: ACK with window=0 to stop remote from sending.
+                        let wnd = rcv_wnd(sock.tcp_recv_buf.len());
+                        reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK, wnd));
                     }
+                } else if seq.wrapping_sub(sock.tcp_rcv_nxt) < 0x8000_0000 {
+                    // Out-of-order segment (seq > rcv_nxt in sequence-space).
+                    // Store in OOO queue only if total OOO buffer doesn't blow up.
+                    let ooo_used: usize = sock.tcp_ooo_queue.values().map(|v| v.len()).sum();
+                    if ooo_used + payload.len() <= MAX_BUF {
+                        sock.tcp_ooo_queue
+                            .entry(seq)
+                            .or_insert_with(|| payload.to_vec());
+                    }
+                    // Send a duplicate ACK so the remote knows what we're waiting for.
+                    let wnd = rcv_wnd(sock.tcp_recv_buf.len());
+                    reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK, wnd));
+                } else {
+                    // Retransmit of already-received data: re-ACK to keep remote in sync.
+                    let wnd = rcv_wnd(sock.tcp_recv_buf.len());
+                    reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK, wnd));
                 }
             }
 
             if flags & TCP_FIN != 0 {
-                sock.tcp_rcv_nxt = seq.wrapping_add(1);
+                sock.tcp_rcv_nxt = sock.tcp_rcv_nxt.wrapping_add(1);
                 sock.tcp_state = TcpState::CloseWait;
 
-                reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK));
+                let wnd = rcv_wnd(sock.tcp_recv_buf.len());
+                reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK, wnd));
                 sock.wait_queue.wake_all();
             }
         }
@@ -459,14 +545,14 @@ fn process_segment(
             }
             if flags & TCP_FIN != 0 {
                 sock.tcp_rcv_nxt = seq.wrapping_add(1);
-                reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK));
+                reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK, 65535));
                 sock.tcp_state = TcpState::Closing;
             }
         }
         TcpState::FinWait2 => {
             if flags & TCP_FIN != 0 {
                 sock.tcp_rcv_nxt = seq.wrapping_add(1);
-                reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK));
+                reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK, 65535));
                 sock.tcp_state = TcpState::Closed;
                 sock.wait_queue.wake_all();
             }

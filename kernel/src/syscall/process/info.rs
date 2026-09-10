@@ -18,6 +18,7 @@
 use super::super::{Errno, SyscallResult};
 use crate::process::scheduler;
 use crate::syscall::validation::{validate_user_ptr, validate_user_ptr_write};
+use alloc::string::String;
 
 /// Linux `uname` struct (sys/utsname.h), each field is 65 bytes.
 #[repr(C)]
@@ -36,6 +37,10 @@ static DOMAINNAME: spin::Mutex<alloc::string::String> =
     spin::Mutex::new(alloc::string::String::new());
 
 /// `uname(buf)` — Write kernel identity information into a `utsname` struct.
+///
+/// Reads `hostname` and `domainname` from the calling task's UTS namespace so
+/// that containers that called `unshare(CLONE_NEWUTS)` + `sethostname()` get
+/// their own view of the system identity.
 pub fn sys_uname(buf: *mut u8) -> SyscallResult {
     if buf.is_null() {
         return Errno::EFAULT.into();
@@ -62,26 +67,34 @@ pub fn sys_uname(buf: *mut u8) -> SyscallResult {
     }
 
     fill(&mut u.sysname, b"Linux");
-    {
-        let h = HOSTNAME.lock();
-        if h.is_empty() {
-            fill(&mut u.nodename, b"kontsnoros");
-        } else {
-            fill(&mut u.nodename, h.as_bytes());
-        }
-    }
     fill(&mut u.release, b"6.1.0-KontsnorOS");
     fill(&mut u.version, b"#1 SMP");
     fill(&mut u.machine, b"x86_64");
-    {
-        let d = DOMAINNAME.lock();
-        if d.is_empty() {
-            fill(&mut u.domainname, b"(none)");
+
+    // Read hostname/domainname from the task's per-task UTS namespace.
+    let (hostname, domainname) = if let Some(pid) = scheduler::current_pid() {
+        if let Some(task_arc) = scheduler::get_task_arc(pid) {
+            let task = task_arc.lock();
+            (task.uts_ns.hostname.clone(), task.uts_ns.domainname.clone())
         } else {
-            fill(&mut u.domainname, d.as_bytes());
+            (String::from("kontsnoros"), String::from("(none)"))
         }
+    } else {
+        (String::from("kontsnoros"), String::from("(none)"))
+    };
+
+    if hostname.is_empty() {
+        fill(&mut u.nodename, b"kontsnoros");
+    } else {
+        fill(&mut u.nodename, hostname.as_bytes());
+    }
+    if domainname.is_empty() {
+        fill(&mut u.domainname, b"(none)");
+    } else {
+        fill(&mut u.domainname, domainname.as_bytes());
     }
 
+    // SAFETY: buf has been validated above via validate_user_ptr_write.
     unsafe {
         core::ptr::write(buf as *mut UtsName, u);
     }
@@ -103,6 +116,31 @@ struct TimeZone {
     tz_dsttime: i32,
 }
 
+/// Boot-time Unix timestamp (seconds since epoch), read from the CMOS RTC
+/// during early kernel init by `init_boot_time()`. All `CLOCK_REALTIME`
+/// values are computed as `BOOT_REALTIME_SEC + monotonic_elapsed`.
+static BOOT_REALTIME_SEC: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Initialise the wall-clock base from the CMOS Real-Time Clock.
+///
+/// Must be called once during early kernel boot (before any time syscall can
+/// be made) and after I/O port access is available (i.e. after GDT/IDT init).
+pub fn init_boot_time() {
+    let unix_sec = crate::arch::x86_64::boot::read_rtc_unix_time();
+    BOOT_REALTIME_SEC.store(unix_sec, core::sync::atomic::Ordering::Relaxed);
+    crate::kprintln!("[time] RTC boot time: {} s (Unix epoch)", unix_sec);
+}
+
+/// Return the boot-time Unix timestamp (seconds since epoch) read from the CMOS RTC.
+///
+/// Used by any kernel subsystem that needs wall-clock seconds without going
+/// through the full `clock_gettime` syscall path.
+#[inline]
+pub fn boot_realtime_sec() -> u64 {
+    BOOT_REALTIME_SEC.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 fn get_monotonic_ns() -> u64 {
     let ticks = crate::arch::x86_64::interrupts::timer_ticks();
     let current_count = crate::arch::x86_64::apic::get_lapic_timer_current() as u64;
@@ -121,7 +159,8 @@ pub fn sys_gettimeofday(tv: *mut u8, tz: *mut u8) -> SyscallResult {
         if validate_user_ptr_write(tv, core::mem::size_of::<TimeVal>()).is_err() {
             return Errno::EFAULT.into();
         }
-        let realtime_ns = 1782158506 * 1_000_000_000 + get_monotonic_ns();
+        let boot_sec = BOOT_REALTIME_SEC.load(core::sync::atomic::Ordering::Relaxed);
+        let realtime_ns = boot_sec * 1_000_000_000 + get_monotonic_ns();
         let t = TimeVal {
             tv_sec: (realtime_ns / 1_000_000_000) as i64,
             tv_usec: ((realtime_ns % 1_000_000_000) / 1000) as i64,
@@ -166,7 +205,8 @@ pub fn sys_clock_gettime(clockid: i32, tp: *mut u8) -> SyscallResult {
     let ts = match clockid {
         0 => {
             // CLOCK_REALTIME
-            let realtime_ns = 1782158506 * 1_000_000_000 + get_monotonic_ns();
+            let boot_sec = BOOT_REALTIME_SEC.load(core::sync::atomic::Ordering::Relaxed);
+            let realtime_ns = boot_sec * 1_000_000_000 + get_monotonic_ns();
             TimeSpec {
                 tv_sec: (realtime_ns / 1_000_000_000) as i64,
                 tv_nsec: (realtime_ns % 1_000_000_000) as i64,
@@ -233,7 +273,8 @@ pub fn sys_nanosleep(req: *const u8, rem: *mut u8) -> SyscallResult {
 
 /// `time(tloc)` — Get time in seconds since the Epoch.
 pub fn sys_time(tloc: *mut i64) -> SyscallResult {
-    let sec = (1782158506 + get_monotonic_ns() / 1_000_000_000) as i64;
+    let boot_sec = BOOT_REALTIME_SEC.load(core::sync::atomic::Ordering::Relaxed);
+    let sec = (boot_sec + get_monotonic_ns() / 1_000_000_000) as i64;
     if !tloc.is_null() {
         if validate_user_ptr_write(tloc as *mut u8, core::mem::size_of::<i64>()).is_err() {
             return Errno::EFAULT.into();
@@ -1096,6 +1137,10 @@ pub fn sys_alarm(_seconds: u32) -> SyscallResult {
 }
 
 /// `sethostname(name, len)` — set system host name.
+///
+/// Writes to the calling task's per-task UTS namespace so that containers
+/// which have called `unshare(CLONE_NEWUTS)` get their own hostname without
+/// affecting the host or sibling processes.
 pub fn sys_sethostname(name: *const u8, len: usize) -> SyscallResult {
     if len > 64 {
         return Errno::EINVAL.into();
@@ -1115,11 +1160,15 @@ pub fn sys_sethostname(name: *const u8, len: usize) -> SyscallResult {
     // SAFETY: Pointer and length validated above
     let bytes = unsafe { core::slice::from_raw_parts(name, len) };
     let s = alloc::string::String::from_utf8_lossy(bytes).into_owned();
-    *HOSTNAME.lock() = s;
+    if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+        task_arc.lock().uts_ns.hostname = s;
+    }
     0
 }
 
 /// `setdomainname(name, len)` — set system NIS domain name.
+///
+/// Writes to the calling task's per-task UTS namespace.
 pub fn sys_setdomainname(name: *const u8, len: usize) -> SyscallResult {
     if len > 64 {
         return Errno::EINVAL.into();
@@ -1139,7 +1188,9 @@ pub fn sys_setdomainname(name: *const u8, len: usize) -> SyscallResult {
     // SAFETY: Pointer and length validated above
     let bytes = unsafe { core::slice::from_raw_parts(name, len) };
     let s = alloc::string::String::from_utf8_lossy(bytes).into_owned();
-    *DOMAINNAME.lock() = s;
+    if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+        task_arc.lock().uts_ns.domainname = s;
+    }
     0
 }
 
@@ -1158,52 +1209,11 @@ pub struct Rseq {
 pub const RSEQ_FLAG_UNREGISTER: i32 = 1;
 
 /// `rseq(rseq, rseq_len, flags, sig)` — register/unregister restartable sequence.
-pub fn sys_rseq(rseq_ptr: *mut Rseq, rseq_len: u32, flags: i32, sig: u32) -> SyscallResult {
-    if rseq_len != 32 {
-        return Errno::EINVAL.into();
-    }
-    if (rseq_ptr as usize) % 32 != 0 {
-        return Errno::EINVAL.into();
-    }
-    if (flags & !RSEQ_FLAG_UNREGISTER) != 0 {
-        return Errno::EINVAL.into();
-    }
-    let current_pid = match scheduler::current_pid() {
-        Some(p) => p,
-        None => return Errno::ESRCH.into(),
-    };
-    let task_arc = match scheduler::get_task_arc(current_pid) {
-        Some(t) => t,
-        None => return Errno::ESRCH.into(),
-    };
-    let mut task = task_arc.lock();
-
-    if (flags & RSEQ_FLAG_UNREGISTER) != 0 {
-        match task.rseq {
-            Some(registered) if registered == (rseq_ptr as u64) && task.rseq_sig == sig => {
-                task.rseq = None;
-                task.rseq_len = 0;
-                task.rseq_sig = 0;
-                0
-            }
-            _ => Errno::EINVAL.into(),
-        }
-    } else {
-        if task.rseq.is_some() {
-            return Errno::EBUSY.into();
-        }
-        if validate_user_ptr_write(rseq_ptr as *mut u8, 32).is_err() {
-            return Errno::EFAULT.into();
-        }
-        // Write CPU ID 0 to cpu_id_start and cpu_id
-        // SAFETY: Pointer is validated and 32-byte aligned
-        unsafe {
-            (*rseq_ptr).cpu_id_start = 0;
-            (*rseq_ptr).cpu_id = 0;
-        }
-        task.rseq = Some(rseq_ptr as u64);
-        task.rseq_len = rseq_len;
-        task.rseq_sig = sig;
-        0
-    }
+///
+/// NOTE: Full rseq requires compiler-level restartable sequence support and
+/// kernel scheduler preemption abort handlers. Returning ENOSYS instructs the
+/// userspace C runtime (musl/glibc) to safely fall back to standard mutexes/atomics,
+/// preventing multi-core data races on CPU 0 arena allocations.
+pub fn sys_rseq(_rseq_ptr: *mut Rseq, _rseq_len: u32, _flags: i32, _sig: u32) -> SyscallResult {
+    Errno::ENOSYS.into()
 }

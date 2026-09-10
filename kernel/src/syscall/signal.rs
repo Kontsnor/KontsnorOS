@@ -63,6 +63,7 @@ pub fn deliver_signal(pid: crate::process::pid::Pid, sig: i32) {
     if sig < 1 || sig > 64 {
         return;
     }
+    crate::kprintln!("[signal deliver] sig {} to PID {:?}", sig, pid);
 
     if let Some(task_arc) = scheduler::get_task_arc(pid) {
         let mut target_core = None;
@@ -101,11 +102,22 @@ pub fn sys_kill(pid: i32, sig: i32) -> SyscallResult {
         return Errno::EINVAL.into();
     }
 
+    let caller_ns_id = {
+        use crate::process::scheduler;
+        scheduler::current_pid()
+            .and_then(scheduler::get_task_arc)
+            .map(|t| t.lock().pid_ns_id)
+            .unwrap_or(0)
+    };
+
     if sig == 0 {
         if pid > 0 {
             use crate::process::scheduler;
             let target_pid = Pid::from_raw(pid as u64);
-            if scheduler::get_task_arc(target_pid).is_some() {
+            if let Some(target_arc) = scheduler::get_task_arc(target_pid) {
+                if caller_ns_id != 0 && target_arc.lock().pid_ns_id != caller_ns_id {
+                    return Errno::ESRCH.into();
+                }
                 return 0;
             } else {
                 return Errno::ESRCH.into();
@@ -118,7 +130,9 @@ pub fn sys_kill(pid: i32, sig: i32) -> SyscallResult {
             let tasks = scheduler::TASKS.read();
             let exists = tasks.iter().any(|t| {
                 if let Some(task_arc) = t {
-                    task_arc.lock().pgid == target_pgid
+                    let task = task_arc.lock();
+                    (caller_ns_id == 0 || task.pid_ns_id == caller_ns_id)
+                        && task.pgid == target_pgid
                 } else {
                     false
                 }
@@ -137,7 +151,10 @@ pub fn sys_kill(pid: i32, sig: i32) -> SyscallResult {
     if pid > 0 {
         use crate::process::scheduler;
         let target_pid = Pid::from_raw(pid as u64);
-        if scheduler::get_task_arc(target_pid).is_some() {
+        if let Some(target_arc) = scheduler::get_task_arc(target_pid) {
+            if caller_ns_id != 0 && target_arc.lock().pid_ns_id != caller_ns_id {
+                return Errno::ESRCH.into();
+            }
             deliver_signal(target_pid, sig);
         } else {
             return Errno::ESRCH.into();
@@ -159,17 +176,22 @@ pub fn sys_kill(pid: i32, sig: i32) -> SyscallResult {
     } else if pid < -1 {
         let target_pgid = (-pid) as u64;
         crate::fs::pty::deliver_signal_to_pgrp(target_pgid, sig);
-    } else {
-        // pid == -1: broadcast to all processes except init
+        // pid == -1: broadcast to all processes in the same PID namespace (except caller and namespace init)
         use crate::process::scheduler;
+        let caller_pid = scheduler::current_pid().map(|p| p.as_u64()).unwrap_or(0);
         let tasks = scheduler::TASKS.read();
         let mut pids = alloc::vec::Vec::new();
         for task_opt in tasks.iter() {
             if let Some(task_arc) = task_opt {
                 let task = task_arc.lock();
-                if task.pid.as_u64() > 1 {
-                    pids.push(task.pid);
+                if caller_ns_id != 0 && task.pid_ns_id != caller_ns_id {
+                    continue;
                 }
+                let host_pid = task.pid.as_u64();
+                if host_pid == caller_pid || host_pid <= 1 {
+                    continue;
+                }
+                pids.push(task.pid);
             }
         }
         drop(tasks);

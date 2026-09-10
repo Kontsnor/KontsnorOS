@@ -364,10 +364,13 @@ pub fn allocate_frame() -> Option<u64> {
                     if let Some(f) = global_alloc.allocate() {
                         if first_frame.is_none() {
                             first_frame = Some(f);
-                        } else {
+                        } else if cache.count < 15 {
                             let count = cache.count;
                             cache.frames[count] = f;
                             cache.count += 1;
+                        } else {
+                            // Cache full — return surplus to global allocator
+                            global_alloc.deallocate(f);
                         }
                     } else {
                         break;

@@ -41,8 +41,8 @@ const REG_MTA: u32 = 0x5200;
 const REG_RAL: u32 = 0x5400;
 const REG_RAH: u32 = 0x5404;
 
-const NUM_RX_DESC: usize = 128;
-const NUM_TX_DESC: usize = 128;
+const NUM_RX_DESC: usize = 512;
+const NUM_TX_DESC: usize = 512;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -113,17 +113,17 @@ impl E1000 {
         let src = self.rx_bufs_virt[self.rx_idx] as *const u8;
         unsafe {
             buf[..len].copy_from_slice(core::slice::from_raw_parts(src, len));
-        }
-
-        unsafe {
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc_ptr).status), 0);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc_ptr).errors), 0);
         }
 
-        self.write_reg(REG_RDT, self.rx_idx as u32);
-
         self.rx_idx = (self.rx_idx + 1) % NUM_RX_DESC;
         Ok(len)
+    }
+
+    fn flush_rx_tail(&self) {
+        let rdt = (self.rx_idx + NUM_RX_DESC - 1) % NUM_RX_DESC;
+        self.write_reg(REG_RDT, rdt as u32);
     }
 
     fn send_packet(&mut self, data: &[u8]) -> Result<(), DriverError> {
@@ -348,7 +348,8 @@ pub unsafe fn init(bus: u8, device: u8, function: u8) {
     let tctl = (1 << 1) | (1 << 3) | (15 << 4) | (64 << 12);
     e1000.write_reg(REG_TCTL, tctl);
 
-    e1000.write_reg(REG_IMS, 0x80 | 0x40);
+    // Enable RXT0 (Receiver Timer Interrupt - 0x1000), RXO (0x80), RXDMT0 (0x40), LSC (0x04)
+    e1000.write_reg(REG_IMS, 0x1000 | 0x80 | 0x40 | 0x04);
 
     let device = Arc::new(E1000Device {
         inner: Mutex::new(e1000),
@@ -388,24 +389,31 @@ pub fn send_packet(data: &[u8]) -> Result<(), DriverError> {
 
 /// Handle interrupt triggered by the e1000 controller.
 pub fn handle_interrupt() {
-    let mut packets = alloc::vec::Vec::new();
+    let mut batch = [[0u8; 1536]; 32];
+    let mut batch_lens = [0usize; 32];
+    let mut count = 0;
+
     if let Some(dev_lock) = E1000_INSTANCE.try_lock() {
         if let Some(ref dev) = *dev_lock {
             if let Some(mut inner) = dev.inner.try_lock() {
                 let _cause = inner.read_reg(REG_ICR);
-                let mut buf = [0u8; 2048];
-                while let Ok(len) = inner.recv_packet(&mut buf) {
-                    if len > 0 {
-                        packets.push(buf[..len].to_vec());
-                    } else {
-                        break;
+                while count < 32 {
+                    match inner.recv_packet(&mut batch[count]) {
+                        Ok(len) if len > 0 => {
+                            batch_lens[count] = len;
+                            count += 1;
+                        }
+                        _ => break,
                     }
+                }
+                if count > 0 {
+                    inner.flush_rx_tail();
                 }
             }
         }
     }
 
-    for packet in packets {
-        crate::net::ethernet::handle_packet(&packet);
+    for i in 0..count {
+        crate::net::ethernet::handle_packet(&batch[i][..batch_lens[i]]);
     }
 }

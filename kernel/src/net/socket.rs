@@ -43,8 +43,8 @@ pub struct Socket {
     pub tcp_snd_una: u32,
     pub tcp_snd_nxt: u32,
     pub tcp_rcv_nxt: u32,
-    pub tcp_recv_buf: Vec<u8>,
-    pub tcp_send_buf: Vec<u8>,
+    pub tcp_recv_buf: VecDeque<u8>,
+    pub tcp_send_buf: VecDeque<u8>,
     pub tcp_backlog: Vec<Arc<Mutex<Socket>>>,
     pub tcp_max_backlog: usize,
     /// Dynamic receive window — shrinks as tcp_recv_buf fills up.
@@ -79,8 +79,8 @@ impl Socket {
             tcp_snd_una: 0,
             tcp_snd_nxt: 0,
             tcp_rcv_nxt: 0,
-            tcp_recv_buf: Vec::new(),
-            tcp_send_buf: Vec::new(),
+            tcp_recv_buf: VecDeque::new(),
+            tcp_send_buf: VecDeque::new(),
             tcp_backlog: Vec::new(),
             tcp_max_backlog: 0,
             tcp_rcv_wnd: 65535,
@@ -155,7 +155,13 @@ impl InodeOps for SocketInode {
             let prev_buf_len = sock.tcp_recv_buf.len();
             let n = buf.len().min(prev_buf_len);
             if n > 0 {
-                buf[..n].copy_from_slice(&sock.tcp_recv_buf[..n]);
+                let (s1, s2) = sock.tcp_recv_buf.as_slices();
+                if s1.len() >= n {
+                    buf[..n].copy_from_slice(&s1[..n]);
+                } else {
+                    buf[..s1.len()].copy_from_slice(s1);
+                    buf[s1.len()..n].copy_from_slice(&s2[..n - s1.len()]);
+                }
                 sock.tcp_recv_buf.drain(..n);
 
                 // Check if user-space drain reopened the receive window significantly
@@ -477,17 +483,30 @@ pub fn find_tcp_connection(
 ) -> Option<Arc<Mutex<Socket>>> {
     let reg = SOCKET_REGISTRY.lock();
     for s in reg.iter() {
-        let s_lock = s.lock();
-        if s_lock.sock_type == 1 {
-            // TCP
-            if s_lock.local_port == Some(local_port)
-                && s_lock.remote_port == Some(remote_port)
-                && (s_lock.local_addr == Some(local_ip)
-                    || s_lock.local_addr == Some(Ipv4Addr::UNSPECIFIED)
-                    || s_lock.local_addr.is_none())
-                && s_lock.remote_addr == Some(remote_ip)
-            {
-                return Some(s.clone());
+        if let Some(s_lock) = s.try_lock() {
+            if s_lock.sock_type == 1 {
+                if s_lock.local_port == Some(local_port)
+                    && s_lock.remote_port == Some(remote_port)
+                    && (s_lock.local_addr == Some(local_ip)
+                        || s_lock.local_addr == Some(Ipv4Addr::UNSPECIFIED)
+                        || s_lock.local_addr.is_none())
+                    && s_lock.remote_addr == Some(remote_ip)
+                {
+                    return Some(s.clone());
+                }
+            }
+        } else {
+            let s_lock = s.lock();
+            if s_lock.sock_type == 1 {
+                if s_lock.local_port == Some(local_port)
+                    && s_lock.remote_port == Some(remote_port)
+                    && (s_lock.local_addr == Some(local_ip)
+                        || s_lock.local_addr == Some(Ipv4Addr::UNSPECIFIED)
+                        || s_lock.local_addr.is_none())
+                    && s_lock.remote_addr == Some(remote_ip)
+                {
+                    return Some(s.clone());
+                }
             }
         }
     }

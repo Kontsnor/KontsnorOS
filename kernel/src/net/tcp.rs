@@ -42,7 +42,7 @@
 //! ```
 
 use super::ipv4::Ipv4Addr;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use spin::Mutex;
 
@@ -143,9 +143,9 @@ pub struct TcpConnection {
     /// Initial receive sequence number.
     pub irs: u32,
     /// Send buffer.
-    pub send_buf: alloc::vec::Vec<u8>,
+    pub send_buf: VecDeque<u8>,
     /// Receive buffer.
-    pub recv_buf: alloc::vec::Vec<u8>,
+    pub recv_buf: VecDeque<u8>,
 }
 
 impl TcpConnection {
@@ -160,8 +160,8 @@ impl TcpConnection {
             rcv_wnd: 65535,
             iss: 0,
             irs: 0,
-            send_buf: alloc::vec::Vec::new(),
-            recv_buf: alloc::vec::Vec::new(),
+            send_buf: VecDeque::new(),
+            recv_buf: VecDeque::new(),
         }
     }
 
@@ -173,14 +173,22 @@ impl TcpConnection {
     /// Read data from the receive buffer.
     pub fn read(&mut self, buf: &mut [u8]) -> usize {
         let n = buf.len().min(self.recv_buf.len());
-        buf[..n].copy_from_slice(&self.recv_buf[..n]);
-        self.recv_buf.drain(..n);
+        if n > 0 {
+            let (s1, s2) = self.recv_buf.as_slices();
+            if s1.len() >= n {
+                buf[..n].copy_from_slice(&s1[..n]);
+            } else {
+                buf[..s1.len()].copy_from_slice(s1);
+                buf[s1.len()..n].copy_from_slice(&s2[..n - s1.len()]);
+            }
+            self.recv_buf.drain(..n);
+        }
         n
     }
 
     /// Queue data for sending.
     pub fn write(&mut self, data: &[u8]) -> usize {
-        self.send_buf.extend_from_slice(data);
+        self.send_buf.extend(data.iter().copied());
         data.len()
     }
 }
@@ -498,56 +506,43 @@ fn process_segment(
                 if !effective_payload.is_empty() && effective_seq == sock.tcp_rcv_nxt {
                     // In-order segment (or trimmed partial overlap that is now in-order).
                     if sock.tcp_recv_buf.len() + effective_payload.len() <= TCP_MAX_RECV_BUF {
-                        sock.tcp_recv_buf.extend_from_slice(effective_payload);
+                        sock.tcp_recv_buf.extend(effective_payload.iter().copied());
                         sock.tcp_rcv_nxt = effective_seq.wrapping_add(effective_payload.len() as u32);
 
                         // Drain any now-consecutive out-of-order segments from OOO queue.
                         loop {
                             let cur_nxt = sock.tcp_rcv_nxt;
-
-                            // Find any OOO key that is either at cur_nxt or partially overlaps cur_nxt
-                            let matching_key = sock.tcp_ooo_queue.keys().cloned().find(|&k| {
-                                k == cur_nxt || (k.wrapping_sub(cur_nxt) >= 0x8000_0000 && {
-                                    let len = sock.tcp_ooo_queue.get(&k).map(|v| v.len() as u32).unwrap_or(0);
-                                    let ooo_end = k.wrapping_add(len);
-                                    ooo_end.wrapping_sub(cur_nxt) < 0x8000_0000 && ooo_end != cur_nxt
-                                })
-                            });
-
-                            if let Some(k) = matching_key {
-                                let peek_len = sock.tcp_ooo_queue.get(&k).map(|v| v.len()).unwrap_or(0);
-                                let overlap = if k == cur_nxt { 0 } else { cur_nxt.wrapping_sub(k) as usize };
-                                let chunk_len = peek_len.saturating_sub(overlap);
-
-                                if chunk_len > 0 {
-                                    if sock.tcp_recv_buf.len() + chunk_len <= TCP_MAX_RECV_BUF {
-                                        if let Some(ooo_data) = sock.tcp_ooo_queue.remove(&k) {
-                                            let chunk = &ooo_data[overlap..];
-                                            sock.tcp_recv_buf.extend_from_slice(chunk);
-                                            sock.tcp_rcv_nxt = cur_nxt.wrapping_add(chunk.len() as u32);
-                                        }
+                            if let Some((&k, _)) = sock.tcp_ooo_queue.first_key_value() {
+                                if k == cur_nxt {
+                                    let ooo_data = sock.tcp_ooo_queue.remove(&k).unwrap();
+                                    if sock.tcp_recv_buf.len() + ooo_data.len() <= TCP_MAX_RECV_BUF {
+                                        let len = ooo_data.len() as u32;
+                                        sock.tcp_recv_buf.extend(ooo_data);
+                                        sock.tcp_rcv_nxt = cur_nxt.wrapping_add(len);
                                     } else {
+                                        sock.tcp_ooo_queue.insert(k, ooo_data);
                                         break;
                                     }
+                                } else if k.wrapping_sub(cur_nxt) >= 0x8000_0000 {
+                                    // k < cur_nxt: stale or overlapping segment
+                                    let ooo_data = sock.tcp_ooo_queue.remove(&k).unwrap();
+                                    let ooo_end = k.wrapping_add(ooo_data.len() as u32);
+                                    if ooo_end.wrapping_sub(cur_nxt) < 0x8000_0000 && ooo_end != cur_nxt {
+                                        let overlap = cur_nxt.wrapping_sub(k) as usize;
+                                        let chunk = &ooo_data[overlap..];
+                                        if sock.tcp_recv_buf.len() + chunk.len() <= TCP_MAX_RECV_BUF {
+                                            let chunk_len = chunk.len() as u32;
+                                            sock.tcp_recv_buf.extend(chunk.iter().copied());
+                                            sock.tcp_rcv_nxt = cur_nxt.wrapping_add(chunk_len);
+                                        } else {
+                                            sock.tcp_ooo_queue.insert(cur_nxt, chunk.to_vec());
+                                            break;
+                                        }
+                                    }
                                 } else {
-                                    sock.tcp_ooo_queue.remove(&k);
+                                    break;
                                 }
                             } else {
-                                // Prune any purely stale OOO keys completely behind cur_nxt
-                                let stale_keys: alloc::vec::Vec<u32> = sock
-                                    .tcp_ooo_queue
-                                    .keys()
-                                    .cloned()
-                                    .filter(|&k| {
-                                        let len = sock.tcp_ooo_queue.get(&k).map(|v| v.len() as u32).unwrap_or(0);
-                                        let ooo_end = k.wrapping_add(len);
-                                        ooo_end.wrapping_sub(cur_nxt) >= 0x8000_0000 || ooo_end == cur_nxt
-                                    })
-                                    .collect();
-
-                                for sk in stale_keys {
-                                    sock.tcp_ooo_queue.remove(&sk);
-                                }
                                 break;
                             }
                         }

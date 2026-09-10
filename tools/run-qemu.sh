@@ -58,12 +58,12 @@ if [ ! -f "$DISK_IMG" ]; then
     dd if=/dev/zero of="$DISK_IMG" bs=1M count=6144 2>/dev/null
 fi
 
-ACCEL_OPTS="-cpu qemu64,+fsgsbase -smp 1"
-if [ -w /dev/kvm ]; then
+ACCEL_OPTS="-cpu qemu64,+fsgsbase -smp 8"
+if [ -w /dev/kvm ] && qemu-system-x86_64 -enable-kvm -cpu host -M none -display none 2>/dev/null; then
     echo "Enabling KVM Hardware Acceleration (-enable-kvm -cpu host -smp 8)..."
     ACCEL_OPTS="-enable-kvm -cpu host -smp 8"
 else
-    echo "KVM unavailable, falling back to software TCG emulation..."
+    echo "KVM unavailable, falling back to software TCG emulation (-cpu qemu64,+fsgsbase -smp 8)..."
 fi
 rm -f /tmp/qmp-kontsnor.sock
 
@@ -73,6 +73,8 @@ qemu-system-x86_64 \
     -serial stdio \
     -display none \
     -m 4G \
+    -netdev user,id=net0 \
+    -device e1000,netdev=net0 \
     -qmp unix:/tmp/qmp-kontsnor.sock,server,nowait \
     $ACCEL_OPTS \
     -no-reboot \

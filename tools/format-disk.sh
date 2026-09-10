@@ -224,12 +224,18 @@ export PATH="/usr/bin:/bin:$PATH"
 STATUS=$?
 echo "Cargo build finished with exit status $STATUS"
 if [ $STATUS -eq 0 ]; then
+    echo "=== NATIVE BUILD SUCCEEDED ==="
     echo "Copying compiled kernel binary to persistent disk..."
     mkdir -p /disk/src/KontsnorOS/target/x86_64-unknown-linux-musl/fast-build/
     cp /tmp/target/x86_64-unknown-linux-musl/fast-build/kontsnor-kernel /disk/src/KontsnorOS/target/x86_64-unknown-linux-musl/fast-build/ 2>/dev/null
+    sync
+    ls -lh /tmp/target/x86_64-unknown-linux-musl/fast-build/kontsnor-kernel /disk/src/KontsnorOS/target/x86_64-unknown-linux-musl/fast-build/kontsnor-kernel 2>/dev/null
+    while true; do sleep 3600; done
+else
+    echo "=== NATIVE BUILD FAILED: $STATUS ==="
+    sync
+    sleep 10
 fi
-sync
-ls -lh /tmp/target/x86_64-unknown-linux-musl/fast-build/kontsnor-kernel /disk/src/KontsnorOS/target/x86_64-unknown-linux-musl/fast-build/kontsnor-kernel 2>/dev/null
 EOF
 chmod +x /tmp/build_cargo.sh
 echo "write /tmp/build_cargo.sh /build_cargo.sh" >> "$CMD_FILE"

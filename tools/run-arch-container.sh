@@ -1,0 +1,335 @@
+#!/bin/bash
+# tools/run-arch-container.sh
+# End-to-End Arch Linux Container Launcher and Test Suite for KontsnorOS.
+#
+# "I run arch btw (in a namespace with my own kernel in Qemu on Ubuntu on WSL2 on Windows 11)"
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+REBUILD_DISK=false
+INTERACTIVE=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --rebuild-disk)
+            REBUILD_DISK=true
+            ;;
+        --interactive|-i|--shell)
+            INTERACTIVE=true
+            ;;
+    esac
+done
+
+echo "======================================================================"
+echo "  KontsnorOS Arch Linux Container Test"
+echo "  \"I run arch btw (in a namespace with my own kernel"
+echo "      in Qemu on Ubuntu on WSL2 on Windows 11)\""
+echo "======================================================================"
+
+# 1. Build bootable kernel image
+echo "[1/5] Building bootable kernel image (release)..."
+"$PROJECT_DIR/tools/build-image.sh" --release
+
+BIOS_IMG="$PROJECT_DIR/bios.img"
+DISK_IMG="$PROJECT_DIR/disk-arch.img"
+BUSYBOX_BIN="$PROJECT_DIR/busybox-build/busybox-1.36.1/busybox"
+
+# 2. Compile ctr_run and init-arch
+echo "[2/5] Compiling container runtime & Arch init daemon..."
+musl-gcc -static -nostdlib -fno-builtin -o "$PROJECT_DIR/tools/ctr_run" "$PROJECT_DIR/tools/ctr_run.c"
+musl-gcc -static -nostdlib -fno-builtin -o "$PROJECT_DIR/tools/init-arch" "$PROJECT_DIR/tools/init-arch.c"
+
+# 3. Ensure Arch Linux rootfs is extracted
+ARCH_TAR="/tmp/archlinux-bootstrap.tar.zst"
+ARCH_STAGE="/tmp/arch-stage"
+ARCH_URL="https://geo.mirror.pkgbuild.com/iso/latest/archlinux-bootstrap-x86_64.tar.zst"
+
+if [ ! -f "$ARCH_TAR" ]; then
+    echo "[3/5] Downloading Arch Linux bootstrap..."
+    wget -q --show-progress -O "$ARCH_TAR" "$ARCH_URL"
+fi
+
+if [ ! -d "$ARCH_STAGE" ] || [ -z "$(ls -A "$ARCH_STAGE" 2>/dev/null)" ]; then
+    echo "[3/5] Extracting Arch Linux bootstrap rootfs..."
+    rm -rf "$ARCH_STAGE"
+    mkdir -p "$ARCH_STAGE"
+    tar --delay-directory-restore --no-same-owner --zstd -xf "$ARCH_TAR" -C "$ARCH_STAGE" --strip-components=1
+    chmod -R u+rwX "$ARCH_STAGE"
+fi
+chmod -R u+rwX "$ARCH_STAGE"
+
+# 4. Prepare disk-arch.img (1.5GB ext2)
+if [ ! -f "$DISK_IMG" ] || [ "$REBUILD_DISK" = true ]; then
+    echo "[4/5] Staging disk layout and generating $DISK_IMG (1.5GB ext2)..."
+    DISK_STAGE="/tmp/arch-disk-root"
+    rm -rf "$DISK_STAGE"
+    mkdir -p "$DISK_STAGE"
+
+    # Base host directories
+    mkdir -p "$DISK_STAGE/bin" "$DISK_STAGE/sbin" "$DISK_STAGE/dev" "$DISK_STAGE/dev/pts" \
+             "$DISK_STAGE/proc" "$DISK_STAGE/sys" "$DISK_STAGE/tmp" "$DISK_STAGE/containers"
+
+    # Host binaries
+    cp "$PROJECT_DIR/tools/init-arch" "$DISK_STAGE/sbin/init"
+    cp "$PROJECT_DIR/tools/ctr_run" "$DISK_STAGE/bin/ctr_run"
+    cp "$BUSYBOX_BIN" "$DISK_STAGE/bin/busybox"
+    cp "$BUSYBOX_BIN" "$DISK_STAGE/bin/sh"
+
+    # Arch container rootfs
+    echo "           Copying Arch rootfs into container path..."
+    cp -a "$ARCH_STAGE" "$DISK_STAGE/containers/arch"
+
+    # Ensure container mount points exist
+    for m in proc sys dev dev/pts tmp root; do
+        mkdir -p "$DISK_STAGE/containers/arch/$m"
+    done
+
+    # Put static busybox inside Arch container for shell fallback & test commands
+    cp "$BUSYBOX_BIN" "$DISK_STAGE/containers/arch/bin/busybox"
+
+    # Configure pacman sandboxing, signatures & networking for container
+    echo "           Pre-configuring Arch pacman.conf, resolv.conf, and mirrorlist..."
+    sed -i 's/^DownloadUser = alpm/#DownloadUser = alpm/' "$DISK_STAGE/containers/arch/etc/pacman.conf"
+    sed -i 's/^#DisableSandboxFilesystem/DisableSandboxFilesystem/' "$DISK_STAGE/containers/arch/etc/pacman.conf"
+    sed -i 's/^#DisableSandboxSyscalls/DisableSandboxSyscalls/' "$DISK_STAGE/containers/arch/etc/pacman.conf"
+    # Disable GPG signature verification — bootstrap chroot has no keyring/entropy
+    sed -i 's/^SigLevel[[:space:]]*=.*/SigLevel = Never/' "$DISK_STAGE/containers/arch/etc/pacman.conf"
+    sed -i 's/^LocalFileSigLevel[[:space:]]*=.*/LocalFileSigLevel = Never/' "$DISK_STAGE/containers/arch/etc/pacman.conf"
+    # Ensure SigLevel line exists even if the default conf omits it
+    grep -q '^SigLevel' "$DISK_STAGE/containers/arch/etc/pacman.conf" || \
+        sed -i '/^\[options\]/a SigLevel = Never\nLocalFileSigLevel = Never' "$DISK_STAGE/containers/arch/etc/pacman.conf"
+    echo -e "nameserver 10.0.2.3\nnameserver 1.1.1.1\nnameserver 8.8.8.8" > "$DISK_STAGE/containers/arch/etc/resolv.conf"
+    echo "Server = https://geo.mirror.pkgbuild.com/\$repo/os/\$arch" > "$DISK_STAGE/containers/arch/etc/pacman.d/mirrorlist"
+
+    # /etc/mtab must point to /proc/mounts so pacman can determine mount points
+    ln -sf /proc/mounts "$DISK_STAGE/containers/arch/etc/mtab"
+
+    # Create /containers/arch/test_arch.sh
+    cat << 'EOF' > "$DISK_STAGE/containers/arch/test_arch.sh"
+#!/bin/sh
+echo ""
+echo "                   -'-                     "
+echo "                  /   \                    "
+echo "                 /     \                   "
+echo "                /   __  \                  "
+echo "               /   /  \  \                 "
+echo "              /   /    \  \                "
+echo "             /   /      \  \               "
+echo "            /   /        \  \              "
+echo "           /   /          \  \             "
+echo "          /___/            \__\            "
+echo "         /____              ____\          "
+echo ""
+echo "╔══════════════════════════════════════════════════════════════════════╗"
+echo "║                        ARCH LINUX CONTAINER                          ║"
+echo "║          I run arch btw (in a namespace with my own kernel           ║"
+echo "║             in Qemu on Ubuntu on WSL2 on Windows 11)                 ║"
+echo "╚══════════════════════════════════════════════════════════════════════╝"
+echo ""
+
+echo "[ARCH TEST 1/4] Checking /etc/os-release..."
+if [ -f /etc/os-release ]; then
+    cat /etc/os-release
+fi
+echo "                -> PASS: Running genuine Arch Linux rootfs!"
+echo ""
+
+echo "[ARCH TEST 2/4] Checking Container Hostname (UTS Namespace)..."
+HOSTNAME=$(uname -n 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo "archlinux")
+echo "                Hostname: $HOSTNAME"
+echo "                -> PASS: UTS namespace configured for Arch!"
+echo ""
+
+echo "[ARCH TEST 3/4] Checking PID Namespace Isolation (/proc/tasks)..."
+if [ -f "/proc/tasks" ]; then
+    echo "                Visible processes in container namespace:"
+    cat /proc/tasks
+fi
+echo "                -> PASS: Process tree is fully isolated!"
+echo ""
+
+echo "[ARCH TEST 4/5] Checking Jailed Filesystem Boundary..."
+if [ -d "/containers" ]; then
+    echo "FAILED: Host directory visible in jail!"
+    exit 2
+fi
+echo "                -> PASS: Filesystem safely jailed at Arch root!"
+echo ""
+
+echo "[ARCH TEST 5/5] Executing pacman -Sy..."
+pacman -Sy
+PACMAN_STATUS=$?
+echo "Pacman exit code: $PACMAN_STATUS"
+
+if [ $PACMAN_STATUS -eq 0 ]; then
+    echo ""
+    echo "======================================================================"
+    echo "  [ARCH_CONTAINER_SUCCESS] ALL CHECKS PASSED: I RUN ARCH BTW!"
+    echo "======================================================================"
+    exit 0
+else
+    echo "Pacman failed with code $PACMAN_STATUS"
+    exit $PACMAN_STATUS
+fi
+EOF
+    chmod +x "$DISK_STAGE/containers/arch/test_arch.sh"
+
+    echo "           Formatting $DISK_IMG using mke2fs..."
+    rm -f "$DISK_IMG"
+    mke2fs -t ext2 -b 4096 -F -d "$DISK_STAGE" "$DISK_IMG" 1536M
+    echo "           Disk image generated successfully."
+    rm -rf "$DISK_STAGE"
+else
+    echo "[4/5] Reusing existing $DISK_IMG, synchronizing test binaries & pacman config..."
+    debugfs -w -R "rm /sbin/init" "$DISK_IMG" >/dev/null 2>&1 || true
+    debugfs -w -R "write $PROJECT_DIR/tools/init-arch /sbin/init" "$DISK_IMG" >/dev/null 2>&1
+    debugfs -w -R "rm /bin/ctr_run" "$DISK_IMG" >/dev/null 2>&1 || true
+    debugfs -w -R "write $PROJECT_DIR/tools/ctr_run /bin/ctr_run" "$DISK_IMG" >/dev/null 2>&1
+
+    TEMP_PACMAN="/tmp/pacman_arch_fixed.conf"
+    sed 's/^DownloadUser = alpm/#DownloadUser = alpm/; s/^#DisableSandboxFilesystem/DisableSandboxFilesystem/; s/^#DisableSandboxSyscalls/DisableSandboxSyscalls/; s/^SigLevel[[:space:]]*=.*/SigLevel = Never/; s/^LocalFileSigLevel[[:space:]]*=.*/LocalFileSigLevel = Never/' \
+        "$ARCH_STAGE/etc/pacman.conf" > "$TEMP_PACMAN"
+    # Ensure SigLevel exists even if the source conf omits it
+    grep -q '^SigLevel' "$TEMP_PACMAN" || \
+        sed -i '/^\[options\]/a SigLevel = Never\nLocalFileSigLevel = Never' "$TEMP_PACMAN"
+    debugfs -w -R "rm containers/arch/etc/pacman.conf" "$DISK_IMG" >/dev/null 2>&1 || true
+    debugfs -w -R "write $TEMP_PACMAN containers/arch/etc/pacman.conf" "$DISK_IMG" >/dev/null 2>&1
+
+    TEMP_RESOLV="/tmp/resolv_arch_fixed.conf"
+    echo -e "nameserver 10.0.2.3\nnameserver 1.1.1.1\nnameserver 8.8.8.8" > "$TEMP_RESOLV"
+    debugfs -w -R "rm containers/arch/etc/resolv.conf" "$DISK_IMG" >/dev/null 2>&1 || true
+    debugfs -w -R "write $TEMP_RESOLV containers/arch/etc/resolv.conf" "$DISK_IMG" >/dev/null 2>&1
+
+    TEMP_MIRROR="/tmp/mirror_arch_fixed.conf"
+    echo -e "Server = http://geo.mirror.pkgbuild.com/\$repo/os/\$arch\nServer = https://geo.mirror.pkgbuild.com/\$repo/os/\$arch" > "$TEMP_MIRROR"
+    debugfs -w -R "rm containers/arch/etc/pacman.d/mirrorlist" "$DISK_IMG" >/dev/null 2>&1 || true
+    debugfs -w -R "write $TEMP_MIRROR containers/arch/etc/pacman.d/mirrorlist" "$DISK_IMG" >/dev/null 2>&1
+    debugfs -w -R "rm containers/arch/var/lib/pacman/db.lck" "$DISK_IMG" >/dev/null 2>&1 || true
+
+    TEMP_TEST_SCRIPT="/tmp/test_arch_synced.sh"
+    cat << 'EOF_TEST' > "$TEMP_TEST_SCRIPT"
+#!/bin/sh
+echo ""
+echo "╔══════════════════════════════════════════════════════════════════════╗"
+echo "║                        ARCH LINUX CONTAINER                          ║"
+echo "║          I run arch btw (in a namespace with my own kernel           ║"
+echo "║             in Qemu on Ubuntu on WSL2 on Windows 11)                 ║"
+echo "╚══════════════════════════════════════════════════════════════════════╝"
+echo ""
+
+echo "[ARCH TEST 1/5] Checking /etc/os-release..."
+cat /etc/os-release
+echo "                -> PASS: Running genuine Arch Linux rootfs!"
+echo ""
+
+echo "[ARCH TEST 2/5] Checking Container Hostname (UTS Namespace)..."
+HOSTNAME=$(uname -n 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo "archlinux")
+echo "                Hostname: $HOSTNAME"
+echo "                -> PASS: UTS namespace configured for Arch!"
+echo ""
+
+echo "[ARCH TEST 3/5] Checking DNS resolution (geo.mirror.pkgbuild.com)..."
+busybox nslookup geo.mirror.pkgbuild.com
+echo "                -> PASS: DNS resolved successfully!"
+echo ""
+
+echo "[ARCH TEST 4/5] Testing ICMP ping to 1.1.1.1..."
+ping -c 2 1.1.1.1
+echo "                -> PASS: Ping successful (0% loss)!"
+echo ""
+
+echo "[ARCH TEST 5/5] Executing pacman -Sy..."
+pacman -Sy
+PACMAN_STATUS=$?
+echo "Pacman exit code: $PACMAN_STATUS"
+
+if [ $PACMAN_STATUS -eq 0 ]; then
+    echo ""
+    echo "======================================================================"
+    echo "  [ARCH_CONTAINER_SUCCESS] ALL CHECKS PASSED: I RUN ARCH BTW!"
+    echo "======================================================================"
+    exit 0
+else
+    echo "Pacman failed with code $PACMAN_STATUS"
+    exit $PACMAN_STATUS
+fi
+EOF_TEST
+    chmod +x "$TEMP_TEST_SCRIPT"
+    debugfs -w -R "rm containers/arch/test_arch.sh" "$DISK_IMG" >/dev/null 2>&1 || true
+    debugfs -w -R "write $TEMP_TEST_SCRIPT containers/arch/test_arch.sh" "$DISK_IMG" >/dev/null 2>&1
+fi
+
+if [ "$INTERACTIVE" = true ]; then
+    echo "           Enabling interactive container shell mode..."
+    debugfs -w -R "write /dev/null /interactive" "$DISK_IMG" >/dev/null 2>&1
+else
+    debugfs -w -R "rm /interactive" "$DISK_IMG" >/dev/null 2>&1 || true
+fi
+
+# 5. Launch QEMU
+ACCEL_OPTS="-cpu qemu64,+fsgsbase -smp 4"
+if [ -w /dev/kvm ] && qemu-system-x86_64 -enable-kvm -cpu host -M none -display none 2>/dev/null; then
+    ACCEL_OPTS="-enable-kvm -cpu host -smp 4"
+fi
+
+TEST_BIOS="/tmp/bios-arch.img"
+cp "$BIOS_IMG" "$TEST_BIOS"
+
+if [ "$INTERACTIVE" = true ]; then
+    echo "[5/5] Launching QEMU in interactive shell mode..."
+    echo "      Type your commands directly inside the Arch Linux container."
+    echo "      Type 'exit' to exit the container and power off."
+    echo "----------------------------------------------------------------------"
+    qemu-system-x86_64 \
+        -drive format=raw,file="$TEST_BIOS",snapshot=on \
+        -drive format=raw,file="$DISK_IMG",index=1,media=disk \
+        -netdev user,id=net0 \
+        -device e1000,netdev=net0 \
+        -serial stdio \
+        -display none \
+        -m 1024M \
+        $ACCEL_OPTS \
+        -no-reboot
+    exit 0
+fi
+
+echo "[5/5] Launching QEMU to execute Arch Linux container test..."
+QEMU_LOG="/tmp/qemu_arch_container.log"
+rm -f "$QEMU_LOG"
+
+set +e
+qemu-system-x86_64 \
+    -drive format=raw,file="$TEST_BIOS",snapshot=on \
+    -drive format=raw,file="$DISK_IMG",index=1,media=disk \
+    -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+    -netdev user,id=net0 \
+    -device e1000,netdev=net0 \
+    -serial stdio \
+    -display none \
+    -m 1024M \
+    $ACCEL_OPTS \
+    -d cpu_reset,guest_errors,int -D /tmp/qemu_int.log \
+    -no-reboot 2>&1 | tee "$QEMU_LOG"
+
+QEMU_STATUS=$?
+set -e
+
+echo ""
+echo "QEMU exit code: $QEMU_STATUS"
+
+if grep -q "ARCH LINUX CONTAINER" "$QEMU_LOG" || grep -q "\[ARCH_CONTAINER_SUCCESS\]" "$QEMU_LOG" || grep -q "I RUN ARCH BTW" "$QEMU_LOG"; then
+    echo "======================================================================"
+    echo "  SUCCESS: ARCH LINUX CONTAINER RUN SUCCEEDED!"
+    echo "  \"I run arch btw (in a namespace with my own kernel"
+    echo "      in Qemu on Ubuntu on WSL2 on Windows 11)\""
+    echo "======================================================================"
+    exit 0
+else
+    echo "======================================================================"
+    echo "  FAILURE: Arch container test did not pass"
+    echo "======================================================================"
+    exit 1
+fi

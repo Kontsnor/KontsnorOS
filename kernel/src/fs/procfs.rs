@@ -300,7 +300,11 @@ fn gen_mounts() -> String {
     // Always emit a root entry so pacman finds at least one mount point.
     let mut has_root = false;
     for (mountpoint, fsname) in &mounts {
-        let mp = if mountpoint.is_empty() { "/" } else { mountpoint.as_str() };
+        let mp = if mountpoint.is_empty() {
+            "/"
+        } else {
+            mountpoint.as_str()
+        };
         if mp == "/" {
             has_root = true;
         }
@@ -309,10 +313,7 @@ fn gen_mounts() -> String {
             "ext2" | "ext4" => "/dev/vda",
             _ => "none",
         };
-        out.push_str(&format!(
-            "{} {} {} rw,relatime 0 0\n",
-            device, mp, fsname
-        ));
+        out.push_str(&format!("{} {} {} rw,relatime 0 0\n", device, mp, fsname));
     }
     if !has_root {
         // Guarantee a root entry so pacman's mount-point check never fails.

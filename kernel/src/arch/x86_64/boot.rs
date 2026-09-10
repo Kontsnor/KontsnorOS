@@ -127,22 +127,22 @@ pub fn read_rtc_unix_time() -> u64 {
         while unsafe { rtc_updating() } {
             core::hint::spin_loop();
         }
-        let s  = unsafe { cmos_read(0x00) };
+        let s = unsafe { cmos_read(0x00) };
         let mn = unsafe { cmos_read(0x02) };
-        let h  = unsafe { cmos_read(0x04) };
-        let d  = unsafe { cmos_read(0x07) };
+        let h = unsafe { cmos_read(0x04) };
+        let d = unsafe { cmos_read(0x07) };
         let mo = unsafe { cmos_read(0x08) };
-        let y  = unsafe { cmos_read(0x09) };
+        let y = unsafe { cmos_read(0x09) };
 
         while unsafe { rtc_updating() } {
             core::hint::spin_loop();
         }
-        let s2  = unsafe { cmos_read(0x00) };
+        let s2 = unsafe { cmos_read(0x00) };
         let mn2 = unsafe { cmos_read(0x02) };
-        let h2  = unsafe { cmos_read(0x04) };
-        let d2  = unsafe { cmos_read(0x07) };
+        let h2 = unsafe { cmos_read(0x04) };
+        let d2 = unsafe { cmos_read(0x07) };
         let mo2 = unsafe { cmos_read(0x08) };
-        let y2  = unsafe { cmos_read(0x09) };
+        let y2 = unsafe { cmos_read(0x09) };
 
         if s == s2 && mn == mn2 && h == h2 && d == d2 && mo == mo2 && y == y2 {
             break (s, mn, h, d, mo, y);
@@ -156,11 +156,11 @@ pub fn read_rtc_unix_time() -> u64 {
 
     let to_bin = |v: u8| if is_binary { v } else { bcd_to_bin(v) };
 
-    let sec  = to_bin(sec)  as u64;
-    let min  = to_bin(min)  as u64;
+    let sec = to_bin(sec) as u64;
+    let min = to_bin(min) as u64;
     let hour = to_bin(hour) as u64;
-    let day  = to_bin(day)  as u64;
-    let mon  = to_bin(mon)  as u64;
+    let day = to_bin(day) as u64;
+    let mon = to_bin(mon) as u64;
     // CMOS stores two-digit year; assume 2000+ for years 0-99.
     let year = to_bin(year) as u64 + 2000;
 

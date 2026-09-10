@@ -41,8 +41,8 @@ const REG_MTA: u32 = 0x5200;
 const REG_RAL: u32 = 0x5400;
 const REG_RAH: u32 = 0x5404;
 
-const NUM_RX_DESC: usize = 512;
-const NUM_TX_DESC: usize = 512;
+const NUM_RX_DESC: usize = 256;
+const NUM_TX_DESC: usize = 256;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -389,31 +389,27 @@ pub fn send_packet(data: &[u8]) -> Result<(), DriverError> {
 
 /// Handle interrupt triggered by the e1000 controller.
 pub fn handle_interrupt() {
-    let mut batch = [[0u8; 1536]; 32];
-    let mut batch_lens = [0usize; 32];
-    let mut count = 0;
-
-    if let Some(dev_lock) = E1000_INSTANCE.try_lock() {
-        if let Some(ref dev) = *dev_lock {
-            if let Some(mut inner) = dev.inner.try_lock() {
-                let _cause = inner.read_reg(REG_ICR);
-                while count < 32 {
-                    match inner.recv_packet(&mut batch[count]) {
-                        Ok(len) if len > 0 => {
-                            batch_lens[count] = len;
-                            count += 1;
+    let mut buf = [0u8; 1536];
+    loop {
+        let mut pkt_len = 0;
+        if let Some(dev_lock) = E1000_INSTANCE.try_lock() {
+            if let Some(ref dev) = *dev_lock {
+                if let Some(mut inner) = dev.inner.try_lock() {
+                    let _cause = inner.read_reg(REG_ICR);
+                    if let Ok(len) = inner.recv_packet(&mut buf) {
+                        pkt_len = len;
+                        if pkt_len > 0 {
+                            inner.flush_rx_tail();
                         }
-                        _ => break,
                     }
-                }
-                if count > 0 {
-                    inner.flush_rx_tail();
                 }
             }
         }
-    }
 
-    for i in 0..count {
-        crate::net::ethernet::handle_packet(&batch[i][..batch_lens[i]]);
+        if pkt_len > 0 {
+            crate::net::ethernet::handle_packet(&buf[..pkt_len]);
+        } else {
+            break;
+        }
     }
 }

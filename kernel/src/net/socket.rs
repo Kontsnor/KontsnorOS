@@ -483,30 +483,16 @@ pub fn find_tcp_connection(
 ) -> Option<Arc<Mutex<Socket>>> {
     let reg = SOCKET_REGISTRY.lock();
     for s in reg.iter() {
-        if let Some(s_lock) = s.try_lock() {
-            if s_lock.sock_type == 1 {
-                if s_lock.local_port == Some(local_port)
-                    && s_lock.remote_port == Some(remote_port)
-                    && (s_lock.local_addr == Some(local_ip)
-                        || s_lock.local_addr == Some(Ipv4Addr::UNSPECIFIED)
-                        || s_lock.local_addr.is_none())
-                    && s_lock.remote_addr == Some(remote_ip)
-                {
-                    return Some(s.clone());
-                }
-            }
-        } else {
-            let s_lock = s.lock();
-            if s_lock.sock_type == 1 {
-                if s_lock.local_port == Some(local_port)
-                    && s_lock.remote_port == Some(remote_port)
-                    && (s_lock.local_addr == Some(local_ip)
-                        || s_lock.local_addr == Some(Ipv4Addr::UNSPECIFIED)
-                        || s_lock.local_addr.is_none())
-                    && s_lock.remote_addr == Some(remote_ip)
-                {
-                    return Some(s.clone());
-                }
+        let s_lock = s.lock();
+        if s_lock.sock_type == 1 {
+            if s_lock.local_port == Some(local_port)
+                && s_lock.remote_port == Some(remote_port)
+                && (s_lock.local_addr == Some(local_ip)
+                    || s_lock.local_addr == Some(Ipv4Addr::UNSPECIFIED)
+                    || s_lock.local_addr.is_none())
+                && s_lock.remote_addr == Some(remote_ip)
+            {
+                return Some(s.clone());
             }
         }
     }

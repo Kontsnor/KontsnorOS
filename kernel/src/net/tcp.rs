@@ -478,27 +478,76 @@ fn process_segment(
             }
 
             if !payload.is_empty() {
-                if seq == sock.tcp_rcv_nxt {
-                    // In-order segment.
-                    if sock.tcp_recv_buf.len() + payload.len() <= TCP_MAX_RECV_BUF {
-                        sock.tcp_recv_buf.extend_from_slice(payload);
-                        sock.tcp_rcv_nxt = seq.wrapping_add(payload.len() as u32);
+                // Determine sequence boundaries.
+                // Handle overlapping retransmissions (seq < rcv_nxt but seq + payload.len() > rcv_nxt).
+                let (effective_seq, effective_payload) =
+                    if seq.wrapping_sub(sock.tcp_rcv_nxt) >= 0x8000_0000 {
+                        // seq < rcv_nxt
+                        let overlap = sock.tcp_rcv_nxt.wrapping_sub(seq) as usize;
+                        if overlap < payload.len() {
+                            // Partial overlap: trim the already-received prefix.
+                            (sock.tcp_rcv_nxt, &payload[overlap..])
+                        } else {
+                            // Complete retransmission of old data.
+                            (seq, &payload[0..0])
+                        }
+                    } else {
+                        (seq, payload)
+                    };
 
-                        // Drain any now-consecutive out-of-order segments.
+                if !effective_payload.is_empty() && effective_seq == sock.tcp_rcv_nxt {
+                    // In-order segment (or trimmed partial overlap that is now in-order).
+                    if sock.tcp_recv_buf.len() + effective_payload.len() <= TCP_MAX_RECV_BUF {
+                        sock.tcp_recv_buf.extend_from_slice(effective_payload);
+                        sock.tcp_rcv_nxt = effective_seq.wrapping_add(effective_payload.len() as u32);
+
+                        // Drain any now-consecutive out-of-order segments from OOO queue.
                         loop {
-                            // BTreeMap is ordered; peek the smallest key.
-                            let next_seq = sock.tcp_rcv_nxt;
-                            if let Some(ooo_payload) = sock.tcp_ooo_queue.remove(&next_seq) {
-                                if sock.tcp_recv_buf.len() + ooo_payload.len() <= TCP_MAX_RECV_BUF {
-                                    sock.tcp_recv_buf.extend_from_slice(&ooo_payload);
-                                    sock.tcp_rcv_nxt =
-                                        next_seq.wrapping_add(ooo_payload.len() as u32);
-                                } else {
-                                    // No space; put it back and stop draining.
-                                    sock.tcp_ooo_queue.insert(next_seq, ooo_payload);
-                                    break;
+                            let cur_nxt = sock.tcp_rcv_nxt;
+
+                            // Find any OOO key that is either at cur_nxt or partially overlaps cur_nxt
+                            let matching_key = sock.tcp_ooo_queue.keys().cloned().find(|&k| {
+                                k == cur_nxt || (k.wrapping_sub(cur_nxt) >= 0x8000_0000 && {
+                                    let len = sock.tcp_ooo_queue.get(&k).map(|v| v.len() as u32).unwrap_or(0);
+                                    let ooo_end = k.wrapping_add(len);
+                                    ooo_end.wrapping_sub(cur_nxt) < 0x8000_0000 && ooo_end != cur_nxt
+                                })
+                            });
+
+                            if let Some(k) = matching_key {
+                                if let Some(ooo_data) = sock.tcp_ooo_queue.remove(&k) {
+                                    let (chunk_seq, chunk) = if k == cur_nxt {
+                                        (cur_nxt, &ooo_data[..])
+                                    } else {
+                                        let overlap = cur_nxt.wrapping_sub(k) as usize;
+                                        (cur_nxt, &ooo_data[overlap..])
+                                    };
+
+                                    if !chunk.is_empty() {
+                                        if sock.tcp_recv_buf.len() + chunk.len() <= TCP_MAX_RECV_BUF {
+                                            sock.tcp_recv_buf.extend_from_slice(chunk);
+                                            sock.tcp_rcv_nxt = chunk_seq.wrapping_add(chunk.len() as u32);
+                                        } else {
+                                            break;
+                                        }
+                                    }
                                 }
                             } else {
+                                // Prune any purely stale OOO keys completely behind cur_nxt
+                                let stale_keys: alloc::vec::Vec<u32> = sock
+                                    .tcp_ooo_queue
+                                    .keys()
+                                    .cloned()
+                                    .filter(|&k| {
+                                        let len = sock.tcp_ooo_queue.get(&k).map(|v| v.len() as u32).unwrap_or(0);
+                                        let ooo_end = k.wrapping_add(len);
+                                        ooo_end.wrapping_sub(cur_nxt) >= 0x8000_0000 || ooo_end == cur_nxt
+                                    })
+                                    .collect();
+
+                                for sk in stale_keys {
+                                    sock.tcp_ooo_queue.remove(&sk);
+                                }
                                 break;
                             }
                         }
@@ -511,20 +560,20 @@ fn process_segment(
                         let wnd = rcv_wnd(sock.tcp_recv_buf.len());
                         reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK, wnd));
                     }
-                } else if seq.wrapping_sub(sock.tcp_rcv_nxt) < 0x8000_0000 {
-                    // Out-of-order segment (seq > rcv_nxt in sequence-space).
-                    // Store in OOO queue only if total OOO buffer doesn't blow up.
+                } else if !effective_payload.is_empty() && effective_seq.wrapping_sub(sock.tcp_rcv_nxt) < 0x8000_0000 {
+                    // Future out-of-order segment (effective_seq > rcv_nxt).
                     let ooo_used: usize = sock.tcp_ooo_queue.values().map(|v| v.len()).sum();
-                    if ooo_used + payload.len() <= TCP_MAX_RECV_BUF {
+                    if ooo_used + effective_payload.len() <= TCP_MAX_RECV_BUF {
                         sock.tcp_ooo_queue
-                            .entry(seq)
-                            .or_insert_with(|| payload.to_vec());
+                            .entry(effective_seq)
+                            .or_insert_with(|| effective_payload.to_vec());
                     }
-                    // Send a duplicate ACK so the remote knows what we're waiting for.
+                    // Send duplicate ACK advertising rcv_nxt
                     let wnd = rcv_wnd(sock.tcp_recv_buf.len());
                     reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK, wnd));
                 } else {
-                    // Retransmit of already-received data: re-ACK to keep remote in sync.
+                    // Old retransmitted data completely acknowledged.
+                    // Always respond with pure ACK for current rcv_nxt.
                     let wnd = rcv_wnd(sock.tcp_recv_buf.len());
                     reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK, wnd));
                 }

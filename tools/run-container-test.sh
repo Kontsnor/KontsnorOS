@@ -45,8 +45,9 @@ BUSYBOX_BIN="$PROJECT_DIR/busybox-build/busybox-1.36.1/busybox"
 
 # 2. Compile ctr_run and init-container
 echo "[2/5] Compiling container runtime & test harness..."
-musl-gcc -static -nostdlib -fno-builtin -o "$PROJECT_DIR/tools/ctr_run" "$PROJECT_DIR/tools/ctr_run.c"
-musl-gcc -static -nostdlib -fno-builtin -o "$PROJECT_DIR/tools/init-container" "$PROJECT_DIR/tools/init-container.c"
+CC=$(which musl-gcc 2>/dev/null || echo gcc)
+"$CC" -static -nostdlib -fno-builtin -o "$PROJECT_DIR/tools/ctr_run" "$PROJECT_DIR/tools/ctr_run.c"
+"$CC" -static -nostdlib -fno-builtin -o "$PROJECT_DIR/tools/init-container" "$PROJECT_DIR/tools/init-container.c"
 
 # 3. Ensure Alpine minirootfs is available
 ALPINE_TAR="/tmp/alpine-minirootfs-3.20.0-x86_64.tar.gz"

@@ -39,8 +39,9 @@ BUSYBOX_BIN="$PROJECT_DIR/busybox-build/busybox-1.36.1/busybox"
 
 # 2. Compile ctr_run and init-arch
 echo "[2/5] Compiling container runtime & Arch init daemon..."
-musl-gcc -static -nostdlib -fno-builtin -o "$PROJECT_DIR/tools/ctr_run" "$PROJECT_DIR/tools/ctr_run.c"
-musl-gcc -static -nostdlib -fno-builtin -o "$PROJECT_DIR/tools/init-arch" "$PROJECT_DIR/tools/init-arch.c"
+CC=$(which musl-gcc 2>/dev/null || echo gcc)
+"$CC" -static -nostdlib -fno-builtin -o "$PROJECT_DIR/tools/ctr_run" "$PROJECT_DIR/tools/ctr_run.c"
+"$CC" -static -nostdlib -fno-builtin -o "$PROJECT_DIR/tools/init-arch" "$PROJECT_DIR/tools/init-arch.c"
 
 # 3. Ensure Arch Linux rootfs is extracted
 ARCH_TAR="/tmp/archlinux-bootstrap.tar.zst"
@@ -137,6 +138,16 @@ fi
 echo "                -> PASS: Running genuine Arch Linux rootfs!"
 echo ""
 
+echo "[ARCH TEST GREP 1] grep root /etc/passwd..."
+grep root /etc/passwd
+echo "                -> PASS: grep file!"
+echo ""
+
+echo "[ARCH TEST GREP 2] echo test | grep test..."
+echo test | grep test
+echo "                -> PASS: grep pipe!"
+echo ""
+
 echo "[ARCH TEST 2/4] Checking Container Hostname (UTS Namespace)..."
 HOSTNAME=$(uname -n 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo "archlinux")
 echo "                Hostname: $HOSTNAME"
@@ -223,6 +234,16 @@ echo ""
 echo "[ARCH TEST 1/5] Checking /etc/os-release..."
 cat /etc/os-release
 echo "                -> PASS: Running genuine Arch Linux rootfs!"
+echo ""
+
+echo "[ARCH TEST GREP 1] grep root /etc/passwd..."
+grep root /etc/passwd
+echo "                -> PASS: grep file!"
+echo ""
+
+echo "[ARCH TEST GREP 2] echo test | grep test..."
+echo test | grep test
+echo "                -> PASS: grep pipe!"
 echo ""
 
 echo "[ARCH TEST 2/5] Checking Container Hostname (UTS Namespace)..."

@@ -1005,27 +1005,12 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: i32) -> SyscallResult {
     unsafe {
         core::ptr::copy_nonoverlapping(iov, local_iov.as_mut_ptr(), iovcnt as usize);
     }
-    crate::kprintln!(
-        "[writev] fd={}, iovcnt={}, iov[0]=({:p}, {}), iov[1]=({:p}, {})",
-        fd,
-        iovcnt,
-        local_iov[0].iov_base,
-        local_iov[0].iov_len,
-        if iovcnt > 1 {
-            local_iov[1].iov_base
-        } else {
-            core::ptr::null()
-        },
-        if iovcnt > 1 { local_iov[1].iov_len } else { 0 }
-    );
     let mut total_written = 0;
-    for (idx, io) in local_iov.iter().enumerate() {
+    for io in local_iov {
         if io.iov_len == 0 {
             continue;
         }
-        crate::kprintln!("[writev] writing chunk {}: len={}", idx, io.iov_len);
         let ret = sys_write(fd, io.iov_base, io.iov_len);
-        crate::kprintln!("[writev] chunk {} returned {}", idx, ret);
         if ret < 0 {
             if total_written > 0 {
                 break;
@@ -1034,7 +1019,6 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: i32) -> SyscallResult {
         }
         total_written += ret;
     }
-    crate::kprintln!("[writev] finished total_written={}", total_written);
     total_written
 }
 
@@ -1348,6 +1332,30 @@ pub fn sys_copy_file_range(
     len: usize,
     _flags: u32,
 ) -> SyscallResult {
+    if fd_in < 0 || fd_out < 0 {
+        return Errno::EBADF.into();
+    }
+    let in_desc = match proc_fd::current_task_get_file_desc(fd_in) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+    let out_desc = match proc_fd::current_task_get_file_desc(fd_out) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+
+    let in_type = in_desc.inode.inode().file_type;
+    let out_type = out_desc.inode.inode().file_type;
+
+    // Per Linux copy_file_range(2), fd_in and fd_out MUST be regular files.
+    // If either refers to a pipe, socket, or character device/TTY, return EXDEV (-18)
+    // so programs like GNU cat fall back to a standard read/write loop.
+    if in_type != crate::fs::inode::FileType::Regular
+        || out_type != crate::fs::inode::FileType::Regular
+    {
+        return -18; // EXDEV
+    }
+
     sys_sendfile(fd_out, fd_in, off_in, len)
 }
 

@@ -215,12 +215,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     arch::x86_64::smp::start_aps();
     kprintln!("[boot] Secondary CPU cores started.");
 
-    // Spawn demo multitasking threads
-    if ENABLE_DEMO_THREADS {
-        kprintln!("[boot] Spawning kernel multitasking demo threads...");
-        process::spawn_kernel_thread(alloc::string::String::from("demo_1"), demo_thread_1);
-    }
-
     kprintln!("[boot] Initializing network stack...");
     net::init();
     kprintln!("[boot] Network stack initialized.");
@@ -353,13 +347,4 @@ fn idle_loop() -> ! {
         x86_64::instructions::hlt();
     }
 }
-
-/// Demo thread 1: prints and cooperatively yields control.
-#[allow(dead_code)]
-fn demo_thread_1() {
-    for i in 0..5 {
-        kprintln!("[demo_thread_1] Executing step {} — yielding", i);
-        process::scheduler::yield_now();
-    }
-    kprintln!("[demo_thread_1] Completed task.");
 }

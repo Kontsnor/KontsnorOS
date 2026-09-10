@@ -128,9 +128,20 @@ impl InodeOps for SocketInode {
             if sock.tcp_state == TcpState::Closed {
                 return Err(-104); // ECONNRESET
             }
-            if sock.tcp_recv_buf.is_empty() {
-                if sock.tcp_state == TcpState::CloseWait {
-                    return Ok(0); // EOF
+            while sock.tcp_recv_buf.is_empty() {
+                match sock.tcp_state {
+                    TcpState::CloseWait | TcpState::TimeWait => {
+                        return Ok(0); // Graceful EOF
+                    }
+                    TcpState::Closed => {
+                        let err = if sock.so_error != 0 {
+                            -sock.so_error
+                        } else {
+                            -104 // ECONNRESET
+                        };
+                        return Err(err);
+                    }
+                    _ => {}
                 }
                 if sock.nonblocking {
                     return Err(-11); // -EAGAIN
@@ -141,13 +152,55 @@ impl InodeOps for SocketInode {
                 wq.wait();
                 sock = self.socket.lock();
             }
-            let n = buf.len().min(sock.tcp_recv_buf.len());
+            let prev_buf_len = sock.tcp_recv_buf.len();
+            let n = buf.len().min(prev_buf_len);
             if n > 0 {
                 buf[..n].copy_from_slice(&sock.tcp_recv_buf[..n]);
                 sock.tcp_recv_buf.drain(..n);
-                // NOTE: tcp_rcv_nxt is already advanced by process_segment() as
-                // data arrives from the network. We must NOT advance it again here
-                // or the ACK numbers sent to the remote will be wrong.
+
+                // Check if user-space drain reopened the receive window significantly
+                // or if buffer was full/nearly full previously.
+                let new_buf_len = sock.tcp_recv_buf.len();
+                let prev_wnd = super::tcp::TCP_MAX_RECV_BUF.saturating_sub(prev_buf_len);
+                let new_wnd = super::tcp::TCP_MAX_RECV_BUF.saturating_sub(new_buf_len);
+
+                // If window opened by at least 16 KB or opened from 0, send window update ACK
+                if (prev_wnd == 0 && new_wnd > 0) || (new_wnd.saturating_sub(prev_wnd) >= 16384) {
+                    if sock.tcp_state == TcpState::Established {
+                        if let (Some(local_ip), Some(remote_ip), Some(local_port), Some(remote_port)) =
+                            (sock.local_addr, sock.remote_addr, sock.local_port, sock.remote_port)
+                        {
+                            let seq = sock.tcp_snd_nxt;
+                            let ack = sock.tcp_rcv_nxt;
+                            let wnd = (new_wnd as u32).min(65535) as u16;
+
+                            drop(sock);
+
+                            let mut tcp_buf = [0u8; 128];
+                            if let Some(tcp_len) = super::tcp::build_tcp_packet(
+                                &mut tcp_buf,
+                                local_ip,
+                                remote_ip,
+                                local_port,
+                                remote_port,
+                                seq,
+                                ack,
+                                super::tcp::TCP_ACK,
+                                wnd,
+                                &[],
+                            ) {
+                                let _ = super::ipv4::send_packet(
+                                    local_ip,
+                                    remote_ip,
+                                    super::ipv4::PROTO_TCP,
+                                    &tcp_buf[..tcp_len],
+                                );
+                            }
+
+                            return Ok(n);
+                        }
+                    }
+                }
             }
             Ok(n)
         } else if sock.sock_type == 2 || sock.sock_type == 3 {
@@ -205,7 +258,7 @@ impl InodeOps for SocketInode {
             let window = {
                 let sock = self.socket.lock();
                 let buf_used = sock.tcp_recv_buf.len();
-                (65536usize.saturating_sub(buf_used) as u32).min(65535) as u16
+                (super::tcp::TCP_MAX_RECV_BUF.saturating_sub(buf_used) as u32).min(65535) as u16
             };
 
             let tcp_len = super::tcp::build_tcp_packet(

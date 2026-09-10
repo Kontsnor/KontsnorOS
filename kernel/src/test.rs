@@ -2230,3 +2230,46 @@ fn test_phase2_features() {
 
     kprintln!("[test] Phase 2 features verification test PASSED!");
 }
+
+#[test_case]
+fn test_serial_console_buffered_read() {
+    use crate::drivers::console::serial::{push_byte, SerialConsole};
+    use crate::drivers::traits::{CharDevice, DriverError};
+
+    let console = SerialConsole;
+
+    // Test 1: Empty buffer returns DriverError::NotReady
+    let mut buf = [0u8; 16];
+    assert_eq!(console.read(&mut buf), Err(DriverError::NotReady));
+
+    // Test 2: Push bytes and read back
+    push_byte(b'H');
+    push_byte(b'e');
+    push_byte(b'l');
+    push_byte(b'l');
+    push_byte(b'o');
+
+    assert!(console.poll().readable);
+
+    let res = console.read(&mut buf);
+    assert_eq!(res, Ok(5));
+    assert_eq!(&buf[..5], b"Hello");
+
+    // Test 3: Buffer is now empty again
+    assert_eq!(console.read(&mut buf), Err(DriverError::NotReady));
+
+    // Test 4: Partial read when buffer has fewer bytes than requested slice
+    push_byte(b'A');
+    push_byte(b'B');
+
+    let mut small_buf = [0u8; 5];
+    let res2 = console.read(&mut small_buf);
+    assert_eq!(res2, Ok(2));
+    assert_eq!(&small_buf[..2], b"AB");
+
+    // Test 5: Empty buffer slice
+    let mut empty_buf = [0u8; 0];
+    assert_eq!(console.read(&mut empty_buf), Ok(0));
+
+    kprintln!("[test] Serial console buffered read test PASSED!");
+}

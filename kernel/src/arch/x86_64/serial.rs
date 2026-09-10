@@ -114,8 +114,8 @@ pub fn init() {
     SERIAL1.with_lock(|_| {});
 }
 
-/// Try to read one byte from the serial receive buffer (non-blocking).
-pub fn try_read_byte() -> Option<u8> {
+/// Read directly from the raw COM1 receive hardware port (non-blocking).
+pub fn raw_try_read_byte() -> Option<u8> {
     use x86_64::instructions::port::Port;
     let mut lsr: Port<u8> = Port::new(COM1_PORT + 5);
     let mut data: Port<u8> = Port::new(COM1_PORT);
@@ -125,6 +125,27 @@ pub fn try_read_byte() -> Option<u8> {
     } else {
         None
     }
+}
+
+/// Enable received data interrupts on COM1 UART.
+pub fn enable_interrupts() {
+    use x86_64::instructions::port::Port;
+    unsafe {
+        // Enable Received Data Available Interrupt (IER bit 0)
+        let mut ier: Port<u8> = Port::new(COM1_PORT + 1);
+        ier.write(0x01);
+
+        // Enable OUT2 in Modem Control Register (MCR bit 3) to enable IRQ line output on IBM PC serial hardware
+        let mut mcr: Port<u8> = Port::new(COM1_PORT + 4);
+        mcr.write(0x0B); // DTR (1) | RTS (2) | OUT2 (8)
+    }
+}
+
+/// Try to read one byte from the serial receive buffer (non-blocking).
+///
+/// Routes through the buffered serial console driver ring buffer.
+pub fn try_read_byte() -> Option<u8> {
+    crate::drivers::console::serial::read_byte()
 }
 
 /// Output a single byte to serial and graphics console.

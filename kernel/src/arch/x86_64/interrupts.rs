@@ -70,6 +70,8 @@ pub enum InterruptIndex {
     IpiHalt = 35,
     /// IPI TLB Shootdown interrupt (vector 36).
     IpiTlbShootdown = 36,
+    /// Serial interrupt (IRQ 4, vector 37).
+    Serial = 37,
     /// Network interrupt (IRQ 11, vector 43).
     Network = 43,
 }
@@ -115,6 +117,7 @@ lazy_static! {
         idt[InterruptIndex::IpiReschedule.as_u8()].set_handler_fn(ipi_reschedule_handler);
         idt[InterruptIndex::IpiHalt.as_u8()].set_handler_fn(ipi_halt_handler);
         idt[InterruptIndex::IpiTlbShootdown.as_u8()].set_handler_fn(ipi_tlb_shootdown_handler);
+        idt[InterruptIndex::Serial.as_u8()].set_handler_fn(serial_interrupt_handler);
         idt[InterruptIndex::Network.as_u8()].set_handler_fn(network_interrupt_handler);
         idt[255].set_handler_fn(spurious_interrupt_handler);
 
@@ -791,6 +794,28 @@ extern "x86-interrupt" fn ipi_tlb_shootdown_handler(stack_frame: InterruptStackF
     super::apic::lapic_eoi();
     x86_64::instructions::tlb::flush_all();
     crate::arch::x86_64::smp::tlb_shootdown_ack();
+
+    if swap_needed {
+        // SAFETY: Swap back to user GS base before returning
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        }
+    }
+}
+
+extern "x86-interrupt" fn serial_interrupt_handler(stack_frame: InterruptStackFrame) {
+    let swap_needed = stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3;
+    if swap_needed {
+        // SAFETY: Swap to kernel GS base if entering from user space
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        }
+    }
+
+    crate::drivers::console::serial::handle_interrupt();
+
+    // Acknowledge interrupt to Local APIC
+    super::apic::lapic_eoi();
 
     if swap_needed {
         // SAFETY: Swap back to user GS base before returning

@@ -219,7 +219,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     if ENABLE_DEMO_THREADS {
         kprintln!("[boot] Spawning kernel multitasking demo threads...");
         process::spawn_kernel_thread(alloc::string::String::from("demo_1"), demo_thread_1);
-        process::spawn_kernel_thread(alloc::string::String::from("demo_2"), demo_thread_2);
     }
 
     kprintln!("[boot] Initializing network stack...");
@@ -363,14 +362,4 @@ fn demo_thread_1() {
         process::scheduler::yield_now();
     }
     kprintln!("[demo_thread_1] Completed task.");
-}
-
-/// Demo thread 2: prints and cooperatively yields control.
-#[allow(dead_code)]
-fn demo_thread_2() {
-    for i in 0..5 {
-        kprintln!("[demo_thread_2] Executing step {} — yielding", i);
-        process::scheduler::yield_now();
-    }
-    kprintln!("[demo_thread_2] Completed task.");
 }

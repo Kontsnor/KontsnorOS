@@ -380,8 +380,6 @@ pub extern "C" fn syscall_dispatch_rust(regs: *mut SavedRegisters, syscall_num: 
 
     let res = dispatch(regs, syscall_num, arg0, arg1, arg2, arg3, arg4, arg5);
 
-
-
     if DEBUG_SYSCALLS {
         crate::kprintln!("[debug syscall {} ret] res={}", syscall_num, res);
         if syscall_num == 16 {

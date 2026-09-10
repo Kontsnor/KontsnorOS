@@ -926,11 +926,11 @@ pub fn sys_msync(addr: u64, length: usize, _flags: i32) -> SyscallResult {
     if length == 0 || (addr & 4095) != 0 {
         return Errno::EINVAL.into();
     }
-    let current_pid = match scheduler::current_pid() {
+    let current_pid = match crate::process::scheduler::current_pid() {
         Some(p) => p,
         None => return Errno::ESRCH.into(),
     };
-    let task_arc = match scheduler::get_task_arc(current_pid) {
+    let task_arc = match crate::process::scheduler::get_task_arc(current_pid) {
         Some(t) => t,
         None => return Errno::ESRCH.into(),
     };
@@ -970,6 +970,45 @@ pub fn sys_mincore(addr: u64, length: usize, vec: *mut u8) -> SyscallResult {
     };
     if crate::syscall::validation::validate_user_ptr_write(vec, pages).is_err() {
         return Errno::EFAULT.into();
+    }
+
+    let current_pid = match crate::process::scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+    let task_arc = match crate::process::scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
+    };
+
+    let task = task_arc.lock();
+    let addr_space = task.address_space.lock();
+
+    for i in 0..pages {
+        let page_addr = match addr.checked_add((i as u64) * 4096) {
+            Some(a) => a,
+            None => return Errno::ENOMEM.into(),
+        };
+
+        let is_in_mmap = addr_space
+            .mmap_regions
+            .iter()
+            .any(|r| page_addr >= r.start && page_addr < r.start + r.len as u64);
+
+        let is_in_heap = page_addr < addr_space.brk && page_addr >= 0x0000_0000_0001_0000;
+
+        let is_in_pt = unsafe {
+            crate::memory::page_cache::get_page_table_entry(
+                addr_space.page_table_root,
+                x86_64::VirtAddr::new(page_addr),
+            )
+            .map(|pte| !pte.is_unused())
+            .unwrap_or(false)
+        };
+
+        if !is_in_mmap && !is_in_heap && !is_in_pt {
+            return Errno::ENOMEM.into();
+        }
     }
 
     // In KontsnorOS, all mapped user pages are resident in physical RAM.

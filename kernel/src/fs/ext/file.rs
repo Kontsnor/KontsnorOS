@@ -27,11 +27,6 @@ impl ExtInode {
         i_block: &[u32; 15],
         file_block: u32,
     ) -> Result<u32, &'static str> {
-        crate::kprintln!(
-            "[resolve_extent_block] ino={}, file_block={}",
-            self.ino,
-            file_block
-        );
         let mut current_buf = [0u8; 4096];
         let mut current_len = 60;
         for i in 0..15 {
@@ -39,10 +34,6 @@ impl ExtInode {
         }
 
         loop {
-            crate::kprintln!(
-                "[resolve_extent_block] loop offset, buf len={}",
-                current_len
-            );
             if current_len < 12 {
                 return Err("Extent buffer too small for header");
             }
@@ -53,12 +44,6 @@ impl ExtInode {
             let eh_magic = header.eh_magic;
             let eh_depth = header.eh_depth;
             let eh_entries = header.eh_entries;
-            crate::kprintln!(
-                "[resolve_extent_block] magic={:#x}, depth={}, entries={}",
-                eh_magic,
-                eh_depth,
-                eh_entries
-            );
             if eh_magic != 0xF30A {
                 return Err("Invalid extent header magic");
             }
@@ -116,13 +101,6 @@ impl ExtInode {
 
                 if let Some(best) = best_idx {
                     let child_block = ((best.ei_leaf_hi as u64) << 32) | (best.ei_leaf_lo as u64);
-                    let best_ei_block = best.ei_block;
-                    crate::kprintln!(
-                        "[resolve_extent_block] depth={}, ei_block={}, child_block={}",
-                        eh_depth,
-                        best_ei_block,
-                        child_block
-                    );
                     let block_size = self.fs.block_size as usize;
                     assert!(block_size <= 4096);
                     read_blocks(

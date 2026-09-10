@@ -298,7 +298,8 @@ pub fn sys_epoll_wait(
                 if let Some(inode) = crate::process::fd::current_task_read_fd(fd) {
                     // Query readiness using the generalized poll method
                     let current_poll = inode.poll(ev.events);
-                    let matched_ready = current_poll & ev.events;
+                    let matched_ready = current_poll
+                        & (ev.events | crate::fs::inode::POLLHUP | crate::fs::inode::POLLERR);
 
                     if matched_ready != 0 {
                         let is_et = (ev.events & EPOLLET) != 0;

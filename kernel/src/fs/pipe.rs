@@ -176,10 +176,14 @@ impl InodeOps for PipeReader {
     fn poll(&self, events: u32) -> u32 {
         let mut revents = 0;
         let buf = self.state.buffer.lock();
+        let writers = self.state.writers.load(Ordering::SeqCst);
         if (events & crate::fs::inode::POLLIN) != 0 {
-            if !buf.is_empty() || self.state.writers.load(Ordering::SeqCst) == 0 {
+            if !buf.is_empty() || writers == 0 {
                 revents |= crate::fs::inode::POLLIN;
             }
+        }
+        if writers == 0 {
+            revents |= crate::fs::inode::POLLHUP;
         }
         revents
     }
@@ -290,7 +294,7 @@ impl InodeOps for PipeWriter {
             }
         }
         if self.state.readers.load(Ordering::SeqCst) == 0 {
-            revents |= crate::fs::inode::POLLERR;
+            revents |= crate::fs::inode::POLLERR | crate::fs::inode::POLLHUP;
         }
         revents
     }

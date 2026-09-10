@@ -81,6 +81,9 @@ pub const TCP_ACK: u16 = 0x010;
 /// URG flag.
 pub const TCP_URG: u16 = 0x020;
 
+/// Default maximum receive buffer size (512 KB).
+pub const TCP_MAX_RECV_BUF: usize = 524288;
+
 /// TCP connection states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpState {
@@ -432,10 +435,9 @@ fn process_segment(
     payload: &[u8],
 ) -> Option<(u32, u32, u16, u16)> {
     // Helper: compute the current receive window based on how full tcp_recv_buf is.
-    // We cap it at 65535. When the buffer is at the hard limit we advertise 0.
+    // We cap it at 65535. When the buffer is at TCP_MAX_RECV_BUF (512 KB), we advertise 0.
     let rcv_wnd = |buf_len: usize| -> u16 {
-        const MAX_BUF: usize = 65536;
-        (MAX_BUF.saturating_sub(buf_len) as u32).min(65535) as u16
+        (TCP_MAX_RECV_BUF.saturating_sub(buf_len) as u32).min(65535) as u16
     };
 
     let mut reply = None;
@@ -476,10 +478,9 @@ fn process_segment(
             }
 
             if !payload.is_empty() {
-                const MAX_BUF: usize = 65536;
                 if seq == sock.tcp_rcv_nxt {
                     // In-order segment.
-                    if sock.tcp_recv_buf.len() + payload.len() <= MAX_BUF {
+                    if sock.tcp_recv_buf.len() + payload.len() <= TCP_MAX_RECV_BUF {
                         sock.tcp_recv_buf.extend_from_slice(payload);
                         sock.tcp_rcv_nxt = seq.wrapping_add(payload.len() as u32);
 
@@ -488,7 +489,7 @@ fn process_segment(
                             // BTreeMap is ordered; peek the smallest key.
                             let next_seq = sock.tcp_rcv_nxt;
                             if let Some(ooo_payload) = sock.tcp_ooo_queue.remove(&next_seq) {
-                                if sock.tcp_recv_buf.len() + ooo_payload.len() <= MAX_BUF {
+                                if sock.tcp_recv_buf.len() + ooo_payload.len() <= TCP_MAX_RECV_BUF {
                                     sock.tcp_recv_buf.extend_from_slice(&ooo_payload);
                                     sock.tcp_rcv_nxt =
                                         next_seq.wrapping_add(ooo_payload.len() as u32);
@@ -514,7 +515,7 @@ fn process_segment(
                     // Out-of-order segment (seq > rcv_nxt in sequence-space).
                     // Store in OOO queue only if total OOO buffer doesn't blow up.
                     let ooo_used: usize = sock.tcp_ooo_queue.values().map(|v| v.len()).sum();
-                    if ooo_used + payload.len() <= MAX_BUF {
+                    if ooo_used + payload.len() <= TCP_MAX_RECV_BUF {
                         sock.tcp_ooo_queue
                             .entry(seq)
                             .or_insert_with(|| payload.to_vec());

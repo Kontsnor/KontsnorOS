@@ -821,10 +821,17 @@ extern "x86-interrupt" fn network_interrupt_handler(stack_frame: InterruptStackF
     // Acknowledge interrupt to Local APIC
     super::apic::lapic_eoi();
 
-    if swap_needed {
-        // SAFETY: Swap back to user GS base before returning
-        unsafe {
-            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+    let is_idle = crate::process::scheduler::current_pid()
+        .map(|p| p.as_u64() >= 900)
+        .unwrap_or(false);
+
+    if swap_needed || is_idle {
+        crate::process::scheduler::schedule();
+        if swap_needed {
+            // SAFETY: Swap back to user GS base before returning
+            unsafe {
+                core::arch::asm!("swapgs", options(nostack, preserves_flags));
+            }
         }
     }
 }

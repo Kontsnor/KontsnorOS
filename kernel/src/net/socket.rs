@@ -205,7 +205,7 @@ impl InodeOps for SocketInode {
             let window = {
                 let sock = self.socket.lock();
                 let buf_used = sock.tcp_recv_buf.len();
-                (65536usize.saturating_sub(buf_used) as u32).min(65535) as u16
+                (super::tcp::TCP_MAX_RECV_BUF.saturating_sub(buf_used) as u32).min(65535) as u16
             };
 
             let tcp_len = super::tcp::build_tcp_packet(

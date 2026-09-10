@@ -128,9 +128,20 @@ impl InodeOps for SocketInode {
             if sock.tcp_state == TcpState::Closed {
                 return Err(-104); // ECONNRESET
             }
-            if sock.tcp_recv_buf.is_empty() {
-                if sock.tcp_state == TcpState::CloseWait {
-                    return Ok(0); // EOF
+            while sock.tcp_recv_buf.is_empty() {
+                match sock.tcp_state {
+                    TcpState::CloseWait | TcpState::TimeWait => {
+                        return Ok(0); // Graceful EOF
+                    }
+                    TcpState::Closed => {
+                        let err = if sock.so_error != 0 {
+                            -sock.so_error
+                        } else {
+                            -104 // ECONNRESET
+                        };
+                        return Err(err);
+                    }
+                    _ => {}
                 }
                 if sock.nonblocking {
                     return Err(-11); // -EAGAIN

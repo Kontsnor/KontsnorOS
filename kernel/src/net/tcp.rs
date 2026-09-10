@@ -515,22 +515,22 @@ fn process_segment(
                             });
 
                             if let Some(k) = matching_key {
-                                if let Some(ooo_data) = sock.tcp_ooo_queue.remove(&k) {
-                                    let (chunk_seq, chunk) = if k == cur_nxt {
-                                        (cur_nxt, &ooo_data[..])
-                                    } else {
-                                        let overlap = cur_nxt.wrapping_sub(k) as usize;
-                                        (cur_nxt, &ooo_data[overlap..])
-                                    };
+                                let peek_len = sock.tcp_ooo_queue.get(&k).map(|v| v.len()).unwrap_or(0);
+                                let overlap = if k == cur_nxt { 0 } else { cur_nxt.wrapping_sub(k) as usize };
+                                let chunk_len = peek_len.saturating_sub(overlap);
 
-                                    if !chunk.is_empty() {
-                                        if sock.tcp_recv_buf.len() + chunk.len() <= TCP_MAX_RECV_BUF {
+                                if chunk_len > 0 {
+                                    if sock.tcp_recv_buf.len() + chunk_len <= TCP_MAX_RECV_BUF {
+                                        if let Some(ooo_data) = sock.tcp_ooo_queue.remove(&k) {
+                                            let chunk = &ooo_data[overlap..];
                                             sock.tcp_recv_buf.extend_from_slice(chunk);
-                                            sock.tcp_rcv_nxt = chunk_seq.wrapping_add(chunk.len() as u32);
-                                        } else {
-                                            break;
+                                            sock.tcp_rcv_nxt = cur_nxt.wrapping_add(chunk.len() as u32);
                                         }
+                                    } else {
+                                        break;
                                     }
+                                } else {
+                                    sock.tcp_ooo_queue.remove(&k);
                                 }
                             } else {
                                 // Prune any purely stale OOO keys completely behind cur_nxt

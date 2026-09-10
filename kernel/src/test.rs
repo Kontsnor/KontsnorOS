@@ -2230,3 +2230,42 @@ fn test_phase2_features() {
 
     kprintln!("[test] Phase 2 features verification test PASSED!");
 }
+
+static TEST_PIPE: spin::Mutex<Option<alloc::sync::Arc<crate::ipc::pipe::Pipe>>> =
+    spin::Mutex::new(None);
+
+fn ipc_pipe_writer_thread() {
+    for _ in 0..10 {
+        crate::process::scheduler::yield_now();
+    }
+    if let Some(pipe) = TEST_PIPE.lock().as_ref() {
+        let _ = pipe.write(b"hello pipe");
+    }
+}
+
+#[test_case]
+fn test_ipc_pipe_blocking_read() {
+    kprintln!("[test] Starting IPC pipe blocking read test...");
+    let pipe = crate::ipc::pipe::Pipe::new();
+    *TEST_PIPE.lock() = Some(pipe.clone());
+
+    // 1. Spawn writer thread that writes after delay
+    crate::process::spawn_kernel_thread(
+        alloc::string::String::from("pipe_writer"),
+        ipc_pipe_writer_thread,
+    );
+
+    // 2. Read should block until writer writes "hello pipe"
+    let mut buf = [0u8; 32];
+    let n = pipe.read(&mut buf).expect("Pipe read failed");
+    assert_eq!(n, 10);
+    assert_eq!(&buf[..n], b"hello pipe");
+
+    // 3. Test closing write end returns EOF (0 bytes) when empty
+    pipe.close_write();
+    let n_eof = pipe.read(&mut buf).expect("Pipe read EOF failed");
+    assert_eq!(n_eof, 0);
+
+    *TEST_PIPE.lock() = None;
+    kprintln!("[test] IPC pipe blocking read test PASSED!");
+}

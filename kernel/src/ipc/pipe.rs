@@ -24,6 +24,7 @@
 
 use alloc::sync::Arc;
 use spin::Mutex;
+use crate::sync::wait_queue::WaitQueue;
 
 /// Default pipe buffer size (64 KiB, matching Linux).
 const PIPE_BUF_SIZE: usize = 64 * 1024;
@@ -36,6 +37,8 @@ pub struct Pipe {
     write_open: Mutex<bool>,
     /// Whether the read end is still open.
     read_open: Mutex<bool>,
+    /// Wait queue for blocking tasks on pipe events.
+    wait_queue: WaitQueue,
 }
 
 struct PipeBuffer {
@@ -57,6 +60,7 @@ impl Pipe {
             }),
             write_open: Mutex::new(true),
             read_open: Mutex::new(true),
+            wait_queue: WaitQueue::new(),
         })
     }
 
@@ -85,6 +89,9 @@ impl Pipe {
             buf.count += 1;
         }
 
+        drop(buf);
+        self.wait_queue.wake_all();
+
         Ok(to_write)
     }
 
@@ -93,36 +100,56 @@ impl Pipe {
     /// Returns the number of bytes read, or 0 if the write end is
     /// closed and the buffer is empty (EOF).
     pub fn read(&self, out: &mut [u8]) -> Result<usize, i32> {
-        let mut buf = self.buffer.lock();
-
-        if buf.count == 0 {
-            if !*self.write_open.lock() {
-                return Ok(0); // EOF — write end closed, no data left
-            }
-            // TODO: Block until data is available
+        if out.is_empty() {
             return Ok(0);
         }
 
-        let to_read = out.len().min(buf.count);
+        loop {
+            let mut buf = self.buffer.lock();
 
-        for byte in &mut out[..to_read] {
-            let pos = buf.read_pos;
-            *byte = buf.data[pos];
-            buf.read_pos = (pos + 1) % PIPE_BUF_SIZE;
-            buf.count -= 1;
+            if buf.count == 0 {
+                if !*self.write_open.lock() {
+                    return Ok(0); // EOF — write end closed, no data left
+                }
+                drop(buf);
+
+                // Pre-check before blocking: re-evaluate if data arrived or write end closed
+                let buf = self.buffer.lock();
+                if buf.count > 0 || !*self.write_open.lock() {
+                    continue;
+                }
+                drop(buf);
+
+                self.wait_queue.wait();
+                continue;
+            }
+
+            let to_read = out.len().min(buf.count);
+
+            for byte in &mut out[..to_read] {
+                let pos = buf.read_pos;
+                *byte = buf.data[pos];
+                buf.read_pos = (pos + 1) % PIPE_BUF_SIZE;
+                buf.count -= 1;
+            }
+
+            drop(buf);
+            self.wait_queue.wake_all();
+
+            return Ok(to_read);
         }
-
-        Ok(to_read)
     }
 
     /// Close the write end of the pipe.
     pub fn close_write(&self) {
         *self.write_open.lock() = false;
+        self.wait_queue.wake_all();
     }
 
     /// Close the read end of the pipe.
     pub fn close_read(&self) {
         *self.read_open.lock() = false;
+        self.wait_queue.wake_all();
     }
 
     /// Check if the pipe has data available for reading.

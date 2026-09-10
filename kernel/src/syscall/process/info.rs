@@ -119,8 +119,7 @@ struct TimeZone {
 /// Boot-time Unix timestamp (seconds since epoch), read from the CMOS RTC
 /// during early kernel init by `init_boot_time()`. All `CLOCK_REALTIME`
 /// values are computed as `BOOT_REALTIME_SEC + monotonic_elapsed`.
-static BOOT_REALTIME_SEC: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static BOOT_REALTIME_SEC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Initialise the wall-clock base from the CMOS Real-Time Clock.
 ///

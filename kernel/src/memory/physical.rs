@@ -168,26 +168,30 @@ impl FrameAllocator {
         let mut searched = 0;
         let mut index = self.next_free_hint;
         while searched < MAX_FRAMES {
-            // Try to skip 64 frames (8 bytes) at once
-            if index % 64 == 0 && searched + 64 <= MAX_FRAMES {
+            // Try to scan 64 frames (8 bytes) at once when 64-frame aligned and within MAX_FRAMES
+            if index % 64 == 0 && index + 64 <= MAX_FRAMES && searched + 64 <= MAX_FRAMES {
                 let byte_idx = index / 8;
                 if byte_idx + 8 <= self.bitmap.len() {
                     let bytes = &self.bitmap[byte_idx..byte_idx + 8];
                     let val = u64::from_ne_bytes(bytes.try_into().unwrap());
-                    if val == 0xffff_ffff_ffff_ffffu64 {
+                    if val == u64::MAX {
+                        // Fast path: All 64 frames in this word are allocated
                         index = (index + 64) % MAX_FRAMES;
                         searched += 64;
                         continue;
+                    } else {
+                        // Fast path: At least one frame is free in this word.
+                        // Compute exact free bit index in O(1) time using (!val).trailing_zeros(),
+                        // which maps directly to the x86 hardware instruction TZCNT/BSF.
+                        let free_bit = (!val).trailing_zeros() as usize;
+                        let free_frame_index = index + free_bit;
+                        if free_frame_index < MAX_FRAMES {
+                            self.mark_used(free_frame_index);
+                            self.allocated_frames += 1;
+                            self.next_free_hint = (free_frame_index + 1) % MAX_FRAMES;
+                            return Some(free_frame_index as u64 * PAGE_SIZE as u64);
+                        }
                     }
-                }
-            }
-            // Try to skip 8 frames (1 byte) at once
-            if index % 8 == 0 && searched + 8 <= MAX_FRAMES {
-                let byte_idx = index / 8;
-                if byte_idx < self.bitmap.len() && self.bitmap[byte_idx] == 0xFF {
-                    index = (index + 8) % MAX_FRAMES;
-                    searched += 8;
-                    continue;
                 }
             }
             if self.is_free(index) {

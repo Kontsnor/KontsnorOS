@@ -499,7 +499,8 @@ fn process_segment(
                     // In-order segment (or trimmed partial overlap that is now in-order).
                     if sock.tcp_recv_buf.len() + effective_payload.len() <= TCP_MAX_RECV_BUF {
                         sock.tcp_recv_buf.extend_from_slice(effective_payload);
-                        sock.tcp_rcv_nxt = effective_seq.wrapping_add(effective_payload.len() as u32);
+                        sock.tcp_rcv_nxt =
+                            effective_seq.wrapping_add(effective_payload.len() as u32);
 
                         // Drain any now-consecutive out-of-order segments from OOO queue.
                         loop {
@@ -507,16 +508,27 @@ fn process_segment(
 
                             // Find any OOO key that is either at cur_nxt or partially overlaps cur_nxt
                             let matching_key = sock.tcp_ooo_queue.keys().cloned().find(|&k| {
-                                k == cur_nxt || (k.wrapping_sub(cur_nxt) >= 0x8000_0000 && {
-                                    let len = sock.tcp_ooo_queue.get(&k).map(|v| v.len() as u32).unwrap_or(0);
-                                    let ooo_end = k.wrapping_add(len);
-                                    ooo_end.wrapping_sub(cur_nxt) < 0x8000_0000 && ooo_end != cur_nxt
-                                })
+                                k == cur_nxt
+                                    || (k.wrapping_sub(cur_nxt) >= 0x8000_0000 && {
+                                        let len = sock
+                                            .tcp_ooo_queue
+                                            .get(&k)
+                                            .map(|v| v.len() as u32)
+                                            .unwrap_or(0);
+                                        let ooo_end = k.wrapping_add(len);
+                                        ooo_end.wrapping_sub(cur_nxt) < 0x8000_0000
+                                            && ooo_end != cur_nxt
+                                    })
                             });
 
                             if let Some(k) = matching_key {
-                                let peek_len = sock.tcp_ooo_queue.get(&k).map(|v| v.len()).unwrap_or(0);
-                                let overlap = if k == cur_nxt { 0 } else { cur_nxt.wrapping_sub(k) as usize };
+                                let peek_len =
+                                    sock.tcp_ooo_queue.get(&k).map(|v| v.len()).unwrap_or(0);
+                                let overlap = if k == cur_nxt {
+                                    0
+                                } else {
+                                    cur_nxt.wrapping_sub(k) as usize
+                                };
                                 let chunk_len = peek_len.saturating_sub(overlap);
 
                                 if chunk_len > 0 {
@@ -524,7 +536,8 @@ fn process_segment(
                                         if let Some(ooo_data) = sock.tcp_ooo_queue.remove(&k) {
                                             let chunk = &ooo_data[overlap..];
                                             sock.tcp_recv_buf.extend_from_slice(chunk);
-                                            sock.tcp_rcv_nxt = cur_nxt.wrapping_add(chunk.len() as u32);
+                                            sock.tcp_rcv_nxt =
+                                                cur_nxt.wrapping_add(chunk.len() as u32);
                                         }
                                     } else {
                                         break;
@@ -539,9 +552,14 @@ fn process_segment(
                                     .keys()
                                     .cloned()
                                     .filter(|&k| {
-                                        let len = sock.tcp_ooo_queue.get(&k).map(|v| v.len() as u32).unwrap_or(0);
+                                        let len = sock
+                                            .tcp_ooo_queue
+                                            .get(&k)
+                                            .map(|v| v.len() as u32)
+                                            .unwrap_or(0);
                                         let ooo_end = k.wrapping_add(len);
-                                        ooo_end.wrapping_sub(cur_nxt) >= 0x8000_0000 || ooo_end == cur_nxt
+                                        ooo_end.wrapping_sub(cur_nxt) >= 0x8000_0000
+                                            || ooo_end == cur_nxt
                                     })
                                     .collect();
 
@@ -560,7 +578,9 @@ fn process_segment(
                         let wnd = rcv_wnd(sock.tcp_recv_buf.len());
                         reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK, wnd));
                     }
-                } else if !effective_payload.is_empty() && effective_seq.wrapping_sub(sock.tcp_rcv_nxt) < 0x8000_0000 {
+                } else if !effective_payload.is_empty()
+                    && effective_seq.wrapping_sub(sock.tcp_rcv_nxt) < 0x8000_0000
+                {
                     // Future out-of-order segment (effective_seq > rcv_nxt).
                     let ooo_used: usize = sock.tcp_ooo_queue.values().map(|v| v.len()).sum();
                     if ooo_used + effective_payload.len() <= TCP_MAX_RECV_BUF {

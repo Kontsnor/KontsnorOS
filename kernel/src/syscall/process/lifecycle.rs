@@ -1207,35 +1207,65 @@ pub fn sys_brk(addr: u64) -> SyscallResult {
     new_brk as SyscallResult
 }
 
-/// `arch_prctl()` — Set thread base register (FS_BASE).
+/// `arch_prctl()` — Set/get thread base registers (FS_BASE / GS_BASE).
 pub fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
     // kprintln!("[syscall] arch_prctl(code={:#x}, addr={:#x})", code, addr);
-    if code == 0x1002 {
-        // ARCH_SET_FS
-        x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(addr));
+    match code {
+        0x1001 => {
+            // ARCH_SET_GS
+            let mut msr = x86_64::registers::model_specific::Msr::new(0xC0000102);
+            unsafe {
+                msr.write(addr);
+            }
+            let current_pid = match scheduler::current_pid() {
+                Some(p) => p,
+                None => return Errno::ESRCH.into(),
+            };
+            if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+                task_arc.lock().context.kernel_gs_base = addr;
+            }
+            0
+        }
+        0x1002 => {
+            // ARCH_SET_FS
+            x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(addr));
 
-        let current_pid = match scheduler::current_pid() {
-            Some(p) => p,
-            None => return Errno::ESRCH.into(),
-        };
+            let current_pid = match scheduler::current_pid() {
+                Some(p) => p,
+                None => return Errno::ESRCH.into(),
+            };
 
-        if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
-            task_arc.lock().context.fs_base = addr;
+            if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+                task_arc.lock().context.fs_base = addr;
+            }
+            0
         }
-        0
-    } else if code == 0x1003 {
-        // ARCH_GET_FS
-        if validate_user_ptr_write(addr as *mut u8, 8).is_err() {
-            return Errno::EFAULT.into();
+        0x1003 => {
+            // ARCH_GET_FS
+            if validate_user_ptr_write(addr as *mut u8, 8).is_err() {
+                return Errno::EFAULT.into();
+            }
+            let fs_base = x86_64::registers::model_specific::FsBase::read().as_u64();
+            // SAFETY: The pointer was validated with validate_user_ptr_write and is safe to write to.
+            unsafe {
+                *(addr as *mut u64) = fs_base;
+            }
+            0
         }
-        let fs_base = x86_64::registers::model_specific::FsBase::read().as_u64();
-        // SAFETY: The pointer was validated with validate_user_ptr_write and is safe to write to.
-        unsafe {
-            *(addr as *mut u64) = fs_base;
+        0x1004 => {
+            // ARCH_GET_GS
+            if validate_user_ptr_write(addr as *mut u8, 8).is_err() {
+                return Errno::EFAULT.into();
+            }
+            let msr = x86_64::registers::model_specific::Msr::new(0xC0000102);
+            let gs_base = unsafe { msr.read() };
+            // SAFETY: The pointer was validated with validate_user_ptr_write and is safe to write to.
+            unsafe {
+                *(addr as *mut u64) = gs_base;
+            }
+            0
         }
-        0
-    } else {
-        Errno::EINVAL.into()
+        _ => Errno::EINVAL.into(),
     }
 }
 

@@ -76,6 +76,7 @@ pub fn sys_mmap(
     };
 
     let is_fixed = (flags & 0x10) != 0;
+    let is_fixed_noreplace = (flags & 0x100000) != 0;
 
     // Resolve address and register mmap_region atomically under task.address_space.lock()
     let resolved_addr = {
@@ -86,7 +87,35 @@ pub fn sys_mmap(
         let task = task_arc.lock();
         let mut addr_space = task.address_space.lock();
 
-        let resolved = if is_fixed {
+        let resolved = if is_fixed_noreplace {
+            if addr & 4095 != 0 || addr == 0 {
+                return Errno::EINVAL.into();
+            }
+            let end_addr = match addr.checked_add(aligned_len as u64) {
+                Some(end) => end,
+                None => return Errno::EINVAL.into(),
+            };
+            if end_addr > 0x0000_7FFF_FFFF_FFFF {
+                return Errno::EINVAL.into();
+            }
+
+            // MAP_FIXED_NOREPLACE: Fail with EEXIST if any existing mapping overlaps
+            if addr < addr_space.brk {
+                return Errno::EEXIST.into();
+            }
+            for r in &addr_space.mmap_regions {
+                let r_end = r.start.saturating_add(r.len as u64);
+                if addr < r_end && end_addr > r.start {
+                    return Errno::EEXIST.into();
+                }
+            }
+
+            if end_addr > addr_space.mmap_bump {
+                addr_space.mmap_bump = end_addr;
+            }
+
+            addr
+        } else if is_fixed {
             if addr & 4095 != 0 || addr == 0 {
                 return Errno::EINVAL.into();
             }
@@ -117,13 +146,18 @@ pub fn sys_mmap(
             use x86_64::VirtAddr;
             let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
             let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(end_addr - 1));
+            let mut unmapped_any = false;
             for page in Page::range_inclusive(start_page, end_page) {
                 let result = unsafe {
                     crate::memory::r#virtual::unmap_user_page_no_shootdown(page_table_root, page)
                 };
                 if let Ok(phys_addr) = result {
                     crate::memory::physical::deallocate_frame(phys_addr);
+                    unmapped_any = true;
                 }
+            }
+            if unmapped_any {
+                crate::arch::x86_64::smp::shootdown_tlb();
             }
 
             // Truncate or remove overlapping regions in mmap_regions
@@ -534,27 +568,33 @@ pub fn sys_mprotect(addr: u64, length: usize, prot: i32) -> SyscallResult {
                 use x86_64::structures::paging::PageTableFlags;
                 let mut pte_flags = pte.flags();
 
-                // Handle WRITABLE and BIT_9 (COW)
-                if (prot & 2) != 0 {
-                    if is_shared || !is_file_backed {
-                        pte_flags.insert(PageTableFlags::WRITABLE);
-                        pte_flags.remove(PageTableFlags::BIT_9);
-                    } else {
-                        // Private file mapping: if not already writable, keep or mark as COW
-                        if !pte_flags.contains(PageTableFlags::WRITABLE) {
-                            pte_flags.insert(PageTableFlags::BIT_9);
-                        }
-                    }
+                if prot == 0 {
+                    pte_flags.remove(PageTableFlags::USER_ACCESSIBLE);
                 } else {
-                    pte_flags.remove(PageTableFlags::WRITABLE);
-                    pte_flags.remove(PageTableFlags::BIT_9);
-                }
+                    pte_flags.insert(PageTableFlags::USER_ACCESSIBLE);
 
-                // Handle NO_EXECUTE
-                if (prot & 5) != 0 {
-                    pte_flags.remove(PageTableFlags::NO_EXECUTE);
-                } else {
-                    pte_flags.insert(PageTableFlags::NO_EXECUTE);
+                    // Handle WRITABLE and BIT_9 (COW)
+                    if (prot & 2) != 0 {
+                        if is_shared || !is_file_backed {
+                            pte_flags.insert(PageTableFlags::WRITABLE);
+                            pte_flags.remove(PageTableFlags::BIT_9);
+                        } else {
+                            // Private file mapping: if not already writable, keep or mark as COW
+                            if !pte_flags.contains(PageTableFlags::WRITABLE) {
+                                pte_flags.insert(PageTableFlags::BIT_9);
+                            }
+                        }
+                    } else {
+                        pte_flags.remove(PageTableFlags::WRITABLE);
+                        pte_flags.remove(PageTableFlags::BIT_9);
+                    }
+
+                    // Handle NO_EXECUTE
+                    if (prot & 4) != 0 {
+                        pte_flags.remove(PageTableFlags::NO_EXECUTE);
+                    } else {
+                        pte_flags.insert(PageTableFlags::NO_EXECUTE);
+                    }
                 }
 
                 let addr = pte.addr();

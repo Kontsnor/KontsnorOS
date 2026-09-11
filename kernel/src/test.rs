@@ -2230,3 +2230,157 @@ fn test_phase2_features() {
 
     kprintln!("[test] Phase 2 features verification test PASSED!");
 }
+
+#[test_case]
+fn test_wine_tls_arch_prctl() {
+    kprintln!("[test] Starting Wine TLS & arch_prctl test...");
+
+    // Allocate 1 page for user buffer to test GET_FS / GET_GS
+    let user_buf_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    assert!(user_buf_addr > 0);
+    let fs_ptr = user_buf_addr as *mut u64;
+    let gs_ptr = (user_buf_addr + 8) as *mut u64;
+
+    let fs_val = 0x0000_7FFF_1234_5678u64;
+    let gs_val = 0x0000_7FFF_8765_4321u64;
+
+    // 1. Set FS_BASE (ARCH_SET_FS = 0x1002)
+    let res_set_fs = crate::syscall::process::sys_arch_prctl(0x1002, fs_val);
+    assert_eq!(res_set_fs, 0);
+
+    // 2. Get FS_BASE (ARCH_GET_FS = 0x1003)
+    let res_get_fs = crate::syscall::process::sys_arch_prctl(0x1003, fs_ptr as u64);
+    assert_eq!(res_get_fs, 0);
+    let read_fs = unsafe { fs_ptr.read_volatile() };
+    assert_eq!(read_fs, fs_val);
+
+    // 3. Set GS_BASE (ARCH_SET_GS = 0x1001)
+    let res_set_gs = crate::syscall::process::sys_arch_prctl(0x1001, gs_val);
+    assert_eq!(res_set_gs, 0);
+
+    // 4. Get GS_BASE (ARCH_GET_GS = 0x1004)
+    let res_get_gs = crate::syscall::process::sys_arch_prctl(0x1004, gs_ptr as u64);
+    assert_eq!(res_get_gs, 0);
+    let read_gs = unsafe { gs_ptr.read_volatile() };
+    assert_eq!(read_gs, gs_val);
+
+    // Yield to cause context switches and verify TLS bases remain intact
+    for _ in 0..5 {
+        crate::process::scheduler::yield_now();
+    }
+
+    let res_get_fs2 = crate::syscall::process::sys_arch_prctl(0x1003, fs_ptr as u64);
+    assert_eq!(res_get_fs2, 0);
+    assert_eq!(unsafe { fs_ptr.read_volatile() }, fs_val);
+
+    let res_get_gs2 = crate::syscall::process::sys_arch_prctl(0x1004, gs_ptr as u64);
+    assert_eq!(res_get_gs2, 0);
+    assert_eq!(unsafe { gs_ptr.read_volatile() }, gs_val);
+
+    crate::syscall::memory::sys_munmap(user_buf_addr, 4096);
+    kprintln!("[test] Wine TLS & arch_prctl test PASSED!");
+}
+
+#[test_case]
+fn test_wine_memory_fixed_and_mprotect() {
+    kprintln!("[test] Starting Wine memory model & MAP_FIXED_NOREPLACE test...");
+
+    // Pick a low 2GB address for hardcoded PE base simulation (e.g. 0x40000000)
+    let target_base: u64 = 0x4000_0000;
+    let page_size: usize = 4096;
+
+    // First map a region at target_base using MAP_FIXED (0x10)
+    let addr1 = crate::syscall::memory::sys_mmap(target_base, page_size, 3, 0x32, -1, 0) as u64; // PROT_READ|WRITE, MAP_PRIVATE|ANON|MAP_FIXED
+    assert_eq!(addr1, target_base);
+
+    // Write magic value to page
+    let ptr = addr1 as *mut u64;
+    unsafe {
+        ptr.write_volatile(0xABCDEF1234567890);
+    }
+    assert_eq!(unsafe { ptr.read_volatile() }, 0xABCDEF1234567890);
+
+    // Attempt MAP_FIXED_NOREPLACE (0x100000) on overlapping address -> must return -EEXIST (-17)
+    let res_overlap = crate::syscall::memory::sys_mmap(target_base, page_size, 3, 0x100022, -1, 0);
+    assert_eq!(res_overlap, crate::syscall::Errno::EEXIST as i64);
+
+    // Attempt MAP_FIXED_NOREPLACE on adjacent non-overlapping page (target_base + 0x1000) -> must succeed
+    let next_base = target_base + 0x1000;
+    let addr2 = crate::syscall::memory::sys_mmap(next_base, page_size, 3, 0x100022, -1, 0) as u64;
+    assert_eq!(addr2, next_base);
+
+    // Test sys_mprotect transitions (e.g., PROT_READ = 1, PROT_NONE = 0, PROT_READ|WRITE = 3)
+    let res_prot_read = crate::syscall::memory::sys_mprotect(target_base, page_size, 1);
+    assert_eq!(res_prot_read, 0);
+
+    let res_prot_rw = crate::syscall::memory::sys_mprotect(target_base, page_size, 3);
+    assert_eq!(res_prot_rw, 0);
+
+    // Clean up
+    crate::syscall::memory::sys_munmap(addr1, page_size);
+    crate::syscall::memory::sys_munmap(addr2, page_size);
+    kprintln!("[test] Wine memory model & MAP_FIXED_NOREPLACE test PASSED!");
+}
+
+#[test_case]
+fn test_wine_sigaltstack_and_ucontext() {
+    kprintln!("[test] Starting Wine sigaltstack & ucontext frame test...");
+
+    // Allocate stack memory for sigaltstack
+    let alt_stack_size: u64 = 16384;
+    let alt_stack_mem = crate::syscall::memory::sys_mmap(0, alt_stack_size as usize, 3, 0x22, -1, 0) as u64;
+    assert!(alt_stack_mem > 0);
+
+    let old_ss_buf = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    assert!(old_ss_buf > 0);
+
+    let new_ss = crate::process::task::StackT {
+        ss_sp: alt_stack_mem,
+        ss_flags: 0,
+        _pad: 0,
+        ss_size: alt_stack_size,
+    };
+
+    // 1. Register alternate signal stack
+    let res_alt = crate::syscall::process::sys_sigaltstack(
+        &new_ss as *const _ as *const u8,
+        old_ss_buf as *mut u8,
+        0x0000_7FFF_0000_0000,
+    );
+    assert_eq!(res_alt, 0);
+
+    // Read back old_ss from old_ss_buf
+    let old_ss = unsafe { *(old_ss_buf as *const crate::process::task::StackT) };
+    assert_ne!(old_ss.ss_flags & 2, 0); // Previously SS_DISABLE
+
+    // Query sigaltstack again to verify active configuration
+    let res_query = crate::syscall::process::sys_sigaltstack(
+        core::ptr::null(),
+        old_ss_buf as *mut u8,
+        0x0000_7FFF_0000_0000,
+    );
+    assert_eq!(res_query, 0);
+    let query_ss = unsafe { *(old_ss_buf as *const crate::process::task::StackT) };
+    assert_eq!(query_ss.ss_sp, alt_stack_mem);
+    assert_eq!(query_ss.ss_size, alt_stack_size);
+    assert_eq!(query_ss.ss_flags, 0);
+
+    // Disable alternate signal stack
+    let disable_ss = crate::process::task::StackT {
+        ss_sp: 0,
+        ss_flags: 2, // SS_DISABLE
+        _pad: 0,
+        ss_size: 0,
+    };
+    let res_disable = crate::syscall::process::sys_sigaltstack(
+        &disable_ss as *const _ as *const u8,
+        core::ptr::null_mut(),
+        0x0000_7FFF_0000_0000,
+    );
+    assert_eq!(res_disable, 0);
+
+    // Clean up
+    crate::syscall::memory::sys_munmap(alt_stack_mem, alt_stack_size as usize);
+    crate::syscall::memory::sys_munmap(old_ss_buf, 4096);
+    kprintln!("[test] Wine sigaltstack & ucontext frame test PASSED!");
+}

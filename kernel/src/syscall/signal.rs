@@ -340,21 +340,10 @@ pub fn sys_rt_sigprocmask(
     0
 }
 
-/// User space signal handler trampoline frame.
+/// Linux x86_64 `sigcontext` / `mcontext_t` structure.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct SignalFrame {
-    pub ret_addr: u64,
-    pub rflags: u64,
-    pub rip: u64,
-    pub rax: u64,
-    pub rbx: u64,
-    pub rbp: u64,
-    pub rsp: u64,
-    pub rdi: u64,
-    pub rsi: u64,
-    pub rdx: u64,
-    pub rcx: u64,
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SigContext {
     pub r8: u64,
     pub r9: u64,
     pub r10: u64,
@@ -363,7 +352,60 @@ pub struct SignalFrame {
     pub r13: u64,
     pub r14: u64,
     pub r15: u64,
-    pub mask: u64, // Saved signal mask (blocked_signals)
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rbp: u64,
+    pub rbx: u64,
+    pub rdx: u64,
+    pub rax: u64,
+    pub rcx: u64,
+    pub rsp: u64,
+    pub rip: u64,
+    pub eflags: u64,
+    pub cs: u16,
+    pub gs: u16,
+    pub fs: u16,
+    pub __pad0: u16,
+    pub err: u64,
+    pub trapno: u64,
+    pub oldmask: u64,
+    pub cr2: u64,
+    pub fpstate: u64,
+    pub reserved1: [u64; 8],
+}
+
+/// Linux x86_64 `ucontext_t` structure.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct UContext {
+    pub uc_flags: u64,
+    pub uc_link: u64,
+    pub uc_stack: crate::process::task::StackT,
+    pub uc_mcontext: SigContext,
+    pub uc_sigmask: u64,
+    pub __fpregs_mem: [u8; 512],
+}
+
+impl Default for UContext {
+    fn default() -> Self {
+        Self {
+            uc_flags: 0,
+            uc_link: 0,
+            uc_stack: crate::process::task::StackT::default(),
+            uc_mcontext: SigContext::default(),
+            uc_sigmask: 0,
+            __fpregs_mem: [0u8; 512],
+        }
+    }
+}
+
+/// Linux x86_64 `rt_sigframe` stack structure.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RtSigFrame {
+    pub pretcode: u64,
+    pub info: crate::syscall::process::lifecycle::SigInfo,
+    pub uc: UContext,
 }
 
 fn terminate_group_and_exit(current_pid: crate::process::pid::Pid, exit_code: i32) -> ! {
@@ -496,51 +538,90 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
             }
         }
 
-        let new_user_sp = (user_sp - core::mem::size_of::<SignalFrame>() as u64) & !0xF;
+        let new_user_sp = (user_sp - core::mem::size_of::<RtSigFrame>() as u64) & !0xF;
 
         if !crate::syscall::fs::validate_user_ptr(
             new_user_sp as *const u8,
-            core::mem::size_of::<SignalFrame>(),
+            core::mem::size_of::<RtSigFrame>(),
         ) {
             kprintln!("[signal] Invalid user stack for signal delivery. Exiting task group.");
             terminate_group_and_exit(current_pid, 11 | 128); // SIGSEGV
         }
 
-        let frame = SignalFrame {
-            ret_addr: action.sa_restorer,
-            rflags: unsafe { (*regs).rflags },
-            rip: unsafe { (*regs).rip },
-            rax: unsafe { (*regs).rax },
-            rbx: unsafe { (*regs).rbx },
-            rbp: unsafe { (*regs).rbp },
-            rsp: original_user_sp,
-            rdi: unsafe { (*regs).rdi },
-            rsi: unsafe { (*regs).rsi },
-            rdx: unsafe { (*regs).rdx },
-            rcx: unsafe { (*regs).rip }, // Aliased to user RIP (rcx) on the syscall path
-            r8: unsafe { (*regs).r8 },
-            r9: unsafe { (*regs).r9 },
-            r10: unsafe { (*regs).r10 },
-            r11: unsafe { (*regs).rflags }, // Aliased to user RFLAGS (r11) on the syscall path
-            r12: unsafe { (*regs).r12 },
-            r13: unsafe { (*regs).r13 },
-            r14: unsafe { (*regs).r14 },
-            r15: unsafe { (*regs).r15 },
-            mask: old_mask,
+        let frame = RtSigFrame {
+            pretcode: action.sa_restorer,
+            info: crate::syscall::process::lifecycle::SigInfo {
+                si_signo: sig as i32,
+                si_errno: 0,
+                si_code: 0,
+                si_pid: current_pid.as_u64() as i32,
+                si_uid: 0,
+                si_status: 0,
+                _pad: [0u8; 104],
+            },
+            uc: UContext {
+                uc_flags: 0,
+                uc_link: 0,
+                uc_stack: sigaltstack.unwrap_or(crate::process::task::StackT {
+                    ss_sp: 0,
+                    ss_flags: 2, // SS_DISABLE
+                    _pad: 0,
+                    ss_size: 0,
+                }),
+                uc_mcontext: SigContext {
+                    r8: unsafe { (*regs).r8 },
+                    r9: unsafe { (*regs).r9 },
+                    r10: unsafe { (*regs).r10 },
+                    r11: unsafe { (*regs).rflags },
+                    r12: unsafe { (*regs).r12 },
+                    r13: unsafe { (*regs).r13 },
+                    r14: unsafe { (*regs).r14 },
+                    r15: unsafe { (*regs).r15 },
+                    rdi: unsafe { (*regs).rdi },
+                    rsi: unsafe { (*regs).rsi },
+                    rbp: unsafe { (*regs).rbp },
+                    rbx: unsafe { (*regs).rbx },
+                    rdx: unsafe { (*regs).rdx },
+                    rax: unsafe { (*regs).rax },
+                    rcx: unsafe { (*regs).rip },
+                    rsp: original_user_sp,
+                    rip: unsafe { (*regs).rip },
+                    eflags: unsafe { (*regs).rflags },
+                    cs: (crate::arch::x86_64::gdt::user_code_selector().0 | 3) as u16,
+                    gs: 0,
+                    fs: 0,
+                    __pad0: 0,
+                    err: 0,
+                    trapno: 0,
+                    oldmask: old_mask,
+                    cr2: 0,
+                    fpstate: 0,
+                    reserved1: [0u64; 8],
+                },
+                uc_sigmask: old_mask,
+                __fpregs_mem: [0u8; 512],
+            },
         };
 
+        let info_ptr = new_user_sp + 8; // pretcode is 8 bytes
+        let uc_ptr = new_user_sp + 8 + core::mem::size_of::<crate::syscall::process::lifecycle::SigInfo>() as u64;
+
         unsafe {
-            core::ptr::write(new_user_sp as *mut SignalFrame, frame);
+            core::ptr::write(new_user_sp as *mut RtSigFrame, frame);
             (*regs).rsp = new_user_sp;
             (*regs).rip = action.sa_handler;
             (*regs).rdi = sig as u64;
+            (*regs).rsi = info_ptr;
+            (*regs).rdx = uc_ptr;
         }
 
         if DEBUG_SIGNALS {
             kprintln!(
-                "[signal] Delivered signal {} to custom handler at {:#x}, trampoline user stack: {:#x}",
+                "[signal] Delivered signal {} to custom handler at {:#x}, info={:#x}, ucontext={:#x}, stack={:#x}",
                 sig,
                 action.sa_handler,
+                info_ptr,
+                uc_ptr,
                 new_user_sp
             );
         }
@@ -550,41 +631,42 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
 /// `sys_rt_sigreturn` — Return from signal handler.
 pub fn sys_rt_sigreturn(regs: *mut super::SavedRegisters) -> SyscallResult {
     let user_sp = unsafe { (*regs).rsp };
-    let frame_ptr = (user_sp - 8) as *const SignalFrame;
+    let frame_ptr = (user_sp - 8) as *const RtSigFrame;
 
     if !crate::syscall::fs::validate_user_ptr(
         frame_ptr as *const u8,
-        core::mem::size_of::<SignalFrame>(),
+        core::mem::size_of::<RtSigFrame>(),
     ) {
         return Errno::EFAULT.into();
     }
 
     unsafe {
         let frame = &*frame_ptr;
-        (*regs).rflags = (frame.rflags & !0x3000) | 0x202; // Strip IOPL, enable interrupts
-        (*regs).rip = frame.rip;
-        (*regs).rax = frame.rax;
-        (*regs).rbx = frame.rbx;
-        (*regs).rbp = frame.rbp;
-        (*regs).rdi = frame.rdi;
-        (*regs).rsi = frame.rsi;
-        (*regs).rdx = frame.rdx;
-        (*regs).r8 = frame.r8;
-        (*regs).r9 = frame.r9;
-        (*regs).r10 = frame.r10;
-        (*regs).r12 = frame.r12;
-        (*regs).r13 = frame.r13;
-        (*regs).r14 = frame.r14;
-        (*regs).r15 = frame.r15;
+        let mctx = &frame.uc.uc_mcontext;
+        (*regs).rflags = (mctx.eflags & !0x3000) | 0x202; // Strip IOPL, enable interrupts
+        (*regs).rip = mctx.rip;
+        (*regs).rax = mctx.rax;
+        (*regs).rbx = mctx.rbx;
+        (*regs).rbp = mctx.rbp;
+        (*regs).rdi = mctx.rdi;
+        (*regs).rsi = mctx.rsi;
+        (*regs).rdx = mctx.rdx;
+        (*regs).r8 = mctx.r8;
+        (*regs).r9 = mctx.r9;
+        (*regs).r10 = mctx.r10;
+        (*regs).r12 = mctx.r12;
+        (*regs).r13 = mctx.r13;
+        (*regs).r14 = mctx.r14;
+        (*regs).r15 = mctx.r15;
 
-        (*regs).rsp = frame.rsp;
+        (*regs).rsp = mctx.rsp;
 
         // Restore saved signal mask
         use crate::process::scheduler;
         if let Some(current_pid) = scheduler::current_pid() {
             if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
                 let mut task = task_arc.lock();
-                task.blocked_signals = frame.mask;
+                task.blocked_signals = frame.uc.uc_sigmask;
                 // SIGKILL (9) and SIGSTOP (19) cannot be blocked
                 task.blocked_signals &= !((1 << 8) | (1 << 18));
 
@@ -600,8 +682,8 @@ pub fn sys_rt_sigreturn(regs: *mut super::SavedRegisters) -> SyscallResult {
         if DEBUG_SIGNALS {
             kprintln!(
                 "[signal] sys_rt_sigreturn: restored execution context to RIP={:#x}, RSP={:#x}",
-                frame.rip,
-                frame.rsp
+                mctx.rip,
+                mctx.rsp
             );
         }
 

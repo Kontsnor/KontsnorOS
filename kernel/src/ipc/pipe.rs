@@ -22,9 +22,9 @@
 //! Writer Process ──write()──→ [Ring Buffer] ──read()──→ Reader Process
 //! ```
 
+use crate::sync::wait_queue::WaitQueue;
 use alloc::sync::Arc;
 use spin::Mutex;
-use crate::sync::wait_queue::WaitQueue;
 
 /// Default pipe buffer size (64 KiB, matching Linux).
 const PIPE_BUF_SIZE: usize = 64 * 1024;

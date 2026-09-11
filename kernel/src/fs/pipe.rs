@@ -53,25 +53,57 @@ impl PipeBuffer {
         self.len == 0
     }
 
-    fn push(&mut self, byte: u8) -> bool {
-        if self.len < PIPE_BUF_SIZE {
-            self.data[self.write_pos] = byte;
-            self.write_pos = (self.write_pos + 1) % PIPE_BUF_SIZE;
-            self.len += 1;
-            true
-        } else {
-            false
+    /// Push a slice of bytes into the circular buffer using fast contiguous block memory copies.
+    ///
+    /// Performance: Replaces byte-by-byte loop iterations and modulo division with at most two
+    /// `copy_from_slice` calls (vectorized block memory moves), reducing O(N) loop overheads
+    /// to O(1) bulk operations.
+    fn push_slice(&mut self, src: &[u8]) -> usize {
+        let available = PIPE_BUF_SIZE - self.len;
+        if available == 0 || src.is_empty() {
+            return 0;
         }
+        let to_write = core::cmp::min(src.len(), available);
+
+        // First contiguous chunk: from write_pos to buffer end (or write end)
+        let first_chunk = core::cmp::min(to_write, PIPE_BUF_SIZE - self.write_pos);
+        self.data[self.write_pos..self.write_pos + first_chunk]
+            .copy_from_slice(&src[..first_chunk]);
+
+        // Second contiguous chunk: wrap around to start of ring buffer
+        let second_chunk = to_write - first_chunk;
+        if second_chunk > 0 {
+            self.data[..second_chunk].copy_from_slice(&src[first_chunk..to_write]);
+        }
+
+        self.write_pos = (self.write_pos + to_write) & (PIPE_BUF_SIZE - 1);
+        self.len += to_write;
+        to_write
     }
 
-    fn pop(&mut self) -> Option<u8> {
-        if self.len == 0 {
-            return None;
+    /// Pop bytes from the circular buffer into a slice using fast contiguous block memory copies.
+    ///
+    /// Performance: Replaces byte-by-byte loop iterations and modulo division with at most two
+    /// `copy_from_slice` calls, maximizing CPU throughput during pipe IPC reads.
+    fn pop_slice(&mut self, dst: &mut [u8]) -> usize {
+        if self.len == 0 || dst.is_empty() {
+            return 0;
         }
-        let byte = self.data[self.read_pos];
-        self.read_pos = (self.read_pos + 1) % PIPE_BUF_SIZE;
-        self.len -= 1;
-        Some(byte)
+        let to_read = core::cmp::min(dst.len(), self.len);
+
+        // First contiguous chunk: from read_pos to buffer end (or read end)
+        let first_chunk = core::cmp::min(to_read, PIPE_BUF_SIZE - self.read_pos);
+        dst[..first_chunk].copy_from_slice(&self.data[self.read_pos..self.read_pos + first_chunk]);
+
+        // Second contiguous chunk: wrap around to start of ring buffer
+        let second_chunk = to_read - first_chunk;
+        if second_chunk > 0 {
+            dst[first_chunk..to_read].copy_from_slice(&self.data[..second_chunk]);
+        }
+
+        self.read_pos = (self.read_pos + to_read) & (PIPE_BUF_SIZE - 1);
+        self.len -= to_read;
+        to_read
     }
 }
 
@@ -115,15 +147,7 @@ impl InodeOps for PipeReader {
             {
                 let mut guard = self.state.buffer.lock();
                 if !guard.is_empty() {
-                    let mut count = 0;
-                    while count < buf.len() {
-                        if let Some(byte) = guard.pop() {
-                            buf[count] = byte;
-                            count += 1;
-                        } else {
-                            break;
-                        }
-                    }
+                    let count = guard.pop_slice(buf);
                     drop(guard);
                     self.state.wait_queue.wake_all();
                     return Ok(count);
@@ -223,25 +247,20 @@ impl InodeOps for PipeWriter {
                 return Err(-32); // EPIPE
             }
 
-            let space_available = {
+            let bytes_pushed = {
                 let mut guard = self.state.buffer.lock();
                 if !guard.is_full() {
-                    while written < data.len() && !guard.is_full() {
-                        if guard.push(data[written]) {
-                            written += 1;
-                        } else {
-                            break;
-                        }
-                    }
+                    let n = guard.push_slice(&data[written..]);
+                    written += n;
                     drop(guard);
                     self.state.wait_queue.wake_all();
-                    true
+                    n
                 } else {
-                    false
+                    0
                 }
             };
 
-            if !space_available {
+            if bytes_pushed == 0 {
                 if self.non_blocking.load(Ordering::SeqCst) {
                     if written > 0 {
                         return Ok(written);

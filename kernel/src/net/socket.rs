@@ -167,9 +167,17 @@ impl InodeOps for SocketInode {
                 // If window opened by at least 16 KB or opened from 0, send window update ACK
                 if (prev_wnd == 0 && new_wnd > 0) || (new_wnd.saturating_sub(prev_wnd) >= 16384) {
                     if sock.tcp_state == TcpState::Established {
-                        if let (Some(local_ip), Some(remote_ip), Some(local_port), Some(remote_port)) =
-                            (sock.local_addr, sock.remote_addr, sock.local_port, sock.remote_port)
-                        {
+                        if let (
+                            Some(local_ip),
+                            Some(remote_ip),
+                            Some(local_port),
+                            Some(remote_port),
+                        ) = (
+                            sock.local_addr,
+                            sock.remote_addr,
+                            sock.local_port,
+                            sock.remote_port,
+                        ) {
                             let seq = sock.tcp_snd_nxt;
                             let ack = sock.tcp_rcv_nxt;
                             let wnd = (new_wnd as u32).min(65535) as u16;

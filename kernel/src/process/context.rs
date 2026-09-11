@@ -182,6 +182,12 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut CpuContext, _new_ctx: *co
         // Save FS_BASE using rdfsbase (since userspace can now modify FS_BASE directly)
         "rdfsbase rax",
         "mov [rdi + 0x50], rax",
+        // Save user GS_BASE (stored in KERNEL_GS_BASE MSR 0xC0000102 while in ring 0)
+        "mov ecx, 0xC0000102",
+        "rdmsr",
+        "shl rdx, 32",
+        "or rax, rdx",
+        "mov [rdi + 0x60], rax",
         // Save FPU/SSE state (XMM0-XMM15, MXCSR, FPU control words)
         "fxsave64 [rdi + 0x70]",
         // ── Restore new context ────────────────────────────────────
@@ -215,14 +221,11 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut CpuContext, _new_ctx: *co
         "popfq",
         // 5. Restore FS_BASE (TLS)
         "wrfsbase rax",
-        // 6. Restore KERNEL_GS_BASE MSR if non-zero
-        "test rdx, rdx",
-        "jz 5f",
+        // 6. Restore KERNEL_GS_BASE MSR unconditionally
         "mov rax, rdx",
         "shr rdx, 32",
         "mov ecx, 0xC0000102",
         "wrmsr",
-        "5:",
         // 7. Jump to the new task's entry point
         "jmp r9",
     );

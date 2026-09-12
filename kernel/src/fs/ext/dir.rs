@@ -235,7 +235,7 @@ impl ExtInode {
 
         if is_dir {
             let block = self.fs.allocate_block().ok()?;
-            raw_child.i_block[0] = block as u32;
+            raw_child.i_block[0] = block;
             raw_child.i_blocks = self.fs.block_size / 512;
             raw_child.i_size = self.fs.block_size;
 

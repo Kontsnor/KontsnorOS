@@ -30,8 +30,8 @@ fi
 echo "Creating 6GB blank disk image..."
 dd if=/dev/zero of="$DISK_IMG" bs=1M count=6144
 
-echo "Formatting disk.img with ext4 (4096 byte blocks)..."
-mkfs.ext4 -b 4096 -F "$DISK_IMG"
+echo "Formatting disk.img with ext2 (4096 byte blocks)..."
+mkfs.ext2 -b 4096 -F "$DISK_IMG"
 
 echo "Making binaries executable on host..."
 chmod +x "$SH_BIN"

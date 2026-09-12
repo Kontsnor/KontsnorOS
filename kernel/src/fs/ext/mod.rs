@@ -96,6 +96,25 @@ pub(crate) fn write_blocks(
         .map_err(|_| "Block device write error")
 }
 
+/// Mark a physical disk block as allocated in the calculated group block bitmaps.
+fn mark_phys_block(
+    calc_block_bitmaps: &mut [Vec<u8>],
+    phys_block: u64,
+    first_data_block: u32,
+    blocks_per_group: u32,
+    total_blocks: u64,
+) {
+    if phys_block >= first_data_block as u64 && phys_block < total_blocks {
+        let b_group = ((phys_block - first_data_block as u64) / blocks_per_group as u64) as usize;
+        let local_b = ((phys_block - first_data_block as u64) % blocks_per_group as u64) as usize;
+        let byte = local_b / 8;
+        let bit = local_b % 8;
+        if b_group < calc_block_bitmaps.len() && byte < calc_block_bitmaps[b_group].len() {
+            calc_block_bitmaps[b_group][byte] |= 1 << bit;
+        }
+    }
+}
+
 /// Trace physical blocks allocated in an extent tree for FSCK.
 fn trace_extent_tree_blocks(
     device: &dyn BlockDevice,
@@ -146,16 +165,7 @@ fn trace_extent_tree_blocks(
                     let start = ext.start_block();
                     let len = ext.len() as u64;
                     for b in 0..len {
-                        let phys = start + b;
-                        if phys >= first_data_block as u64 && phys < total_blocks {
-                            let b_group = ((phys - first_data_block as u64) / blocks_per_group as u64) as usize;
-                            let local_b = ((phys - first_data_block as u64) % blocks_per_group as u64) as usize;
-                            let byte = local_b / 8;
-                            let bit = local_b % 8;
-                            if b_group < num_groups && byte < calc_block_bitmaps[b_group].len() {
-                                calc_block_bitmaps[b_group][byte] |= 1 << bit;
-                            }
-                        }
+                        mark_phys_block(calc_block_bitmaps, start + b, first_data_block, blocks_per_group, total_blocks);
                     }
                 }
             }
@@ -168,28 +178,20 @@ fn trace_extent_tree_blocks(
                         core::ptr::read_unaligned(buf[offset..].as_ptr() as *const types::Ext4ExtentIdx)
                     };
                     let child_block = idx.leaf_block();
-                    if child_block >= first_data_block as u64 && child_block < total_blocks {
-                        let b_group = ((child_block - first_data_block as u64) / blocks_per_group as u64) as usize;
-                        let local_b = ((child_block - first_data_block as u64) % blocks_per_group as u64) as usize;
-                        let byte = local_b / 8;
-                        let bit = local_b % 8;
-                        if b_group < num_groups && byte < calc_block_bitmaps[b_group].len() {
-                            calc_block_bitmaps[b_group][byte] |= 1 << bit;
-                        }
+                    mark_phys_block(calc_block_bitmaps, child_block, first_data_block, blocks_per_group, total_blocks);
 
-                        let mut child_buf = ::alloc::vec![0u8; block_size as usize];
-                        if read_blocks(device, child_block, &mut child_buf, block_size).is_ok() {
-                            trace_node(
-                                device,
-                                block_size,
-                                num_groups,
-                                blocks_per_group,
-                                first_data_block,
-                                total_blocks,
-                                &child_buf,
-                                calc_block_bitmaps,
-                            );
-                        }
+                    let mut child_buf = ::alloc::vec![0u8; block_size as usize];
+                    if read_blocks(device, child_block, &mut child_buf, block_size).is_ok() {
+                        trace_node(
+                            device,
+                            block_size,
+                            num_groups,
+                            blocks_per_group,
+                            first_data_block,
+                            total_blocks,
+                            &child_buf,
+                            calc_block_bitmaps,
+                        );
                     }
                 }
             }
@@ -561,19 +563,44 @@ impl ExtFileSystem {
             None => return Err("Overflow in metadata size calculation"),
         };
 
-        // 1. Mark reserved metadata blocks as allocated
+        // 1. Mark reserved metadata blocks as allocated across all groups (accounting for flex_bg placement)
         for g in 0..num_groups {
-            let start_block = (g as u64) * blocks_per_group as u64 + sb.s_first_data_block as u64;
-            let inode_table_loc = gds[g].inode_table(is_64bit);
-            let end_block = core::cmp::min(inode_table_loc + it_blocks as u64, total_blocks);
-            for b in start_block..end_block {
-                if b >= start_block && b < start_block + blocks_per_group as u64 {
-                    let local_b = (b - start_block) as usize;
-                    let byte = local_b / 8;
-                    let bit = local_b % 8;
-                    if byte < calc_block_bitmaps[g].len() {
-                        calc_block_bitmaps[g][byte] |= 1 << bit;
+            let gd = &gds[g];
+
+            // Block bitmap for group g
+            mark_phys_block(&mut calc_block_bitmaps, gd.block_bitmap(is_64bit), sb.s_first_data_block, blocks_per_group, total_blocks);
+
+            // Inode bitmap for group g
+            mark_phys_block(&mut calc_block_bitmaps, gd.inode_bitmap(is_64bit), sb.s_first_data_block, blocks_per_group, total_blocks);
+
+            // Inode table blocks for group g
+            let it_start = gd.inode_table(is_64bit);
+            for b in 0..it_blocks as u64 {
+                mark_phys_block(&mut calc_block_bitmaps, it_start + b, sb.s_first_data_block, blocks_per_group, total_blocks);
+            }
+
+            // Check if group g has superblock + GDT backup blocks
+            let group_start_block = (g as u64) * blocks_per_group as u64 + sb.s_first_data_block as u64;
+            let is_sparse_bg = (sb.s_feature_ro_compat & types::RO_COMPAT_SPARSE_SUPER) != 0;
+            let has_super = if !is_sparse_bg {
+                true
+            } else if g == 0 || g == 1 {
+                true
+            } else {
+                fn is_power_of(mut n: usize, base: usize) -> bool {
+                    if n == 0 { return false; }
+                    while n % base == 0 {
+                        n /= base;
                     }
+                    n == 1
+                }
+                is_power_of(g, 3) || is_power_of(g, 5) || is_power_of(g, 7)
+            };
+
+            if has_super {
+                mark_phys_block(&mut calc_block_bitmaps, group_start_block, sb.s_first_data_block, blocks_per_group, total_blocks);
+                for gb in 1..=gdt_blocks as u64 {
+                    mark_phys_block(&mut calc_block_bitmaps, group_start_block + gb, sb.s_first_data_block, blocks_per_group, total_blocks);
                 }
             }
         }
@@ -607,7 +634,7 @@ impl ExtFileSystem {
 
             let raw_inode = read_raw_inode(&block_cache_buf, offset_in_block, s_inode_size as usize);
 
-            if raw_inode.i_links_count > 0 {
+            if raw_inode.i_links_count > 0 && raw_inode.i_mode != 0 {
                 // Mark inode as allocated
                 let i_idx = (ino - 1) % s_inodes_per_group;
                 let byte = (i_idx / 8) as usize;
@@ -633,28 +660,12 @@ impl ExtFileSystem {
                     // Trace block pointers
                     for file_block in 0..12 {
                         let block_num = raw_inode.i_block[file_block] as u64;
-                        if block_num != 0 && block_num < total_blocks {
-                            let b_group =
-                                ((block_num - sb.s_first_data_block as u64) / blocks_per_group as u64) as usize;
-                            let local_b = ((block_num - sb.s_first_data_block as u64) % blocks_per_group as u64) as usize;
-                            let byte = local_b / 8;
-                            let bit = local_b % 8;
-                            if b_group < num_groups && byte < calc_block_bitmaps[b_group].len() {
-                                calc_block_bitmaps[b_group][byte] |= 1 << bit;
-                            }
-                        }
+                        mark_phys_block(&mut calc_block_bitmaps, block_num, sb.s_first_data_block, blocks_per_group, total_blocks);
                     }
 
                     let sib = raw_inode.i_block[12] as u64;
                     if sib != 0 && sib < total_blocks {
-                        // Mark indirect block as allocated
-                        let sib_group = ((sib - sb.s_first_data_block as u64) / blocks_per_group as u64) as usize;
-                        let sib_local = ((sib - sb.s_first_data_block as u64) % blocks_per_group as u64) as usize;
-                        let sib_byte = sib_local / 8;
-                        let sib_bit = sib_local % 8;
-                        if sib_group < num_groups && sib_byte < calc_block_bitmaps[sib_group].len() {
-                            calc_block_bitmaps[sib_group][sib_byte] |= 1 << sib_bit;
-                        }
+                        mark_phys_block(&mut calc_block_bitmaps, sib, sb.s_first_data_block, blocks_per_group, total_blocks);
 
                         // Read indirect block and trace its pointers
                         let mut ind_buf = ::alloc::vec![0u8; block_size as usize];
@@ -668,33 +679,14 @@ impl ExtFileSystem {
                                     ind_buf[ptr_offset + 2],
                                     ind_buf[ptr_offset + 3],
                                 ]) as u64;
-                                if phys_block != 0 && phys_block < total_blocks {
-                                    let b_group = ((phys_block - sb.s_first_data_block as u64)
-                                        / blocks_per_group as u64)
-                                        as usize;
-                                    let local_b =
-                                        ((phys_block - sb.s_first_data_block as u64) % blocks_per_group as u64) as usize;
-                                    let byte = local_b / 8;
-                                    let bit = local_b % 8;
-                                    if b_group < num_groups && byte < calc_block_bitmaps[b_group].len()
-                                    {
-                                        calc_block_bitmaps[b_group][byte] |= 1 << bit;
-                                    }
-                                }
+                                mark_phys_block(&mut calc_block_bitmaps, phys_block, sb.s_first_data_block, blocks_per_group, total_blocks);
                             }
                         }
                     }
 
                     let dib = raw_inode.i_block[13] as u64;
                     if dib != 0 && dib < total_blocks {
-                        // Mark double indirect block as allocated
-                        let dib_group = ((dib - sb.s_first_data_block as u64) / blocks_per_group as u64) as usize;
-                        let dib_local = ((dib - sb.s_first_data_block as u64) % blocks_per_group as u64) as usize;
-                        let dib_byte = dib_local / 8;
-                        let dib_bit = dib_local % 8;
-                        if dib_group < num_groups && dib_byte < calc_block_bitmaps[dib_group].len() {
-                            calc_block_bitmaps[dib_group][dib_byte] |= 1 << dib_bit;
-                        }
+                        mark_phys_block(&mut calc_block_bitmaps, dib, sb.s_first_data_block, blocks_per_group, total_blocks);
 
                         // Read double indirect block and trace its single indirect blocks
                         let mut dib_buf = ::alloc::vec![0u8; block_size as usize];
@@ -709,17 +701,7 @@ impl ExtFileSystem {
                                     dib_buf[ptr_offset + 3],
                                 ]) as u64;
                                 if sib != 0 && sib < total_blocks {
-                                    // Mark indirect block as allocated
-                                    let sib_group =
-                                        ((sib - sb.s_first_data_block as u64) / blocks_per_group as u64) as usize;
-                                    let sib_local = ((sib - sb.s_first_data_block as u64) % blocks_per_group as u64) as usize;
-                                    let sib_byte = sib_local / 8;
-                                    let sib_bit = sib_local % 8;
-                                    if sib_group < num_groups
-                                        && sib_byte < calc_block_bitmaps[sib_group].len()
-                                    {
-                                        calc_block_bitmaps[sib_group][sib_byte] |= 1 << sib_bit;
-                                    }
+                                    mark_phys_block(&mut calc_block_bitmaps, sib, sb.s_first_data_block, blocks_per_group, total_blocks);
 
                                     // Read indirect block and trace its pointers
                                     let mut ind_buf = ::alloc::vec![0u8; block_size as usize];
@@ -734,20 +716,7 @@ impl ExtFileSystem {
                                                 ind_buf[ptr_offset2 + 2],
                                                 ind_buf[ptr_offset2 + 3],
                                             ]) as u64;
-                                            if phys_block != 0 && phys_block < total_blocks {
-                                                let b_group = ((phys_block - sb.s_first_data_block as u64)
-                                                    / blocks_per_group as u64)
-                                                    as usize;
-                                                let local_b = ((phys_block - sb.s_first_data_block as u64)
-                                                    % blocks_per_group as u64) as usize;
-                                                let byte = local_b / 8;
-                                                let bit = local_b % 8;
-                                                if b_group < num_groups
-                                                    && byte < calc_block_bitmaps[b_group].len()
-                                                {
-                                                    calc_block_bitmaps[b_group][byte] |= 1 << bit;
-                                                }
-                                            }
+                                            mark_phys_block(&mut calc_block_bitmaps, phys_block, sb.s_first_data_block, blocks_per_group, total_blocks);
                                         }
                                     }
                                 }

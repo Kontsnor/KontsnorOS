@@ -134,6 +134,7 @@ The following tables document the 150+ actively handled Linux system calls in Ko
 | 438 | `pidfd_getfd`| **Real**| Duplicate descriptor from another task |
 | 439 | `faccessat2`| **Real**| Extended faccessat |
 | 441 | `epoll_pwait2`| **Real**| Epoll wait with nanosecond timeout |
+| 452 | `fchmodat2` | **Real** | Modify permissions with flags (`AT_SYMLINK_NOFOLLOW`) |
 
 ---
 

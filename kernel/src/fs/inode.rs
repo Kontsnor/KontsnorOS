@@ -245,6 +245,16 @@ pub trait InodeOps: Send + Sync {
         Ok(())
     }
 
+    /// Increment the link count of this inode (for hard links).
+    fn inc_nlink(&self) -> Result<(), i32> {
+        Ok(())
+    }
+
+    /// Decrement the link count of this inode.
+    fn dec_nlink(&self) -> Result<(), i32> {
+        Ok(())
+    }
+
     /// Return the inner socket if this inode is a socket.
     fn as_socket(&self) -> Option<Arc<Mutex<crate::net::socket::Socket>>> {
         None

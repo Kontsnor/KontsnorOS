@@ -733,14 +733,23 @@ pub fn sys_linkat(
     if oldpath.is_null() || newpath.is_null() {
         return Errno::EFAULT.into();
     }
+    // SAFETY: copy_string_from_user validates bounds and reads until null terminator.
     let raw_old = match unsafe { copy_string_from_user(oldpath) } {
         Some(p) => p,
         None => return Errno::EFAULT.into(),
     };
+    // SAFETY: copy_string_from_user validates bounds and reads until null terminator.
     let raw_new = match unsafe { copy_string_from_user(newpath) } {
         Some(p) => p,
         None => return Errno::EFAULT.into(),
     };
+
+    if raw_old.is_empty() && (flags & 0x1000 == 0) {
+        return Errno::ENOENT.into();
+    }
+    if raw_new.is_empty() {
+        return Errno::ENOENT.into();
+    }
 
     let resolved_old = match crate::fs::vfs::resolve_relative_path_at(olddirfd, &raw_old) {
         Ok(path) => path,
@@ -789,6 +798,11 @@ pub fn sys_link_with_resolved_paths(
         return Errno::ENOTDIR.into();
     }
 
+    // Cross-device hard links are forbidden by POSIX
+    if src_inode.inode().dev != new_parent.inode().dev {
+        return Errno::EXDEV.into();
+    }
+
     // Verify write and execute permissions on the target directory
     if let Err(e) =
         crate::fs::inode::check_permission(new_parent.inode(), crate::fs::inode::MAY_WRITE)
@@ -808,6 +822,10 @@ pub fn sys_link_with_resolved_paths(
 
     match new_parent.link_entry(new_name, src_inode.clone()) {
         Ok(()) => {
+            if let Err(e) = src_inode.inc_nlink() {
+                let _ = new_parent.unlink_entry(new_name);
+                return e as SyscallResult;
+            }
             crate::fs::vfs::invalidate_dentry(&resolved_new);
             0
         }
@@ -1283,10 +1301,17 @@ pub fn sys_pselect6(
 
 /// `chmod(pathname, mode)` — Change file permissions.
 pub fn sys_chmod(pathname: *const u8, mode: u32) -> SyscallResult {
+    if pathname.is_null() {
+        return Errno::EFAULT.into();
+    }
+    // SAFETY: copy_string_from_user validates bounds and reads until null terminator.
     let raw_path = match unsafe { copy_string_from_user(pathname) } {
         Some(p) => p,
         None => return Errno::EFAULT.into(),
     };
+    if raw_path.is_empty() {
+        return Errno::ENOENT.into();
+    }
 
     let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
     sys_chmod_with_resolved_path_follow(resolved_path, mode, true)
@@ -1823,10 +1848,18 @@ pub fn sys_fchmodat(dfd: i32, pathname: *const u8, mode: u32, flags: i32) -> Sys
     if pathname.is_null() {
         return Errno::EFAULT.into();
     }
+    // Linux supports AT_SYMLINK_NOFOLLOW (0x100) and AT_EMPTY_PATH (0x1000)
+    if (flags & !(0x100 | 0x1000)) != 0 {
+        return Errno::EINVAL.into();
+    }
+    // SAFETY: copy_string_from_user validates bounds and reads until null terminator.
     let raw_path = match unsafe { copy_string_from_user(pathname) } {
         Some(p) => p,
         None => return Errno::EFAULT.into(),
     };
+    if raw_path.is_empty() && (flags & 0x1000 == 0) {
+        return Errno::ENOENT.into();
+    }
     let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
         Ok(path) => path,
         Err(e) => return e.into(),
@@ -2092,7 +2125,8 @@ pub struct StatX {
 fn populate_statx(inode_ops: &dyn crate::fs::inode::InodeOps) -> StatX {
     let stat = populate_stat(inode_ops);
     let mut sx = StatX::default();
-    sx.stx_mask = 0x07ff; // STATX_BASIC_STATS
+    // STATX_BASIC_STATS (0x07ff) | STATX_BTIME (0x0800) | STATX_MNT_ID (0x01000)
+    sx.stx_mask = 0x07ff | 0x0800 | 0x1000;
     sx.stx_blksize = stat.st_blksize as u32;
     sx.stx_nlink = stat.st_nlink as u32;
     sx.stx_uid = stat.st_uid;
@@ -2119,6 +2153,13 @@ fn populate_statx(inode_ops: &dyn crate::fs::inode::InodeOps) -> StatX {
     sx.stx_btime = sx.stx_ctime;
     sx.stx_rdev_major = ((stat.st_rdev >> 8) & 0xfff) as u32;
     sx.stx_rdev_minor = (stat.st_rdev & 0xff) as u32;
+    sx.stx_dev_major = ((stat.st_dev >> 8) & 0xfff) as u32;
+    sx.stx_dev_minor = (stat.st_dev & 0xff) as u32;
+    sx.stx_mnt_id = if inode_ops.inode().dev != 0 {
+        inode_ops.inode().dev
+    } else {
+        1
+    };
     sx
 }
 

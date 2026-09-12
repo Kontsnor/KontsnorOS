@@ -252,6 +252,17 @@ pub fn get_lapic_timer_current() -> u32 {
     unsafe { lapic_read(LAPIC_REG_TIMER_CURRENT) }
 }
 
+/// Helper: Wait until the ICR Delivery Status bit (bit 12) becomes 0 (idle) with timeout.
+fn wait_icr_idle() {
+    let mut spins = 1_000_000;
+    unsafe {
+        while (lapic_read(LAPIC_REG_ICR_LOW) & (1 << 12)) != 0 && spins > 0 {
+            spins -= 1;
+            core::hint::spin_loop();
+        }
+    }
+}
+
 /// Send an Inter-Processor Interrupt (IPI) to a specific target Local APIC.
 pub fn send_ipi(target_lapic_id: u8, vector: u8) {
     // SAFETY: Writing to the Local APIC MMIO registers to send an IPI is safe because
@@ -263,10 +274,7 @@ pub fn send_ipi(target_lapic_id: u8, vector: u8) {
         // Write delivery mode (000 = Fixed), dest mode (0 = Physical), level (1 = Assert)
         lapic_write(LAPIC_REG_ICR_LOW, vector as u32 | (1 << 14));
 
-        // Wait until the Delivery Status bit (bit 12) becomes 0 (idle)
-        while (lapic_read(LAPIC_REG_ICR_LOW) & (1 << 12)) != 0 {
-            core::hint::spin_loop();
-        }
+        wait_icr_idle();
     }
 }
 
@@ -281,10 +289,7 @@ pub fn broadcast_ipi_all_excluding_self(vector: u8) {
         // Delivery Mode: 000 (Fixed), Dest Mode: 0 (Physical), Level: 1 (Assert) -> bit 14 set to 1.
         lapic_write(LAPIC_REG_ICR_LOW, vector as u32 | (1 << 14) | (3 << 18));
 
-        // Wait until the Delivery Status bit (bit 12) becomes 0 (idle)
-        while (lapic_read(LAPIC_REG_ICR_LOW) & (1 << 12)) != 0 {
-            core::hint::spin_loop();
-        }
+        wait_icr_idle();
     }
 }
 
@@ -293,10 +298,7 @@ pub fn send_init_ipi(target_lapic_id: u8) {
     // SAFETY: Writing to the Local APIC MMIO registers to send an INIT IPI is safe
     // for configuring the processor topologies during AP bootstrap.
     unsafe {
-        // Wait for delivery status bit to clear
-        while (lapic_read(LAPIC_REG_ICR_LOW) & (1 << 12)) != 0 {
-            core::hint::spin_loop();
-        }
+        wait_icr_idle();
 
         // 1. Set target APIC ID in high ICR
         let high_val = (target_lapic_id as u32) << 24;
@@ -312,10 +314,7 @@ pub fn send_init_ipi(target_lapic_id: u8) {
         );
         lapic_write(LAPIC_REG_ICR_LOW, low_val_assert);
 
-        // Wait for delivery status bit to clear
-        while (lapic_read(LAPIC_REG_ICR_LOW) & (1 << 12)) != 0 {
-            core::hint::spin_loop();
-        }
+        wait_icr_idle();
 
         // 3. Write INIT De-assert command to low ICR: Delivery Mode: 101 (5 = INIT), Level: 0 (De-assert), Trigger Mode: 1 (Level)
         let low_val_deassert = (5 << 8) | (1 << 15);
@@ -326,10 +325,7 @@ pub fn send_init_ipi(target_lapic_id: u8) {
         );
         lapic_write(LAPIC_REG_ICR_LOW, low_val_deassert);
 
-        // Wait for delivery status bit to clear
-        while (lapic_read(LAPIC_REG_ICR_LOW) & (1 << 12)) != 0 {
-            core::hint::spin_loop();
-        }
+        wait_icr_idle();
     }
 }
 
@@ -338,10 +334,7 @@ pub fn send_startup_ipi(target_lapic_id: u8, vector: u8) {
     // SAFETY: Writing to the Local APIC MMIO registers to send a SIPI is safe
     // for configuring the processor topologies during AP bootstrap.
     unsafe {
-        // Wait for delivery status bit to clear
-        while (lapic_read(LAPIC_REG_ICR_LOW) & (1 << 12)) != 0 {
-            core::hint::spin_loop();
-        }
+        wait_icr_idle();
 
         // Set target APIC ID in high ICR
         let high_val = (target_lapic_id as u32) << 24;
@@ -352,10 +345,7 @@ pub fn send_startup_ipi(target_lapic_id: u8, vector: u8) {
         kprintln!("[apic] send_startup_ipi: target {}, vector {:#04x}, ICR_HIGH={:#010x}, ICR_LOW={:#010x}", target_lapic_id, vector, high_val, low_val);
         lapic_write(LAPIC_REG_ICR_LOW, low_val);
 
-        // Wait for delivery status bit to clear
-        while (lapic_read(LAPIC_REG_ICR_LOW) & (1 << 12)) != 0 {
-            core::hint::spin_loop();
-        }
+        wait_icr_idle();
     }
 }
 

@@ -188,17 +188,28 @@ pub fn init() {
     // SAFETY: We just loaded a valid GDT containing these segments.
     unsafe {
         CS::set_reg(GDT.1.kernel_code);
+        x86_64::instructions::segmentation::SS::set_reg(GDT.1.kernel_data);
+        x86_64::instructions::segmentation::DS::set_reg(GDT.1.kernel_data);
+        x86_64::instructions::segmentation::ES::set_reg(GDT.1.kernel_data);
         load_tss(GDT.1.tss);
     }
 }
 
-/// Initialize heap-allocated per-core GDT and TSS.
-///
-/// Once the kernel heap is initialized, we dynamically allocate the
-/// GDT and TSS to avoid global static mutations and prepare for SMP.
-pub fn init_heap() {
-    use alloc::boxed::Box;
+static mut PER_CPU_GDTS: [GlobalDescriptorTable; 32] = {
+    const EMPTY: GlobalDescriptorTable = GlobalDescriptorTable::empty();
+    [EMPTY; 32]
+};
 
+static mut PER_CPU_TSSS: [TaskStateSegment; 32] = {
+    const EMPTY: TaskStateSegment = TaskStateSegment::new();
+    [EMPTY; 32]
+};
+
+static mut PER_CPU_DF_STACKS: [[u8; INTERRUPT_STACK_SIZE]; 32] = [[0; INTERRUPT_STACK_SIZE]; 32];
+static mut PER_CPU_PF_STACKS: [[u8; INTERRUPT_STACK_SIZE]; 32] = [[0; INTERRUPT_STACK_SIZE]; 32];
+
+/// Initialize per-core GDT and TSS for the current processor.
+pub fn init_heap() {
     let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
     if apic_id >= 32 {
         panic!("APIC ID {} out of bounds (>= 32) in init_heap", apic_id);
@@ -214,32 +225,37 @@ pub fn init_heap() {
         );
     }
 
-    let tss_mut = Box::leak(Box::new(TaskStateSegment::new()));
+    // SAFETY: apic_id < 32 is checked, each core only initializes its own slot.
+    let tss_mut = unsafe { &mut *core::ptr::addr_of_mut!(PER_CPU_TSSS[apic_id]) };
 
     // F-14: Initialize privilege_stack_table[0] (RSP0) immediately to the current RSP
     // to prevent page faults/triple faults on interrupt delivery before the first context switch.
     let current_rsp: u64;
+    // SAFETY: Reading RSP register with no memory side effects.
     unsafe {
-        core::arch::asm!("mov {}, rsp", out(reg) current_rsp);
+        core::arch::asm!("mov {}, rsp", out(reg) current_rsp, options(nomem, preserves_flags));
     }
     tss_mut.privilege_stack_table[0] = VirtAddr::new(current_rsp);
 
-    // Allocate double-fault and page-fault stacks on the heap per-core to avoid sharing them
-    let double_fault_stack = Box::leak(Box::new([0u8; INTERRUPT_STACK_SIZE]));
-    let page_fault_stack = Box::leak(Box::new([0u8; INTERRUPT_STACK_SIZE]));
+    // Set up double-fault and page-fault stacks
+    // SAFETY: Accessing statically allocated per-core IST stacks in BSS.
+    unsafe {
+        let df_start = VirtAddr::from_ptr(core::ptr::addr_of!(PER_CPU_DF_STACKS[apic_id]));
+        tss_mut.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
+            df_start + INTERRUPT_STACK_SIZE as u64;
 
-    tss_mut.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
-        let stack_start = VirtAddr::from_ptr(double_fault_stack.as_ptr());
-        stack_start + INTERRUPT_STACK_SIZE as u64
-    };
-    tss_mut.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = {
-        let stack_start = VirtAddr::from_ptr(page_fault_stack.as_ptr());
-        stack_start + INTERRUPT_STACK_SIZE as u64
-    };
+        let pf_start = VirtAddr::from_ptr(core::ptr::addr_of!(PER_CPU_PF_STACKS[apic_id]));
+        tss_mut.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] =
+            pf_start + INTERRUPT_STACK_SIZE as u64;
+    }
 
-    let tss_ref = unsafe { &*(tss_mut as *const TaskStateSegment) };
+    // SAFETY: Static TSS reference for GDT descriptor generation.
+    let tss_ref: &'static TaskStateSegment =
+        unsafe { &*core::ptr::addr_of!(PER_CPU_TSSS[apic_id]) };
 
-    let gdt_mut = Box::leak(Box::new(GlobalDescriptorTable::new()));
+    // SAFETY: Initializing the static GDT for this core.
+    let gdt_mut = unsafe { &mut *core::ptr::addr_of_mut!(PER_CPU_GDTS[apic_id]) };
+    *gdt_mut = GlobalDescriptorTable::new();
 
     let kernel_code = gdt_mut.append(Descriptor::kernel_code_segment());
     let kernel_data = gdt_mut.append(Descriptor::kernel_data_segment());
@@ -255,11 +271,17 @@ pub fn init_heap() {
         tss: tss_sel,
     };
 
-    let gdt_ref = unsafe { &*(gdt_mut as *const GlobalDescriptorTable) };
+    // SAFETY: Static reference to loaded GDT.
+    let gdt_ref: &'static GlobalDescriptorTable =
+        unsafe { &*core::ptr::addr_of!(PER_CPU_GDTS[apic_id]) };
     gdt_ref.load();
 
+    // SAFETY: Selectors belong to the newly loaded GDT table.
     unsafe {
         CS::set_reg(selectors.kernel_code);
+        x86_64::instructions::segmentation::SS::set_reg(selectors.kernel_data);
+        x86_64::instructions::segmentation::DS::set_reg(selectors.kernel_data);
+        x86_64::instructions::segmentation::ES::set_reg(selectors.kernel_data);
         load_tss(selectors.tss);
     }
 

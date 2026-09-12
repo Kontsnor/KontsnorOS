@@ -376,51 +376,21 @@ pub fn start_aps() {
             let apic_id = cpu.apic_id;
             kprintln!("[smp] Booting AP core {} (APIC ID {})...", i, apic_id);
 
-            // 1. Allocate a unique PID for the AP's idle task
-            let ap_idle_pid = crate::process::pid::allocate();
+            // 1. Fetch the idle task stack allocated during scheduler::init()
+            let stack_top = {
+                let tasks = crate::process::scheduler::TASKS.read();
+                let idx = 900 + apic_id as usize;
+                let task_lock = tasks[idx]
+                    .as_ref()
+                    .expect("Idle task not found in scheduler for core");
+                let task = task_lock.lock();
+                task.kernel_stack_base + task.kernel_stack_size as u64
+            };
 
-            // 2. Allocate stack (64 KiB)
-            let stack_size = 65536;
-            let layout = alloc::alloc::Layout::from_size_align(stack_size, 16).unwrap();
-
-            // SAFETY: Allocating memory for the AP stack using standard layout is safe.
-            let stack_base = unsafe { alloc::alloc::alloc(layout) } as u64;
-            let stack_top = stack_base + stack_size as u64;
-
-            // 3. Get current CR3
+            // 2. Get current CR3
             // SAFETY: Reading CR3 on the BSP is safe.
             let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
             let cr3_val = cr3_frame.start_address().as_u64();
-
-            // 4. Create task
-            let mut ap_idle_task = crate::process::task::Task::new(
-                ap_idle_pid,
-                alloc::format!("idle-{}", apic_id),
-                cr3_val,
-            );
-            ap_idle_task.kernel_stack_base = stack_base;
-            ap_idle_task.kernel_stack_size = stack_size;
-            ap_idle_task.priority = crate::process::task::Priority::Idle;
-            ap_idle_task.state = crate::process::task::TaskState::Running;
-            ap_idle_task.is_idle = true;
-
-            // 5. Register in SCHEDULER and TASKS
-            {
-                let mut sched = crate::process::scheduler::SCHEDULER.lock();
-                let task_arc = alloc::sync::Arc::new(spin::Mutex::new(ap_idle_task));
-                let idx = ap_idle_pid.as_u64() as usize;
-                {
-                    let mut tasks = crate::process::scheduler::TASKS.write();
-                    while tasks.len() <= idx {
-                        tasks.push(None);
-                    }
-                    tasks[idx] = Some(task_arc);
-                }
-                if let Some(ref mut s) = *sched {
-                    s.current_cpus[apic_id as usize] = Some(ap_idle_pid);
-                    s.idle_cpus[apic_id as usize] = ap_idle_pid;
-                }
-            }
 
             // 7. Write boot parameters into the communication block
             // SAFETY: Writing to the allocated and identity-mapped trampoline block is safe.
@@ -494,6 +464,16 @@ pub fn start_aps() {
 /// It must initialize the processor state and never return.
 #[no_mangle]
 pub extern "C" fn ap_entry() -> ! {
+    // 0. Ensure CPU caching and write-protection are active
+    // SAFETY: Enabling caching and write protection on x86_64 CPU is safe and required.
+    unsafe {
+        let mut cr0 = x86_64::registers::control::Cr0::read();
+        cr0.remove(x86_64::registers::control::Cr0Flags::CACHE_DISABLE);
+        cr0.remove(x86_64::registers::control::Cr0Flags::NOT_WRITE_THROUGH);
+        cr0.insert(x86_64::registers::control::Cr0Flags::WRITE_PROTECT);
+        x86_64::registers::control::Cr0::write(cr0);
+    }
+
     // 1. Load GDT and TSS for this core
     super::gdt::init_heap();
 

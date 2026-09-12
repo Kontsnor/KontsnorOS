@@ -2372,8 +2372,14 @@ fn test_crypto_prng() {
     crate::crypto::prng::reset_for_test();
     let mut unseeded_buf = [0xAAu8; 32];
     let res_unseeded = crate::crypto::prng::fill_bytes(&mut unseeded_buf);
-    assert!(!res_unseeded, "fill_bytes should return false when PRNG has no entropy");
-    assert_eq!(unseeded_buf, [0xAAu8; 32], "Destination slice must remain unmodified when fill_bytes fails");
+    assert!(
+        !res_unseeded,
+        "fill_bytes should return false when PRNG has no entropy"
+    );
+    assert_eq!(
+        unseeded_buf, [0xAAu8; 32],
+        "Destination slice must remain unmodified when fill_bytes fails"
+    );
 
     // 2. Seed PRNG with initial entropy key
     let seed_key = [0x42u8; 32];
@@ -2382,15 +2388,24 @@ fn test_crypto_prng() {
     // 3. Test small buffer fill and mutation verification
     let mut small_buf = [0u8; 16];
     let res_seeded = crate::crypto::prng::fill_bytes(&mut small_buf);
-    assert!(res_seeded, "fill_bytes should return true after PRNG is seeded");
-    assert_ne!(small_buf, [0u8; 16], "Destination slice must be mutated with random bytes");
+    assert!(
+        res_seeded,
+        "fill_bytes should return true after PRNG is seeded"
+    );
+    assert_ne!(
+        small_buf, [0u8; 16],
+        "Destination slice must be mutated with random bytes"
+    );
 
     // 4. Test distinct, non-repetitive random output across consecutive calls
     let mut buf_a = [0u8; 32];
     let mut buf_b = [0u8; 32];
     assert!(crate::crypto::prng::fill_bytes(&mut buf_a));
     assert!(crate::crypto::prng::fill_bytes(&mut buf_b));
-    assert_ne!(buf_a, buf_b, "Consecutive PRNG byte fills must produce distinct random output");
+    assert_ne!(
+        buf_a, buf_b,
+        "Consecutive PRNG byte fills must produce distinct random output"
+    );
 
     // 5. Test multi-block generation (> 64 bytes) to test ChaCha20 block generation and buffer index wrapping
     let mut large_buf = [0u8; 128];
@@ -2559,8 +2574,7 @@ fn test_acpi_find_table_edge_cases() {
     crate::memory::physical::deallocate_frame(phys3);
 
     // 5. XSDT (64-bit pointers) lookup success with null entry skipping
-    let target_phys =
-        crate::memory::physical::allocate_frame().expect("Frame allocation failed");
+    let target_phys = crate::memory::physical::allocate_frame().expect("Frame allocation failed");
     let target_virt = target_phys + phys_offset;
     unsafe {
         (target_virt as *mut crate::acpi::tables::SdtHeader).write(
@@ -2581,26 +2595,24 @@ fn test_acpi_find_table_edge_cases() {
     let xsdt_phys = crate::memory::physical::allocate_frame().expect("Frame allocation failed");
     let xsdt_virt = xsdt_phys + phys_offset;
     unsafe {
-        (xsdt_virt as *mut crate::acpi::tables::SdtHeader).write(
-            crate::acpi::tables::SdtHeader {
-                signature: *b"XSDT",
-                length: 36 + 16, // 36 header + 2 * 8-byte entries
-                revision: 1,
-                checksum: 0,
-                oem_id: [0; 6],
-                oem_table_id: [0; 8],
-                oem_revision: 0,
-                creator_id: 0,
-                creator_revision: 0,
-            },
-        );
+        (xsdt_virt as *mut crate::acpi::tables::SdtHeader).write(crate::acpi::tables::SdtHeader {
+            signature: *b"XSDT",
+            length: 36 + 16, // 36 header + 2 * 8-byte entries
+            revision: 1,
+            checksum: 0,
+            oem_id: [0; 6],
+            oem_table_id: [0; 8],
+            oem_revision: 0,
+            creator_id: 0,
+            creator_revision: 0,
+        });
         let entries_ptr = (xsdt_virt + 36) as *mut u64;
         core::ptr::write_unaligned(entries_ptr, 0); // Null entry
         core::ptr::write_unaligned(entries_ptr.add(1), target_phys); // Valid entry
     }
 
-    let found_phys = crate::acpi::tables::find_table(xsdt_phys, b"APIC", 2)
-        .expect("XSDT find_table failed");
+    let found_phys =
+        crate::acpi::tables::find_table(xsdt_phys, b"APIC", 2).expect("XSDT find_table failed");
     assert_eq!(found_phys, target_phys);
 
     crate::memory::physical::deallocate_frame(target_phys);
@@ -2629,26 +2641,25 @@ fn test_acpi_find_table_edge_cases() {
     let rsdt_phys = crate::memory::physical::allocate_frame().expect("Frame allocation failed");
     let rsdt_virt = rsdt_phys + phys_offset;
     unsafe {
-        (rsdt_virt as *mut crate::acpi::tables::SdtHeader).write(
-            crate::acpi::tables::SdtHeader {
-                signature: *b"RSDT",
-                length: 36 + 8, // 36 header + 2 * 4-byte entries
-                revision: 1,
-                checksum: 0,
-                oem_id: [0; 6],
-                oem_table_id: [0; 8],
-                oem_revision: 0,
-                creator_id: 0,
-                creator_revision: 0,
-            },
-        );
+        (rsdt_virt as *mut crate::acpi::tables::SdtHeader).write(crate::acpi::tables::SdtHeader {
+            signature: *b"RSDT",
+            length: 36 + 8, // 36 header + 2 * 4-byte entries
+            revision: 1,
+            checksum: 0,
+            oem_id: [0; 6],
+            oem_table_id: [0; 8],
+            oem_revision: 0,
+            creator_id: 0,
+            creator_revision: 0,
+        });
         let entries_ptr = (rsdt_virt + 36) as *mut u32;
         core::ptr::write_unaligned(entries_ptr, 0); // Null entry
-        core::ptr::write_unaligned(entries_ptr.add(1), target_rsdt_phys as u32); // Valid entry
+        core::ptr::write_unaligned(entries_ptr.add(1), target_rsdt_phys as u32);
+        // Valid entry
     }
 
-    let found_rsdt_phys = crate::acpi::tables::find_table(rsdt_phys, b"MCFG", 0)
-        .expect("RSDT find_table failed");
+    let found_rsdt_phys =
+        crate::acpi::tables::find_table(rsdt_phys, b"MCFG", 0).expect("RSDT find_table failed");
     assert_eq!(found_rsdt_phys, target_rsdt_phys);
 
     crate::memory::physical::deallocate_frame(target_rsdt_phys);
@@ -2874,9 +2885,8 @@ fn test_acpi_rsdp_parsing() {
         reserved: [0; 3],
     };
     // Calculate valid checksum for first 20 bytes
-    let bytes = unsafe {
-        core::slice::from_raw_parts_mut(&mut valid_rsdp as *mut _ as *mut u8, 20)
-    };
+    let bytes =
+        unsafe { core::slice::from_raw_parts_mut(&mut valid_rsdp as *mut _ as *mut u8, 20) };
     let sum_without_checksum: u8 = bytes[0..8]
         .iter()
         .chain(&bytes[9..20])
@@ -2900,10 +2910,9 @@ fn test_prng_seed_initialization() {
 
     // 1. Seed the PRNG with initial 32-byte entropy key
     let seed1: [u8; 32] = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-        0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+        0x1f, 0x20,
     ];
 
     crate::crypto::prng::seed(&seed1);
@@ -2921,7 +2930,10 @@ fn test_prng_seed_initialization() {
     let mut buf2 = [0u8; 32];
     let ok2 = crate::crypto::prng::fill_bytes(&mut buf2);
     assert!(ok2);
-    assert_eq!(buf1, buf2, "Identical seeds must produce identical initial output blocks");
+    assert_eq!(
+        buf1, buf2,
+        "Identical seeds must produce identical initial output blocks"
+    );
 
     // 4. Verify re-seeding / different seed initialization changes output sequence
     let seed2: [u8; 32] = [0xff; 32];
@@ -2929,7 +2941,10 @@ fn test_prng_seed_initialization() {
     let mut buf3 = [0u8; 32];
     let ok3 = crate::crypto::prng::fill_bytes(&mut buf3);
     assert!(ok3);
-    assert_ne!(buf1, buf3, "Different seeds must produce different output blocks");
+    assert_ne!(
+        buf1, buf3,
+        "Different seeds must produce different output blocks"
+    );
 
     kprintln!("[test] PRNG seed initialization test PASSED!");
 }

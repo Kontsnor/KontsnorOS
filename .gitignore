@@ -32,3 +32,6 @@ tools/init
 tools/init-ubuntu
 tcc-build/
 
+# Python cache
+__pycache__/
+*.pyc

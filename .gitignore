@@ -1,3 +1,37 @@
+# Rust build artifacts
 target/
+Cargo.lock
+rust_out
+
+# Disk images and bootloader builds
+bios.img
+uefi.img
+disk.img
+disk*.img
+
+# Logs
+*.log
+qemu_output.log
+qemu.err
+qemu.out
+qemu_selfhost_validate.out
+qemu_selfhost_validate_run*.out.bak
+
+# IDE and environment files
+.antigravity/
+.vscode/
+.idea/
+
+# BusyBox build and source files
+busybox-build/
+busybox/
+busybox
+
+# User space binaries
+tools/init
+tools/init-ubuntu
+tcc-build/
+
+# Python cache
 __pycache__/
 *.pyc

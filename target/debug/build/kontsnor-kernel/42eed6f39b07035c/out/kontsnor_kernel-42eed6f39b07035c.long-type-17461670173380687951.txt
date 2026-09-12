@@ -1,0 +1,1 @@
+unsafe extern "C" fn(*mut c_void, i32, usize) -> *mut c_void

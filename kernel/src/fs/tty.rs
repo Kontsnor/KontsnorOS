@@ -61,6 +61,9 @@ pub static TTY_TERMIOS: Mutex<Termios> = Mutex::new(Termios {
 /// Global active TTY foreground process group ID.
 pub static TTY_FOREGROUND_PGID: Mutex<u64> = Mutex::new(1);
 
+/// Console graphics/text mode: 0 = KD_TEXT, 1 = KD_GRAPHICS
+pub static KD_MODE: Mutex<u64> = Mutex::new(0);
+
 // ── /dev/stdin ────────────────────────────────────────────────────────────────
 
 /// Global lock to serialize reads from `/dev/stdin`.
@@ -355,6 +358,30 @@ impl InodeOps for DevStdin {
                         *TTY_FOREGROUND_PGID.lock() = task.lock().pgid;
                     }
                 }
+                Ok(0)
+            }
+            0x4B3A => {
+                // KDSETMODE: Set console text/graphics mode (0 = KD_TEXT, 1 = KD_GRAPHICS)
+                *KD_MODE.lock() = arg;
+                crate::kprintln!("[tty] KDSETMODE set console mode to {}", arg);
+                Ok(0)
+            }
+            0x4B3B => {
+                // KDGETMODE: Get console mode (expects int * arg, 4 bytes)
+                if !crate::syscall::fs::validate_user_ptr(
+                    arg as *const u32 as *const u8,
+                    core::mem::size_of::<u32>(),
+                ) {
+                    return Err(-14); // EFAULT
+                }
+                let mode = *KD_MODE.lock() as u32;
+                unsafe {
+                    core::ptr::write(arg as *mut u32, mode);
+                }
+                Ok(0)
+            }
+            0x5600 | 0x5601 | 0x5602 | 0x5603 | 0x5604 | 0x5605 => {
+                // VT_OPENQRY, VT_GETMODE, VT_SETMODE, VT_GETSTATE, VT_RELDISP, VT_ACTIVATE
                 Ok(0)
             }
             _ => Err(-22), // EINVAL

@@ -2365,6 +2365,50 @@ fn test_wine_sigaltstack_and_ucontext() {
 }
 
 #[test_case]
+fn test_crypto_prng() {
+    kprintln!("[test] Starting PRNG byte generation test...");
+
+    // 1. Reset PRNG state to test unseeded / no-entropy state
+    crate::crypto::prng::reset_for_test();
+    let mut unseeded_buf = [0xAAu8; 32];
+    let res_unseeded = crate::crypto::prng::fill_bytes(&mut unseeded_buf);
+    assert!(!res_unseeded, "fill_bytes should return false when PRNG has no entropy");
+    assert_eq!(unseeded_buf, [0xAAu8; 32], "Destination slice must remain unmodified when fill_bytes fails");
+
+    // 2. Seed PRNG with initial entropy key
+    let seed_key = [0x42u8; 32];
+    crate::crypto::prng::seed(&seed_key);
+
+    // 3. Test small buffer fill and mutation verification
+    let mut small_buf = [0u8; 16];
+    let res_seeded = crate::crypto::prng::fill_bytes(&mut small_buf);
+    assert!(res_seeded, "fill_bytes should return true after PRNG is seeded");
+    assert_ne!(small_buf, [0u8; 16], "Destination slice must be mutated with random bytes");
+
+    // 4. Test distinct, non-repetitive random output across consecutive calls
+    let mut buf_a = [0u8; 32];
+    let mut buf_b = [0u8; 32];
+    assert!(crate::crypto::prng::fill_bytes(&mut buf_a));
+    assert!(crate::crypto::prng::fill_bytes(&mut buf_b));
+    assert_ne!(buf_a, buf_b, "Consecutive PRNG byte fills must produce distinct random output");
+
+    // 5. Test multi-block generation (> 64 bytes) to test ChaCha20 block generation and buffer index wrapping
+    let mut large_buf = [0u8; 128];
+    assert!(crate::crypto::prng::fill_bytes(&mut large_buf));
+    // Verify first block (0..64) and second block (64..128) are non-zero and non-identical
+    assert_ne!(&large_buf[0..64], &large_buf[64..128]);
+
+    // 6. Test reseed functionality
+    let reseed_entropy = [0x99u8; 32];
+    crate::crypto::prng::reseed(&reseed_entropy);
+    let mut reseeded_buf = [0u8; 32];
+    assert!(crate::crypto::prng::fill_bytes(&mut reseeded_buf));
+    assert_ne!(reseeded_buf, [0u8; 32]);
+
+    kprintln!("[test] PRNG byte generation test PASSED!");
+}
+
+#[test_case]
 fn test_ext_file_write_persistence() {
     kprintln!("[test] Starting ext file write persistence test...");
     let path_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
@@ -2573,4 +2617,129 @@ fn test_git_pack_write_and_trailer_pread() {
     // Clean up
     crate::syscall::memory::sys_munmap(mmap_addr, 16384);
     kprintln!("[test] Git packfile write and trailer pread test PASSED!");
+}
+
+#[test_case]
+fn test_acpi_rsdp_parsing() {
+    kprintln!("[test] Starting ACPI RSDP parsing error handling test...");
+
+    // 1. Null physical address
+    assert_eq!(
+        crate::acpi::tables::parse_rsdp(0),
+        Err(crate::acpi::tables::AcpiError::InvalidAddress)
+    );
+
+    let phys_offset = crate::memory::r#virtual::phys_mem_offset();
+
+    // 2. Invalid RSDP Signature
+    let mut invalid_rsdp = crate::acpi::tables::Rsdp {
+        signature: *b"BAD SIG ",
+        checksum: 0,
+        oem_id: *b"TESTOM",
+        revision: 2,
+        rsdt_address: 0x1000,
+        length: 36,
+        xsdt_address: 0x2000,
+        extended_checksum: 0,
+        reserved: [0; 3],
+    };
+    let virt_addr1 = &invalid_rsdp as *const _ as u64;
+    let phys_addr1 = virt_addr1 - phys_offset;
+
+    assert_eq!(
+        crate::acpi::tables::parse_rsdp(phys_addr1),
+        Err(crate::acpi::tables::AcpiError::InvalidRsdpSignature)
+    );
+
+    // 3. Invalid Checksum
+    let mut bad_checksum_rsdp = crate::acpi::tables::Rsdp {
+        signature: *b"RSD PTR ",
+        checksum: 0xFF, // Intentionally incorrect checksum
+        oem_id: *b"TESTOM",
+        revision: 2,
+        rsdt_address: 0x1000,
+        length: 36,
+        xsdt_address: 0x2000,
+        extended_checksum: 0,
+        reserved: [0; 3],
+    };
+    let virt_addr2 = &bad_checksum_rsdp as *const _ as u64;
+    let phys_addr2 = virt_addr2 - phys_offset;
+
+    assert_eq!(
+        crate::acpi::tables::parse_rsdp(phys_addr2),
+        Err(crate::acpi::tables::AcpiError::InvalidChecksum)
+    );
+
+    // 4. Valid RSDP (Happy Path)
+    let mut valid_rsdp = crate::acpi::tables::Rsdp {
+        signature: *b"RSD PTR ",
+        checksum: 0,
+        oem_id: *b"MY OEM",
+        revision: 2,
+        rsdt_address: 0x1000,
+        length: 36,
+        xsdt_address: 0x2000_0000,
+        extended_checksum: 0,
+        reserved: [0; 3],
+    };
+    // Calculate valid checksum for first 20 bytes
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(&mut valid_rsdp as *mut _ as *mut u8, 20)
+    };
+    let sum_without_checksum: u8 = bytes[0..8]
+        .iter()
+        .chain(&bytes[9..20])
+        .fold(0u8, |acc, &b| acc.wrapping_add(b));
+    valid_rsdp.checksum = (0u8).wrapping_sub(sum_without_checksum);
+
+    let virt_addr3 = &valid_rsdp as *const _ as u64;
+    let phys_addr3 = virt_addr3 - phys_offset;
+
+    let parsed = crate::acpi::tables::parse_rsdp(phys_addr3).expect("Valid RSDP parsing failed");
+    assert_eq!(parsed.oem_id, "MY OEM");
+    assert_eq!(parsed.revision, 2);
+    assert_eq!(parsed.xsdt_address, 0x2000_0000);
+
+    kprintln!("[test] ACPI RSDP parsing error handling test PASSED!");
+}
+
+#[test_case]
+fn test_prng_seed_initialization() {
+    kprintln!("[test] Starting PRNG seed initialization test...");
+
+    // 1. Seed the PRNG with initial 32-byte entropy key
+    let seed1: [u8; 32] = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+    ];
+
+    crate::crypto::prng::seed(&seed1);
+
+    // 2. Verify fill_bytes returns true after seeding
+    let mut buf1 = [0u8; 32];
+    let ok = crate::crypto::prng::fill_bytes(&mut buf1);
+    assert!(ok, "fill_bytes should return true after PRNG is seeded");
+
+    // Ensure the generated random bytes are not all zeros
+    assert_ne!(buf1, [0u8; 32], "PRNG output should non-zero");
+
+    // 3. Verify deterministic generation for identical seed initialization
+    crate::crypto::prng::seed(&seed1);
+    let mut buf2 = [0u8; 32];
+    let ok2 = crate::crypto::prng::fill_bytes(&mut buf2);
+    assert!(ok2);
+    assert_eq!(buf1, buf2, "Identical seeds must produce identical initial output blocks");
+
+    // 4. Verify re-seeding / different seed initialization changes output sequence
+    let seed2: [u8; 32] = [0xff; 32];
+    crate::crypto::prng::seed(&seed2);
+    let mut buf3 = [0u8; 32];
+    let ok3 = crate::crypto::prng::fill_bytes(&mut buf3);
+    assert!(ok3);
+    assert_ne!(buf1, buf3, "Different seeds must produce different output blocks");
+
+    kprintln!("[test] PRNG seed initialization test PASSED!");
 }

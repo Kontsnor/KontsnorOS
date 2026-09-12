@@ -66,6 +66,62 @@ pub struct Framebuffer {
     info: FramebufferInfo,
 }
 
+/// `/dev/fb0` character device inode for userspace framebuffer access.
+pub struct DevFb0 {
+    pub inode: crate::fs::inode::Inode,
+}
+
+impl DevFb0 {
+    pub fn new() -> Self {
+        Self {
+            inode: crate::fs::inode::Inode::new(18, crate::fs::inode::FileType::CharDevice)
+                .with_dev(crate::fs::devfs::DEVFS_DEV_ID),
+        }
+    }
+}
+
+impl crate::fs::inode::InodeOps for DevFb0 {
+    fn inode(&self) -> &crate::fs::inode::Inode {
+        &self.inode
+    }
+
+    fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
+        let console = super::bochs::GRAPHICS_CONSOLE.lock();
+        if let Some(ref gc) = *console {
+            let fb_size = gc.gpu.size;
+            if offset >= fb_size {
+                return Ok(0);
+            }
+            let to_read = core::cmp::min(buf.len() as u64, fb_size - offset) as usize;
+            unsafe {
+                let src = (gc.gpu.lfb_virt + offset) as *const u8;
+                core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), to_read);
+            }
+            Ok(to_read)
+        } else {
+            Err(-6) // ENXIO
+        }
+    }
+
+    fn write(&self, offset: u64, buf: &[u8]) -> Result<usize, i32> {
+        let console = super::bochs::GRAPHICS_CONSOLE.lock();
+        if let Some(ref gc) = *console {
+            let fb_size = gc.gpu.size;
+            if offset >= fb_size {
+                return Ok(0);
+            }
+            let to_write = core::cmp::min(buf.len() as u64, fb_size - offset) as usize;
+            unsafe {
+                let dst = (gc.gpu.lfb_virt + offset) as *mut u8;
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, to_write);
+            }
+            Ok(to_write)
+        } else {
+            Err(-6) // ENXIO
+        }
+    }
+}
+
 // SAFETY: The framebuffer is accessed through synchronized methods.
 unsafe impl Send for Framebuffer {}
 unsafe impl Sync for Framebuffer {}

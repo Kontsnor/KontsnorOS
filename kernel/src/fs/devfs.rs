@@ -224,6 +224,12 @@ pub fn create_devfs() -> Arc<DevFs> {
         }) as Arc<dyn InodeOps>,
     );
 
+    // Create /dev/fb0 framebuffer device
+    entries.insert(
+        String::from("fb0"),
+        Arc::new(crate::drivers::gpu::framebuffer::DevFb0::new()) as Arc<dyn InodeOps>,
+    );
+
     let root = Arc::new(DevFsDir {
         inode: Inode::new(1, FileType::Directory).with_dev(DEVFS_DEV_ID),
         entries: RwLock::new(entries),

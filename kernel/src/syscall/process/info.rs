@@ -248,23 +248,63 @@ pub fn sys_clock_gettime(clockid: i32, tp: *mut u8) -> SyscallResult {
 
 /// `nanosleep(req, rem)` — High-resolution sleep.
 pub fn sys_nanosleep(req: *const u8, rem: *mut u8) -> SyscallResult {
-    if !req.is_null() {
-        if !validate_user_ptr(req, core::mem::size_of::<TimeSpec>()) {
-            return Errno::EFAULT.into();
-        }
+    if req.is_null() {
+        return Errno::EINVAL.into();
     }
-    // Yield to the scheduler.
-    crate::process::scheduler::yield_now();
+    if !validate_user_ptr(req, core::mem::size_of::<TimeSpec>()) {
+        return Errno::EFAULT.into();
+    }
+    let ts = unsafe { core::ptr::read(req as *const TimeSpec) };
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return Errno::EINVAL.into();
+    }
+
+    let sleep_ns = (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64);
+    let start_ns = get_monotonic_ns();
+    let end_ns = start_ns.saturating_add(sleep_ns);
+
+    let current_pid = match crate::process::scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+
+    while get_monotonic_ns() < end_ns {
+        // Check for unblocked pending signals
+        if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+            let task = task_arc.lock();
+            let unblocked = task.pending_signals & !task.blocked_signals;
+            if unblocked != 0 {
+                let now = get_monotonic_ns();
+                let remaining_ns = end_ns.saturating_sub(now);
+                if !rem.is_null() {
+                    if validate_user_ptr_write(rem, core::mem::size_of::<TimeSpec>()).is_ok() {
+                        let remaining_ts = TimeSpec {
+                            tv_sec: (remaining_ns / 1_000_000_000) as i64,
+                            tv_nsec: (remaining_ns % 1_000_000_000) as i64,
+                        };
+                        unsafe {
+                            core::ptr::write(rem as *mut TimeSpec, remaining_ts);
+                        }
+                    }
+                }
+                return Errno::EINTR.into();
+            }
+        }
+        crate::process::scheduler::yield_now();
+    }
+
     if !rem.is_null() {
         if validate_user_ptr_write(rem, core::mem::size_of::<TimeSpec>()).is_err() {
             return Errno::EFAULT.into();
         }
-        let ts = TimeSpec {
+        let zero_ts = TimeSpec {
             tv_sec: 0,
             tv_nsec: 0,
         };
         unsafe {
-            core::ptr::write(rem as *mut TimeSpec, ts);
+            core::ptr::write(rem as *mut TimeSpec, zero_ts);
         }
     }
     0

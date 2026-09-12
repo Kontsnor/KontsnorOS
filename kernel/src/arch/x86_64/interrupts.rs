@@ -658,6 +658,9 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
             stack_frame.instruction_pointer.as_u64()
         );
         let _ = crate::syscall::process::sys_exit_group(139);
+        loop {
+            x86_64::instructions::hlt();
+        }
     }
 
     panic!("Unhandled page fault — system cannot recover");

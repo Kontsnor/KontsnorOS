@@ -210,6 +210,7 @@ pub fn sys_setsid() -> SyscallResult {
     if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
         let mut task = task_arc.lock();
         task.pgid = current_pid.as_u64();
+        task.sid = current_pid.as_u64();
         return current_pid.as_u64() as SyscallResult;
     }
     Errno::ESRCH.into()

@@ -72,10 +72,13 @@ else
 fi
 rm -f /tmp/qmp-kontsnor.sock
 
+trap 'stty sane 2>/dev/null || true' EXIT INT TERM
+
 qemu-system-x86_64 \
     -drive format=raw,file="$BIOS_IMG" \
     -drive format=raw,file="$DISK_IMG",index=1,media=disk \
-    -serial stdio \
+    -chardev stdio,id=char0,signal=off \
+    -serial chardev:char0 \
     -display none \
     -m 4G \
     -netdev user,id=net0 \

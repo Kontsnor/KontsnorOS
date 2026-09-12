@@ -93,6 +93,12 @@ void _start(void) {
             if (fd > 2) syscall1(3, fd);
         }
 
+        // Establish private session and acquire controlling terminal on /dev/pts/0
+        syscall0(112); // setsid()
+        syscall2(16, 0, 0x540E); // ioctl(0, TIOCSCTTY, 0)
+        long self_pid = syscall0(39); // getpid()
+        syscall3(16, 0, 0x5410, (long)&self_pid); // ioctl(0, TIOCSPGRP, &self_pid)
+
         long ifd = syscall3(2, (long)"/interactive", 0, 0); // open(..., O_RDONLY)
         char *argv_test[] = {
             "/bin/ctr_run",
@@ -105,6 +111,7 @@ void _start(void) {
             "/bin/ctr_run",
             "/containers/arch",
             "/bin/sh",
+            "-i",
             NULL
         };
         char **argv = (ifd >= 0) ? argv_interactive : argv_test;

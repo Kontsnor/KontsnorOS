@@ -128,6 +128,7 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
             // namespace if parent previously called unshare(CLONE_NEWPID).
             if let Some(new_pid_ns) = parent_task.child_pid_ns_id {
                 child_task.pid_ns_id = new_pid_ns;
+                child_task.is_pid_ns_init = true;
                 crate::kprintln!(
                     "[namespace] Forked child PID {} entered new PID namespace {}",
                     child_pid.as_u64(),
@@ -135,6 +136,7 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
                 );
             } else {
                 child_task.pid_ns_id = parent_task.pid_ns_id;
+                child_task.is_pid_ns_init = false;
             }
         } else {
             return Errno::ESRCH.into();
@@ -842,13 +844,22 @@ pub fn sys_exit_group(status: i32) -> SyscallResult {
 
     let current_pid = match scheduler::current_pid() {
         Some(p) => p,
-        None => return Errno::ESRCH.into(),
+        None => {
+            scheduler::schedule();
+            loop {
+                x86_64::instructions::hlt();
+            }
+        }
     };
 
     let tgid = if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
         task_arc.lock().tgid
     } else {
-        return Errno::ESRCH.into();
+        // Task already exited or reaped on another core; schedule away and halt
+        scheduler::schedule();
+        loop {
+            x86_64::instructions::hlt();
+        }
     };
 
     // Get all other tasks sharing the same tgid without taking Task locks
@@ -1440,6 +1451,7 @@ pub fn sys_clone(
             // with its real PID, but kill/wait4/procfs are restricted by pid_ns_id.
             if flags & CLONE_NEWPID != 0 {
                 child_task.pid_ns_id = crate::fs::namespace::alloc_pid_ns_id();
+                child_task.is_pid_ns_init = true;
                 crate::kprintln!(
                     "[namespace] PID {} entered new PID namespace {}",
                     child_pid.as_u64(),
@@ -1447,6 +1459,7 @@ pub fn sys_clone(
                 );
             } else if let Some(new_pid_ns) = parent_task.child_pid_ns_id {
                 child_task.pid_ns_id = new_pid_ns;
+                child_task.is_pid_ns_init = true;
                 crate::kprintln!(
                     "[namespace] Cloned child PID {} entered new PID namespace {}",
                     child_pid.as_u64(),
@@ -1454,6 +1467,7 @@ pub fn sys_clone(
                 );
             } else {
                 child_task.pid_ns_id = parent_task.pid_ns_id;
+                child_task.is_pid_ns_init = false;
             }
         } else {
             return Errno::ESRCH.into();

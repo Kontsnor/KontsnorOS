@@ -149,6 +149,12 @@ int main(int argc, char **argv) {
         // ── Container Child Process ──────────────────────────────────────────
         print("[container-init] Container init spawned (PID namespace active).\n");
 
+        // Establish private session and acquire controlling terminal on fd 0
+        syscall0(112); // setsid()
+        syscall2(16, 0, 0x540E); // ioctl(0, TIOCSCTTY, 0)
+        long self_pid = syscall0(39); // getpid()
+        syscall3(16, 0, 0x5410, (long)&self_pid); // ioctl(0, TIOCSPGRP, &self_pid)
+
         // 1. UTS isolation: Set container hostname
         const char *hostname = "kontsnor-container";
         for (int i = 0; rootfs[i]; i++) {

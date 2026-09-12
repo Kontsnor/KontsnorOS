@@ -620,6 +620,181 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
         }
     }
 
+    // ── Stack auto-growth ─────────────────────────────────────────────────────────────
+    // Two-phase expansion mirroring Linux expand_stack() behavior:
+    //
+    //  Phase 1 — Main-thread stack (is_stack region):
+    //    If the fault is below the current is_stack region bottom and within MAX_STACK_SIZE
+    //    of the region's high end, extend the region downward and page the fault frame.
+    //
+    //  Phase 2 — Thread/vfork child stacks (any anonymous writable region):
+    //    If Phase 1 didn't fire, look for the nearest anonymous writable mmap region
+    //    whose top is at or just below the faulting address (within MAX_STACK_SIZE).
+    //    Extend that region upward to cover the fault. This handles clone(CLONE_VM,
+    //    child_stack=mmap_top) where libc places the thread stack right above a small
+    //    anonymous mmap region.
+    //
+    // Condition for either phase: user-mode, no-protection-violation, fault near RSP.
+    {
+        /// Linux uses 65536 + 32*sizeof(ulong) = 65792 bytes on x86-64.
+        const STACK_GUARD_THRESHOLD: u64 = 65536 + 32 * 8;
+        /// Hard limit: refuse to grow beyond 8 MiB in either direction.
+        const MAX_STACK_SIZE: u64 = 8 * 1024 * 1024;
+
+        if is_user
+            && !error_code
+                .contains(x86_64::structures::idt::PageFaultErrorCode::PROTECTION_VIOLATION)
+        {
+            let fault_vaddr = fault_addr.as_u64();
+            let rsp = stack_frame.stack_pointer.as_u64();
+
+            // The fault must be within STACK_GUARD_THRESHOLD of the current RSP.
+            let near_rsp = fault_vaddr >= rsp.saturating_sub(STACK_GUARD_THRESHOLD)
+                && fault_vaddr <= rsp.saturating_add(STACK_GUARD_THRESHOLD);
+
+            if near_rsp {
+                use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
+                use x86_64::{PhysAddr, VirtAddr};
+
+                /// Allocate one physical page, zero it, and map it at `page_vaddr_aligned`
+                /// inside `page_table_root`. Returns true on success.
+                fn map_stack_page(page_table_root: u64, page_vaddr_aligned: u64) -> bool {
+                    use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
+                    use x86_64::{PhysAddr, VirtAddr};
+                    match crate::memory::physical::allocate_frame() {
+                        Some(phys) => {
+                            let dest =
+                                (phys + crate::memory::r#virtual::phys_mem_offset()) as *mut u8;
+                            // SAFETY: phys is a freshly allocated physical frame; the linear-
+                            // mapped VA is valid for the full 4 KiB extent.
+                            unsafe { core::ptr::write_bytes(dest, 0, 4096) };
+
+                            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+                                page_vaddr_aligned,
+                            ));
+                            let frame = PhysFrame::containing_address(PhysAddr::new(phys));
+                            let page_flags = PageTableFlags::PRESENT
+                                | PageTableFlags::WRITABLE
+                                | PageTableFlags::USER_ACCESSIBLE
+                                | PageTableFlags::NO_EXECUTE;
+
+                            // SAFETY: page_table_root is the active CR3 for this user process.
+                            // page and frame are valid, aligned, and in the user address space.
+                            unsafe {
+                                crate::memory::r#virtual::ensure_directory_permissions(
+                                    page_table_root,
+                                    VirtAddr::new(page_vaddr_aligned),
+                                );
+                                match crate::memory::r#virtual::map_user_page_no_shootdown(
+                                    page_table_root,
+                                    page,
+                                    frame,
+                                    page_flags,
+                                ) {
+                                    Ok(()) => {}
+                                    Err("PageAlreadyMapped") => {
+                                        crate::memory::physical::deallocate_frame(phys);
+                                    }
+                                    Err(_) => {
+                                        crate::memory::physical::deallocate_frame(phys);
+                                        return false;
+                                    }
+                                }
+                            }
+                            x86_64::instructions::tlb::flush(VirtAddr::new(page_vaddr_aligned));
+                            true
+                        }
+                        None => false,
+                    }
+                }
+
+                let grew = crate::process::scheduler::current_pid()
+                    .and_then(|pid| crate::process::scheduler::get_task_arc(pid))
+                    .and_then(|task_arc| {
+                        let address_space_arc = {
+                            let task = task_arc.lock();
+                            task.address_space.clone()
+                        };
+                        let mut addr_space = address_space_arc.lock();
+                        let page_table_root = addr_space.page_table_root;
+
+                        // ── Phase 1: grow the main is_stack region downward ───────────
+                        if let Some(stack_idx) =
+                            addr_space.mmap_regions.iter().position(|r| r.is_stack)
+                        {
+                            let region = &addr_space.mmap_regions[stack_idx];
+                            // The is_stack region's low boundary (grows downward from stack_high).
+                            let stack_low = region.start;
+                            let stack_high = region.start + region.len as u64;
+                            let stack_low_limit = stack_high.saturating_sub(MAX_STACK_SIZE);
+
+                            // Fault must be BELOW the current region bottom and within the
+                            // maximum allowed growth window.
+                            if fault_vaddr < stack_low && fault_vaddr >= stack_low_limit {
+                                let new_start = fault_vaddr & !4095;
+                                let additional = (stack_low - new_start) as usize;
+                                addr_space.mmap_regions[stack_idx].start = new_start;
+                                addr_space.mmap_regions[stack_idx].len += additional;
+                                drop(addr_space);
+
+                                let page_vaddr_aligned = fault_vaddr & !4095;
+                                if map_stack_page(page_table_root, page_vaddr_aligned) {
+                                    return Some(true);
+                                }
+                                return Some(false);
+                            }
+                        }
+
+                        // ── Phase 2: grow any nearby anonymous writable region upward ─
+                        // Handles clone(CLONE_VM, child_stack=X) where X is just above a
+                        // small anonymous mmap region. The thread's initial RSP equals X
+                        // (the top of that region), and the very first push faults
+                        // because the page below X is not mapped.
+                        //
+                        // Find the anonymous writable region whose TOP is the nearest
+                        // address <= fault_vaddr and within MAX_STACK_SIZE distance.
+                        let region_idx = addr_space
+                            .mmap_regions
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, r)| {
+                                // Anonymous (no file backing), writable, and its top <=
+                                // fault_vaddr with a gap of at most MAX_STACK_SIZE.
+                                r.inode.is_none() && (r.prot & 2) != 0 && {
+                                    let top = r.start + r.len as u64;
+                                    top <= fault_vaddr && fault_vaddr < top + MAX_STACK_SIZE
+                                }
+                            })
+                            .max_by_key(|(_, r)| r.start + r.len as u64)
+                            .map(|(i, _)| i);
+
+                        if let Some(idx) = region_idx {
+                            let new_end = (fault_vaddr & !4095) + 4096; // align up
+                            let old_end = addr_space.mmap_regions[idx].start
+                                + addr_space.mmap_regions[idx].len as u64;
+                            if new_end > old_end {
+                                let additional = (new_end - old_end) as usize;
+                                addr_space.mmap_regions[idx].len += additional;
+                            }
+                            drop(addr_space);
+
+                            let page_vaddr_aligned = fault_vaddr & !4095;
+                            if map_stack_page(page_table_root, page_vaddr_aligned) {
+                                return Some(true);
+                            }
+                            return Some(false);
+                        }
+
+                        None
+                    });
+
+                if grew == Some(true) {
+                    return; // Stack growth resolved the fault.
+                }
+            }
+        }
+    }
+
     kprintln!("[EXCEPTION] Unhandled Page Fault");
     kprintln!("  Accessed Address: {:#x}", fault_addr.as_u64());
     kprintln!("  Error Code bits: {:#x}", error_code.bits());
@@ -660,6 +835,31 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
         let _ = crate::syscall::process::sys_exit_group(139);
         loop {
             x86_64::instructions::hlt();
+        }
+    }
+
+    // For kernel-mode faults into user-space addresses: the kernel was executing
+    // on behalf of a user process (e.g. a copy_to_user, a Weak<> with a stale
+    // pointer, or an Arc control block that was misdirected into user space).
+    // Rather than crashing the whole system, terminate the offending process and
+    // let the scheduler continue. Only panic if this happens with no active
+    // process (a true bare-metal kernel bug) or if the address is kernel-space.
+    let fault_vaddr = fault_addr.as_u64();
+    let is_user_space_addr = fault_vaddr < 0x0000_8000_0000_0000;
+
+    if !is_user && is_user_space_addr {
+        if let Some(pid) = crate::process::scheduler::current_pid() {
+            crate::kprintln!(
+                "[page_fault] KERNEL mode fault in user-space addr {:#x} for PID {:?} — \
+                 RIP={:#x} (likely stale ptr or Weak<> corruption). Killing process.",
+                fault_vaddr,
+                pid,
+                stack_frame.instruction_pointer.as_u64()
+            );
+            let _ = crate::syscall::process::sys_exit_group(139);
+            loop {
+                x86_64::instructions::hlt();
+            }
         }
     }
 

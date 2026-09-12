@@ -296,6 +296,92 @@ impl ExtFileSystem {
         Ok(())
     }
 
+    /// Deallocate all data blocks (direct, indirect, double-indirect) and the inode itself.
+    pub fn deallocate_inode_and_blocks(
+        &self,
+        ino: u32,
+        raw_inode: &ExtRawInode,
+        is_dir: bool,
+    ) -> Result<(), &'static str> {
+        let is_symlink = (raw_inode.i_mode & 0xF000) == 0xA000;
+        let is_fast_symlink = is_symlink && (raw_inode.i_size < 60 || raw_inode.i_blocks == 0);
+
+        if !is_fast_symlink {
+            // Copy array to avoid creating unaligned reference to packed struct field
+            let i_block = raw_inode.i_block;
+            for block in &i_block[0..12] {
+                if *block != 0 {
+                    let _ = self.deallocate_block(*block);
+                }
+            }
+
+            // Free indirect block if present
+            let sib = i_block[12];
+            if sib != 0 {
+                let mut ind_buf = alloc::vec![0u8; self.block_size as usize];
+                if read_blocks(&*self.device, sib as u64, &mut ind_buf, self.block_size).is_ok() {
+                    let refs_per_block = self.block_size / 4;
+                    for j in 0..refs_per_block {
+                        let ptr_offset = (j * 4) as usize;
+                        let phys_block = u32::from_le_bytes([
+                            ind_buf[ptr_offset],
+                            ind_buf[ptr_offset + 1],
+                            ind_buf[ptr_offset + 2],
+                            ind_buf[ptr_offset + 3],
+                        ]);
+                        if phys_block != 0 {
+                            let _ = self.deallocate_block(phys_block);
+                        }
+                    }
+                }
+                let _ = self.deallocate_block(sib);
+            }
+
+            // Free double indirect block if present
+            let dib = i_block[13];
+            if dib != 0 {
+                let mut dib_buf = alloc::vec![0u8; self.block_size as usize];
+                if read_blocks(&*self.device, dib as u64, &mut dib_buf, self.block_size).is_ok() {
+                    let refs_per_block = self.block_size / 4;
+                    for i in 0..refs_per_block {
+                        let sib_offset = (i * 4) as usize;
+                        let sib = u32::from_le_bytes([
+                            dib_buf[sib_offset],
+                            dib_buf[sib_offset + 1],
+                            dib_buf[sib_offset + 2],
+                            dib_buf[sib_offset + 3],
+                        ]);
+                        if sib != 0 {
+                            let mut sib_buf = alloc::vec![0u8; self.block_size as usize];
+                            if read_blocks(&*self.device, sib as u64, &mut sib_buf, self.block_size)
+                                .is_ok()
+                            {
+                                for j in 0..refs_per_block {
+                                    let ptr_offset = (j * 4) as usize;
+                                    let phys_block = u32::from_le_bytes([
+                                        sib_buf[ptr_offset],
+                                        sib_buf[ptr_offset + 1],
+                                        sib_buf[ptr_offset + 2],
+                                        sib_buf[ptr_offset + 3],
+                                    ]);
+                                    if phys_block != 0 {
+                                        let _ = self.deallocate_block(phys_block);
+                                    }
+                                }
+                            }
+                            let _ = self.deallocate_block(sib);
+                        }
+                    }
+                }
+                let _ = self.deallocate_block(dib);
+            }
+        }
+
+        // Release the inode
+        self.deallocate_inode(ino, is_dir)?;
+        Ok(())
+    }
+
     /// Decrement the links count of an inode. Cleans up blocks and frees the inode if it reaches 0.
     pub fn decrement_links_count(&self, ino: u32, is_dir: bool) -> Result<(), &'static str> {
         let group = (ino - 1) / self.inodes_per_group;
@@ -329,72 +415,7 @@ impl ExtFileSystem {
         }
 
         if raw_inode.i_links_count == 0 {
-            // Copy array to avoid creating unaligned reference to packed struct field
-            let i_block = raw_inode.i_block;
-            for block in &i_block[0..12] {
-                if *block != 0 {
-                    self.deallocate_block(*block)?;
-                }
-            }
-
-            // Free indirect block if present
-            let sib = i_block[12];
-            if sib != 0 {
-                let mut ind_buf = alloc::vec![0u8; self.block_size as usize];
-                read_blocks(&*self.device, sib as u64, &mut ind_buf, self.block_size)?;
-                let refs_per_block = self.block_size / 4;
-                for j in 0..refs_per_block {
-                    let ptr_offset = (j * 4) as usize;
-                    let phys_block = u32::from_le_bytes([
-                        ind_buf[ptr_offset],
-                        ind_buf[ptr_offset + 1],
-                        ind_buf[ptr_offset + 2],
-                        ind_buf[ptr_offset + 3],
-                    ]);
-                    if phys_block != 0 {
-                        self.deallocate_block(phys_block)?;
-                    }
-                }
-                self.deallocate_block(sib)?;
-            }
-
-            // Free double indirect block if present
-            let dib = i_block[13];
-            if dib != 0 {
-                let mut dib_buf = alloc::vec![0u8; self.block_size as usize];
-                read_blocks(&*self.device, dib as u64, &mut dib_buf, self.block_size)?;
-                let refs_per_block = self.block_size / 4;
-                for i in 0..refs_per_block {
-                    let sib_offset = (i * 4) as usize;
-                    let sib = u32::from_le_bytes([
-                        dib_buf[sib_offset],
-                        dib_buf[sib_offset + 1],
-                        dib_buf[sib_offset + 2],
-                        dib_buf[sib_offset + 3],
-                    ]);
-                    if sib != 0 {
-                        let mut sib_buf = alloc::vec![0u8; self.block_size as usize];
-                        read_blocks(&*self.device, sib as u64, &mut sib_buf, self.block_size)?;
-                        for j in 0..refs_per_block {
-                            let ptr_offset = (j * 4) as usize;
-                            let phys_block = u32::from_le_bytes([
-                                sib_buf[ptr_offset],
-                                sib_buf[ptr_offset + 1],
-                                sib_buf[ptr_offset + 2],
-                                sib_buf[ptr_offset + 3],
-                            ]);
-                            if phys_block != 0 {
-                                self.deallocate_block(phys_block)?;
-                            }
-                        }
-                        self.deallocate_block(sib)?;
-                    }
-                }
-                self.deallocate_block(dib)?;
-            }
-
-            // Release the inode
-            self.deallocate_inode(ino, is_dir)?;
+            self.deallocate_inode_and_blocks(ino, &raw_inode, is_dir)?;
         } else {
             let dst_ptr = block_buf[offset_in_block..].as_mut_ptr();
             let src_ptr = &raw_inode as *const ExtRawInode as *const u8;

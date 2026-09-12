@@ -2483,6 +2483,109 @@ fn test_ext_file_write_persistence() {
 }
 
 #[test_case]
+fn test_ext_fast_symlink_and_unlinked_open_file() {
+    kprintln!("[test] Starting ext fast symlink and unlinked open file test...");
+
+    // 1. Test fast symlink creation and unlinking
+    let target_str = b"target_file.txt\0";
+    let link_path = b"/disk/fast_symlink_test\0";
+
+    let target_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    let link_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    assert!(target_addr > 0 && link_addr > 0);
+
+    // SAFETY: target_addr and link_addr are newly allocated valid mapped user buffers.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            target_str.as_ptr(),
+            target_addr as *mut u8,
+            target_str.len(),
+        );
+        core::ptr::copy_nonoverlapping(link_path.as_ptr(), link_addr as *mut u8, link_path.len());
+    }
+
+    let sym_res = crate::syscall::fs::sys_symlink(target_addr as *const u8, link_addr as *const u8);
+    assert_eq!(sym_res, 0, "Failed to create fast symlink");
+
+    // Readlink to verify content
+    let readlink_buf = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    let rl_res =
+        crate::syscall::fs::sys_readlink(link_addr as *const u8, readlink_buf as *mut u8, 4096);
+    assert_eq!(rl_res, (target_str.len() - 1) as i64);
+    // SAFETY: readlink_buf has been written with target_str bytes without null terminator.
+    let read_slice =
+        unsafe { core::slice::from_raw_parts(readlink_buf as *const u8, rl_res as usize) };
+    assert_eq!(read_slice, &target_str[..target_str.len() - 1]);
+
+    // Unlink fast symlink - MUST NOT FAIL WITH -5 (EIO)
+    let unlink_res = crate::syscall::fs::sys_unlink(link_addr as *const u8);
+    assert_eq!(unlink_res, 0, "Unlink on fast symlink failed!");
+
+    // Verify symlink is gone
+    let mut stat_buf = crate::syscall::fs::meta::LinuxStat::default();
+    let lstat_res = crate::syscall::fs::sys_lstat(link_addr as *const u8, &mut stat_buf);
+    assert_eq!(lstat_res, -2, "Fast symlink should not exist after unlink");
+
+    // 2. Test unlinked open file read and write semantics
+    let file_path = b"/disk/unlinked_open_file.txt\0";
+    let file_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    // SAFETY: file_addr is a newly allocated valid mapped user buffer.
+    unsafe {
+        core::ptr::copy_nonoverlapping(file_path.as_ptr(), file_addr as *mut u8, file_path.len());
+    }
+
+    let fd = crate::syscall::fs::sys_open(file_addr as *const u8, 0o102, 0o644); // O_CREAT | O_RDWR
+    assert!(fd >= 0, "Failed to create test file");
+
+    let test_data = b"data_written_before_unlink_12345";
+    let data_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    // SAFETY: data_addr is a newly allocated valid mapped user buffer.
+    unsafe {
+        core::ptr::copy_nonoverlapping(test_data.as_ptr(), data_addr as *mut u8, test_data.len());
+    }
+
+    let written = crate::syscall::fs::sys_write(fd as i32, data_addr as *const u8, test_data.len());
+    assert_eq!(written, test_data.len() as i64);
+
+    // Unlink file while fd is still open!
+    let unlink_file_res = crate::syscall::fs::sys_unlink(file_addr as *const u8);
+    assert_eq!(unlink_file_res, 0, "Failed to unlink open file");
+
+    // Seeking back to 0 and reading from fd should still succeed and return test_data!
+    let lseek_res = crate::syscall::fs::sys_lseek(fd as i32, 0, 0); // SEEK_SET
+    assert_eq!(lseek_res, 0);
+
+    let read_dest = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    let bytes_read = crate::syscall::fs::sys_read(fd as i32, read_dest as *mut u8, test_data.len());
+    assert_eq!(
+        bytes_read,
+        test_data.len() as i64,
+        "Read from unlinked open file failed"
+    );
+    // SAFETY: read_dest has bytes_read bytes written by sys_read.
+    let read_slice =
+        unsafe { core::slice::from_raw_parts(read_dest as *const u8, bytes_read as usize) };
+    assert_eq!(read_slice, test_data);
+
+    // Close fd - now the file blocks and inode will be cleaned up on Drop
+    let close_res = crate::syscall::fs::sys_close(fd as i32);
+    assert_eq!(close_res, 0);
+
+    // Verify lookup fails
+    assert!(crate::fs::vfs::lookup("/disk/unlinked_open_file.txt").is_none());
+
+    // Clean up allocated mmap buffers
+    crate::syscall::memory::sys_munmap(target_addr, 4096);
+    crate::syscall::memory::sys_munmap(link_addr, 4096);
+    crate::syscall::memory::sys_munmap(readlink_buf, 4096);
+    crate::syscall::memory::sys_munmap(file_addr, 4096);
+    crate::syscall::memory::sys_munmap(data_addr, 4096);
+    crate::syscall::memory::sys_munmap(read_dest, 4096);
+
+    kprintln!("[test] ext fast symlink and unlinked open file test PASSED!");
+}
+
+#[test_case]
 fn test_acpi_find_table_edge_cases() {
     kprintln!("[test] Starting ACPI find_table edge cases test...");
 

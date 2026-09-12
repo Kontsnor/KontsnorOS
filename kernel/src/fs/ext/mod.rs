@@ -1048,6 +1048,32 @@ impl InodeOps for ExtInode {
     }
 }
 
+impl Drop for ExtInode {
+    fn drop(&mut self) {
+        let (links_count, is_dir, raw_copy) = {
+            let raw = self.raw.lock();
+            let is_dir = (raw.i_mode & 0xF000) == 0x4000;
+            (raw.i_links_count, is_dir, *raw)
+        };
+
+        if links_count == 0 {
+            // All directory references are gone and all in-memory references have dropped.
+            // Clean up the page cache, free data blocks, and deallocate the inode.
+            crate::memory::page_cache::page_cache_invalidate_inode(EXT_DEV_ID, self.ino as u64);
+            let _ = self
+                .fs
+                .deallocate_inode_and_blocks(self.ino, &raw_copy, is_dir);
+        } else {
+            let mut cache = self.fs.inode_cache.lock();
+            if let Some(weak) = cache.get(&self.ino) {
+                if weak.upgrade().is_none() {
+                    cache.remove(&self.ino);
+                }
+            }
+        }
+    }
+}
+
 impl FileSystem for ExtFileSystem {
     fn root(&self) -> Option<Arc<dyn InodeOps>> {
         self.root_node.lock().clone()

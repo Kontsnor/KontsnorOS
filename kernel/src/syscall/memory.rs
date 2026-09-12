@@ -177,6 +177,7 @@ pub fn sys_mmap(
                             is_shared: r.is_shared,
                             prot: r.prot,
                             pathname: r.pathname.clone(),
+                            is_stack: r.is_stack,
                         });
                     }
                     if r_end > end_addr {
@@ -189,6 +190,7 @@ pub fn sys_mmap(
                             is_shared: r.is_shared,
                             prot: r.prot,
                             pathname: r.pathname.clone(),
+                            is_stack: r.is_stack,
                         });
                     }
                 }
@@ -267,6 +269,7 @@ pub fn sys_mmap(
                 is_shared,
                 prot,
                 pathname: file_desc.as_ref().and_then(|d| d.path.clone()),
+                is_stack: false,
             });
 
         if crate::syscall::DEBUG_SYSCALLS {
@@ -369,6 +372,7 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
                         is_shared: r.is_shared,
                         prot: r.prot,
                         pathname: r.pathname.clone(),
+                        is_stack: r.is_stack,
                     });
                 }
                 if r_end > unmap_end {
@@ -381,6 +385,7 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
                         is_shared: r.is_shared,
                         prot: r.prot,
                         pathname: r.pathname.clone(),
+                        is_stack: r.is_stack,
                     });
                 }
             }
@@ -509,6 +514,7 @@ pub fn sys_mprotect(addr: u64, length: usize, prot: i32) -> SyscallResult {
                         is_shared: r.is_shared,
                         prot: r.prot,
                         pathname: r.pathname.clone(),
+                        is_stack: r.is_stack,
                     });
                 }
                 // Overlapping part (gets new protection flags)
@@ -523,6 +529,7 @@ pub fn sys_mprotect(addr: u64, length: usize, prot: i32) -> SyscallResult {
                     is_shared: r.is_shared,
                     prot, // new protection flags
                     pathname: r.pathname.clone(),
+                    is_stack: r.is_stack,
                 });
                 // Right non-overlapping part
                 if r_end > mprotect_end {
@@ -535,6 +542,7 @@ pub fn sys_mprotect(addr: u64, length: usize, prot: i32) -> SyscallResult {
                         is_shared: r.is_shared,
                         prot: r.prot,
                         pathname: r.pathname.clone(),
+                        is_stack: r.is_stack,
                     });
                 }
             }
@@ -778,6 +786,7 @@ pub fn sys_mremap(
         let mut old_region_offset = 0;
         let mut old_region_is_shared = false;
         let mut old_region_pathname = None;
+        let mut old_region_is_stack = false;
         let mut found_old = false;
 
         {
@@ -792,6 +801,7 @@ pub fn sys_mremap(
                     old_region_offset = r.offset + (old_address - r.start);
                     old_region_is_shared = r.is_shared;
                     old_region_pathname = r.pathname.clone();
+                    old_region_is_stack = r.is_stack;
                     found_old = true;
                     break;
                 }
@@ -880,6 +890,7 @@ pub fn sys_mremap(
                     is_shared: old_region_is_shared,
                     prot: old_region_prot,
                     pathname: old_region_pathname,
+                    is_stack: old_region_is_stack,
                 });
         }
 

@@ -300,13 +300,8 @@ impl ExtInode {
     /// Implement VFS unlink.
     pub fn unlink_dir_entry(&self, name: &str) -> Result<(), i32> {
         let child_ino = self.remove_directory_entry(name).map_err(|_| -2)?; // ENOENT
-        crate::memory::page_cache::page_cache_invalidate_inode(
-            crate::fs::ext::EXT_DEV_ID,
-            child_ino as u64,
-        );
-        self.fs
-            .decrement_links_count(child_ino, false)
-            .map_err(|_| -5)?; // EIO
+        let child_node = self.fs.get_inode(child_ino).map_err(|_| -5)?;
+        child_node.dec_nlink()?;
         Ok(())
     }
 
@@ -328,7 +323,7 @@ impl ExtInode {
             return Err(-39); // ENOTEMPTY
         }
 
-        let child_ino = self.remove_directory_entry(name).map_err(|_| -2)?; // ENOENT
+        let _child_ino = self.remove_directory_entry(name).map_err(|_| -2)?; // ENOENT
 
         let mut parent_raw = self.raw.lock();
         if parent_raw.i_links_count > 2 {
@@ -337,12 +332,8 @@ impl ExtInode {
         self.fs.write_inode(self.ino, &parent_raw).map_err(|_| -5)?;
         self.vfs_inode.write().nlink = parent_raw.i_links_count as u32;
 
-        self.fs
-            .decrement_links_count(child_ino, true)
-            .map_err(|_| -5)?;
-        self.fs
-            .decrement_links_count(child_ino, true)
-            .map_err(|_| -5)?;
+        child.dec_nlink()?;
+        child.dec_nlink()?;
 
         Ok(())
     }

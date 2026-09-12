@@ -1038,13 +1038,27 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, timeout: i32) -> SyscallResult {
     }
 
     let start_ticks = crate::arch::x86_64::interrupts::timer_ticks();
+    // timeout < 0  → wait forever (no deadline)
+    // timeout = 0  → return immediately (poll, no block)
+    // timeout > 0  → wait up to `timeout` ms
     let timeout_ticks = if timeout > 0 {
-        Some((timeout as u64 + 9) / 10)
+        Some((timeout as u64 + 9) / 10) // convert ms → 10ms ticks, round up
     } else {
         None
     };
+    let wait_forever = timeout < 0;
 
-    let mut poll_guard: Option<PollWaitGuard> = None;
+    // ── Register the wait-queue BEFORE the first poll check ──────────────────
+    // This closes the missed-wakeup race: if an event (e.g. TCP data arriving)
+    // fires wake_all_epolls() between the empty-buffer check and wq.wait(), the
+    // wakeup is NOT lost because the guard is already in EPOLL_WAIT_QUEUES.
+    // For timeout=0 (immediate) we still skip the wait, but registration is
+    // harmless and avoids a special-case branch.
+    let poll_guard = if timeout != 0 {
+        Some(PollWaitGuard::new())
+    } else {
+        None
+    };
 
     loop {
         let mut ready = 0i64;
@@ -1057,7 +1071,7 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, timeout: i32) -> SyscallResult {
                         ready += 1;
                     }
                 } else {
-                    pfd.revents = 0x0008; // POLLERR
+                    pfd.revents = 0x0008; // POLLERR — fd not open
                     ready += 1;
                 }
             } else {
@@ -1090,7 +1104,7 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, timeout: i32) -> SyscallResult {
             }
         }
 
-        // Handle signals checking (break with EINTR if a signal is pending)
+        // Handle pending signals — return EINTR if any unblocked signal is pending.
         let current_pid = match crate::process::scheduler::current_pid() {
             Some(p) => p,
             None => return Errno::ESRCH.into(),
@@ -1103,14 +1117,22 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, timeout: i32) -> SyscallResult {
             }
         }
 
-        // Sleep on wait queue registered in EPOLL_WAIT_QUEUES with timeout
-        if let Some(limit) = timeout_ticks {
-            crate::fs::epoll::add_sleep_timeout(current_pid, start_ticks + limit);
-        }
-        let guard = poll_guard.get_or_insert_with(PollWaitGuard::new);
-        guard.wq.wait();
-        if timeout_ticks.is_some() {
-            crate::fs::epoll::remove_sleep_timeout(current_pid);
+        // Sleep until an event fires or a deadline expires.
+        // The guard is already registered in EPOLL_WAIT_QUEUES, so any
+        // wake_all_epolls() call (from TCP receive, pipe write, etc.) will
+        // unblock us. We then loop back to re-check all fds.
+        if let Some(ref guard) = poll_guard {
+            if !wait_forever {
+                if let Some(limit) = timeout_ticks {
+                    crate::fs::epoll::add_sleep_timeout(current_pid, start_ticks + limit);
+                }
+            }
+            guard.wq.wait();
+            if !wait_forever {
+                if timeout_ticks.is_some() {
+                    crate::fs::epoll::remove_sleep_timeout(current_pid);
+                }
+            }
         }
     }
 }
@@ -1189,8 +1211,15 @@ pub fn sys_pselect6(
 
     let start_ticks = crate::arch::x86_64::interrupts::timer_ticks();
     let timeout_ticks = timeout_ms.map(|ms| if ms > 0 { ((ms as u64) + 9) / 10 } else { 0 });
+    let wait_forever = timeout.is_null(); // NULL timeout = block until event
 
-    let mut pselect_guard: Option<PollWaitGuard> = None;
+    // Pre-register the poll wait-queue before the first fd check to close the
+    // missed-wakeup race (same fix as sys_poll).
+    let pselect_guard = if timeout_ticks != Some(0) {
+        Some(PollWaitGuard::new())
+    } else {
+        None
+    };
 
     loop {
         let mut out_read = [0u64; 16];
@@ -1288,13 +1317,18 @@ pub fn sys_pselect6(
             }
         }
 
-        if let Some(limit) = timeout_ticks {
-            crate::fs::epoll::add_sleep_timeout(current_pid, start_ticks + limit);
-        }
-        let guard = pselect_guard.get_or_insert_with(PollWaitGuard::new);
-        guard.wq.wait();
-        if timeout_ticks.is_some() {
-            crate::fs::epoll::remove_sleep_timeout(current_pid);
+        if let Some(ref guard) = pselect_guard {
+            if !wait_forever {
+                if let Some(limit) = timeout_ticks {
+                    crate::fs::epoll::add_sleep_timeout(current_pid, start_ticks + limit);
+                }
+            }
+            guard.wq.wait();
+            if !wait_forever {
+                if timeout_ticks.is_some() {
+                    crate::fs::epoll::remove_sleep_timeout(current_pid);
+                }
+            }
         }
     }
 }

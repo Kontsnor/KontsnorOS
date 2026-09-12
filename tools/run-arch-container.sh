@@ -64,7 +64,7 @@ chmod -R u+rwX "$ARCH_STAGE"
 
 # 4. Prepare disk-arch.img (1.5GB ext2)
 if [ ! -f "$DISK_IMG" ] || [ "$REBUILD_DISK" = true ]; then
-    echo "[4/5] Staging disk layout and generating $DISK_IMG (1.5GB ext2)..."
+    echo "[4/5] Staging disk layout and generating $DISK_IMG (3GB ext2)..."
     DISK_STAGE="/tmp/arch-disk-root"
     rm -rf "$DISK_STAGE"
     mkdir -p "$DISK_STAGE"
@@ -190,7 +190,7 @@ EOF
 
     echo "           Formatting $DISK_IMG using mke2fs..."
     rm -f "$DISK_IMG"
-    mke2fs -t ext2 -b 4096 -F -d "$DISK_STAGE" "$DISK_IMG" 1536M
+    mke2fs -t ext2 -b 4096 -F -d "$DISK_STAGE" "$DISK_IMG" 3072M
     echo "           Disk image generated successfully."
     rm -rf "$DISK_STAGE"
 else

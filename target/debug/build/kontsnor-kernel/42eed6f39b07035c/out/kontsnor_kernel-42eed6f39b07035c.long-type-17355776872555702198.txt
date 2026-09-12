@@ -1,2 +1,0 @@
-unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> *mut c_void
-unsafe extern "C" fn(*mut u8, *const u8, usize) -> *mut u8

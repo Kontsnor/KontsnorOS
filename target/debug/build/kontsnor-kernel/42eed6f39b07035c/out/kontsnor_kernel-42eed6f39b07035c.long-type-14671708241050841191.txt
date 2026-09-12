@@ -1,2 +1,0 @@
-unsafe extern "C" fn(*const c_void, *const c_void, usize) -> i32
-unsafe extern "C" fn(*const u8, *const u8, usize) -> i32

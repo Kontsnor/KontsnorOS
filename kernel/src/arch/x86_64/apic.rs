@@ -361,19 +361,12 @@ pub fn send_startup_ipi(target_lapic_id: u8, vector: u8) {
 
 /// Delay execution for a specified number of microseconds using LAPIC timer tick calibration.
 pub fn delay_us(us: u32) {
-    let ticks_to_wait = (us as u64) * 1000;
-    let mut elapsed = 0u64;
-    let mut last_val = get_lapic_timer_current() as u64;
-    while elapsed < ticks_to_wait {
-        let current_val = get_lapic_timer_current() as u64;
-        if current_val < last_val {
-            elapsed += last_val - current_val;
-        } else if current_val > last_val {
-            // Wrapped!
-            elapsed += last_val + (10000000 - current_val);
+    // Port 0x80 is the standard POST delay port (takes ~1µs per read/write on x86)
+    let mut p = Port::<u8>::new(0x80);
+    for _ in 0..us {
+        unsafe {
+            let _ = p.read();
         }
-        last_val = current_val;
-        core::hint::spin_loop();
     }
 }
 

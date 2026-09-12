@@ -7,3 +7,7 @@
 ## 2026-03-30 - Pipe Buffer Ring-Buffer Bulk Slice Copy Optimization
 **Learning:** Performing byte-by-byte loops and modulo operations in `PipeBuffer` (`push`/`pop`) incurs severe CPU overhead and branch mispredictions on large pipe read/write operations (e.g. 64 KiB buffers). Implementing `push_slice` and `pop_slice` with `copy_from_slice` reduces transfer overheads from O(N) loop iterations to at most two O(1) bulk memory copies (`rep movsb`).
 **Action:** When working with ring buffers or IPC stream channels, prefer slice-based contiguous chunk copies over element-by-element push/pop loops.
+
+## 2026-03-30 - VFS Path Resolution Dcache Lookups
+**Learning:** In `kernel/src/fs/vfs.rs`, component traversal previously performed heap string formatting (`format!("/{}/{}", ...)`), BTreeMap lookups, and `RwLock` acquisitions on `self.dentry_cache` for every component. Integrating `crate::fs::dcache::dcache_lookup(parent_ino, component)` bypasses BTreeMap lookup locks and eliminates heap allocation on dcache hits.
+**Action:** Always check whether path traversal routines leverage fixed-capacity hashed dentry caches before building dynamic string keys.

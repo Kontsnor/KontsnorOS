@@ -233,24 +233,18 @@ impl Vfs {
                 }
 
                 i += 1;
-                let path_key = if resolved_till_now.is_empty() || resolved_till_now == "/" {
-                    format!("/{}", component)
-                } else {
-                    format!("{}/{}", resolved_till_now, component)
-                };
+                let parent_ino = current.inode().ino;
 
-                let next = {
-                    let cache = self.dentry_cache.read();
-                    cache.get(&path_key).cloned()
-                };
-
-                let next = if let Some(n) = next {
-                    n
-                } else {
-                    let n = current.lookup(component)?;
-                    let mut cache = self.dentry_cache.write();
-                    cache.insert(path_key.clone(), n.clone());
-                    n
+                // Check global O(1) fixed-size dcache first to avoid heap allocations
+                // (e.g. String formatting) and lock contention on path resolution.
+                let next = match crate::fs::dcache::dcache_lookup(parent_ino, component) {
+                    Some(Some(cached_inode)) => cached_inode,
+                    Some(None) => return None, // Negative dcache hit
+                    None => {
+                        let n = current.lookup(component)?;
+                        crate::fs::dcache::dcache_insert(parent_ino, component, n.clone());
+                        n
+                    }
                 };
 
                 // Check if this component is a symlink
@@ -275,7 +269,13 @@ impl Vfs {
                 }
 
                 current = next;
-                resolved_till_now = path_key;
+
+                // Update resolved_till_now path string only if needed for symlink resolution
+                if resolved_till_now.is_empty() || resolved_till_now == "/" {
+                    resolved_till_now = format!("/{}", component);
+                } else {
+                    resolved_till_now = format!("{}/{}", resolved_till_now, component);
+                }
             }
 
             if let Some((dir_path, target, remainder)) = symlink_target {

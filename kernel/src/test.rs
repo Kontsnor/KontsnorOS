@@ -2468,6 +2468,91 @@ fn test_ext_file_write_persistence() {
 }
 
 #[test_case]
+fn test_acpi_rsdp_parsing() {
+    kprintln!("[test] Starting ACPI RSDP parsing error handling test...");
+
+    // 1. Null physical address
+    assert_eq!(
+        crate::acpi::tables::parse_rsdp(0),
+        Err(crate::acpi::tables::AcpiError::InvalidAddress)
+    );
+
+    let phys_offset = crate::memory::r#virtual::phys_mem_offset();
+
+    // 2. Invalid RSDP Signature
+    let mut invalid_rsdp = crate::acpi::tables::Rsdp {
+        signature: *b"BAD SIG ",
+        checksum: 0,
+        oem_id: *b"TESTOM",
+        revision: 2,
+        rsdt_address: 0x1000,
+        length: 36,
+        xsdt_address: 0x2000,
+        extended_checksum: 0,
+        reserved: [0; 3],
+    };
+    let virt_addr1 = &invalid_rsdp as *const _ as u64;
+    let phys_addr1 = virt_addr1 - phys_offset;
+
+    assert_eq!(
+        crate::acpi::tables::parse_rsdp(phys_addr1),
+        Err(crate::acpi::tables::AcpiError::InvalidRsdpSignature)
+    );
+
+    // 3. Invalid Checksum
+    let mut bad_checksum_rsdp = crate::acpi::tables::Rsdp {
+        signature: *b"RSD PTR ",
+        checksum: 0xFF, // Intentionally incorrect checksum
+        oem_id: *b"TESTOM",
+        revision: 2,
+        rsdt_address: 0x1000,
+        length: 36,
+        xsdt_address: 0x2000,
+        extended_checksum: 0,
+        reserved: [0; 3],
+    };
+    let virt_addr2 = &bad_checksum_rsdp as *const _ as u64;
+    let phys_addr2 = virt_addr2 - phys_offset;
+
+    assert_eq!(
+        crate::acpi::tables::parse_rsdp(phys_addr2),
+        Err(crate::acpi::tables::AcpiError::InvalidChecksum)
+    );
+
+    // 4. Valid RSDP (Happy Path)
+    let mut valid_rsdp = crate::acpi::tables::Rsdp {
+        signature: *b"RSD PTR ",
+        checksum: 0,
+        oem_id: *b"MY OEM",
+        revision: 2,
+        rsdt_address: 0x1000,
+        length: 36,
+        xsdt_address: 0x2000_0000,
+        extended_checksum: 0,
+        reserved: [0; 3],
+    };
+    // Calculate valid checksum for first 20 bytes
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(&mut valid_rsdp as *mut _ as *mut u8, 20)
+    };
+    let sum_without_checksum: u8 = bytes[0..8]
+        .iter()
+        .chain(&bytes[9..20])
+        .fold(0u8, |acc, &b| acc.wrapping_add(b));
+    valid_rsdp.checksum = (0u8).wrapping_sub(sum_without_checksum);
+
+    let virt_addr3 = &valid_rsdp as *const _ as u64;
+    let phys_addr3 = virt_addr3 - phys_offset;
+
+    let parsed = crate::acpi::tables::parse_rsdp(phys_addr3).expect("Valid RSDP parsing failed");
+    assert_eq!(parsed.oem_id, "MY OEM");
+    assert_eq!(parsed.revision, 2);
+    assert_eq!(parsed.xsdt_address, 0x2000_0000);
+
+    kprintln!("[test] ACPI RSDP parsing error handling test PASSED!");
+}
+
+#[test_case]
 fn test_prng_seed_initialization() {
     kprintln!("[test] Starting PRNG seed initialization test...");
 

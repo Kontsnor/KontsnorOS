@@ -2365,6 +2365,50 @@ fn test_wine_sigaltstack_and_ucontext() {
 }
 
 #[test_case]
+fn test_crypto_prng() {
+    kprintln!("[test] Starting PRNG byte generation test...");
+
+    // 1. Reset PRNG state to test unseeded / no-entropy state
+    crate::crypto::prng::reset_for_test();
+    let mut unseeded_buf = [0xAAu8; 32];
+    let res_unseeded = crate::crypto::prng::fill_bytes(&mut unseeded_buf);
+    assert!(!res_unseeded, "fill_bytes should return false when PRNG has no entropy");
+    assert_eq!(unseeded_buf, [0xAAu8; 32], "Destination slice must remain unmodified when fill_bytes fails");
+
+    // 2. Seed PRNG with initial entropy key
+    let seed_key = [0x42u8; 32];
+    crate::crypto::prng::seed(&seed_key);
+
+    // 3. Test small buffer fill and mutation verification
+    let mut small_buf = [0u8; 16];
+    let res_seeded = crate::crypto::prng::fill_bytes(&mut small_buf);
+    assert!(res_seeded, "fill_bytes should return true after PRNG is seeded");
+    assert_ne!(small_buf, [0u8; 16], "Destination slice must be mutated with random bytes");
+
+    // 4. Test distinct, non-repetitive random output across consecutive calls
+    let mut buf_a = [0u8; 32];
+    let mut buf_b = [0u8; 32];
+    assert!(crate::crypto::prng::fill_bytes(&mut buf_a));
+    assert!(crate::crypto::prng::fill_bytes(&mut buf_b));
+    assert_ne!(buf_a, buf_b, "Consecutive PRNG byte fills must produce distinct random output");
+
+    // 5. Test multi-block generation (> 64 bytes) to test ChaCha20 block generation and buffer index wrapping
+    let mut large_buf = [0u8; 128];
+    assert!(crate::crypto::prng::fill_bytes(&mut large_buf));
+    // Verify first block (0..64) and second block (64..128) are non-zero and non-identical
+    assert_ne!(&large_buf[0..64], &large_buf[64..128]);
+
+    // 6. Test reseed functionality
+    let reseed_entropy = [0x99u8; 32];
+    crate::crypto::prng::reseed(&reseed_entropy);
+    let mut reseeded_buf = [0u8; 32];
+    assert!(crate::crypto::prng::fill_bytes(&mut reseeded_buf));
+    assert_ne!(reseeded_buf, [0u8; 32]);
+
+    kprintln!("[test] PRNG byte generation test PASSED!");
+}
+
+#[test_case]
 fn test_ext_file_write_persistence() {
     kprintln!("[test] Starting ext file write persistence test...");
     let path_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
@@ -2611,4 +2655,281 @@ fn test_acpi_find_table_edge_cases() {
     crate::memory::physical::deallocate_frame(rsdt_phys);
 
     kprintln!("[test] ACPI find_table edge cases test PASSED!");
+}
+
+#[test_case]
+fn test_git_pack_write_and_trailer_pread() {
+    kprintln!("[test] Starting Git packfile write and trailer pread test...");
+
+    // Map user memory buffers for paths and data
+    let mmap_addr = crate::syscall::memory::sys_mmap(0, 16384, 3, 0x22, -1, 0) as u64;
+    assert!(mmap_addr > 0);
+
+    let pack_path = b"/disk/test_pack.pack\0";
+    let idx_path = b"/disk/test_pack.idx\0";
+
+    let pack_path_addr = mmap_addr;
+    let idx_path_addr = mmap_addr + 256;
+    let write_buf_addr = mmap_addr + 512;
+    let read_buf_addr = mmap_addr + 12288;
+
+    // SAFETY: mmap_addr points to an allocated 16384-byte region with PROT_READ | PROT_WRITE.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            pack_path.as_ptr(),
+            pack_path_addr as *mut u8,
+            pack_path.len(),
+        );
+        core::ptr::copy_nonoverlapping(idx_path.as_ptr(), idx_path_addr as *mut u8, idx_path.len());
+    }
+
+    // 1. Create simulated packfile (10,000 bytes spanning multiple 4096-byte blocks)
+    let pack_fd = crate::syscall::fs::sys_open(pack_path_addr as *const u8, 0o102, 0o644); // O_CREAT | O_RDWR
+    assert!(pack_fd >= 0, "Failed to open packfile");
+
+    const PACK_SIZE: usize = 30000;
+    const TRAILER_SIZE: usize = 20;
+    let expected_trailer = [
+        0x54u8, 0x26, 0x4a, 0xd5, 0xf5, 0x90, 0x99, 0x1b, 0x8e, 0xad, 0xf8, 0x7d, 0x2e, 0x87, 0x15,
+        0x3a, 0xdf, 0xf9, 0xa0, 0x54,
+    ];
+
+    // Write in chunks to simulate git-index-pack
+    let mut written_total = 0;
+    while written_total < PACK_SIZE {
+        let chunk_len = core::cmp::min(4096, PACK_SIZE - written_total);
+        // SAFETY: write_buf_addr has 4096 bytes available.
+        unsafe {
+            let slice = core::slice::from_raw_parts_mut(write_buf_addr as *mut u8, chunk_len);
+            for (i, byte) in slice.iter_mut().enumerate() {
+                let file_pos = written_total + i;
+                if file_pos >= PACK_SIZE - TRAILER_SIZE {
+                    *byte = expected_trailer[file_pos - (PACK_SIZE - TRAILER_SIZE)];
+                } else {
+                    *byte = ((file_pos * 31 + 7) & 0xFF) as u8;
+                }
+            }
+        }
+        let res =
+            crate::syscall::fs::sys_write(pack_fd as i32, write_buf_addr as *const u8, chunk_len);
+        assert_eq!(res, chunk_len as i64, "Short write in packfile");
+        written_total += chunk_len;
+    }
+    assert_eq!(crate::syscall::fs::sys_close(pack_fd as i32), 0);
+
+    // 2. Create adjacent index file to trigger adjacent inode table allocation and writes
+    let idx_fd = crate::syscall::fs::sys_open(idx_path_addr as *const u8, 0o102, 0o644);
+    assert!(idx_fd >= 0, "Failed to open index file");
+    let idx_content = b"GIT_PACK_INDEX_V2_DATA_SIMULATION_HEADER";
+    // SAFETY: write_buf_addr has space for idx_content.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            idx_content.as_ptr(),
+            write_buf_addr as *mut u8,
+            idx_content.len(),
+        );
+    }
+    let idx_written = crate::syscall::fs::sys_write(
+        idx_fd as i32,
+        write_buf_addr as *const u8,
+        idx_content.len(),
+    );
+    assert_eq!(idx_written, idx_content.len() as i64);
+    assert_eq!(crate::syscall::fs::sys_close(idx_fd as i32), 0);
+
+    // 3. Open packfile read-only and verify trailer with pread64 (matching open_packed_git_1)
+    let ro_pack_fd = crate::syscall::fs::sys_open(pack_path_addr as *const u8, 0, 0);
+    assert!(ro_pack_fd >= 0, "Failed to re-open packfile");
+
+    let pread_offset = (PACK_SIZE - TRAILER_SIZE) as i64;
+    let pread_res = crate::syscall::fs::sys_pread64(
+        ro_pack_fd as i32,
+        read_buf_addr as *mut u8,
+        TRAILER_SIZE,
+        pread_offset,
+    );
+    assert_eq!(pread_res, TRAILER_SIZE as i64, "pread64 trailer failed");
+
+    // SAFETY: read_buf_addr contains TRAILER_SIZE bytes read by pread64.
+    let trailer_read =
+        unsafe { core::slice::from_raw_parts(read_buf_addr as *const u8, TRAILER_SIZE) };
+    assert_eq!(
+        trailer_read, &expected_trailer,
+        "Trailer mismatch via pread64"
+    );
+
+    // Invalidate page cache to force reading packfile and idx from underlying block cache / disk
+    let pack_inode = crate::fs::vfs::lookup("/disk/test_pack.pack").expect("packfile must exist");
+    crate::memory::page_cache::page_cache_invalidate_inode(
+        pack_inode.inode().dev,
+        pack_inode.inode().ino,
+    );
+
+    let pread_res2 = crate::syscall::fs::sys_pread64(
+        ro_pack_fd as i32,
+        read_buf_addr as *mut u8,
+        TRAILER_SIZE,
+        pread_offset,
+    );
+    assert_eq!(pread_res2, TRAILER_SIZE as i64);
+    // SAFETY: read_buf_addr contains TRAILER_SIZE bytes read by pread64.
+    let trailer_read2 =
+        unsafe { core::slice::from_raw_parts(read_buf_addr as *const u8, TRAILER_SIZE) };
+    assert_eq!(
+        trailer_read2, &expected_trailer,
+        "Trailer mismatch after page cache invalidation"
+    );
+
+    assert_eq!(crate::syscall::fs::sys_close(ro_pack_fd as i32), 0);
+
+    // 4. Verify index file was not corrupted by adjacent inode writes
+    let ro_idx_fd = crate::syscall::fs::sys_open(idx_path_addr as *const u8, 0, 0);
+    assert!(ro_idx_fd >= 0, "Failed to re-open index file");
+    let read_idx_res = crate::syscall::fs::sys_read(
+        ro_idx_fd as i32,
+        read_buf_addr as *mut u8,
+        idx_content.len(),
+    );
+    assert_eq!(
+        read_idx_res,
+        idx_content.len() as i64,
+        "Index file read corrupted"
+    );
+    // SAFETY: read_buf_addr contains idx_content.len() bytes read by sys_read.
+    let idx_read =
+        unsafe { core::slice::from_raw_parts(read_buf_addr as *const u8, idx_content.len()) };
+    assert_eq!(
+        idx_read, idx_content,
+        "Index file contents corrupted by adjacent inode write"
+    );
+    assert_eq!(crate::syscall::fs::sys_close(ro_idx_fd as i32), 0);
+
+    // Clean up
+    crate::syscall::memory::sys_munmap(mmap_addr, 16384);
+    kprintln!("[test] Git packfile write and trailer pread test PASSED!");
+}
+
+#[test_case]
+fn test_acpi_rsdp_parsing() {
+    kprintln!("[test] Starting ACPI RSDP parsing error handling test...");
+
+    // 1. Null physical address
+    assert_eq!(
+        crate::acpi::tables::parse_rsdp(0),
+        Err(crate::acpi::tables::AcpiError::InvalidAddress)
+    );
+
+    let phys_offset = crate::memory::r#virtual::phys_mem_offset();
+
+    // 2. Invalid RSDP Signature
+    let mut invalid_rsdp = crate::acpi::tables::Rsdp {
+        signature: *b"BAD SIG ",
+        checksum: 0,
+        oem_id: *b"TESTOM",
+        revision: 2,
+        rsdt_address: 0x1000,
+        length: 36,
+        xsdt_address: 0x2000,
+        extended_checksum: 0,
+        reserved: [0; 3],
+    };
+    let virt_addr1 = &invalid_rsdp as *const _ as u64;
+    let phys_addr1 = virt_addr1 - phys_offset;
+
+    assert_eq!(
+        crate::acpi::tables::parse_rsdp(phys_addr1),
+        Err(crate::acpi::tables::AcpiError::InvalidRsdpSignature)
+    );
+
+    // 3. Invalid Checksum
+    let mut bad_checksum_rsdp = crate::acpi::tables::Rsdp {
+        signature: *b"RSD PTR ",
+        checksum: 0xFF, // Intentionally incorrect checksum
+        oem_id: *b"TESTOM",
+        revision: 2,
+        rsdt_address: 0x1000,
+        length: 36,
+        xsdt_address: 0x2000,
+        extended_checksum: 0,
+        reserved: [0; 3],
+    };
+    let virt_addr2 = &bad_checksum_rsdp as *const _ as u64;
+    let phys_addr2 = virt_addr2 - phys_offset;
+
+    assert_eq!(
+        crate::acpi::tables::parse_rsdp(phys_addr2),
+        Err(crate::acpi::tables::AcpiError::InvalidChecksum)
+    );
+
+    // 4. Valid RSDP (Happy Path)
+    let mut valid_rsdp = crate::acpi::tables::Rsdp {
+        signature: *b"RSD PTR ",
+        checksum: 0,
+        oem_id: *b"MY OEM",
+        revision: 2,
+        rsdt_address: 0x1000,
+        length: 36,
+        xsdt_address: 0x2000_0000,
+        extended_checksum: 0,
+        reserved: [0; 3],
+    };
+    // Calculate valid checksum for first 20 bytes
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(&mut valid_rsdp as *mut _ as *mut u8, 20)
+    };
+    let sum_without_checksum: u8 = bytes[0..8]
+        .iter()
+        .chain(&bytes[9..20])
+        .fold(0u8, |acc, &b| acc.wrapping_add(b));
+    valid_rsdp.checksum = (0u8).wrapping_sub(sum_without_checksum);
+
+    let virt_addr3 = &valid_rsdp as *const _ as u64;
+    let phys_addr3 = virt_addr3 - phys_offset;
+
+    let parsed = crate::acpi::tables::parse_rsdp(phys_addr3).expect("Valid RSDP parsing failed");
+    assert_eq!(parsed.oem_id, "MY OEM");
+    assert_eq!(parsed.revision, 2);
+    assert_eq!(parsed.xsdt_address, 0x2000_0000);
+
+    kprintln!("[test] ACPI RSDP parsing error handling test PASSED!");
+}
+
+#[test_case]
+fn test_prng_seed_initialization() {
+    kprintln!("[test] Starting PRNG seed initialization test...");
+
+    // 1. Seed the PRNG with initial 32-byte entropy key
+    let seed1: [u8; 32] = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+    ];
+
+    crate::crypto::prng::seed(&seed1);
+
+    // 2. Verify fill_bytes returns true after seeding
+    let mut buf1 = [0u8; 32];
+    let ok = crate::crypto::prng::fill_bytes(&mut buf1);
+    assert!(ok, "fill_bytes should return true after PRNG is seeded");
+
+    // Ensure the generated random bytes are not all zeros
+    assert_ne!(buf1, [0u8; 32], "PRNG output should non-zero");
+
+    // 3. Verify deterministic generation for identical seed initialization
+    crate::crypto::prng::seed(&seed1);
+    let mut buf2 = [0u8; 32];
+    let ok2 = crate::crypto::prng::fill_bytes(&mut buf2);
+    assert!(ok2);
+    assert_eq!(buf1, buf2, "Identical seeds must produce identical initial output blocks");
+
+    // 4. Verify re-seeding / different seed initialization changes output sequence
+    let seed2: [u8; 32] = [0xff; 32];
+    crate::crypto::prng::seed(&seed2);
+    let mut buf3 = [0u8; 32];
+    let ok3 = crate::crypto::prng::fill_bytes(&mut buf3);
+    assert!(ok3);
+    assert_ne!(buf1, buf3, "Different seeds must produce different output blocks");
+
+    kprintln!("[test] PRNG seed initialization test PASSED!");
 }

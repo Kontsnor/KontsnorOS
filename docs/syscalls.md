@@ -40,11 +40,7 @@ Simple non-yielding inquiries (`getpid`, `getuid`, `getgid`, `geteuid`, `getegid
 ## Implemented System Call Reference
 
 The following tables document the 150+ actively handled Linux system calls in KontsnorOS.
-## Implemented System Call Reference
 
-The following tables document the 150+ actively handled Linux system calls in KontsnorOS.
-
-### 1. File & Directory Operations
 ### 1. File & Directory Operations
 
 | Number | Name | Implementation | Description |

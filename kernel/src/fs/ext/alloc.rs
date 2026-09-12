@@ -210,7 +210,6 @@ impl ExtFileSystem {
         if ino == 0 {
             return Ok(());
         }
-        self.inode_cache.lock().remove(&ino);
         let mut sb = self.superblock.lock();
         let mut gds = self.group_descriptors.lock();
 
@@ -282,14 +281,8 @@ impl ExtFileSystem {
 
         let dst_ptr = block_buf[offset_in_block..].as_mut_ptr();
         let src_ptr = raw_inode as *const ExtRawInode as *const u8;
-        let copy_size = core::cmp::min(
-            self.inode_size as usize,
-            core::mem::size_of::<ExtRawInode>(),
-        );
-        // SAFETY: Both pointers are valid. src_ptr points to an ExtRawInode of size copy_size,
-        // and dst_ptr points to block_buf at offset_in_block with at least copy_size bytes available.
         unsafe {
-            core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_size);
+            core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, self.inode_size as usize);
         }
 
         write_blocks(&*self.device, logical_block, &block_buf, self.block_size)?;
@@ -398,14 +391,8 @@ impl ExtFileSystem {
         } else {
             let dst_ptr = block_buf[offset_in_block..].as_mut_ptr();
             let src_ptr = &raw_inode as *const ExtRawInode as *const u8;
-            let copy_size = core::cmp::min(
-                self.inode_size as usize,
-                core::mem::size_of::<ExtRawInode>(),
-            );
-            // SAFETY: Both pointers are valid. src_ptr points to an ExtRawInode of size copy_size,
-            // and dst_ptr points to block_buf at offset_in_block with at least copy_size bytes available.
             unsafe {
-                core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_size);
+                core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, self.inode_size as usize);
             }
             write_blocks(&*self.device, logical_block, &block_buf, self.block_size)?;
         }

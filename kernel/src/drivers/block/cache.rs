@@ -157,12 +157,11 @@ impl BlockDevice for BlockCache {
                         last_access: counter,
                     },
                 );
-                buf[offset..offset + block_size].copy_from_slice(block_slice);
             } else {
                 let entry = inner.entries.get_mut(&curr_block).unwrap();
                 entry.last_access = counter;
-                buf[offset..offset + block_size].copy_from_slice(&entry.data);
             }
+            buf[offset..offset + block_size].copy_from_slice(block_slice);
         }
 
         Ok(())

@@ -20,8 +20,7 @@ use crate::fs::inode::{DirEntry, FilePermissions, FileType, Inode, InodeOps};
 use crate::fs::vfs::{FileSystem, FsStats};
 use crate::kprintln;
 use crate::sync::spinlock::TicketLock;
-use ::alloc::collections::BTreeMap;
-use ::alloc::sync::{Arc, Weak};
+use ::alloc::sync::Arc;
 use ::alloc::vec::Vec;
 use spin::RwLock;
 
@@ -94,7 +93,6 @@ pub struct ExtFileSystem {
     pub(crate) group_descriptors: TicketLock<Vec<GroupDescriptor>>,
     pub(crate) root_node: TicketLock<Option<Arc<dyn InodeOps>>>,
     pub(crate) self_weak: spin::Mutex<Option<::alloc::sync::Weak<ExtFileSystem>>>,
-    pub(crate) inode_cache: TicketLock<BTreeMap<u32, Weak<ExtInode>>>,
 }
 
 impl ExtFileSystem {
@@ -712,7 +710,6 @@ impl ExtFileSystem {
             group_descriptors: TicketLock::new(gds),
             root_node: TicketLock::new(None),
             self_weak: spin::Mutex::new(None),
-            inode_cache: TicketLock::new(BTreeMap::new()),
         });
 
         *fs.self_weak.lock() = Some(Arc::downgrade(&fs));
@@ -827,17 +824,8 @@ impl ExtFileSystem {
 
     /// Retrieve an inode by its number.
     pub fn get_inode(self: &Arc<Self>, ino: u32) -> Result<Arc<dyn InodeOps>, &'static str> {
-        let mut cache = self.inode_cache.lock();
-        if let Some(weak) = cache.get(&ino) {
-            if let Some(arc) = weak.upgrade() {
-                return Ok(arc);
-            }
-        }
-
         let ext_inode = self.get_ext_inode(ino)?;
-        let arc = Arc::new(ext_inode);
-        cache.insert(ino, Arc::downgrade(&arc));
-        Ok(arc)
+        Ok(Arc::new(ext_inode))
     }
 
     /// Write superblock back to the block device.

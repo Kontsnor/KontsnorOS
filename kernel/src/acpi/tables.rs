@@ -24,7 +24,7 @@ use alloc::vec::Vec;
 use crate::kprintln;
 
 /// ACPI parsing errors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub enum AcpiError {
     /// Invalid RSDP signature.
     InvalidRsdpSignature,
@@ -39,7 +39,7 @@ pub enum AcpiError {
 }
 
 /// Information extracted from the RSDP.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct RsdpInfo {
     /// OEM identifier string.
     pub oem_id: String,

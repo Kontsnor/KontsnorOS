@@ -361,16 +361,19 @@ pub fn send_startup_ipi(target_lapic_id: u8, vector: u8) {
 
 /// Delay execution for a specified number of microseconds using LAPIC timer tick calibration.
 pub fn delay_us(us: u32) {
-    let ticks_to_wait = (us as u64) * 1000;
+    // Standard APIC timer bus frequency is ~100 MHz (100 ticks per microsecond).
+    let ticks_to_wait = (us as u64) * 100;
     let mut elapsed = 0u64;
     let mut last_val = get_lapic_timer_current() as u64;
-    while elapsed < ticks_to_wait {
+    let mut max_spins = 10_000_000u64;
+    while elapsed < ticks_to_wait && max_spins > 0 {
+        max_spins -= 1;
         let current_val = get_lapic_timer_current() as u64;
         if current_val < last_val {
             elapsed += last_val - current_val;
         } else if current_val > last_val {
             // Wrapped!
-            elapsed += last_val + (10000000 - current_val);
+            elapsed += last_val + (10_000_000 - current_val);
         }
         last_val = current_val;
         core::hint::spin_loop();

@@ -153,13 +153,6 @@ pub fn seed(initial_entropy: &[u8; 32]) {
     HAS_ENTROPY.store(true, Ordering::SeqCst);
 }
 
-/// Reset PRNG state for testing purposes.
-pub fn reset_for_test() {
-    let mut lock = PRNG.lock();
-    *lock = None;
-    HAS_ENTROPY.store(false, Ordering::SeqCst);
-}
-
 /// Periodic reseed to mix in fresh entropy.
 pub fn reseed(entropy: &[u8; 32]) {
     let mut lock = PRNG.lock();

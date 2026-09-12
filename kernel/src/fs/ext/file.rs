@@ -769,13 +769,12 @@ impl ExtInode {
             // Re-acquire locks for the next block allocation check or loop finalization
             raw = self.raw.lock();
             vfs = self.vfs_inode.write();
-
-            if current_offset > vfs.size {
-                vfs.size = current_offset;
-                raw.i_size = current_offset as u32;
-            }
         }
 
+        if current_offset > vfs.size {
+            vfs.size = current_offset;
+            raw.i_size = current_offset as u32;
+        }
         vfs.blocks = raw.i_blocks as u64;
 
         let now = crate::fs::vfs::current_time_sec();

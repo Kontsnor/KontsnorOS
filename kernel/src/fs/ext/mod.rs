@@ -216,6 +216,7 @@ pub struct ExtFileSystem {
     pub(crate) inodes_per_group: u32,
     pub(crate) inode_size: u16,
     pub(crate) is_64bit: bool,
+    pub(crate) gd_size: usize,
     pub(crate) superblock: TicketLock<Superblock>,
     pub(crate) group_descriptors: TicketLock<Vec<GroupDescriptor>>,
     pub(crate) root_node: TicketLock<Option<Arc<dyn InodeOps>>>,
@@ -911,6 +912,7 @@ impl ExtFileSystem {
             inodes_per_group,
             inode_size,
             is_64bit,
+            gd_size,
             superblock: TicketLock::new(sb),
             group_descriptors: TicketLock::new(gds),
             root_node: TicketLock::new(None),
@@ -1075,10 +1077,7 @@ impl ExtFileSystem {
         let block_size = self.block_size;
         let gdt_block = if block_size == 1024 { 2 } else { 1 };
 
-        let gd_size = {
-            let sb = self.superblock.lock();
-            sb.desc_size()
-        };
+        let gd_size = self.gd_size;
         let gdt_size = gds.len() * gd_size;
         let gdt_blocks = (gdt_size + block_size as usize - 1) / block_size as usize;
 

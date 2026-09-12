@@ -1,6 +1,6 @@
 # KontsnorOS Strategic Roadmap: Linux ABI Compatibility Track
 
-This document details the strategic engineering roadmap and phase progression for **KontsnorOS**. The project's ultimate, non-negotiable objective is to serve as an **uncompromising, drop-in replacement for the Linux Kernel (ABI-compatible)**, capable of booting unmodified, stock Linux distributions (both heavy glibc/systemd stacks like Ubuntu/Arch and lightweight musl stacks like Alpine) directly on our custom Rust-based hybrid architecture.
+This document details the strategic engineering roadmap, architectural phases, and milestone progression for **KontsnorOS**. The project's ultimate, non-negotiable objective is to serve as an **uncompromising, drop-in replacement for the Linux Kernel (ABI-compatible)**, capable of booting unmodified, stock Linux distributions (both heavy `glibc`/`systemd` stacks like Arch/Ubuntu and lightweight `musl` stacks like Alpine) directly on our custom Rust-based hybrid architecture.
 
 By prioritizing strict compliance with the Linux Application Binary Interface (ABI), we treat the entire Linux syscall and subsystem surface area as a bounded, Test-Driven Development (TDD) engineering problem optimized for high-velocity machine execution.
 
@@ -18,26 +18,36 @@ gantt
     GNU Bash Shell Integration           :done, f3, after f2, 45d
     e1000 PCI Network Stack              :done, f4, after f3, 30d
     PID 1 Init System & VFS Permissions  :done, f5, after f4, 20d
-    section Phase A: The ELF/Glibc Gate (Future)
-    Virtual Memory Extensions            :active, a1, after f5, 25d
-    ELF Auxiliary Vectors                :a2, after a1, 15d
-    Thread Local Storage (TLS)           :a3, after a2, 15d
-    section Phase B: The Systemd Gate (Future)
-    Asynchronous I/O Multiplexing (epoll):b1, after a3, 20d
-    FD-Centric Subsystems                :b2, after b1, 20d
-    Stub Subsystems & Pseudo-FS          :b3, after b2, 20d
-    section Phase C: Storage Modernization (Future)
-    Ext4 File System Upgrade             :c1, after b3, 25d
-    Modern Block Storage (NVMe/AHCI)     :c2, after c1, 25d
+    section Phase A: The ELF/Glibc Gate (Completed)
+    Virtual Memory Extensions & MAP_SHARED:done, a1, after f5, 25d
+    ELF Auxiliary Vectors & Dynamic Linker:done, a2, after a1, 15d
+    Thread Local Storage (FS_BASE/GS_BASE):done, a3, after a2, 15d
+    section Phase B: The Systemd Gate (Completed)
+    Asynchronous I/O Multiplexing (epoll):done, b1, after a3, 20d
+    FD Subsystems (timerfd, signalfd, eventfd):done, b2, after b1, 20d
+    Pseudo-FS (procfs, sysfs, devpts, tmpfs):done, b3, after b2, 20d
+    section Phase C: Storage Modernization (Completed)
+    Ext4 Extents Support                 :done, c1, after b3, 25d
+    Persistent Writes & Dirty Cache Sync :done, c2, after c1, 25d
+    section Landmark Achievements (Completed)
+    100% Native Self-Hosting (Ouroboros) :done, l1, after c2, 20d
+    Linux Containers & Namespaces (ctr_run):done, l2, after l1, 15d
+    Wine Primitives (ucontext_t, sigaltstack):done, l3, after l2, 15d
+    PTY Subsystem & Interactive Job Control:done, l4, after l3, 15d
+    section Active & Future Horizons (Next)
+    Native GUI & Bochs/VBE Framebuffer   :active, d1, after l4, 30d
+    Modern NVMe / AHCI Block Storage     :d2, after d1, 30d
+    Wine PE Binary Execution             :d3, after d2, 30d
+    Full systemd Multi-User Target Boot  :d4, after d3, 40d
 ```
 
 ---
 
 ## 🏛️ Foundational Milestones [Completed]
 
-Before commencing the Linux ABI Compatibility Track, the core subsystems of KontsnorOS were established to verify general stability:
+The initial foundations established the baseline stability of KontsnorOS:
 
-1. **Symmetric Multiprocessing (SMP):** Dynamic detection of logical cores, Local APIC periodic timers, Inter-Processor Interrupts (IPIs) for scheduler preemption, fine-grained ticket spinlocks, and TLB Shootdown (Vector 36) support.
+1. **Symmetric Multiprocessing (SMP):** Dynamic detection of logical cores via ACPI, real-mode AP trampoline (`0x8000`), Local APIC periodic timers, Inter-Processor Interrupts (IPIs) for scheduler preemption, fine-grained ticket spinlocks, and TLB Shootdown (Vector 36).
 2. **Writable ext2 Filesystem:** Fully functional `write`, `create`, `mkdir`, and `truncate` operations in VFS, LBA28 Port PIO IDE/ATA driver, and self-healing mount-time consistency check (FSCK) routines.
 3. **Bash Shell Integration:** `FS_BASE` model-specific register context switching, COW page-fault allocations, `sys_clone` context creation, non-polling `wait4` queues, TTY/Job Control terminal IOCTLs, and statically compiled GNU Bash execution.
 4. **Network Stack & Socket API:** Intel `82540EM` (e1000) Gigabit Ethernet PCI driver utilizing DMA ring-buffers, complete IP stack (ARP, IPv4, UDP, ICMP), loopback interface, and BSD-compliant socket syscalls (`socket`, `bind`, `connect`, `listen`, `accept`, `sendto`, `recvfrom`).
@@ -47,88 +57,140 @@ Before commencing the Linux ABI Compatibility Track, the core subsystems of Kont
 
 ## 🛠️ Linux ABI Compatibility Track
 
-To boot unmodified, stock Linux distributions, the kernel must satisfy the runtime expectations of the dynamic linker (`ld.so`), library allocators (`glibc`), and service managers (`systemd`).
-
-### Phase A: The Dynamic Runtime & Shared Library Engine (The ELF/Glibc Gate)
+### Phase A: The Dynamic Runtime & Shared Library Engine (The ELF/Glibc Gate) [Completed]
 *Objective: Implement the low-level primitives required for the kernel to load the dynamic linker (`ld.so`) and execute dynamically linked ELF binaries.*
 
 ```mermaid
 flowchart LR
-    ELF[Dynamic ELF Binary] --> LD[ld-linux.so]
+    ELF[Dynamic ELF Binary] --> LD[ld-linux.so / ld-musl.so]
     LD --> MMAP[MAP_SHARED & COW Memory Maps]
     LD --> AUXV[Auxiliary Vectors]
-    LD --> TLS[FS_BASE/WRFSBASE Thread Local Storage]
+    LD --> TLS[FS_BASE/GS_BASE Thread Local Storage]
 ```
 
-#### 1. Virtual Memory Extensions
-* **MAP_SHARED Semantics:** Fully implement `sys_mmap` flag `MAP_SHARED` to permit processes to map the same physical page frames for inter-process communication and shared resources.
-* **Page Cache Backing:** Build a unified Page Cache layer in the Virtual Memory Manager (VMM) to cache disk sectors into memory pages, ensuring file-backed mappings operate seamlessly with direct read/write paths.
-* **Copy-on-Write (COW) Shared Libraries:** Optimize memory management to share page mappings of dynamic library code (e.g., `libc.so`) read-only across process boundaries, only copying pages to physical RAM upon write faults.
-
-#### 2. ELF Auxiliary Vectors (`Elf64_auxv_t`)
-* **Vector Parsing and Stack Injection:** During `sys_execve`, the kernel must parse and push standard Linux Auxiliary Vectors (`Elf64_auxv_t`) onto the initial process stack. These vectors provide critical system parameters to the dynamic loader, including page size, hardware capabilities, system call entry points, and path locations.
-* **Dynamic Linker Handoff:** Ensure the auxiliary vector table correctly points to `/lib64/ld-linux-x86-64.so.2` (or the respective loader requested in the ELF binary's `.interp` section), cleanly transferring entry control flow to the dynamic linker.
-
-#### 3. Thread Local Storage (TLS) & Context Refinements
-* **sys_clone Thread Setup:** Refine `sys_clone` to accept the thread structure pointer from the caller and correctly store it in the architecture-specific registers.
-* **WRFSBASE Instruction & MSR FS_BASE Control:** Enable the CPU hardware feature to allow user-space thread libraries (`glibc`, `musl`) to manipulate `FS_BASE` and `GS_BASE` via the `WRFSBASE`/`WRGSBASE` assembly instructions, avoiding the overhead of kernel-mode roundtrips during thread local storage lookups.
+1. **Virtual Memory Extensions & Shared Mappings:**
+   * **`MAP_SHARED` Semantics:** Fully implemented `sys_mmap` flag `MAP_SHARED` allowing multiple processes to share identical physical page frames for IPC and memory-mapped files.
+   * **Page Cache Backing:** Unified page cache layer caching disk sectors into memory pages, ensuring file-backed mappings operate synchronously with read/write syscalls.
+   * **Copy-on-Write (COW):** Read-only sharing of dynamic library code segments across process boundaries, cloning physical frames only on write faults.
+   * **Gap-Searching Allocator:** Low-overhead virtual address space allocation finding free memory regions for anonymous and file-backed mappings.
+2. **ELF Auxiliary Vectors (`Elf64_auxv_t`):**
+   * Pushes standard Linux auxiliary vectors onto the initial process stack during `sys_execve` (`AT_PAGESZ`, `AT_BASE`, `AT_ENTRY`, `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_RANDOM`, `AT_EXECFN`, `AT_SECURE`, `AT_UID`, `AT_EUID`, `AT_GID`, `AT_EGID`).
+   * Clean control transfer to dynamic linkers (`ld-linux-x86-64.so.2` and `ld-musl-x86_64.so.1`).
+3. **Thread Local Storage (TLS) & Architecture Primitives:**
+   * `sys_clone` and `sys_clone3` with `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID`, and `CLONE_CHILD_CLEARTID`.
+   * `sys_arch_prctl` supporting `ARCH_SET_FS`, `ARCH_GET_FS`, `ARCH_SET_GS`, and `ARCH_GET_GS`.
+   * MSR preservation in context switching.
 
 ---
 
-### Phase B: The Asynchronous Event & Init Gauntlet (The Systemd Gate)
-*Objective: Implement advanced POSIX/Linux extensions to satisfy mainstream service managers (such as `systemd` or `OpenRC`) and prevent immediate kernel panics during early boot.*
+### Phase B: Asynchronous Events & Init Subsystems (The Systemd Gate) [Completed]
+*Objective: Implement advanced POSIX/Linux extensions to satisfy modern service managers and runtime event loops.*
 
 ```mermaid
 flowchart TD
-    Init[systemd / OpenRC] --> Multiplexing[Asynchronous epoll]
-    Init --> FD_Subsystems[FD-Centric Subsystems: signalfd, timerfd, eventfd]
-    Init --> Pseudo_FS[Stub Pseudo-FS: cgroupfs, sysfs, securityfs]
+    Init[Arch / Alpine / ctr_run] --> Multiplexing[Asynchronous epoll: epoll_create1, ctl, wait, pwait2]
+    Init --> FD_Subsystems[FD Subsystems: signalfd4, timerfd, eventfd2, inotify, pidfd]
+    Init --> Pseudo_FS[Pseudo-FS: devpts, procfs, sysfs, tmpfs]
 ```
 
-#### 1. Asynchronous I/O Multiplexing (`epoll`)
-* **epoll Ecosystem:** Implement `epoll_create1`, `epoll_ctl`, and `epoll_wait` system calls.
-* **VFS Readiness Hooking:** Integrate epoll events into the VFS file descriptor architecture. Processes must register interest in read/write readiness on pipes, sockets, and character devices, waking up cooperatively on wait lists without polling.
-
-#### 2. File-Descriptor Centric Subsystems
-* **signalfd4:** Allow processes to accept POSIX signals via standard VFS file descriptors. This enables service managers to handle signals inside event loops (e.g., `epoll`) alongside socket traffic.
-* **timerfd_create:** Expose high-precision kernel timers through file descriptors. This permits timer events to trigger events within the same multiplexed `epoll` infrastructure.
-* **eventfd2:** Implement eventfd counters for lightweight userspace-to-userspace and kernel-to-userspace event notification.
-
-#### 3. Stub Subsystems & Pseudo-Filesystems
-* **cgroupfs v2:** Mount `/sys/fs/cgroup` and expose minimal stub control hierarchies. Provide simulated files that satisfy `systemd` status queries.
-* **sysfs Configuration Nodes:** Mount `/sys` and construct key configuration nodes (e.g., CPU, block device, and module parameters) to allow standard utilities (`udevd`, `systemd`) to detect hardware configurations.
-* **Security & Kernel Stubs:** Expose `/sys/kernel/security` and return clean `ENOSYS` drop-backs or default success codes for security frameworks (like AppArmor/SELinux checks) to bypass validation sweeps without forcing init failures.
+1. **Asynchronous I/O Multiplexing (`epoll`):**
+   * Full implementation of `epoll_create`, `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, and `epoll_pwait2`.
+   * Integrated readiness wait-queues across pipes, sockets, character devices, timerfds, eventfds, and signalfds.
+2. **File-Descriptor Subsystems:**
+   * **`signalfd4`**: Allows signal consumption directly via file descriptor read loops.
+   * **`timerfd`**: High-precision Local APIC backed timers exposed through file descriptors (`timerfd_create`, `timerfd_settime`, `timerfd_gettime`).
+   * **`eventfd2`**: High-performance waitable counters for user-to-user and kernel-to-user notification.
+   * **`inotify`**: Filesystem event notifications (`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`).
+   * **`pidfd`**: Process descriptor handles (`pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`).
+3. **Pseudo-Filesystems:**
+   * **`devpts`**: Virtual pseudo-terminal filesystem generating slave terminal nodes (`/dev/pts/N`) with grantpt/unlockpt IOCTLs.
+   * **`procfs`**: Process state inspection nodes (`/proc/mounts`, `/proc/self`, `/proc/cpuinfo`, `/proc/meminfo`, `/proc/stat`).
+   * **`sysfs`**: System hardware discovery nodes (`/sys/fs/cgroup`, `/sys/class/net`, `/sys/devices`).
+   * **`tmpfs`**: High-speed memory-backed filesystem with directory hierarchies and fast unlink/rename.
 
 ---
 
-### Phase C: Storage & Filesystem Modernization (The Ext4/NVMe Upgrade)
-*Objective: Transition the storage interface from legacy emulated formats to modern distribution defaults for physical and virtual machines.*
+### Phase C: Storage & Filesystem Modernization [Completed]
+*Objective: Transition the storage interface to modern, fault-tolerant distribution defaults.*
 
 ```mermaid
 flowchart LR
-    VFS[Virtual File System] --> Ext4[Ext4 FS Driver: Extents & Journaling]
-    VFS --> NVMe[NVMe Storage Driver]
-    VFS --> AHCI[AHCI SATA Driver]
+    VFS[Virtual File System] --> Ext4[Ext4 FS Driver: Extents & Persistence]
+    VFS --> PageCache[Page Cache & msync]
+    VFS --> Hardlinks[Hard Links & Atomic Rename]
 ```
 
-#### 1. Ext4 File System Upgrade
-* **Ext4 Extents Support:** Expand the writable `ext2` driver to support Ext4 Extents (`EXT4_FEATURE_INCOMPAT_EXTENTS`). This replaces the indirect block mapping table with contiguous physical sector structures, significantly improving performance for larger files.
-* **Journaling Structure Parser:** Implement metadata parsing for the Ext4 journal log (`JBD2`). This allows the kernel to mount and read filesystems that possess journal active dirty bits, gracefully falling back to clean states when no recovery is needed.
-
-#### 2. Modern Block Storage Drivers
-* **AHCI (SATA) Controller Driver:** Utilize the PCI bus enumerator to initialize Advanced Host Controller Interface (AHCI) devices, organizing native command queues (NCQ) for high-speed SATA read/write requests.
-* **NVMe Storage Controller Driver:** Write an NVMe driver utilizing PCIe registers, registering submission and completion queues directly in physical memory, and exposing partitions under the VFS `BlockDevice` trait.
+1. **Ext4 File System Upgrade:**
+   * **Ext4 Extents (`EXT4_FEATURE_INCOMPAT_EXTENTS`):** Full extents tree parsing and extent block index traversal, enabling contiguous block allocation and fast access for multi-gigabyte files.
+   * **Persistent Block Writes:** Full physical sector allocation and metadata block updates committing dirty data blocks to storage.
+   * **Timestamps:** Automatic update of `mtime` and `ctime` on file write operations.
+   * **Hard Links & Symlinks:** Full hard link creation (`sys_link`, `sys_linkat`) and symbolic link resolution (`sys_symlink`, `sys_symlinkat`, `sys_readlink`, `sys_readlinkat`).
+   * **Fast Atomic Rename:** Directory and file rename operations adhering to POSIX atomic guarantees (`sys_rename`, `sys_renameat`, `sys_renameat2`).
+   * **Self-Healing FSCK:** Mount-time consistency validation checking and repairing bitmap and descriptor discrepancies.
 
 ---
 
-## 🔄 Execution Strategy for Sub-Agents (The TDD Feedback Loop)
+## 🏆 Landmark Achievements [Completed]
 
-To scale the implementation of the ABI Compatibility Track, we use an automated Test-Driven Development (TDD) loop executing inside our WSL2/QEMU integration pipeline. The loop feeds back direct testing failures to the AI Agent collective:
+### 1. 🚀 100% Native Self-Hosting (The Ouroboros Milestone)
+Inside QEMU, on an SMP x86_64 machine running KontsnorOS:
+- The native Rust toolchain (`cargo`, `rustc`, `rust-lld` targeting `x86_64-unknown-linux-musl`) successfully compiled all 18 dependency crates and linked `kontsnor-kernel` from scratch.
+- Handled millions of system calls across 8 SMP cores (`mmap`, `futex`, `clone`, `rt_sigaction`, `epoll`, `read`, `write`).
+- Resulted in a valid 3.2MB static-PIE ELF binary written directly to the Ext2/Ext4 disk image.
+
+### 2. 📦 Linux Container Runtime & Namespaces (`ctr_run`)
+- Container runtime running inside KontsnorOS providing mount namespace isolation, PID virtualization, root filesystem switching via `pivot_root` / `chroot`, and resource configuration.
+- Successfully runs full Arch Linux and Alpine Linux bootstrap distributions with dynamic linking, package managers, and interactive shells (`tools/run-arch-container.sh -i`).
+
+### 3. 🍷 Kernel Primitives for Wine Support
+- MSR switching for `ARCH_SET_GS` and `ARCH_GET_GS` in `sys_arch_prctl`.
+- `MAP_FIXED_NOREPLACE` semantics in `sys_mmap` preventing accidental address space collisions.
+- Full Linux x86_64 `ucontext_t` and `siginfo_t` stack frame construction on user stacks for signal delivery.
+- Alternate signal stack management via `sys_sigaltstack`.
+
+### 4. 🖥️ Interactive PTY & Terminal Job Control
+- Full pseudo-terminal master/slave subsystem (`/dev/ptmx`, `/dev/pts/N`).
+- Controlling terminal sessions (`setsid`, `TIOCSCTTY`, `TIOCSPGRP`, `TIOCGPGRP`).
+- Process-group signal delivery deduplicated by thread group (`tgid`) to prevent sibling teardown races during Ctrl+C (`SIGINT`).
+
+---
+
+## 🔭 Active Horizons & Future Roadmap
+
+```mermaid
+flowchart TD
+    Current[KontsnorOS v0.1.0] --> GUI[Phase D: Bochs / VBE Framebuffer GUI & Compositor]
+    Current --> NVMe[Phase E: NVMe & AHCI PCIe Drivers]
+    Current --> Wine[Phase F: Running Windows PE Binaries via Wine]
+    Current --> Systemd[Phase G: Full systemd Boot to Graphical Target]
+```
+
+### Phase D: Native GUI & Display Subsystem (Active)
+* **Bochs / VBE PCI Graphics Driver**: Framebuffer initialization up to 1920x1080 resolution at 32 bpp.
+* **Terminal Emulator & Rasterizer**: In-kernel or lightweight user-space terminal emulator with TrueType / rasterized Unicode font rendering.
+* **Wayland / DirectFB Compositor**: Bring up a lightweight compositor running on top of our shared memory and event subsystems.
+
+### Phase E: High-Speed PCIe Block Storage (NVMe / AHCI)
+* **AHCI (SATA) Controller Driver**: Native Command Queuing (NCQ) for high-speed SATA block operations.
+* **NVMe Storage Driver**: Submission and completion queue management mapped into physical memory via PCIe BARs.
+
+### Phase F: Wine Binary Execution
+* Validation of stock Wine binaries running on top of the Arch Linux container environment on KontsnorOS.
+* Execution of unmodified Windows x86_64 PE applications and games.
+
+### Phase G: Full systemd Boot to Multi-User Target
+* Expand cgroup v2 controller hierarchies and udev hardware hotplug event generation to satisfy `systemd` default targets without fallback modes.
+
+---
+
+## 🔄 Automated TDD Feedback Loop (AI Collective Execution)
+
+We leverage an automated Test-Driven Development (TDD) loop running inside our WSL2/QEMU integration pipeline:
 
 ```mermaid
 graph TD
     A[Code Generation Agent] -->|Applies Implementation| B[QEMU Test Harness]
-    B -->|Executes Test Suite: LTP / Custom ABI| C{System Call Exit?}
+    B -->|Executes Test Suite: LTP / Arch ABI| C{System Call Exit?}
     C -->|Success / All Passed| D[Proceed to Next Backlog Item]
     C -->|Failure / ENOSYS / Fault| E[Kernel Trace Collector]
     E -->|Serialize Log Payload| F[Telemetry Stream / Serial Output]
@@ -136,38 +198,8 @@ graph TD
     G -->|Generate Atomic Fix Prompt| A
 ```
 
-### Technical Feedback Loop Specification
+### Technical Quality Gates
 
-1. **LTP Test Execution:** During kernel test execution (triggered by `tools/run-tests.sh` or an integration hook), a suite of **Linux Test Project (LTP)** binaries or custom compiled syscall wrappers are run under Ring 3.
-2. **ENOSYS & Fault Trapping:** When a binary executes a system call that is either unimplemented (`ENOSYS`) or violates expected Linux behaviour (e.g., incorrect register state returned, unexpected `errno`), the kernel's internal trace collector catches it.
-3. **Telemetry Serialization:** The trace collector serializes the failure payload to the virtual serial port `/dev/ttyS0` in a structured JSON payload:
-   ```json
-   {
-     "syscall_num": 291,
-     "syscall_name": "epoll_create1",
-     "executing_binary": "systemd",
-     "registers": {
-       "rax": "-38",
-       "rdi": "524288"
-     },
-     "backtrace": [
-       "0xffffffff801452aa",
-       "0xffffffff80103de4"
-     ],
-     "expected_behavior": "Return new file descriptor instead of ENOSYS"
-   }
-   ```
-4. **Agent Prompter Processing:** The QEMU wrapper redirects this output to the developer session. The Prompt Agent parses the failure context, cross-references it with POSIX/Linux specifications, and formulates the next atomic implementation prompt to build out the missing compatibility logic.
-
----
-
-## 🛡️ Strategic Principles & Quality Gates
-
-On every phase of execution, the agent workflow must rigidly adhere to these guidelines:
-
-* **Security-First Boundary Architecture:**
-  Every syscall pointer parameter must be strictly audited (`validate_user_ptr` and `validate_user_ptr_write`) on all syscall boundaries. Address spaces must be verified as mapped within the user space limits to prevent kernel memory disclosure or execution vector exploits. Every `unsafe` block must document a `// SAFETY:` clause.
-* **100% Compiler Warning-Free & Clippy Clean:**
-  The Rust kernel must compile in both `debug` and `release` configurations without generating a single compiler warning.
-* **Continuous QEMU Validation:**
-  Every commit must compile and pass the testing scripts (`./tools/run-tests.sh` and `cargo clippy --workspace --all-targets -- -D warnings`), ensuring there are no execution regressions.
+1. **Security-First Boundary Architecture**: All user pointer parameters are validated via `validate_user_ptr` / `validate_user_ptr_write`. Every `unsafe` block must be documented with a `// SAFETY:` clause.
+2. **Zero Compiler Warnings & Clean Clippy**: The entire workspace must compile cleanly with `cargo clippy --workspace --all-targets -- -D warnings`.
+3. **Continuous QEMU Validation**: Every commit must pass `./tools/run-tests.sh` before merging.

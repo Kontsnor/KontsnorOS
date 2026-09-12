@@ -956,12 +956,63 @@ impl InodeOps for ExtInode {
         Ok(())
     }
 
+    fn inc_nlink(&self) -> Result<(), i32> {
+        let mut raw = self.raw.lock();
+        raw.i_links_count = raw.i_links_count.saturating_add(1);
+        self.vfs_inode.write().nlink = raw.i_links_count as u32;
+        self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?;
+        Ok(())
+    }
+
+    fn dec_nlink(&self) -> Result<(), i32> {
+        let mut raw = self.raw.lock();
+        if raw.i_links_count > 0 {
+            raw.i_links_count -= 1;
+        }
+        self.vfs_inode.write().nlink = raw.i_links_count as u32;
+        self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?;
+        Ok(())
+    }
+
     fn create(&self, name: &str, file_type: FileType) -> Option<Arc<dyn InodeOps>> {
         self.create_dir_entry(name, file_type)
     }
 
     fn unlink(&self, name: &str) -> Result<(), i32> {
         self.unlink_dir_entry(name)
+    }
+
+    fn unlink_entry(&self, name: &str) -> Option<Arc<dyn InodeOps>> {
+        if !self.inode().is_dir() {
+            return None;
+        }
+        let node = self.lookup(name)?;
+        if node.inode().is_dir() {
+            return None;
+        }
+        self.remove_directory_entry(name).ok()?;
+        Some(node)
+    }
+
+    fn link_entry(&self, name: &str, node: Arc<dyn InodeOps>) -> Result<(), i32> {
+        if !self.inode().is_dir() {
+            return Err(-20); // ENOTDIR
+        }
+        if self.lookup(name).is_some() {
+            return Err(-17); // EEXIST
+        }
+        if node.inode().dev != self.inode().dev {
+            return Err(-18); // EXDEV
+        }
+        let child_ino = node.inode().ino as u32;
+        self.add_directory_entry(child_ino, name, node.inode().file_type)
+            .map_err(|_| -5)?; // EIO
+        let now = crate::fs::vfs::current_time_sec();
+        let mut raw = self.raw.lock();
+        raw.i_mtime = now;
+        raw.i_ctime = now;
+        let _ = self.fs.write_inode(self.ino, &raw);
+        Ok(())
     }
 
     fn mkdir(&self, name: &str) -> Option<Arc<dyn InodeOps>> {

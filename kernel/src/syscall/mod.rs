@@ -99,6 +99,7 @@ pub enum Errno {
     EACCES = -13,
     EFAULT = -14,
     EEXIST = -17,
+    EXDEV = -18,
     ENOTDIR = -20,
     EISDIR = -21,
     EINVAL = -22,
@@ -633,7 +634,7 @@ pub fn dispatch(
             arg2 as *mut u8,
             arg3 as usize,
         ),
-        268 => fs::sys_fchmodat(arg0 as i32, arg1 as *const u8, arg2 as u32, arg3 as i32),
+        268 => fs::sys_fchmodat(arg0 as i32, arg1 as *const u8, arg2 as u32, 0),
         269 => fs::sys_faccessat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as i32),
         271 => fs::sys_ppoll(
             arg0 as *mut u8,
@@ -1011,6 +1012,7 @@ pub fn dispatch(
             arg3 as *const process::futex::Timespec,
             arg4 as i32,
         ),
+        452 => fs::sys_fchmodat(arg0 as i32, arg1 as *const u8, arg2 as u32, arg3 as i32),
         // System Administration & Kernel Control
         153 => 0, // vhangup
         154 => 0, // modify_ldt

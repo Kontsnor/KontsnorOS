@@ -93,10 +93,31 @@ impl InodeOps for TmpFsDir {
     }
 
     fn set_owner(&self, uid: u32, gid: u32) -> Result<(), i32> {
+        // SAFETY: Direct pointer dereference of interior UnsafeCell is safe within synchronized methods.
         unsafe {
             let inode = &mut *self.inode.get();
             inode.uid = uid;
             inode.gid = gid;
+        }
+        Ok(())
+    }
+
+    fn inc_nlink(&self) -> Result<(), i32> {
+        // SAFETY: Interior UnsafeCell mutation.
+        unsafe {
+            let inode = &mut *self.inode.get();
+            inode.nlink = inode.nlink.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn dec_nlink(&self) -> Result<(), i32> {
+        // SAFETY: Interior UnsafeCell mutation.
+        unsafe {
+            let inode = &mut *self.inode.get();
+            if inode.nlink > 0 {
+                inode.nlink -= 1;
+            }
         }
         Ok(())
     }
@@ -223,10 +244,31 @@ impl InodeOps for TmpFsFile {
     }
 
     fn set_owner(&self, uid: u32, gid: u32) -> Result<(), i32> {
+        // SAFETY: Direct pointer dereference of interior UnsafeCell is safe within synchronized methods.
         unsafe {
             let inode = &mut *self.inode.get();
             inode.uid = uid;
             inode.gid = gid;
+        }
+        Ok(())
+    }
+
+    fn inc_nlink(&self) -> Result<(), i32> {
+        // SAFETY: Interior UnsafeCell mutation.
+        unsafe {
+            let inode = &mut *self.inode.get();
+            inode.nlink = inode.nlink.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn dec_nlink(&self) -> Result<(), i32> {
+        // SAFETY: Interior UnsafeCell mutation.
+        unsafe {
+            let inode = &mut *self.inode.get();
+            if inode.nlink > 0 {
+                inode.nlink -= 1;
+            }
         }
         Ok(())
     }

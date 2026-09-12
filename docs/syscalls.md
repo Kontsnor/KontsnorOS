@@ -3,9 +3,24 @@
 ## Overview
 
 KontsnorOS implements a standard **Linux Application Binary Interface (ABI)** system call interface on `x86_64`. Applications compiled for Linux (against either `glibc` or `musl`) execute their system calls natively without emulation wrappers or binary translation.
+KontsnorOS implements a standard **Linux Application Binary Interface (ABI)** system call interface on `x86_64`. Applications compiled for Linux (against either `glibc` or `musl`) execute their system calls natively without emulation wrappers or binary translation.
 
 ### System V ABI Calling Convention
+### System V ABI Calling Convention
 
+| Register | Direction | Purpose |
+|:---|:---|:---|
+| **`rax`** | Input | Syscall Number |
+| **`rdi`** | Input | Argument 1 |
+| **`rsi`** | Input | Argument 2 |
+| **`rdx`** | Input | Argument 3 |
+| **`r10`** | Input | Argument 4 *(Kernel syscall convention: `r10` instead of `rcx`)* |
+| **`r8`**  | Input | Argument 5 |
+| **`r9`**  | Input | Argument 6 |
+| **`rax`** | Output | Return value (`>= 0` on success; `[-4095, -1]` corresponds to `-errno`) |
+
+### Fast Path Execution (`gs:[16]`)
+Simple non-yielding inquiries (`getpid`, `getuid`, `getgid`, `geteuid`, `getegid`, `getppid`, `getpgrp`, `gettid`, `set_tid_address`) execute via the assembly fast path (`syscall_fast_dispatch`). The active PID/TID is resolved in a single CPU cycle directly from the core's local scratch register (`gs:[16]`), bypassing the scheduler lock and preserving user execution momentum.
 | Register | Direction | Purpose |
 |:---|:---|:---|
 | **`rax`** | Input | Syscall Number |
@@ -25,7 +40,11 @@ Simple non-yielding inquiries (`getpid`, `getuid`, `getgid`, `geteuid`, `getegid
 ## Implemented System Call Reference
 
 The following tables document the 150+ actively handled Linux system calls in KontsnorOS.
+## Implemented System Call Reference
 
+The following tables document the 150+ actively handled Linux system calls in KontsnorOS.
+
+### 1. File & Directory Operations
 ### 1. File & Directory Operations
 
 | Number | Name | Implementation | Description |
@@ -134,7 +153,6 @@ The following tables document the 150+ actively handled Linux system calls in Ko
 | 438 | `pidfd_getfd`| **Real**| Duplicate descriptor from another task |
 | 439 | `faccessat2`| **Real**| Extended faccessat |
 | 441 | `epoll_pwait2`| **Real**| Epoll wait with nanosecond timeout |
-| 452 | `fchmodat2` | **Real** | Modify permissions with flags (`AT_SYMLINK_NOFOLLOW`) |
 
 ---
 

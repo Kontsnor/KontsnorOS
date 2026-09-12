@@ -2365,6 +2365,50 @@ fn test_wine_sigaltstack_and_ucontext() {
 }
 
 #[test_case]
+fn test_crypto_prng() {
+    kprintln!("[test] Starting PRNG byte generation test...");
+
+    // 1. Reset PRNG state to test unseeded / no-entropy state
+    crate::crypto::prng::reset_for_test();
+    let mut unseeded_buf = [0xAAu8; 32];
+    let res_unseeded = crate::crypto::prng::fill_bytes(&mut unseeded_buf);
+    assert!(!res_unseeded, "fill_bytes should return false when PRNG has no entropy");
+    assert_eq!(unseeded_buf, [0xAAu8; 32], "Destination slice must remain unmodified when fill_bytes fails");
+
+    // 2. Seed PRNG with initial entropy key
+    let seed_key = [0x42u8; 32];
+    crate::crypto::prng::seed(&seed_key);
+
+    // 3. Test small buffer fill and mutation verification
+    let mut small_buf = [0u8; 16];
+    let res_seeded = crate::crypto::prng::fill_bytes(&mut small_buf);
+    assert!(res_seeded, "fill_bytes should return true after PRNG is seeded");
+    assert_ne!(small_buf, [0u8; 16], "Destination slice must be mutated with random bytes");
+
+    // 4. Test distinct, non-repetitive random output across consecutive calls
+    let mut buf_a = [0u8; 32];
+    let mut buf_b = [0u8; 32];
+    assert!(crate::crypto::prng::fill_bytes(&mut buf_a));
+    assert!(crate::crypto::prng::fill_bytes(&mut buf_b));
+    assert_ne!(buf_a, buf_b, "Consecutive PRNG byte fills must produce distinct random output");
+
+    // 5. Test multi-block generation (> 64 bytes) to test ChaCha20 block generation and buffer index wrapping
+    let mut large_buf = [0u8; 128];
+    assert!(crate::crypto::prng::fill_bytes(&mut large_buf));
+    // Verify first block (0..64) and second block (64..128) are non-zero and non-identical
+    assert_ne!(&large_buf[0..64], &large_buf[64..128]);
+
+    // 6. Test reseed functionality
+    let reseed_entropy = [0x99u8; 32];
+    crate::crypto::prng::reseed(&reseed_entropy);
+    let mut reseeded_buf = [0u8; 32];
+    assert!(crate::crypto::prng::fill_bytes(&mut reseeded_buf));
+    assert_ne!(reseeded_buf, [0u8; 32]);
+
+    kprintln!("[test] PRNG byte generation test PASSED!");
+}
+
+#[test_case]
 fn test_ext_file_write_persistence() {
     kprintln!("[test] Starting ext file write persistence test...");
     let path_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;

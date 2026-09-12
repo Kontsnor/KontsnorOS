@@ -2468,6 +2468,196 @@ fn test_ext_file_write_persistence() {
 }
 
 #[test_case]
+fn test_acpi_find_table_edge_cases() {
+    kprintln!("[test] Starting ACPI find_table edge cases test...");
+
+    let phys_offset = crate::memory::r#virtual::phys_mem_offset();
+
+    // 1. Invalid physical address (0)
+    let res = crate::acpi::tables::find_table(0, b"APIC", 2);
+    assert!(matches!(
+        res,
+        Err(crate::acpi::tables::AcpiError::InvalidAddress)
+    ));
+
+    // 2. Invalid signature
+    let phys1 = crate::memory::physical::allocate_frame().expect("Frame allocation failed");
+    let virt1 = phys1 + phys_offset;
+    unsafe {
+        (virt1 as *mut crate::acpi::tables::SdtHeader).write(crate::acpi::tables::SdtHeader {
+            signature: *b"BADS",
+            length: 36,
+            revision: 1,
+            checksum: 0,
+            oem_id: [0; 6],
+            oem_table_id: [0; 8],
+            oem_revision: 0,
+            creator_id: 0,
+            creator_revision: 0,
+        });
+    }
+
+    let res = crate::acpi::tables::find_table(phys1, b"APIC", 2);
+    assert!(matches!(
+        res,
+        Err(crate::acpi::tables::AcpiError::InvalidSignature)
+    ));
+
+    let res = crate::acpi::tables::find_table(phys1, b"APIC", 0);
+    assert!(matches!(
+        res,
+        Err(crate::acpi::tables::AcpiError::InvalidSignature)
+    ));
+    crate::memory::physical::deallocate_frame(phys1);
+
+    // 3. Short table length (< 36 bytes)
+    let phys2 = crate::memory::physical::allocate_frame().expect("Frame allocation failed");
+    let virt2 = phys2 + phys_offset;
+    unsafe {
+        (virt2 as *mut crate::acpi::tables::SdtHeader).write(crate::acpi::tables::SdtHeader {
+            signature: *b"XSDT",
+            length: 20, // Less than minimum 36 bytes
+            revision: 1,
+            checksum: 0,
+            oem_id: [0; 6],
+            oem_table_id: [0; 8],
+            oem_revision: 0,
+            creator_id: 0,
+            creator_revision: 0,
+        });
+    }
+
+    let res = crate::acpi::tables::find_table(phys2, b"APIC", 2);
+    assert!(matches!(
+        res,
+        Err(crate::acpi::tables::AcpiError::InvalidSignature)
+    ));
+    crate::memory::physical::deallocate_frame(phys2);
+
+    // 4. Table not found
+    let phys3 = crate::memory::physical::allocate_frame().expect("Frame allocation failed");
+    let virt3 = phys3 + phys_offset;
+    unsafe {
+        (virt3 as *mut crate::acpi::tables::SdtHeader).write(crate::acpi::tables::SdtHeader {
+            signature: *b"XSDT",
+            length: 36, // Header only, 0 entries
+            revision: 1,
+            checksum: 0,
+            oem_id: [0; 6],
+            oem_table_id: [0; 8],
+            oem_revision: 0,
+            creator_id: 0,
+            creator_revision: 0,
+        });
+    }
+
+    let res = crate::acpi::tables::find_table(phys3, b"APIC", 2);
+    assert!(matches!(
+        res,
+        Err(crate::acpi::tables::AcpiError::TableNotFound)
+    ));
+    crate::memory::physical::deallocate_frame(phys3);
+
+    // 5. XSDT (64-bit pointers) lookup success with null entry skipping
+    let target_phys =
+        crate::memory::physical::allocate_frame().expect("Frame allocation failed");
+    let target_virt = target_phys + phys_offset;
+    unsafe {
+        (target_virt as *mut crate::acpi::tables::SdtHeader).write(
+            crate::acpi::tables::SdtHeader {
+                signature: *b"APIC",
+                length: 36,
+                revision: 1,
+                checksum: 0,
+                oem_id: [0; 6],
+                oem_table_id: [0; 8],
+                oem_revision: 0,
+                creator_id: 0,
+                creator_revision: 0,
+            },
+        );
+    }
+
+    let xsdt_phys = crate::memory::physical::allocate_frame().expect("Frame allocation failed");
+    let xsdt_virt = xsdt_phys + phys_offset;
+    unsafe {
+        (xsdt_virt as *mut crate::acpi::tables::SdtHeader).write(
+            crate::acpi::tables::SdtHeader {
+                signature: *b"XSDT",
+                length: 36 + 16, // 36 header + 2 * 8-byte entries
+                revision: 1,
+                checksum: 0,
+                oem_id: [0; 6],
+                oem_table_id: [0; 8],
+                oem_revision: 0,
+                creator_id: 0,
+                creator_revision: 0,
+            },
+        );
+        let entries_ptr = (xsdt_virt + 36) as *mut u64;
+        core::ptr::write_unaligned(entries_ptr, 0); // Null entry
+        core::ptr::write_unaligned(entries_ptr.add(1), target_phys); // Valid entry
+    }
+
+    let found_phys = crate::acpi::tables::find_table(xsdt_phys, b"APIC", 2)
+        .expect("XSDT find_table failed");
+    assert_eq!(found_phys, target_phys);
+
+    crate::memory::physical::deallocate_frame(target_phys);
+    crate::memory::physical::deallocate_frame(xsdt_phys);
+
+    // 6. RSDT (32-bit pointers) lookup success with null entry skipping
+    let target_rsdt_phys =
+        crate::memory::physical::allocate_frame().expect("Frame allocation failed");
+    let target_rsdt_virt = target_rsdt_phys + phys_offset;
+    unsafe {
+        (target_rsdt_virt as *mut crate::acpi::tables::SdtHeader).write(
+            crate::acpi::tables::SdtHeader {
+                signature: *b"MCFG",
+                length: 36,
+                revision: 1,
+                checksum: 0,
+                oem_id: [0; 6],
+                oem_table_id: [0; 8],
+                oem_revision: 0,
+                creator_id: 0,
+                creator_revision: 0,
+            },
+        );
+    }
+
+    let rsdt_phys = crate::memory::physical::allocate_frame().expect("Frame allocation failed");
+    let rsdt_virt = rsdt_phys + phys_offset;
+    unsafe {
+        (rsdt_virt as *mut crate::acpi::tables::SdtHeader).write(
+            crate::acpi::tables::SdtHeader {
+                signature: *b"RSDT",
+                length: 36 + 8, // 36 header + 2 * 4-byte entries
+                revision: 1,
+                checksum: 0,
+                oem_id: [0; 6],
+                oem_table_id: [0; 8],
+                oem_revision: 0,
+                creator_id: 0,
+                creator_revision: 0,
+            },
+        );
+        let entries_ptr = (rsdt_virt + 36) as *mut u32;
+        core::ptr::write_unaligned(entries_ptr, 0); // Null entry
+        core::ptr::write_unaligned(entries_ptr.add(1), target_rsdt_phys as u32); // Valid entry
+    }
+
+    let found_rsdt_phys = crate::acpi::tables::find_table(rsdt_phys, b"MCFG", 0)
+        .expect("RSDT find_table failed");
+    assert_eq!(found_rsdt_phys, target_rsdt_phys);
+
+    crate::memory::physical::deallocate_frame(target_rsdt_phys);
+    crate::memory::physical::deallocate_frame(rsdt_phys);
+
+    kprintln!("[test] ACPI find_table edge cases test PASSED!");
+}
+
+#[test_case]
 fn test_git_pack_write_and_trailer_pread() {
     kprintln!("[test] Starting Git packfile write and trailer pread test...");
 

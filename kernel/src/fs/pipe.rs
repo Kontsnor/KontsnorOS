@@ -144,6 +144,7 @@ impl InodeOps for PipeReader {
         }
 
         loop {
+            // Atomic check under buffer lock: read data if present, or detect EOF if writers closed
             {
                 let mut guard = self.state.buffer.lock();
                 if !guard.is_empty() {
@@ -152,11 +153,12 @@ impl InodeOps for PipeReader {
                     self.state.wait_queue.wake_all();
                     return Ok(count);
                 }
-            }
 
-            // Buffer is empty. Check if any writers are left.
-            if self.state.writers.load(Ordering::SeqCst) == 0 {
-                return Ok(0); // EOF
+                // Buffer is empty under the lock. Check if all writers have closed.
+                // Holding the lock ensures no writer can push bytes before we observe writers == 0.
+                if self.state.writers.load(Ordering::SeqCst) == 0 {
+                    return Ok(0); // EOF
+                }
             }
 
             if self.non_blocking.load(Ordering::SeqCst) {
@@ -201,12 +203,14 @@ impl InodeOps for PipeReader {
         let mut revents = 0;
         let buf = self.state.buffer.lock();
         let writers = self.state.writers.load(Ordering::SeqCst);
+        let has_data = !buf.is_empty();
         if (events & crate::fs::inode::POLLIN) != 0 {
-            if !buf.is_empty() || writers == 0 {
+            if has_data || writers == 0 {
                 revents |= crate::fs::inode::POLLIN;
             }
         }
-        if writers == 0 {
+        // POSIX: POLLHUP is only returned when the peer closed AND all buffered data has been consumed.
+        if writers == 0 && !has_data {
             revents |= crate::fs::inode::POLLHUP;
         }
         revents

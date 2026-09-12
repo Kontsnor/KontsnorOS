@@ -2422,3 +2422,155 @@ fn test_ext_file_write_persistence() {
     crate::syscall::memory::sys_munmap(buf_addr, 4096);
     kprintln!("[test] ext file write persistence test PASSED!");
 }
+
+#[test_case]
+fn test_git_pack_write_and_trailer_pread() {
+    kprintln!("[test] Starting Git packfile write and trailer pread test...");
+
+    // Map user memory buffers for paths and data
+    let mmap_addr = crate::syscall::memory::sys_mmap(0, 16384, 3, 0x22, -1, 0) as u64;
+    assert!(mmap_addr > 0);
+
+    let pack_path = b"/disk/test_pack.pack\0";
+    let idx_path = b"/disk/test_pack.idx\0";
+
+    let pack_path_addr = mmap_addr;
+    let idx_path_addr = mmap_addr + 256;
+    let write_buf_addr = mmap_addr + 512;
+    let read_buf_addr = mmap_addr + 12288;
+
+    // SAFETY: mmap_addr points to an allocated 16384-byte region with PROT_READ | PROT_WRITE.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            pack_path.as_ptr(),
+            pack_path_addr as *mut u8,
+            pack_path.len(),
+        );
+        core::ptr::copy_nonoverlapping(idx_path.as_ptr(), idx_path_addr as *mut u8, idx_path.len());
+    }
+
+    // 1. Create simulated packfile (10,000 bytes spanning multiple 4096-byte blocks)
+    let pack_fd = crate::syscall::fs::sys_open(pack_path_addr as *const u8, 0o102, 0o644); // O_CREAT | O_RDWR
+    assert!(pack_fd >= 0, "Failed to open packfile");
+
+    const PACK_SIZE: usize = 30000;
+    const TRAILER_SIZE: usize = 20;
+    let expected_trailer = [
+        0x54u8, 0x26, 0x4a, 0xd5, 0xf5, 0x90, 0x99, 0x1b, 0x8e, 0xad, 0xf8, 0x7d, 0x2e, 0x87, 0x15,
+        0x3a, 0xdf, 0xf9, 0xa0, 0x54,
+    ];
+
+    // Write in chunks to simulate git-index-pack
+    let mut written_total = 0;
+    while written_total < PACK_SIZE {
+        let chunk_len = core::cmp::min(4096, PACK_SIZE - written_total);
+        // SAFETY: write_buf_addr has 4096 bytes available.
+        unsafe {
+            let slice = core::slice::from_raw_parts_mut(write_buf_addr as *mut u8, chunk_len);
+            for (i, byte) in slice.iter_mut().enumerate() {
+                let file_pos = written_total + i;
+                if file_pos >= PACK_SIZE - TRAILER_SIZE {
+                    *byte = expected_trailer[file_pos - (PACK_SIZE - TRAILER_SIZE)];
+                } else {
+                    *byte = ((file_pos * 31 + 7) & 0xFF) as u8;
+                }
+            }
+        }
+        let res =
+            crate::syscall::fs::sys_write(pack_fd as i32, write_buf_addr as *const u8, chunk_len);
+        assert_eq!(res, chunk_len as i64, "Short write in packfile");
+        written_total += chunk_len;
+    }
+    assert_eq!(crate::syscall::fs::sys_close(pack_fd as i32), 0);
+
+    // 2. Create adjacent index file to trigger adjacent inode table allocation and writes
+    let idx_fd = crate::syscall::fs::sys_open(idx_path_addr as *const u8, 0o102, 0o644);
+    assert!(idx_fd >= 0, "Failed to open index file");
+    let idx_content = b"GIT_PACK_INDEX_V2_DATA_SIMULATION_HEADER";
+    // SAFETY: write_buf_addr has space for idx_content.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            idx_content.as_ptr(),
+            write_buf_addr as *mut u8,
+            idx_content.len(),
+        );
+    }
+    let idx_written = crate::syscall::fs::sys_write(
+        idx_fd as i32,
+        write_buf_addr as *const u8,
+        idx_content.len(),
+    );
+    assert_eq!(idx_written, idx_content.len() as i64);
+    assert_eq!(crate::syscall::fs::sys_close(idx_fd as i32), 0);
+
+    // 3. Open packfile read-only and verify trailer with pread64 (matching open_packed_git_1)
+    let ro_pack_fd = crate::syscall::fs::sys_open(pack_path_addr as *const u8, 0, 0);
+    assert!(ro_pack_fd >= 0, "Failed to re-open packfile");
+
+    let pread_offset = (PACK_SIZE - TRAILER_SIZE) as i64;
+    let pread_res = crate::syscall::fs::sys_pread64(
+        ro_pack_fd as i32,
+        read_buf_addr as *mut u8,
+        TRAILER_SIZE,
+        pread_offset,
+    );
+    assert_eq!(pread_res, TRAILER_SIZE as i64, "pread64 trailer failed");
+
+    // SAFETY: read_buf_addr contains TRAILER_SIZE bytes read by pread64.
+    let trailer_read =
+        unsafe { core::slice::from_raw_parts(read_buf_addr as *const u8, TRAILER_SIZE) };
+    assert_eq!(
+        trailer_read, &expected_trailer,
+        "Trailer mismatch via pread64"
+    );
+
+    // Invalidate page cache to force reading packfile and idx from underlying block cache / disk
+    let pack_inode = crate::fs::vfs::lookup("/disk/test_pack.pack").expect("packfile must exist");
+    crate::memory::page_cache::page_cache_invalidate_inode(
+        pack_inode.inode().dev,
+        pack_inode.inode().ino,
+    );
+
+    let pread_res2 = crate::syscall::fs::sys_pread64(
+        ro_pack_fd as i32,
+        read_buf_addr as *mut u8,
+        TRAILER_SIZE,
+        pread_offset,
+    );
+    assert_eq!(pread_res2, TRAILER_SIZE as i64);
+    // SAFETY: read_buf_addr contains TRAILER_SIZE bytes read by pread64.
+    let trailer_read2 =
+        unsafe { core::slice::from_raw_parts(read_buf_addr as *const u8, TRAILER_SIZE) };
+    assert_eq!(
+        trailer_read2, &expected_trailer,
+        "Trailer mismatch after page cache invalidation"
+    );
+
+    assert_eq!(crate::syscall::fs::sys_close(ro_pack_fd as i32), 0);
+
+    // 4. Verify index file was not corrupted by adjacent inode writes
+    let ro_idx_fd = crate::syscall::fs::sys_open(idx_path_addr as *const u8, 0, 0);
+    assert!(ro_idx_fd >= 0, "Failed to re-open index file");
+    let read_idx_res = crate::syscall::fs::sys_read(
+        ro_idx_fd as i32,
+        read_buf_addr as *mut u8,
+        idx_content.len(),
+    );
+    assert_eq!(
+        read_idx_res,
+        idx_content.len() as i64,
+        "Index file read corrupted"
+    );
+    // SAFETY: read_buf_addr contains idx_content.len() bytes read by sys_read.
+    let idx_read =
+        unsafe { core::slice::from_raw_parts(read_buf_addr as *const u8, idx_content.len()) };
+    assert_eq!(
+        idx_read, idx_content,
+        "Index file contents corrupted by adjacent inode write"
+    );
+    assert_eq!(crate::syscall::fs::sys_close(ro_idx_fd as i32), 0);
+
+    // Clean up
+    crate::syscall::memory::sys_munmap(mmap_addr, 16384);
+    kprintln!("[test] Git packfile write and trailer pread test PASSED!");
+}

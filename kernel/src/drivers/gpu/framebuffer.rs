@@ -66,6 +66,71 @@ pub struct Framebuffer {
     info: FramebufferInfo,
 }
 
+/// Linux fb_fix_screeninfo struct (FBIOGET_FSCREENINFO = 0x4602).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FbFixScreenInfo {
+    pub id: [u8; 16],
+    pub smem_start: u64,
+    pub smem_len: u32,
+    pub type_: u32,
+    pub type_aux: u32,
+    pub visual: u32,
+    pub xpanstep: u16,
+    pub ypanstep: u16,
+    pub ywrapstep: u16,
+    pub line_length: u32,
+    pub mmio_start: u64,
+    pub mmio_len: u32,
+    pub accel: u32,
+    pub capabilities: u16,
+    pub reserved: [u16; 2],
+}
+
+/// Linux fb_bitfield struct.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FbBitfield {
+    pub offset: u32,
+    pub length: u32,
+    pub msb_right: u32,
+}
+
+/// Linux fb_var_screeninfo struct (FBIOGET_VSCREENINFO = 0x4600).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FbVarScreenInfo {
+    pub xres: u32,
+    pub yres: u32,
+    pub xres_virtual: u32,
+    pub yres_virtual: u32,
+    pub xoffset: u32,
+    pub yoffset: u32,
+    pub bits_per_pixel: u32,
+    pub grayscale: u32,
+    pub red: FbBitfield,
+    pub green: FbBitfield,
+    pub blue: FbBitfield,
+    pub transp: FbBitfield,
+    pub nonstd: u32,
+    pub activate: u32,
+    pub height: u32,
+    pub width: u32,
+    pub accel_flags: u32,
+    pub pixclock: u32,
+    pub left_margin: u32,
+    pub right_margin: u32,
+    pub upper_margin: u32,
+    pub lower_margin: u32,
+    pub hsync_len: u32,
+    pub vsync_len: u32,
+    pub sync: u32,
+    pub vmode: u32,
+    pub rotate: u32,
+    pub colorspace: u32,
+    pub reserved: [u32; 4],
+}
+
 /// `/dev/fb0` character device inode for userspace framebuffer access.
 pub struct DevFb0 {
     pub inode: crate::fs::inode::Inode,
@@ -118,6 +183,117 @@ impl crate::fs::inode::InodeOps for DevFb0 {
             Ok(to_write)
         } else {
             Err(-6) // ENXIO
+        }
+    }
+
+    fn ioctl(&self, request: u64, arg: u64) -> Result<u64, i32> {
+        let console = super::bochs::GRAPHICS_CONSOLE.lock();
+        let gc = match *console {
+            Some(ref gc) => gc,
+            None => return Err(-6), // ENXIO
+        };
+
+        match request {
+            0x4600 | 0x4602 => {
+                // FBIOGET_VSCREENINFO or FBIOGET_FSCREENINFO
+                if request == 0x4602 {
+                    // FBIOGET_FSCREENINFO
+                    if !crate::syscall::fs::validate_user_ptr(
+                        arg as *const u8,
+                        core::mem::size_of::<FbFixScreenInfo>(),
+                    ) {
+                        return Err(-14); // EFAULT
+                    }
+                    let mut id = [0u8; 16];
+                    let name = b"bochs-vbe\0";
+                    id[..name.len()].copy_from_slice(name);
+
+                    let fix = FbFixScreenInfo {
+                        id,
+                        smem_start: gc.gpu.lfb_phys,
+                        smem_len: gc.gpu.size as u32,
+                        type_: 0, // FB_TYPE_PACKED_PIXELS
+                        type_aux: 0,
+                        visual: 2, // FB_VISUAL_TRUECOLOR
+                        xpanstep: 0,
+                        ypanstep: 0,
+                        ywrapstep: 0,
+                        line_length: gc.gpu.width * 4,
+                        mmio_start: 0,
+                        mmio_len: 0,
+                        accel: 0,
+                        capabilities: 0,
+                        reserved: [0; 2],
+                    };
+                    unsafe {
+                        core::ptr::write(arg as *mut FbFixScreenInfo, fix);
+                    }
+                } else {
+                    // FBIOGET_VSCREENINFO
+                    if !crate::syscall::fs::validate_user_ptr(
+                        arg as *const u8,
+                        core::mem::size_of::<FbVarScreenInfo>(),
+                    ) {
+                        return Err(-14); // EFAULT
+                    }
+                    let var = FbVarScreenInfo {
+                        xres: gc.gpu.width,
+                        yres: gc.gpu.height,
+                        xres_virtual: gc.gpu.width,
+                        yres_virtual: gc.gpu.height,
+                        xoffset: 0,
+                        yoffset: 0,
+                        bits_per_pixel: gc.gpu.bpp,
+                        grayscale: 0,
+                        red: FbBitfield {
+                            offset: 16,
+                            length: 8,
+                            msb_right: 0,
+                        },
+                        green: FbBitfield {
+                            offset: 8,
+                            length: 8,
+                            msb_right: 0,
+                        },
+                        blue: FbBitfield {
+                            offset: 0,
+                            length: 8,
+                            msb_right: 0,
+                        },
+                        transp: FbBitfield {
+                            offset: 24,
+                            length: 8,
+                            msb_right: 0,
+                        },
+                        nonstd: 0,
+                        activate: 0,
+                        height: 0,
+                        width: 0,
+                        accel_flags: 0,
+                        pixclock: 0,
+                        left_margin: 0,
+                        right_margin: 0,
+                        upper_margin: 0,
+                        lower_margin: 0,
+                        hsync_len: 0,
+                        vsync_len: 0,
+                        sync: 0,
+                        vmode: 0,
+                        rotate: 0,
+                        colorspace: 0,
+                        reserved: [0; 4],
+                    };
+                    unsafe {
+                        core::ptr::write(arg as *mut FbVarScreenInfo, var);
+                    }
+                }
+                Ok(0)
+            }
+            0x4601 => {
+                // FBIOPUT_VSCREENINFO
+                Ok(0)
+            }
+            _ => Err(-22), // EINVAL
         }
     }
 }

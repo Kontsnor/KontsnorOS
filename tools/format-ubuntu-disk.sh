@@ -31,7 +31,7 @@ fi
 
 echo "[4/5] Creating and formatting 6GB disk image: $DISK_IMG..."
 dd if=/dev/zero of="$DISK_IMG" bs=1M count=6144 status=progress
-mkfs.ext2 -b 4096 -F "$DISK_IMG"
+mkfs.ext4 -b 4096 -F "$DISK_IMG"
 
 echo "[5/5] Populating ext2 filesystem via debugfs..."
 python3 - << PYEOF

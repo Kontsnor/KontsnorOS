@@ -310,11 +310,17 @@ impl AtaDrive {
         }
 
         // 9. Stop DMA engine
+        // SAFETY: Stopping the Bus Master DMA engine and clearing interrupt/error bits via hardware I/O ports.
+        // Reading port 0x1F7 acknowledges the interrupt on the ATA device and checks for device-level errors.
         unsafe {
             cmd_port.write(direction_bit);
             let status = status_port.read();
             status_port.write(status | 0x06); // Clear Interrupt and Error again
-            if !success || (status & 0x02) != 0 {
+
+            let mut ata_status_port = Port::<u8>::new(0x1F7);
+            let ata_status = ata_status_port.read();
+
+            if !success || (status & 0x02) != 0 || (ata_status & 0x01) != 0 {
                 return Err("ATA DMA: transfer failed or timed out");
             }
         }

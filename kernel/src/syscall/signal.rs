@@ -604,7 +604,9 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
         };
 
         let info_ptr = new_user_sp + 8; // pretcode is 8 bytes
-        let uc_ptr = new_user_sp + 8 + core::mem::size_of::<crate::syscall::process::lifecycle::SigInfo>() as u64;
+        let uc_ptr = new_user_sp
+            + 8
+            + core::mem::size_of::<crate::syscall::process::lifecycle::SigInfo>() as u64;
 
         unsafe {
             core::ptr::write(new_user_sp as *mut RtSigFrame, frame);

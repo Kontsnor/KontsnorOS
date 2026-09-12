@@ -490,6 +490,7 @@ pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: *const u8) -> Syscal
         LINUX_REBOOT_CMD_CAD_ON | LINUX_REBOOT_CMD_CAD_OFF => 0,
         LINUX_REBOOT_CMD_RESTART | LINUX_REBOOT_CMD_RESTART2 => {
             crate::kprintln!("[kernel] System restart requested via reboot()");
+            crate::fs::vfs::sync_all();
             // Triple fault / 8042 keyboard controller reset
             // SAFETY: Standard x86 8042 reset port access
             unsafe {
@@ -501,6 +502,7 @@ pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: *const u8) -> Syscal
         }
         LINUX_REBOOT_CMD_HALT | LINUX_REBOOT_CMD_POWER_OFF => {
             crate::kprintln!("[kernel] System power off requested via reboot()");
+            crate::fs::vfs::sync_all();
             // Allow pending PTY router and serial queues to drain to console
             for _ in 0..100 {
                 crate::process::scheduler::yield_now();

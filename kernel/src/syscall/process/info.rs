@@ -487,6 +487,15 @@ pub fn sys_sigaltstack(ss_ptr: *const u8, old_ss_ptr: *mut u8, user_rsp: u64) ->
     use crate::process::scheduler;
     use crate::process::task::StackT;
 
+    if !old_ss_ptr.is_null()
+        && validate_user_ptr_write(old_ss_ptr, core::mem::size_of::<StackT>()).is_err()
+    {
+        return Errno::EFAULT.into();
+    }
+    if !ss_ptr.is_null() && !validate_user_ptr(ss_ptr, core::mem::size_of::<StackT>()) {
+        return Errno::EFAULT.into();
+    }
+
     let current_pid = match scheduler::current_pid() {
         Some(pid) => pid,
         None => return Errno::ESRCH.into(),
@@ -501,10 +510,6 @@ pub fn sys_sigaltstack(ss_ptr: *const u8, old_ss_ptr: *mut u8, user_rsp: u64) ->
 
     // 1. If old_ss_ptr is not null, write the current alternate stack configuration
     if !old_ss_ptr.is_null() {
-        if validate_user_ptr_write(old_ss_ptr, core::mem::size_of::<StackT>()).is_err() {
-            return Errno::EFAULT.into();
-        }
-
         let mut flags = 0;
         let mut sp = 0;
         let mut size = 0;
@@ -527,6 +532,7 @@ pub fn sys_sigaltstack(ss_ptr: *const u8, old_ss_ptr: *mut u8, user_rsp: u64) ->
             ss_size: size,
         };
 
+        // SAFETY: old_ss_ptr is non-null and was verified writable with size_of::<StackT>() bytes above.
         unsafe {
             core::ptr::write(old_ss_ptr as *mut StackT, old_ss);
         }
@@ -534,10 +540,7 @@ pub fn sys_sigaltstack(ss_ptr: *const u8, old_ss_ptr: *mut u8, user_rsp: u64) ->
 
     // 2. If ss_ptr is not null, update the alternate stack configuration
     if !ss_ptr.is_null() {
-        if !validate_user_ptr(ss_ptr, core::mem::size_of::<StackT>()) {
-            return Errno::EFAULT.into();
-        }
-
+        // SAFETY: ss_ptr is non-null and was validated user pointer with size_of::<StackT>() bytes above.
         let ss = unsafe { *(ss_ptr as *const StackT) };
 
         // Check if we are currently executing on the alternate stack

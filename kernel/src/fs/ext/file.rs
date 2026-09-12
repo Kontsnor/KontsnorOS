@@ -711,7 +711,7 @@ impl ExtInode {
             let block_offset = (current_offset % self.fs.block_size as u64) as usize;
 
             // Resolve or allocate physical disk block to reserve disk space
-            let _phys_block = self
+            let phys_block = self
                 .get_or_alloc_block(&mut raw, file_block)
                 .map_err(|_| -5)?; // EIO
 
@@ -736,11 +736,26 @@ impl ExtInode {
             };
 
             let phys_offset = page_phys + crate::memory::r#virtual::phys_mem_offset();
+            // SAFETY: phys_offset points to a valid physical frame mapped into the physical memory direct mapping region. The slice covers one 4096-byte page.
             let dest_slice =
                 unsafe { core::slice::from_raw_parts_mut(phys_offset as *mut u8, 4096) };
 
             dest_slice[page_offset..page_offset + bytes_to_write]
                 .copy_from_slice(&buf[written_bytes..written_bytes + bytes_to_write]);
+
+            let block_in_page = (current_offset % 4096) / self.fs.block_size as u64;
+            let block_start = (block_in_page * self.fs.block_size as u64) as usize;
+            let block_size = self.fs.block_size as usize;
+            if write_blocks(
+                &*self.fs.device,
+                phys_block as u64,
+                &dest_slice[block_start..block_start + block_size],
+                self.fs.block_size,
+            )
+            .is_err()
+            {
+                return Err(-5); // EIO
+            }
 
             crate::memory::page_cache::mark_dirty(
                 crate::fs::ext::EXT_DEV_ID,
@@ -761,6 +776,12 @@ impl ExtInode {
             raw.i_size = current_offset as u32;
         }
         vfs.blocks = raw.i_blocks as u64;
+
+        let now = crate::fs::vfs::current_time_sec();
+        raw.i_mtime = now;
+        raw.i_ctime = now;
+        vfs.mtime = now as u64;
+        vfs.ctime = now as u64;
 
         self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?;
 

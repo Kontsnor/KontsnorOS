@@ -233,16 +233,23 @@ impl Vfs {
                 }
 
                 i += 1;
+                let parent_dev = current.inode().dev;
                 let parent_ino = current.inode().ino;
 
                 // Check global O(1) fixed-size dcache first to avoid heap allocations
                 // (e.g. String formatting) and lock contention on path resolution.
-                let next = match crate::fs::dcache::dcache_lookup(parent_ino, component) {
+                let next = match crate::fs::dcache::dcache_lookup(parent_dev, parent_ino, component)
+                {
                     Some(Some(cached_inode)) => cached_inode,
                     Some(None) => return None, // Negative dcache hit
                     None => {
                         let n = current.lookup(component)?;
-                        crate::fs::dcache::dcache_insert(parent_ino, component, n.clone());
+                        crate::fs::dcache::dcache_insert(
+                            parent_dev,
+                            parent_ino,
+                            component,
+                            n.clone(),
+                        );
                         n
                     }
                 };
@@ -311,6 +318,16 @@ impl Vfs {
             format!("{}/", path)
         };
         cache.retain(|k, _| !k.starts_with(&prefix));
+        drop(cache);
+
+        let (parent_path, name) = crate::fs::path::split_path(path);
+        if let Some(parent) = self.lookup_follow(parent_path, false) {
+            crate::fs::dcache::dcache_invalidate_entry(
+                parent.inode().dev,
+                parent.inode().ino,
+                name,
+            );
+        }
     }
 }
 

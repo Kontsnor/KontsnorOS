@@ -55,6 +55,8 @@ const DCACHE_BUCKETS: usize = 4096;
 
 /// A single dentry cache entry.
 struct DcacheEntry {
+    /// Device ID of the parent directory filesystem.
+    parent_dev: u64,
     /// Inode number of the parent directory.
     parent_ino: u64,
     /// Hash of the file name (FNV-1a).
@@ -107,12 +109,12 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Compute the bucket index for a `(parent_ino, name)` pair.
+/// Compute the bucket index for a `(parent_dev, parent_ino, name)` tuple.
 #[inline(always)]
-fn bucket_index(parent_ino: u64, name_hash: u64) -> usize {
-    // Mix parent_ino and name_hash together then reduce to bucket range.
-    let combined = parent_ino
-        .wrapping_mul(2_654_435_761)
+fn bucket_index(parent_dev: u64, parent_ino: u64, name_hash: u64) -> usize {
+    let combined = parent_dev
+        .wrapping_mul(0x9e3779b97f4a7c15)
+        .wrapping_add(parent_ino.wrapping_mul(2_654_435_761))
         .wrapping_add(name_hash);
     (combined as usize) & (DCACHE_BUCKETS - 1)
 }
@@ -126,13 +128,20 @@ static DCACHE: TicketLock<Dcache> = TicketLock::new(Dcache::new());
 /// - `Some(Some(inode))` — positive hit: the entry exists and its inode is cached.
 /// - `Some(None)` — negative hit: the entry is known not to exist.
 /// - `None` — cache miss: the caller must perform a filesystem lookup.
-pub fn dcache_lookup(parent_ino: u64, name: &str) -> Option<Option<Arc<dyn InodeOps>>> {
+pub fn dcache_lookup(
+    parent_dev: u64,
+    parent_ino: u64,
+    name: &str,
+) -> Option<Option<Arc<dyn InodeOps>>> {
     let name_hash = fnv1a(name.as_bytes());
-    let idx = bucket_index(parent_ino, name_hash);
+    let idx = bucket_index(parent_dev, parent_ino, name_hash);
 
     let mut cache = DCACHE.lock();
     if let Some(ref entry) = cache.buckets[idx] {
-        if entry.parent_ino == parent_ino && entry.name_hash == name_hash {
+        if entry.parent_dev == parent_dev
+            && entry.parent_ino == parent_ino
+            && entry.name_hash == name_hash
+        {
             let inode = entry.inode.clone();
             cache.hits += 1;
             return Some(inode);
@@ -145,15 +154,16 @@ pub fn dcache_lookup(parent_ino: u64, name: &str) -> Option<Option<Arc<dyn Inode
 /// Insert or update a positive dentry cache entry.
 ///
 /// This is called after a successful filesystem lookup so subsequent
-/// lookups of the same `(parent_ino, name)` pair can be served from cache.
-pub fn dcache_insert(parent_ino: u64, name: &str, inode: Arc<dyn InodeOps>) {
+/// lookups of the same `(parent_dev, parent_ino, name)` tuple can be served from cache.
+pub fn dcache_insert(parent_dev: u64, parent_ino: u64, name: &str, inode: Arc<dyn InodeOps>) {
     let name_hash = fnv1a(name.as_bytes());
-    let idx = bucket_index(parent_ino, name_hash);
+    let idx = bucket_index(parent_dev, parent_ino, name_hash);
 
     let mut cache = DCACHE.lock();
     let gen = cache.generation;
     cache.generation = gen.wrapping_add(1);
     cache.buckets[idx] = Some(DcacheEntry {
+        parent_dev,
         parent_ino,
         name_hash,
         inode: Some(inode),
@@ -163,17 +173,18 @@ pub fn dcache_insert(parent_ino: u64, name: &str, inode: Arc<dyn InodeOps>) {
 
 /// Insert a negative dentry cache entry.
 ///
-/// Records that `name` does not exist under `parent_ino`, so subsequent
+/// Records that `name` does not exist under `(parent_dev, parent_ino)`, so subsequent
 /// `open()` / `stat()` calls for non-existent paths can return `ENOENT`
 /// without hitting the filesystem.
-pub fn dcache_insert_negative(parent_ino: u64, name: &str) {
+pub fn dcache_insert_negative(parent_dev: u64, parent_ino: u64, name: &str) {
     let name_hash = fnv1a(name.as_bytes());
-    let idx = bucket_index(parent_ino, name_hash);
+    let idx = bucket_index(parent_dev, parent_ino, name_hash);
 
     let mut cache = DCACHE.lock();
     let gen = cache.generation;
     cache.generation = gen.wrapping_add(1);
     cache.buckets[idx] = Some(DcacheEntry {
+        parent_dev,
         parent_ino,
         name_hash,
         inode: None,
@@ -181,35 +192,35 @@ pub fn dcache_insert_negative(parent_ino: u64, name: &str) {
     });
 }
 
-/// Invalidate all dcache entries whose parent inode number is `parent_ino`.
+/// Invalidate all dcache entries whose parent directory is `(parent_dev, parent_ino)`.
 ///
-/// Must be called after any mutation to a directory:
-/// `unlink`, `rename`, `mkdir`, `rmdir`, `create`.
-///
-/// This is O(DCACHE_BUCKETS) but directory mutations are rare compared to
-/// lookups, so the cost is acceptable.
-pub fn dcache_invalidate_inode(parent_ino: u64) {
+/// Must be called after any bulk mutation to a directory:
+/// `rmdir`, recursive deletion, etc.
+pub fn dcache_invalidate_inode(parent_dev: u64, parent_ino: u64) {
     let mut cache = DCACHE.lock();
     for bucket in cache.buckets.iter_mut() {
         if let Some(ref entry) = *bucket {
-            if entry.parent_ino == parent_ino {
+            if entry.parent_dev == parent_dev && entry.parent_ino == parent_ino {
                 *bucket = None;
             }
         }
     }
 }
 
-/// Invalidate a specific `(parent_ino, name)` entry.
+/// Invalidate a specific `(parent_dev, parent_ino, name)` entry.
 ///
 /// More targeted than `dcache_invalidate_inode` when only a single name
-/// changes (e.g., a single file is unlinked).
-pub fn dcache_invalidate_entry(parent_ino: u64, name: &str) {
+/// changes (e.g., a single file is unlinked, renamed, or created).
+pub fn dcache_invalidate_entry(parent_dev: u64, parent_ino: u64, name: &str) {
     let name_hash = fnv1a(name.as_bytes());
-    let idx = bucket_index(parent_ino, name_hash);
+    let idx = bucket_index(parent_dev, parent_ino, name_hash);
 
     let mut cache = DCACHE.lock();
     if let Some(ref entry) = cache.buckets[idx] {
-        if entry.parent_ino == parent_ino && entry.name_hash == name_hash {
+        if entry.parent_dev == parent_dev
+            && entry.parent_ino == parent_ino
+            && entry.name_hash == name_hash
+        {
             cache.buckets[idx] = None;
         }
     }

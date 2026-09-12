@@ -2889,9 +2889,8 @@ fn test_acpi_rsdp_parsing() {
         reserved: [0; 3],
     };
     // Calculate valid checksum for first 20 bytes
-    let bytes = unsafe {
-        core::slice::from_raw_parts_mut(&mut valid_rsdp as *mut _ as *mut u8, 20)
-    };
+    let bytes =
+        unsafe { core::slice::from_raw_parts_mut(&mut valid_rsdp as *mut _ as *mut u8, 20) };
     let sum_without_checksum: u8 = bytes[0..8]
         .iter()
         .chain(&bytes[9..20])
@@ -2952,4 +2951,58 @@ fn test_prng_seed_initialization() {
     );
 
     kprintln!("[test] PRNG seed initialization test PASSED!");
+}
+
+#[test_case]
+fn test_dcache_lock_file_rename_invalidation() {
+    kprintln!("[test] Starting dcache lock file rename invalidation test...");
+
+    let lock_path = b"/disk/test_config.lock\0";
+    let target_path = b"/disk/test_config.cfg\0";
+
+    // Allocate memory for user pointers
+    let mmap_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    assert!(mmap_addr > 0);
+    let lock_ptr = mmap_addr as *mut u8;
+    let target_ptr = (mmap_addr + 256) as *mut u8;
+
+    // SAFETY: mmap_addr points to 4096-byte mapped buffer.
+    unsafe {
+        core::ptr::copy_nonoverlapping(lock_path.as_ptr(), lock_ptr, lock_path.len());
+        core::ptr::copy_nonoverlapping(target_path.as_ptr(), target_ptr, target_path.len());
+    }
+
+    // Clean up any stale files
+    let _ = crate::syscall::fs::sys_unlink(lock_ptr);
+    let _ = crate::syscall::fs::sys_unlink(target_ptr);
+
+    // 1. Create lock file with O_CREAT | O_EXCL | O_RDWR (0o102 | 0o200 = 0o302)
+    let fd1 = crate::syscall::fs::sys_open(lock_ptr, 0o302, 0o644);
+    assert!(fd1 >= 0, "Initial open of lock file failed");
+    assert_eq!(crate::syscall::fs::sys_close(fd1 as i32), 0);
+
+    // 2. Rename lock file to target (simulating Git committing config.lock -> config)
+    let rename_res = crate::syscall::fs::sys_rename(lock_ptr, target_ptr);
+    assert_eq!(rename_res, 0, "Rename of lock file failed");
+
+    // Target must exist
+    let fd_target = crate::syscall::fs::sys_open(target_ptr, 0, 0);
+    assert!(fd_target >= 0, "Renamed target file does not exist");
+    assert_eq!(crate::syscall::fs::sys_close(fd_target as i32), 0);
+
+    // 3. Immediately create lock file again with O_CREAT | O_EXCL
+    // Without dcache invalidation on rename, dcache returned the old cached entry and open failed with -EEXIST!
+    let fd2 = crate::syscall::fs::sys_open(lock_ptr, 0o302, 0o644);
+    assert!(
+        fd2 >= 0,
+        "Re-creating lock file after rename failed (stale dcache hit)"
+    );
+    assert_eq!(crate::syscall::fs::sys_close(fd2 as i32), 0);
+
+    // Clean up
+    assert_eq!(crate::syscall::fs::sys_unlink(lock_ptr), 0);
+    assert_eq!(crate::syscall::fs::sys_unlink(target_ptr), 0);
+    crate::syscall::memory::sys_munmap(mmap_addr, 4096);
+
+    kprintln!("[test] dcache lock file rename invalidation test PASSED!");
 }

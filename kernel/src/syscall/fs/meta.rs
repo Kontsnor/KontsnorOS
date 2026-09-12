@@ -389,7 +389,15 @@ pub fn sys_mkdir_with_resolved_path(resolved_path: String, _mode: u32) -> Syscal
     }
 
     match parent_inode.mkdir(name) {
-        Some(_) => 0,
+        Some(_) => {
+            crate::fs::dcache::dcache_invalidate_entry(
+                parent_inode.inode().dev,
+                parent_inode.inode().ino,
+                name,
+            );
+            crate::fs::vfs::invalidate_dentry(&resolved_path);
+            0
+        }
         None => Errno::EACCES.into(),
     }
 }
@@ -431,6 +439,11 @@ pub fn sys_rmdir_with_resolved_path(resolved_path: String) -> SyscallResult {
 
     match parent_inode.rmdir(name) {
         Ok(_) => {
+            crate::fs::dcache::dcache_invalidate_entry(
+                parent_inode.inode().dev,
+                parent_inode.inode().ino,
+                name,
+            );
             crate::fs::vfs::invalidate_dentry(&resolved_path);
             0
         }
@@ -475,6 +488,11 @@ pub fn sys_unlink_with_resolved_path(resolved_path: String) -> SyscallResult {
 
     match parent_inode.unlink(name) {
         Ok(_) => {
+            crate::fs::dcache::dcache_invalidate_entry(
+                parent_inode.inode().dev,
+                parent_inode.inode().ino,
+                name,
+            );
             crate::fs::vfs::invalidate_dentry(&resolved_path);
             0
         }
@@ -673,6 +691,16 @@ pub fn sys_rename_with_resolved_paths(resolved_old: String, resolved_new: String
             // Remove target if it already exists per POSIX
             let _ = new_parent.unlink(new_name);
             if new_parent.link_entry(new_name, node.clone()).is_ok() {
+                crate::fs::dcache::dcache_invalidate_entry(
+                    old_parent.inode().dev,
+                    old_parent.inode().ino,
+                    old_name,
+                );
+                crate::fs::dcache::dcache_invalidate_entry(
+                    new_parent.inode().dev,
+                    new_parent.inode().ino,
+                    new_name,
+                );
                 crate::fs::vfs::invalidate_dentry(&resolved_old);
                 crate::fs::vfs::invalidate_dentry(&resolved_new);
                 return 0;
@@ -712,6 +740,16 @@ pub fn sys_rename_with_resolved_paths(resolved_old: String, resolved_new: String
         let _ = old_parent.unlink(old_name);
     }
 
+    crate::fs::dcache::dcache_invalidate_entry(
+        old_parent.inode().dev,
+        old_parent.inode().ino,
+        old_name,
+    );
+    crate::fs::dcache::dcache_invalidate_entry(
+        new_parent.inode().dev,
+        new_parent.inode().ino,
+        new_name,
+    );
     crate::fs::vfs::invalidate_dentry(&resolved_old);
     crate::fs::vfs::invalidate_dentry(&resolved_new);
     0
@@ -826,6 +864,11 @@ pub fn sys_link_with_resolved_paths(
                 let _ = new_parent.unlink_entry(new_name);
                 return e as SyscallResult;
             }
+            crate::fs::dcache::dcache_invalidate_entry(
+                new_parent.inode().dev,
+                new_parent.inode().ino,
+                new_name,
+            );
             crate::fs::vfs::invalidate_dentry(&resolved_new);
             0
         }
@@ -952,7 +995,15 @@ pub fn sys_symlink_with_resolved_linkpath(
 
     // Create the symlink inode
     let symlink_inode = match parent_inode.create(name, FileType::Symlink) {
-        Some(i) => i,
+        Some(i) => {
+            crate::fs::dcache::dcache_invalidate_entry(
+                parent_inode.inode().dev,
+                parent_inode.inode().ino,
+                name,
+            );
+            crate::fs::vfs::invalidate_dentry(&resolved_linkpath);
+            i
+        }
         None => return Errno::ENOSPC.into(),
     };
 

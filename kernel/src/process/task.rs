@@ -288,6 +288,8 @@ pub struct Task {
     /// Pending PID namespace ID for subsequent children created via fork/clone.
     /// Set when the task calls unshare(CLONE_NEWPID).
     pub child_pid_ns_id: Option<u64>,
+    /// Tracks if this task is the init process (PID 1) of its PID namespace.
+    pub is_pid_ns_init: bool,
 }
 
 impl Task {
@@ -379,7 +381,13 @@ impl Task {
             uts_ns: UtsNamespace::default_ns(),
             pid_ns_id: INITIAL_PID_NS_ID,
             child_pid_ns_id: None,
+            is_pid_ns_init: pid.as_u64() == 1,
         }
+    }
+
+    /// Check if this task is a user-space task (not kernel thread or idle).
+    pub fn is_user(&self) -> bool {
+        !self.is_idle && self.context.cr3 != crate::memory::r#virtual::kernel_pml4_phys()
     }
 
     /// Create the kernel idle task (PID 0).

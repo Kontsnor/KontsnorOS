@@ -41,6 +41,8 @@ pub struct PtyShared {
     pub winsize: Mutex<Winsize>,
     /// Foreground process group ID (for job control signal delivery).
     pub foreground_pgid: Mutex<u64>,
+    /// Pending EOF flag (Ctrl+D on empty input in canonical mode).
+    pub eof_pending: core::sync::atomic::AtomicBool,
     pub wait_queue: crate::sync::wait_queue::WaitQueue,
 }
 
@@ -96,61 +98,162 @@ impl InodeOps for PtyMaster {
 
     /// Write data to the slave (keyboard input). Handles echo and editing.
     fn write(&self, _offset: u64, data: &[u8]) -> Result<usize, i32> {
-        let mut slave_read = self.shared.slave_read_queue.lock();
-        let mut raw_input = self.shared.raw_input_queue.lock();
-        let mut master_read = self.shared.master_read_queue.lock();
-        let termios = self.shared.termios.lock();
+        let mut sig_to_deliver = None;
 
-        let icanon = (termios.c_lflag & 0x00000002) != 0;
-        let echo = (termios.c_lflag & 0x00000008) != 0;
-        let isig = (termios.c_lflag & 0x00000001) != 0;
+        {
+            let mut slave_read = self.shared.slave_read_queue.lock();
+            let mut raw_input = self.shared.raw_input_queue.lock();
+            let mut master_read = self.shared.master_read_queue.lock();
+            let termios = self.shared.termios.lock();
 
-        for &byte in data {
-            let mut byte = byte;
-            if byte == b'\r' {
-                byte = b'\n';
-            }
+            let icanon = (termios.c_lflag & 0x00000002) != 0;
+            let echo = (termios.c_lflag & 0x00000008) != 0;
+            let isig = (termios.c_lflag & 0x00000001) != 0;
 
-            // SIGINT delivery on Ctrl+C (0x03)
-            if isig && byte == 0x03 {
-                let pgid = *self.shared.foreground_pgid.lock();
-                if pgid != 0 {
-                    deliver_signal_to_pgrp(pgid, 2); // SIGINT = 2
+            for &byte in data {
+                let mut byte = byte;
+                if byte == b'\r' {
+                    byte = b'\n';
                 }
-                continue;
-            }
 
-            if icanon {
-                if byte == 0x7F || byte == b'\x08' {
-                    if let Some(popped) = raw_input.pop_back() {
+                // 1. Interactive terminal signals when ISIG is enabled
+                if isig {
+                    if byte == 0x03 {
+                        // Ctrl+C -> SIGINT (signal 2)
                         if echo {
-                            if popped != b'\n' {
+                            master_read.push_back(b'^');
+                            master_read.push_back(b'C');
+                            master_read.push_back(b'\n');
+                        }
+                        raw_input.clear();
+                        let mut pgid = *self.shared.foreground_pgid.lock();
+                        if pgid == 0 || pgid == 1 {
+                            pgid = find_foreground_pgid();
+                        }
+                        sig_to_deliver = Some((pgid, 2));
+                        continue;
+                    } else if byte == 0x1C {
+                        // Ctrl+\ -> SIGQUIT (signal 3)
+                        if echo {
+                            master_read.push_back(b'^');
+                            master_read.push_back(b'\\');
+                            master_read.push_back(b'\n');
+                        }
+                        raw_input.clear();
+                        let mut pgid = *self.shared.foreground_pgid.lock();
+                        if pgid == 0 || pgid == 1 {
+                            pgid = find_foreground_pgid();
+                        }
+                        sig_to_deliver = Some((pgid, 3));
+                        continue;
+                    } else if byte == 0x1A {
+                        // Ctrl+Z -> SIGTSTP (signal 20)
+                        if echo {
+                            master_read.push_back(b'^');
+                            master_read.push_back(b'Z');
+                            master_read.push_back(b'\n');
+                        }
+                        let mut pgid = *self.shared.foreground_pgid.lock();
+                        if pgid == 0 || pgid == 1 {
+                            pgid = find_foreground_pgid();
+                        }
+                        sig_to_deliver = Some((pgid, 20));
+                        continue;
+                    }
+                }
+
+                // 2. Canonical mode line discipline
+                if icanon {
+                    if byte == 0x04 {
+                        // Ctrl+D (EOF in canonical mode)
+                        if raw_input.is_empty() {
+                            self.shared
+                                .eof_pending
+                                .store(true, core::sync::atomic::Ordering::Release);
+                        } else {
+                            // Flush uncommitted input to slave without newline
+                            while let Some(ch) = raw_input.pop_front() {
+                                slave_read.push_back(ch);
+                            }
+                        }
+                        continue;
+                    } else if byte == 0x15 {
+                        // Ctrl+U (Line Kill)
+                        while let Some(popped) = raw_input.pop_back() {
+                            if echo && popped != b'\n' {
                                 master_read.push_back(b'\x08');
                                 master_read.push_back(b' ');
                                 master_read.push_back(b'\x08');
                             }
                         }
+                        continue;
+                    } else if byte == 0x17 {
+                        // Ctrl+W (Word Erase)
+                        // Skip trailing whitespace
+                        while let Some(&last) = raw_input.back() {
+                            if last == b' ' || last == b'\t' {
+                                raw_input.pop_back();
+                                if echo {
+                                    master_read.push_back(b'\x08');
+                                    master_read.push_back(b' ');
+                                    master_read.push_back(b'\x08');
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        // Erase word characters
+                        while let Some(&last) = raw_input.back() {
+                            if last != b' ' && last != b'\t' && last != b'\n' {
+                                raw_input.pop_back();
+                                if echo {
+                                    master_read.push_back(b'\x08');
+                                    master_read.push_back(b' ');
+                                    master_read.push_back(b'\x08');
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        continue;
+                    } else if byte == 0x7F || byte == b'\x08' {
+                        if let Some(popped) = raw_input.pop_back() {
+                            if echo {
+                                if popped != b'\n' {
+                                    master_read.push_back(b'\x08');
+                                    master_read.push_back(b' ');
+                                    master_read.push_back(b'\x08');
+                                }
+                            }
+                        }
+                    } else {
+                        raw_input.push_back(byte);
+                        if echo {
+                            master_read.push_back(byte);
+                        }
+                        if byte == b'\n' {
+                            while let Some(ch) = raw_input.pop_front() {
+                                slave_read.push_back(ch);
+                            }
+                        }
                     }
                 } else {
-                    raw_input.push_back(byte);
+                    slave_read.push_back(byte);
                     if echo {
                         master_read.push_back(byte);
                     }
-                    if byte == b'\n' {
-                        while let Some(ch) = raw_input.pop_front() {
-                            slave_read.push_back(ch);
-                        }
-                    }
-                }
-            } else {
-                slave_read.push_back(byte);
-                if echo {
-                    master_read.push_back(byte);
                 }
             }
         }
 
         self.shared.wait_queue.wake_all();
+
+        if let Some((pgid, sig)) = sig_to_deliver {
+            if pgid != 0 {
+                deliver_signal_to_pgrp(pgid, sig);
+            }
+        }
+
         Ok(data.len())
     }
 
@@ -233,6 +336,22 @@ impl InodeOps for PtySlave {
                         }
                     }
                     return Ok(count);
+                }
+                if self
+                    .shared
+                    .eof_pending
+                    .swap(false, core::sync::atomic::Ordering::AcqRel)
+                {
+                    return Ok(0); // EOF
+                }
+            }
+
+            // Track reader pgid as foreground if not currently set
+            if *self.shared.foreground_pgid.lock() == 0 {
+                if let Some(current_pid) = crate::process::scheduler::current_pid() {
+                    if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+                        *self.shared.foreground_pgid.lock() = task_arc.lock().pgid;
+                    }
                 }
             }
 
@@ -368,9 +487,45 @@ impl InodeOps for PtySlave {
                 *self.shared.foreground_pgid.lock() = pgid;
                 Ok(0)
             }
+            0x540E => {
+                // TIOCSCTTY: Make the terminal the controlling terminal for the calling process
+                if let Some(pid) = crate::process::scheduler::current_pid() {
+                    if let Some(task) = crate::process::scheduler::get_task_arc(pid) {
+                        *self.shared.foreground_pgid.lock() = task.lock().pgid;
+                    }
+                }
+                Ok(0)
+            }
             _ => Err(-22), // EINVAL
         }
     }
+}
+
+/// Helper function to find the active foreground process group.
+/// Scans running/runnable user tasks with PID > 1.
+pub fn find_foreground_pgid() -> u64 {
+    use crate::process::scheduler;
+    let tasks = scheduler::TASKS.read();
+    let mut best_pid: u64 = 0;
+    let mut best_pgid: u64 = 0;
+    for slot in tasks.iter() {
+        if let Some(task_arc) = slot {
+            if let Some(task) = task_arc.try_lock() {
+                let pid = task.pid.as_u64();
+                // Never target PID 0 (kernel), PID 1 (init), or kernel threads
+                if pid > 1
+                    && task.is_user()
+                    && task.state != crate::process::task::TaskState::Zombie
+                {
+                    if pid > best_pid {
+                        best_pid = pid;
+                        best_pgid = task.pgid;
+                    }
+                }
+            }
+        }
+    }
+    best_pgid
 }
 
 /// Helper function to deliver signal to process group.
@@ -379,17 +534,30 @@ pub fn deliver_signal_to_pgrp(pgid: u64, sig: i32) {
     if sig < 1 || sig > 64 || pgid == 0 {
         return;
     }
-    let caller_ns_id = scheduler::current_pid()
-        .and_then(scheduler::get_task_arc)
-        .map(|t| t.lock().pid_ns_id)
-        .unwrap_or(0);
     let tasks = scheduler::TASKS.read();
     let mut pids = alloc::vec::Vec::new();
+    let mut seen_tgids = alloc::vec::Vec::new();
     for task_opt in tasks.iter() {
         if let Some(task_arc) = task_opt {
-            let task = task_arc.lock();
-            if (caller_ns_id == 0 || task.pid_ns_id == caller_ns_id) && task.pgid == pgid {
-                pids.push(task.pid);
+            if let Some(task) = task_arc.try_lock() {
+                // In POSIX, never deliver fatal interactive keyboard signals to PID 1 or kernel threads
+                if (task.pid.as_u64() == 1 || task.is_pid_ns_init)
+                    && (sig == 2 || sig == 3 || sig == 20)
+                {
+                    continue;
+                }
+                if !task.is_user() {
+                    continue;
+                }
+                if task.pgid == pgid {
+                    let tgid = task.tgid;
+                    // In POSIX, process group signals are delivered per-process (thread group),
+                    // not broadcast to every sibling thread individually.
+                    if !seen_tgids.contains(&tgid) {
+                        seen_tgids.push(tgid);
+                        pids.push(tgid);
+                    }
+                }
             }
         }
     }
@@ -426,6 +594,7 @@ pub fn allocate_new_pty() -> Result<Arc<dyn InodeOps>, i32> {
             ws_ypixel: 0,
         }),
         foreground_pgid: Mutex::new(0),
+        eof_pending: core::sync::atomic::AtomicBool::new(false),
         wait_queue: crate::sync::wait_queue::WaitQueue::new(),
     });
 

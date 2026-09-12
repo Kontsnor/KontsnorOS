@@ -176,22 +176,32 @@ pub fn sys_kill(pid: i32, sig: i32) -> SyscallResult {
     } else if pid < -1 {
         let target_pgid = (-pid) as u64;
         crate::fs::pty::deliver_signal_to_pgrp(target_pgid, sig);
+    } else if pid == -1 {
         // pid == -1: broadcast to all processes in the same PID namespace (except caller and namespace init)
         use crate::process::scheduler;
         let caller_pid = scheduler::current_pid().map(|p| p.as_u64()).unwrap_or(0);
         let tasks = scheduler::TASKS.read();
         let mut pids = alloc::vec::Vec::new();
+        let mut seen_tgids = alloc::vec::Vec::new();
         for task_opt in tasks.iter() {
             if let Some(task_arc) = task_opt {
-                let task = task_arc.lock();
-                if caller_ns_id != 0 && task.pid_ns_id != caller_ns_id {
-                    continue;
+                if let Some(task) = task_arc.try_lock() {
+                    if caller_ns_id != 0 && task.pid_ns_id != caller_ns_id {
+                        continue;
+                    }
+                    let host_pid = task.pid.as_u64();
+                    if host_pid == caller_pid || host_pid <= 1 || task.is_pid_ns_init {
+                        continue;
+                    }
+                    if !task.is_user() {
+                        continue;
+                    }
+                    let tgid = task.tgid;
+                    if !seen_tgids.contains(&tgid) {
+                        seen_tgids.push(tgid);
+                        pids.push(tgid);
+                    }
                 }
-                let host_pid = task.pid.as_u64();
-                if host_pid == caller_pid || host_pid <= 1 {
-                    continue;
-                }
-                pids.push(task.pid);
             }
         }
         drop(tasks);
@@ -510,6 +520,19 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
         return;
     } else if action.sa_handler == 0 {
         // SIG_DFL
+        // In POSIX/Linux, PID 1 (both host init and container namespace init) is immune
+        // to signals for which it has not installed an explicit signal handler.
+        // Fatal default actions must not kill init.
+        let is_init = if let Some(t_arc) = scheduler::get_task_arc(current_pid) {
+            let t = t_arc.lock();
+            t.pid.as_u64() == 1 || t.is_pid_ns_init
+        } else {
+            current_pid.as_u64() == 1
+        };
+        if is_init {
+            return;
+        }
+
         // SIGCHLD (17), SIGCONT (18), SIGTSTP (20), SIGTTIN (21), SIGTTOU (22), SIGURG (23), SIGWINCH (28)
         if sig == 17 || sig == 18 || sig == 20 || sig == 21 || sig == 22 || sig == 23 || sig == 28 {
             return;
@@ -538,7 +561,11 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
             }
         }
 
-        let new_user_sp = (user_sp - core::mem::size_of::<RtSigFrame>() as u64) & !0xF;
+        // In System V AMD64 ABI, function entry requires (rsp + 8) % 16 == 0.
+        // Signal frames place `pretcode` at rsp, simulating a function call where the return address
+        // has been pushed. Linux aligns this via: ((sp - frame_size) & !0xF) - 8.
+        let frame_size = core::mem::size_of::<RtSigFrame>() as u64;
+        let new_user_sp = (user_sp.saturating_sub(frame_size) & !0xF).saturating_sub(8);
 
         if !crate::syscall::fs::validate_user_ptr(
             new_user_sp as *const u8,

@@ -88,6 +88,8 @@ impl InodeOps for DevStdin {
             let mut raw_char = None;
             let mut interrupted = None;
 
+            let mut sig_to_deliver = None;
+
             {
                 let _lock = STDIN_LOCK.lock();
 
@@ -103,17 +105,83 @@ impl InodeOps for DevStdin {
                         byte = b'\n';
                     }
 
-                    // If ISIG is enabled and Ctrl+C is typed, deliver SIGINT immediately!
-                    if isig && byte == 0x03 {
-                        let pgid = *TTY_FOREGROUND_PGID.lock();
-                        crate::fs::pty::deliver_signal_to_pgrp(pgid, 2); // SIGINT = 2
-                        interrupted = Some(-4); // EINTR
+                    // Terminal signals when ISIG is enabled
+                    if isig {
+                        if byte == 0x03 {
+                            // Ctrl+C -> SIGINT
+                            if echo {
+                                crate::arch::x86_64::serial::write_byte(b'^');
+                                crate::arch::x86_64::serial::write_byte(b'C');
+                                crate::arch::x86_64::serial::write_byte(b'\n');
+                            }
+                            let mut pgid = *TTY_FOREGROUND_PGID.lock();
+                            if pgid == 0 || pgid == 1 {
+                                pgid = crate::fs::pty::find_foreground_pgid();
+                            }
+                            sig_to_deliver = Some((pgid, 2));
+                            interrupted = Some(-4); // EINTR
+                        } else if byte == 0x1C {
+                            // Ctrl+\ -> SIGQUIT
+                            if echo {
+                                crate::arch::x86_64::serial::write_byte(b'^');
+                                crate::arch::x86_64::serial::write_byte(b'\\');
+                                crate::arch::x86_64::serial::write_byte(b'\n');
+                            }
+                            let mut pgid = *TTY_FOREGROUND_PGID.lock();
+                            if pgid == 0 || pgid == 1 {
+                                pgid = crate::fs::pty::find_foreground_pgid();
+                            }
+                            sig_to_deliver = Some((pgid, 3));
+                            interrupted = Some(-4);
+                        } else if byte == 0x1A {
+                            // Ctrl+Z -> SIGTSTP
+                            if echo {
+                                crate::arch::x86_64::serial::write_byte(b'^');
+                                crate::arch::x86_64::serial::write_byte(b'Z');
+                                crate::arch::x86_64::serial::write_byte(b'\n');
+                            }
+                            let mut pgid = *TTY_FOREGROUND_PGID.lock();
+                            if pgid == 0 || pgid == 1 {
+                                pgid = crate::fs::pty::find_foreground_pgid();
+                            }
+                            sig_to_deliver = Some((pgid, 20));
+                            interrupted = Some(-4);
+                        }
                     }
 
                     if interrupted.is_none() {
                         if icanon {
-                            // Backspace/delete cooked character erasing
-                            if byte == 0x7F || byte == b'\x08' {
+                            if byte == 0x04 {
+                                // Ctrl+D (EOF in canonical mode)
+                                if !crate::drivers::keyboard::has_input() {
+                                    return Ok(0);
+                                } else {
+                                    got_input = true;
+                                }
+                            } else if byte == 0x15 {
+                                // Ctrl+U (Line Kill)
+                                while let Some(popped) = crate::drivers::keyboard::try_pop_back() {
+                                    if echo && popped != b'\n' {
+                                        crate::arch::x86_64::serial::write_byte(b'\x08');
+                                        crate::arch::x86_64::serial::write_byte(b' ');
+                                        crate::arch::x86_64::serial::write_byte(b'\x08');
+                                    }
+                                }
+                            } else if byte == 0x17 {
+                                // Ctrl+W (Word Erase)
+                                while let Some(popped) = crate::drivers::keyboard::try_pop_back() {
+                                    if echo && popped != b'\n' {
+                                        crate::arch::x86_64::serial::write_byte(b'\x08');
+                                        crate::arch::x86_64::serial::write_byte(b' ');
+                                        crate::arch::x86_64::serial::write_byte(b'\x08');
+                                    }
+                                    if popped == b' ' || popped == b'\t' {
+                                        continue;
+                                    }
+                                    break;
+                                }
+                            } else if byte == 0x7F || byte == b'\x08' {
+                                // Backspace/delete cooked character erasing
                                 if let Some(popped) = crate::drivers::keyboard::try_pop_back() {
                                     if popped != b'\n' {
                                         if echo {
@@ -140,22 +208,16 @@ impl InodeOps for DevStdin {
                         }
                     }
                 }
+            }
 
-                if let Some(err) = interrupted {
-                    return Err(err);
+            if let Some((pgid, sig)) = sig_to_deliver {
+                if pgid != 0 {
+                    crate::fs::pty::deliver_signal_to_pgrp(pgid, sig);
                 }
+            }
 
-                // Verify if we can return
-                if icanon {
-                    if crate::drivers::keyboard::has_newline() {
-                        got_input = true;
-                    }
-                } else {
-                    // Raw mode: check if buffer has characters and return immediately
-                    if let Some(ch) = crate::drivers::keyboard::try_read_char() {
-                        raw_char = Some(ch);
-                    }
-                }
+            if let Some(err) = interrupted {
+                return Err(err);
             }
 
             if let Some(ch) = raw_char {
@@ -284,6 +346,15 @@ impl InodeOps for DevStdin {
                 }
                 let pgid = unsafe { core::ptr::read(arg as *const i32) } as u64;
                 *TTY_FOREGROUND_PGID.lock() = pgid;
+                Ok(0)
+            }
+            0x540E => {
+                // TIOCSCTTY: Set controlling terminal
+                if let Some(pid) = crate::process::scheduler::current_pid() {
+                    if let Some(task) = crate::process::scheduler::get_task_arc(pid) {
+                        *TTY_FOREGROUND_PGID.lock() = task.lock().pgid;
+                    }
+                }
                 Ok(0)
             }
             _ => Err(-22), // EINVAL

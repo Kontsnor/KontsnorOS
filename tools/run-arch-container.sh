@@ -304,12 +304,15 @@ if [ "$INTERACTIVE" = true ]; then
     echo "      Type your commands directly inside the Arch Linux container."
     echo "      Type 'exit' to exit the container and power off."
     echo "----------------------------------------------------------------------"
+    trap 'stty sane 2>/dev/null || true' EXIT INT TERM
     qemu-system-x86_64 \
         -drive format=raw,file="$TEST_BIOS",snapshot=on \
         -drive format=raw,file="$DISK_IMG",index=1,media=disk \
+        -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
         -netdev user,id=net0 \
         -device e1000,netdev=net0 \
-        -serial stdio \
+        -chardev stdio,id=char0,signal=off \
+        -serial chardev:char0 \
         -display none \
         -m 1024M \
         $ACCEL_OPTS \

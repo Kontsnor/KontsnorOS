@@ -1025,16 +1025,26 @@ impl ExtFileSystem {
 
     /// Retrieve an inode by its number.
     pub fn get_inode(self: &Arc<Self>, ino: u32) -> Result<Arc<dyn InodeOps>, &'static str> {
-        let mut cache = self.inode_cache.lock();
-        if let Some(weak) = cache.get(&ino) {
-            if let Some(arc) = weak.upgrade() {
-                return Ok(arc);
+        {
+            let cache = self.inode_cache.lock();
+            if let Some(weak) = cache.get(&ino) {
+                if let Some(arc) = weak.upgrade() {
+                    return Ok(arc);
+                }
             }
         }
 
         let ext_inode = self.get_ext_inode(ino)?;
         let arc = Arc::new(ext_inode);
-        cache.insert(ino, Arc::downgrade(&arc));
+        let weak = Arc::downgrade(&arc);
+
+        let mut cache = self.inode_cache.lock();
+        if let Some(existing_weak) = cache.get(&ino) {
+            if let Some(existing) = existing_weak.upgrade() {
+                return Ok(existing);
+            }
+        }
+        cache.insert(ino, weak);
         Ok(arc)
     }
 

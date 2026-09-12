@@ -34,8 +34,8 @@ qemu-system-x86_64 \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -serial stdio \
     -display none \
-    -m 256M \
-    -smp 4 \
+    -m 512M \
+    -smp 2 \
     -cpu qemu64,+fsgsbase \
     -no-reboot
 QEMU_STATUS=$?

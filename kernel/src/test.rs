@@ -80,12 +80,15 @@ fn panic(info: &PanicInfo) -> ! {
 
 #[test_case]
 fn test_trivial() {
+    kprintln!("[test] Starting trivial test...");
     let two = 2;
     assert_eq!(1 + 1, two);
+    kprintln!("[test] trivial test PASSED!");
 }
 
 #[test_case]
 fn test_memory_allocator() {
+    kprintln!("[test] Starting memory allocator test...");
     let (initial_used, _, _) = crate::memory::heap::stats();
     {
         let mut vec = alloc::vec::Vec::new();
@@ -97,10 +100,12 @@ fn test_memory_allocator() {
     }
     let (final_used, _, _) = crate::memory::heap::stats();
     assert_eq!(initial_used, final_used);
+    kprintln!("[test] memory allocator test PASSED!");
 }
 
 #[test_case]
 fn test_vfs_path_resolution() {
+    kprintln!("[test] Starting VFS path resolution test...");
     // Lookup non-existent path
     let non_existent = crate::fs::vfs::lookup("/tmp/nonexistent");
     assert!(non_existent.is_none());
@@ -135,26 +140,28 @@ fn test_vfs_path_resolution() {
         .expect("Failed to read from test.txt");
     assert_eq!(read_len, test_data.len());
     assert_eq!(&read_buf[..read_len], test_data);
+    kprintln!("[test] VFS path resolution test PASSED!");
 }
 
 #[test_case]
 fn test_scheduler_priority_queues() {
+    kprintln!("[test] Starting scheduler priority queues test...");
     let mut sched = crate::process::scheduler::Scheduler::new();
 
     // Create mock tasks with High, Normal, and Low priorities
-    let pid_high = crate::process::pid::Pid::from_raw(10);
+    let pid_high = crate::process::pid::Pid::from_raw(100);
     let mut task_high =
         crate::process::task::Task::new(pid_high, alloc::string::String::from("high_prio"), 0);
     task_high.priority = crate::process::task::Priority::High;
     task_high.state = crate::process::task::TaskState::Ready;
 
-    let pid_normal = crate::process::pid::Pid::from_raw(11);
+    let pid_normal = crate::process::pid::Pid::from_raw(101);
     let mut task_normal =
         crate::process::task::Task::new(pid_normal, alloc::string::String::from("normal_prio"), 0);
     task_normal.priority = crate::process::task::Priority::Normal;
     task_normal.state = crate::process::task::TaskState::Ready;
 
-    let pid_low = crate::process::pid::Pid::from_raw(12);
+    let pid_low = crate::process::pid::Pid::from_raw(102);
     let mut task_low =
         crate::process::task::Task::new(pid_low, alloc::string::String::from("low_prio"), 0);
     task_low.priority = crate::process::task::Priority::Low;
@@ -164,40 +171,22 @@ fn test_scheduler_priority_queues() {
     sched.add_task(task_low);
     sched.add_task(task_high);
     sched.add_task(task_normal);
+    kprintln!("[test] Tasks added to scheduler");
 
-    // pick_next should retrieve them in priority order: High (10), Normal (11), Low (12)
+    // pick_next should retrieve them in priority order: High (100), Normal (101), Low (102)
     assert_eq!(sched.pick_next().map(|(p, _)| p), Some(pid_high));
     assert_eq!(sched.pick_next().map(|(p, _)| p), Some(pid_normal));
     assert_eq!(sched.pick_next().map(|(p, _)| p), Some(pid_low));
     assert_eq!(sched.pick_next(), None);
+    kprintln!("[test] pick_next asserted");
 
-    // Clean up mock tasks from global TASKS list
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut tasks = crate::process::scheduler::TASKS.write();
-        if tasks.len() > 12 {
-            tasks[10] = None;
-            tasks[11] = None;
-            tasks[12] = None;
-        }
-    });
+    kprintln!("[test] Scheduler priority queues test PASSED!");
 }
 
 #[test_case]
 fn test_orphan_reparenting() {
+    kprintln!("[test] Starting orphan reparenting test...");
     let mut sched = crate::process::scheduler::Scheduler::new();
-
-    // Save the original bootstrap thread (PID 1) from TASKS
-    let original_init = x86_64::instructions::interrupts::without_interrupts(|| {
-        let tasks = crate::process::scheduler::TASKS.read();
-        tasks.get(1).cloned().flatten()
-    });
-
-    // Create a mock init task (PID 1) so it exists in TASKS
-    let pid_init = crate::process::pid::Pid::from_raw(1);
-    let mut task_init =
-        crate::process::task::Task::new(pid_init, alloc::string::String::from("init"), 0);
-    task_init.state = crate::process::task::TaskState::Blocked;
-    sched.add_task(task_init);
 
     // Create parent task (PID 20)
     let pid_parent = crate::process::pid::Pid::from_raw(20);
@@ -228,21 +217,12 @@ fn test_orphan_reparenting() {
     let parent = parent_arc.lock();
     assert_eq!(parent.state, crate::process::task::TaskState::Zombie);
 
-    // Restore original bootstrap thread and clear mock parent/child
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut tasks = crate::process::scheduler::TASKS.write();
-        if tasks.len() > 1 {
-            tasks[1] = original_init;
-        }
-        if tasks.len() > 21 {
-            tasks[20] = None;
-            tasks[21] = None;
-        }
-    });
+    kprintln!("[test] Orphan reparenting test PASSED!");
 }
 
 #[test_case]
 fn test_vfs_permissions() {
+    kprintln!("[test] Starting VFS permissions test...");
     let pid = crate::process::scheduler::current_pid().expect("No current task");
     let task_arc = crate::process::scheduler::get_task_arc(pid).expect("No task arc");
 
@@ -402,6 +382,7 @@ fn test_vfs_permissions() {
         t.euid = orig_euid;
         t.egid = orig_egid;
     }
+    kprintln!("[test] VFS permissions test PASSED!");
 }
 
 #[test_case]
@@ -1595,15 +1576,6 @@ fn test_thread_clone_vm() {
     }
 
     kprintln!("[test] Thread Shared VM test PASSED!");
-
-    // Clean up mock tasks from global TASKS list
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut tasks = crate::process::scheduler::TASKS.write();
-        if tasks.len() > 41 {
-            tasks[40] = None;
-            tasks[41] = None;
-        }
-    });
 }
 
 static STRESS_FUTEX_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -1986,14 +1958,6 @@ fn test_futex_bitset_and_cleartid() {
     // Clean up
     crate::syscall::memory::sys_munmap(addr, 4096);
 
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut tasks = crate::process::scheduler::TASKS.write();
-        let idx = pid_child.as_u64() as usize;
-        if idx < tasks.len() {
-            tasks[idx] = None;
-        }
-    });
-
     kprintln!("[test] futex bitset and CLONE_CHILD_CLEARTID verification test PASSED!");
 }
 
@@ -2328,11 +2292,15 @@ fn test_wine_sigaltstack_and_ucontext() {
 
     // Allocate stack memory for sigaltstack
     let alt_stack_size: u64 = 16384;
-    let alt_stack_mem = crate::syscall::memory::sys_mmap(0, alt_stack_size as usize, 3, 0x22, -1, 0) as u64;
+    let alt_stack_mem =
+        crate::syscall::memory::sys_mmap(0, alt_stack_size as usize, 3, 0x22, -1, 0) as u64;
     assert!(alt_stack_mem > 0);
 
     let old_ss_buf = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
     assert!(old_ss_buf > 0);
+
+    let new_ss_buf = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    assert!(new_ss_buf > 0);
 
     let new_ss = crate::process::task::StackT {
         ss_sp: alt_stack_mem,
@@ -2340,16 +2308,21 @@ fn test_wine_sigaltstack_and_ucontext() {
         _pad: 0,
         ss_size: alt_stack_size,
     };
+    // SAFETY: new_ss_buf is mapped user memory with write permissions.
+    unsafe {
+        core::ptr::write(new_ss_buf as *mut crate::process::task::StackT, new_ss);
+    }
 
     // 1. Register alternate signal stack
     let res_alt = crate::syscall::process::sys_sigaltstack(
-        &new_ss as *const _ as *const u8,
+        new_ss_buf as *const u8,
         old_ss_buf as *mut u8,
         0x0000_7FFF_0000_0000,
     );
     assert_eq!(res_alt, 0);
 
     // Read back old_ss from old_ss_buf
+    // SAFETY: old_ss_buf contains old_ss written by sys_sigaltstack.
     let old_ss = unsafe { *(old_ss_buf as *const crate::process::task::StackT) };
     assert_ne!(old_ss.ss_flags & 2, 0); // Previously SS_DISABLE
 
@@ -2360,6 +2333,7 @@ fn test_wine_sigaltstack_and_ucontext() {
         0x0000_7FFF_0000_0000,
     );
     assert_eq!(res_query, 0);
+    // SAFETY: old_ss_buf contains queried stack written by sys_sigaltstack.
     let query_ss = unsafe { *(old_ss_buf as *const crate::process::task::StackT) };
     assert_eq!(query_ss.ss_sp, alt_stack_mem);
     assert_eq!(query_ss.ss_size, alt_stack_size);
@@ -2372,8 +2346,12 @@ fn test_wine_sigaltstack_and_ucontext() {
         _pad: 0,
         ss_size: 0,
     };
+    // SAFETY: new_ss_buf is mapped user memory with write permissions.
+    unsafe {
+        core::ptr::write(new_ss_buf as *mut crate::process::task::StackT, disable_ss);
+    }
     let res_disable = crate::syscall::process::sys_sigaltstack(
-        &disable_ss as *const _ as *const u8,
+        new_ss_buf as *const u8,
         core::ptr::null_mut(),
         0x0000_7FFF_0000_0000,
     );
@@ -2382,5 +2360,65 @@ fn test_wine_sigaltstack_and_ucontext() {
     // Clean up
     crate::syscall::memory::sys_munmap(alt_stack_mem, alt_stack_size as usize);
     crate::syscall::memory::sys_munmap(old_ss_buf, 4096);
+    crate::syscall::memory::sys_munmap(new_ss_buf, 4096);
     kprintln!("[test] Wine sigaltstack & ucontext frame test PASSED!");
+}
+
+#[test_case]
+fn test_ext_file_write_persistence() {
+    kprintln!("[test] Starting ext file write persistence test...");
+    let path_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    assert!(path_addr > 0);
+    let path_str = b"/disk/persist_test.txt\0";
+    // SAFETY: path_addr is a newly mmapped 4096-byte region with PROT_READ | PROT_WRITE.
+    unsafe {
+        core::ptr::copy_nonoverlapping(path_str.as_ptr(), path_addr as *mut u8, path_str.len());
+    }
+
+    // Open/create file for writing using user-space pathname
+    let fd = crate::syscall::fs::sys_open(path_addr as *const u8, 0o102, 0o644); // O_CREAT | O_RDWR
+    assert!(fd >= 0, "Failed to open/create test file");
+
+    let buf_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    assert!(buf_addr > 0);
+    let test_data = b"persistence_test_content_12345";
+    // SAFETY: buf_addr is a newly mmapped 4096-byte region with PROT_READ | PROT_WRITE.
+    unsafe {
+        core::ptr::copy_nonoverlapping(test_data.as_ptr(), buf_addr as *mut u8, test_data.len());
+    }
+
+    let written = crate::syscall::fs::sys_write(fd as i32, buf_addr as *const u8, test_data.len());
+    assert_eq!(written, test_data.len() as i64, "Short write");
+
+    // Close the file (triggers FileDescription::drop and flush)
+    let close_res = crate::syscall::fs::sys_close(fd as i32);
+    assert_eq!(close_res, 0);
+
+    // Invalidate the page cache for this inode to force reading directly from disk
+    let inode =
+        crate::fs::vfs::lookup("/disk/persist_test.txt").expect("File must exist after write");
+    let ino = inode.inode().ino;
+    let dev = inode.inode().dev;
+    crate::memory::page_cache::page_cache_invalidate_inode(dev, ino);
+
+    // Read directly from disk using read_direct
+    let mut read_buf = [0u8; 64];
+    let read_bytes = inode
+        .read_direct(0, &mut read_buf)
+        .expect("read_direct failed");
+    assert_eq!(read_bytes, test_data.len());
+    assert_eq!(&read_buf[..test_data.len()], test_data);
+
+    // Also verify normal read_page_cache repopulates from disk and matches
+    let mut cache_read_buf = [0u8; 64];
+    let cache_bytes = inode
+        .read(0, &mut cache_read_buf)
+        .expect("inode.read failed");
+    assert_eq!(cache_bytes, test_data.len());
+    assert_eq!(&cache_read_buf[..test_data.len()], test_data);
+
+    // Clean up
+    crate::syscall::memory::sys_munmap(path_addr, 4096);
+    crate::syscall::memory::sys_munmap(buf_addr, 4096);
+    kprintln!("[test] ext file write persistence test PASSED!");
 }

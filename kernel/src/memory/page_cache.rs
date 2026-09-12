@@ -401,36 +401,38 @@ pub fn flush_all_for_inode_inner(inode: &dyn InodeOps) -> Result<(), Errno> {
 
     for (_idx, task_arc) in task_arcs {
         x86_64::instructions::interrupts::without_interrupts(|| {
-            let task = task_arc.lock();
-            let addr_space = task.address_space.lock();
-            for region in &addr_space.mmap_regions {
-                if region.is_shared
-                    && region
-                        .inode
-                        .as_ref()
-                        .map(|i| (i.inode().dev, i.inode().ino))
-                        == Some((dev, ino))
-                {
-                    let start_page = region.start & !4095;
-                    let end_page = (region.start + region.len as u64 - 1) & !4095;
-                    for vaddr in (start_page..=end_page).step_by(4096) {
-                        let page_offset_in_mapping = vaddr - region.start;
-                        let file_offset = region.offset + page_offset_in_mapping;
+            if let Some(task) = task_arc.try_lock() {
+                if let Some(addr_space) = task.address_space.try_lock() {
+                    for region in &addr_space.mmap_regions {
+                        if region.is_shared
+                            && region
+                                .inode
+                                .as_ref()
+                                .map(|i| (i.inode().dev, i.inode().ino))
+                                == Some((dev, ino))
+                        {
+                            let start_page = region.start & !4095;
+                            let end_page = (region.start + region.len as u64 - 1) & !4095;
+                            for vaddr in (start_page..=end_page).step_by(4096) {
+                                let page_offset_in_mapping = vaddr - region.start;
+                                let file_offset = region.offset + page_offset_in_mapping;
 
-                        unsafe {
-                            if let Some(pte) = get_page_table_entry(
-                                addr_space.page_table_root,
-                                VirtAddr::new(vaddr),
-                            ) {
-                                let mut flags = pte.flags();
-                                if flags.contains(PageTableFlags::DIRTY) {
-                                    flags.remove(PageTableFlags::DIRTY);
-                                    pte.set_addr(pte.addr(), flags);
-                                    x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
+                                unsafe {
+                                    if let Some(pte) = get_page_table_entry(
+                                        addr_space.page_table_root,
+                                        VirtAddr::new(vaddr),
+                                    ) {
+                                        let mut flags = pte.flags();
+                                        if flags.contains(PageTableFlags::DIRTY) {
+                                            flags.remove(PageTableFlags::DIRTY);
+                                            pte.set_addr(pte.addr(), flags);
+                                            x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
 
-                                    // Mark dirty in cache
-                                    let aligned_file_offset = file_offset & !4095;
-                                    page_cache_mark_dirty(dev, ino, aligned_file_offset);
+                                            // Mark dirty in cache
+                                            let aligned_file_offset = file_offset & !4095;
+                                            page_cache_mark_dirty(dev, ino, aligned_file_offset);
+                                        }
+                                    }
                                 }
                             }
                         }

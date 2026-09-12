@@ -64,7 +64,7 @@ echo "╚═══════════════════════�
 echo ""
 
 ACCEL_OPTS="-cpu qemu64,+fsgsbase -smp 8"
-if [ -w /dev/kvm ] && qemu-system-x86_64 -enable-kvm -cpu host -M none -display none 2>/dev/null; then
+if [ -w /dev/kvm ]; then
     echo "Enabling KVM Hardware Acceleration (-enable-kvm -cpu host -smp 8)..."
     ACCEL_OPTS="-enable-kvm -cpu host -smp 8"
 else

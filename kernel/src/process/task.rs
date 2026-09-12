@@ -101,6 +101,8 @@ pub struct MappedRegion {
     pub is_shared: bool,
     pub prot: i32,
     pub pathname: Option<alloc::string::String>,
+    /// True for the main user-space stack region — enables auto-growth in the page fault handler.
+    pub is_stack: bool,
 }
 
 #[repr(C)]
@@ -122,6 +124,7 @@ impl core::fmt::Debug for MappedRegion {
             .field("is_shared", &self.is_shared)
             .field("prot", &self.prot)
             .field("pathname", &self.pathname)
+            .field("is_stack", &self.is_stack)
             .finish()
     }
 }

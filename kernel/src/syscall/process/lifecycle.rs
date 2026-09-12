@@ -246,6 +246,7 @@ fn map_elf_segments(
             is_shared: false,
             prot,
             pathname: pathname.map(|p| alloc::string::String::from(p)),
+            is_stack: false,
         });
 
         let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
@@ -597,6 +598,7 @@ pub fn sys_execve(
         is_shared: false,
         prot: 3, // PROT_READ | PROT_WRITE
         pathname: Some(alloc::string::String::from("[stack]")),
+        is_stack: true,
     });
 
     // Construct System V ABI compliant stack with multi-page support

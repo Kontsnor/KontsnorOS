@@ -265,6 +265,7 @@ pub fn sys_shmat(shmid: i32, shmaddr: *const u8, shmflg: i32) -> SyscallResult {
             is_shared: true,
             prot: if (shmflg & SHM_RDONLY) != 0 { 1 } else { 3 },
             pathname: Some(alloc::format!("shm:{}", shmid)),
+            is_stack: false,
         });
 
     seg.ds.shm_nattch = seg.ds.shm_nattch.saturating_add(1);

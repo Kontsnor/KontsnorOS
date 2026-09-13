@@ -153,6 +153,12 @@ impl FileDescription {
     /// Seek to a new offset.
     pub fn seek(&self, offset: i64, whence: i32) -> Result<u64, i32> {
         let mut current = self.offset.lock();
+        let file_type = self.inode.inode().file_type;
+        if file_type == crate::fs::inode::FileType::CharDevice {
+            *current = 0;
+            return Ok(0);
+        }
+
         let new_offset = match whence {
             0 => {
                 // SEEK_SET

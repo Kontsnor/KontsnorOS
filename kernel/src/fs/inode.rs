@@ -181,6 +181,8 @@ pub const POLLIN: u32 = 0x0001;
 pub const POLLOUT: u32 = 0x0004;
 pub const POLLERR: u32 = 0x0008;
 pub const POLLHUP: u32 = 0x0010;
+pub const POLLRDNORM: u32 = 0x0040;
+pub const POLLWRNORM: u32 = 0x0100;
 
 /// Check permission logic.
 pub fn check_permission(inode: &Inode, mask: u16) -> Result<(), Errno> {

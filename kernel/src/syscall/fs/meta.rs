@@ -112,6 +112,9 @@ pub fn sys_chdir(pathname: *const u8) -> SyscallResult {
     };
 
     let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
+    if crate::syscall::DEBUG_SYSCALLS {
+        kprintln!("[syscall] chdir(\"{}\" -> \"{}\")", raw_path, resolved_path);
+    }
 
     // Lookup the directory in VFS
     let inode = match crate::fs::vfs::lookup(&resolved_path) {

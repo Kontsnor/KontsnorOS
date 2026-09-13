@@ -3218,5 +3218,14 @@ fn test_devfs_special_nodes() {
 
     crate::process::fd::current_task_close_fd(fd_dir);
 
+    // 6. Verify sys_chdir functionality and safety
+    let root_path = b"/\0";
+    let chdir_root_res = crate::syscall::fs::sys_chdir(root_path.as_ptr());
+    assert_eq!(chdir_root_res, 0, "sys_chdir(\"/\") must return 0");
+
+    let tmp_path = b"/tmp\0";
+    let chdir_tmp_res = crate::syscall::fs::sys_chdir(tmp_path.as_ptr());
+    assert_eq!(chdir_tmp_res, 0, "sys_chdir(\"/tmp\") must return 0");
+
     kprintln!("[test] devfs special character device nodes test PASSED!");
 }

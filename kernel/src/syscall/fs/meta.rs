@@ -2188,10 +2188,10 @@ fn populate_statx(inode_ops: &dyn crate::fs::inode::InodeOps) -> StatX {
         __reserved: 0,
     };
     sx.stx_btime = sx.stx_ctime;
-    sx.stx_rdev_major = ((stat.st_rdev >> 8) & 0xfff) as u32;
-    sx.stx_rdev_minor = (stat.st_rdev & 0xff) as u32;
-    sx.stx_dev_major = ((stat.st_dev >> 8) & 0xfff) as u32;
-    sx.stx_dev_minor = (stat.st_dev & 0xff) as u32;
+    sx.stx_rdev_major = crate::fs::devfs::major(stat.st_rdev) as u32;
+    sx.stx_rdev_minor = crate::fs::devfs::minor(stat.st_rdev) as u32;
+    sx.stx_dev_major = crate::fs::devfs::major(stat.st_dev) as u32;
+    sx.stx_dev_minor = crate::fs::devfs::minor(stat.st_dev) as u32;
     sx.stx_mnt_id = if inode_ops.inode().dev != 0 {
         inode_ops.inode().dev
     } else {

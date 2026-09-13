@@ -167,7 +167,7 @@ impl InodeOps for DevFull {
     }
 
     fn poll(&self, _events: u32) -> u32 {
-        super::inode::POLLIN | super::inode::POLLOUT
+        super::inode::POLLIN
     }
 }
 
@@ -221,10 +221,28 @@ impl InodeOps for DevRandom {
     }
 }
 
+/// Standard Linux 64-bit `makedev` helper.
+pub const fn makedev(major: u64, minor: u64) -> u64 {
+    ((major & 0x0000_0fff) << 8)
+        | ((major & 0xffff_f000) << 32)
+        | (minor & 0x0000_00ff)
+        | ((minor & 0xffff_ff00) << 12)
+}
+
+/// Extract major device number from 64-bit `rdev`.
+pub const fn major(dev: u64) -> u64 {
+    ((dev >> 8) & 0x0000_0fff) | ((dev >> 32) & 0xffff_f000)
+}
+
+/// Extract minor device number from 64-bit `rdev`.
+pub const fn minor(dev: u64) -> u64 {
+    (dev & 0x0000_00ff) | ((dev >> 12) & 0xffff_ff00)
+}
+
 /// Helper to create a character device inode with Major/Minor numbers and 0666 permissions.
 fn make_chardev_inode(ino: u64, major: u64, minor: u64) -> Inode {
     let mut inode = Inode::new(ino, FileType::CharDevice).with_dev(DEVFS_DEV_ID);
-    inode.rdev = (major << 8) | (minor & 0xff);
+    inode.rdev = makedev(major, minor);
     inode.permissions = super::inode::FilePermissions::new(0o666);
     inode
 }

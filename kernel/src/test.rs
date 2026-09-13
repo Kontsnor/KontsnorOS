@@ -3124,15 +3124,15 @@ fn test_devfs_special_nodes() {
     let dev_null = crate::fs::vfs::lookup("/dev/null").expect("/dev/null missing");
     let inode_null = dev_null.inode();
     assert_eq!(inode_null.file_type, crate::fs::inode::FileType::CharDevice);
-    assert_eq!(inode_null.rdev, (1 << 8) | 3);
+    assert_eq!(inode_null.rdev, crate::fs::devfs::makedev(1, 3));
     assert_eq!(inode_null.permissions.mode, 0o666);
 
     let mut buf = [0xAAu8; 16];
     let read_null = dev_null.read(0, &mut buf).expect("read /dev/null failed");
     assert_eq!(read_null, 0, "/dev/null read must return EOF (0 bytes)");
 
-    let write_null = dev_null.write(0, b"test_data").expect("write /dev/null failed");
-    assert_eq!(write_null, 9, "/dev/null write must discard all bytes and return count");
+    let write_null_1024 = dev_null.write(0, &[0u8; 1024]).expect("write /dev/null failed");
+    assert_eq!(write_null_1024, 1024, "/dev/null write 1024 bytes must return Ok(1024)");
 
     let poll_null = dev_null.poll(crate::fs::inode::POLLIN | crate::fs::inode::POLLOUT);
     assert_eq!(poll_null, crate::fs::inode::POLLIN | crate::fs::inode::POLLOUT);
@@ -3141,7 +3141,7 @@ fn test_devfs_special_nodes() {
     let dev_zero = crate::fs::vfs::lookup("/dev/zero").expect("/dev/zero missing");
     let inode_zero = dev_zero.inode();
     assert_eq!(inode_zero.file_type, crate::fs::inode::FileType::CharDevice);
-    assert_eq!(inode_zero.rdev, (1 << 8) | 5);
+    assert_eq!(inode_zero.rdev, crate::fs::devfs::makedev(1, 5));
     assert_eq!(inode_zero.permissions.mode, 0o666);
 
     let read_zero = dev_zero.read(0, &mut buf).expect("read /dev/zero failed");
@@ -3158,7 +3158,7 @@ fn test_devfs_special_nodes() {
     let dev_full = crate::fs::vfs::lookup("/dev/full").expect("/dev/full missing");
     let inode_full = dev_full.inode();
     assert_eq!(inode_full.file_type, crate::fs::inode::FileType::CharDevice);
-    assert_eq!(inode_full.rdev, (1 << 8) | 7);
+    assert_eq!(inode_full.rdev, crate::fs::devfs::makedev(1, 7));
     assert_eq!(inode_full.permissions.mode, 0o666);
 
     let read_full = dev_full.read(0, &mut buf).expect("read /dev/full failed");
@@ -3173,19 +3173,19 @@ fn test_devfs_special_nodes() {
     );
 
     let poll_full = dev_full.poll(crate::fs::inode::POLLIN | crate::fs::inode::POLLOUT);
-    assert_eq!(poll_full, crate::fs::inode::POLLIN | crate::fs::inode::POLLOUT);
+    assert_eq!(poll_full, crate::fs::inode::POLLIN);
 
     // 4. Verify /dev/random & /dev/urandom
     let dev_random = crate::fs::vfs::lookup("/dev/random").expect("/dev/random missing");
     let inode_random = dev_random.inode();
     assert_eq!(inode_random.file_type, crate::fs::inode::FileType::CharDevice);
-    assert_eq!(inode_random.rdev, (1 << 8) | 8);
+    assert_eq!(inode_random.rdev, crate::fs::devfs::makedev(1, 8));
     assert_eq!(inode_random.permissions.mode, 0o666);
 
     let dev_urandom = crate::fs::vfs::lookup("/dev/urandom").expect("/dev/urandom missing");
     let inode_urandom = dev_urandom.inode();
     assert_eq!(inode_urandom.file_type, crate::fs::inode::FileType::CharDevice);
-    assert_eq!(inode_urandom.rdev, (1 << 8) | 9);
+    assert_eq!(inode_urandom.rdev, crate::fs::devfs::makedev(1, 9));
     assert_eq!(inode_urandom.permissions.mode, 0o666);
 
     let mut rand_buf = [0u8; 32];

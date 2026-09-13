@@ -854,10 +854,6 @@ pub fn sys_exit_group(status: i32) -> SyscallResult {
         }
     };
 
-    if current_pid.as_u64() == 1 {
-        crate::fs::vfs::sync_all();
-    }
-
     let tgid = if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
         task_arc.lock().tgid
     } else {

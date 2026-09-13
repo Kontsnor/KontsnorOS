@@ -224,8 +224,6 @@ pub struct ExtFileSystem {
     pub(crate) root_node: TicketLock<Option<Arc<dyn InodeOps>>>,
     pub(crate) self_weak: spin::Mutex<Option<::alloc::sync::Weak<ExtFileSystem>>>,
     pub(crate) inode_cache: TicketLock<BTreeMap<u32, Weak<ExtInode>>>,
-    pub(crate) last_alloc_inode: TicketLock<u32>,
-    pub(crate) last_alloc_block: TicketLock<u32>,
 }
 
 impl ExtFileSystem {
@@ -889,8 +887,6 @@ impl ExtFileSystem {
             root_node: TicketLock::new(None),
             self_weak: spin::Mutex::new(None),
             inode_cache: TicketLock::new(BTreeMap::new()),
-            last_alloc_inode: TicketLock::new(0),
-            last_alloc_block: TicketLock::new(0),
         });
 
         *fs.self_weak.lock() = Some(Arc::downgrade(&fs));
@@ -1166,15 +1162,6 @@ impl InodeOps for ExtInode {
         }
         self.vfs_inode.write().nlink = raw.i_links_count as u32;
         self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?;
-        if raw.i_links_count == 0 {
-            let is_dir = (raw.i_mode & 0xF000) == 0x4000;
-            let raw_copy = *raw;
-            drop(raw);
-            crate::memory::page_cache::page_cache_invalidate_inode(EXT_DEV_ID, self.ino as u64);
-            let _ = self
-                .fs
-                .deallocate_inode_and_blocks(self.ino, &raw_copy, is_dir);
-        }
         Ok(())
     }
 
@@ -1195,7 +1182,6 @@ impl InodeOps for ExtInode {
             return None;
         }
         self.remove_directory_entry(name).ok()?;
-        crate::fs::dcache::dcache_invalidate_entry(self.ino as u64, name);
         Some(node)
     }
 
@@ -1217,7 +1203,6 @@ impl InodeOps for ExtInode {
         raw.i_mtime = now;
         raw.i_ctime = now;
         let _ = self.fs.write_inode(self.ino, &raw);
-        crate::fs::dcache::dcache_insert(self.ino as u64, name, node);
         Ok(())
     }
 
@@ -1290,8 +1275,6 @@ impl FileSystem for ExtFileSystem {
                 let _ = crate::memory::page_cache::flush_all_for_inode(&inode);
             }
         }
-
-        let _ = self.device.flush();
     }
 
     fn statfs(&self) -> FsStats {

@@ -350,19 +350,10 @@ pub fn sys_fsync(fd: i32) -> SyscallResult {
         None => return Errno::EBADF.into(),
     };
 
-    let res = match crate::memory::page_cache::flush_all_for_inode(&file_desc.inode) {
+    match crate::memory::page_cache::flush_all_for_inode(&file_desc.inode) {
         Ok(_) => 0,
         Err(e) => e as SyscallResult,
-    };
-
-    if let Some(ref path) = file_desc.path {
-        let (parent_path, _) = crate::fs::path::split_path(path);
-        if let Some(parent_inode) = crate::fs::vfs::lookup(parent_path) {
-            let _ = crate::memory::page_cache::flush_all_for_inode(&parent_inode);
-        }
     }
-
-    res
 }
 
 /// `sync()` — Commit all filesystem caches to disk.

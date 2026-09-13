@@ -33,53 +33,6 @@ pub fn count_free_bits(bitmap: &[u8], total_count: u32) -> u32 {
     count
 }
 
-/// Find the index of the first 0 bit in bitmap starting from `start_bit`, up to `total_bits`.
-/// Uses 64-bit word scanning (`u64::from_le_bytes`) for O(1) skipping of full regions.
-fn find_first_zero_bit(bitmap: &[u8], start_bit: u32, total_bits: u32) -> Option<u32> {
-    if start_bit >= total_bits {
-        return None;
-    }
-
-    let mut current_bit = start_bit;
-
-    // 1. Bit-by-bit check until word-aligned (64-bit / 8-byte aligned) or target bit reached
-    while current_bit < total_bits && (current_bit % 64 != 0) {
-        let byte_idx = (current_bit / 8) as usize;
-        let bit_idx = current_bit % 8;
-        if byte_idx < bitmap.len() && (bitmap[byte_idx] & (1 << bit_idx)) == 0 {
-            return Some(current_bit);
-        }
-        current_bit += 1;
-    }
-
-    // 2. Scan word by word (64 bits at a time)
-    while current_bit + 64 <= total_bits {
-        let byte_idx = (current_bit / 8) as usize;
-        if byte_idx + 8 <= bitmap.len() {
-            let word = u64::from_le_bytes(bitmap[byte_idx..byte_idx + 8].try_into().unwrap());
-            if word != !0u64 {
-                let zero_bit = (!word).trailing_zeros();
-                return Some(current_bit + zero_bit);
-            }
-        } else {
-            break;
-        }
-        current_bit += 64;
-    }
-
-    // 3. Scan remaining bits byte/bit at a time
-    while current_bit < total_bits {
-        let byte_idx = (current_bit / 8) as usize;
-        let bit_idx = current_bit % 8;
-        if byte_idx < bitmap.len() && (bitmap[byte_idx] & (1 << bit_idx)) == 0 {
-            return Some(current_bit);
-        }
-        current_bit += 1;
-    }
-
-    None
-}
-
 impl ExtFileSystem {
     /// Allocate a block from the filesystem block bitmap.
     pub fn allocate_block(&self) -> Result<u32, &'static str> {
@@ -91,84 +44,57 @@ impl ExtFileSystem {
         }
 
         let blocks_per_group = sb.s_blocks_per_group;
-        let num_groups = gds.len();
-        let first_data_block = sb.s_first_data_block;
-        let total_blocks = sb.s_blocks_count;
-
-        let last_hint = *self.last_alloc_block.lock();
-        let start_group = if last_hint >= first_data_block {
-            let relative = last_hint - first_data_block;
-            (((relative / blocks_per_group) as usize)).min(num_groups - 1)
-        } else {
-            0
-        };
-
-        for pass in 0..2 {
-            let group_range = if pass == 0 {
-                start_group..num_groups
-            } else {
-                0..start_group
-            };
-
-            for g in group_range {
-                if gds[g].free_blocks_count(self.is_64bit) == 0 {
-                    continue;
-                }
-
-                let group_start_block = (g as u32) * blocks_per_group + first_data_block;
-                let group_blocks = if g == num_groups - 1 {
-                    total_blocks - group_start_block
-                } else {
-                    blocks_per_group
-                };
-
-                let start_bit = if pass == 0 && g == start_group && last_hint >= group_start_block {
-                    (last_hint - group_start_block).min(group_blocks)
-                } else {
-                    0
-                };
-
-                let gd = &mut gds[g];
-                let block_bitmap_loc = gd.block_bitmap(self.is_64bit);
-                let mut bitmap = alloc::vec![0u8; self.block_size as usize];
-                read_blocks(&*self.device, block_bitmap_loc, &mut bitmap, self.block_size)?;
-
-                let found_bit = find_first_zero_bit(&bitmap, start_bit, group_blocks)
-                    .or_else(|| {
-                        if start_bit > 0 {
-                            find_first_zero_bit(&bitmap, 0, start_bit)
-                        } else {
-                            None
-                        }
-                    });
-
-                if let Some(i) = found_bit {
-                    let byte = (i / 8) as usize;
-                    let bit = i % 8;
-                    bitmap[byte] |= 1 << bit;
-
-                    write_blocks(&*self.device, block_bitmap_loc, &bitmap, self.block_size)?;
-
-                    let block_num = group_start_block + i;
-                    *self.last_alloc_block.lock() = block_num + 1;
-
-                    let new_free = sb.free_blocks() - 1;
-                    sb.set_free_blocks(new_free);
-                    gd.set_free_blocks_count(self.is_64bit, gd.free_blocks_count(self.is_64bit) - 1);
-
-                    self.write_superblock(&sb)?;
-                    drop(gds);
-                    self.write_group_descriptors()?;
-
-                    // Zero out the newly allocated block
-                    let zero_buf = alloc::vec![0u8; self.block_size as usize];
-                    write_blocks(&*self.device, block_num as u64, &zero_buf, self.block_size)?;
-
-                    return Ok(block_num);
-                }
+        let mut group_idx = None;
+        for (idx, gd) in gds.iter().enumerate() {
+            if gd.bg_free_blocks_count > 0 {
+                group_idx = Some(idx);
+                break;
             }
         }
+        let g = group_idx.ok_or("No free blocks found in group descriptors")?;
+        let group_blocks = if g == gds.len() - 1 {
+            sb.s_blocks_count - sb.s_first_data_block - (g as u32) * blocks_per_group
+        } else {
+            blocks_per_group
+        };
 
+        let gd = &mut gds[g];
+        let mut bitmap = alloc::vec![0u8; self.block_size as usize];
+        read_blocks(
+            &*self.device,
+            gd.bg_block_bitmap as u64,
+            &mut bitmap,
+            self.block_size,
+        )?;
+
+        for i in 0..group_blocks {
+            let byte = (i / 8) as usize;
+            let bit = i % 8;
+            if (bitmap[byte] & (1 << bit)) == 0 {
+                bitmap[byte] |= 1 << bit;
+                write_blocks(
+                    &*self.device,
+                    gd.bg_block_bitmap as u64,
+                    &bitmap,
+                    self.block_size,
+                )?;
+
+                let block_num = (g as u32) * blocks_per_group + sb.s_first_data_block + i;
+
+                sb.s_free_blocks_count -= 1;
+                gd.bg_free_blocks_count -= 1;
+
+                self.write_superblock(&sb)?;
+                drop(gds);
+                self.write_group_descriptors()?;
+
+                // Zero out the newly allocated block
+                let zero_buf = alloc::vec![0u8; self.block_size as usize];
+                write_blocks(&*self.device, block_num as u64, &zero_buf, self.block_size)?;
+
+                return Ok(block_num);
+            }
+        }
         Err("No free blocks found in bitmap")
     }
 
@@ -227,79 +153,55 @@ impl ExtFileSystem {
         }
 
         let inodes_per_group = self.inodes_per_group;
-        let num_groups = gds.len();
-        let total_inodes = sb.s_inodes_count;
-
-        let last_hint = *self.last_alloc_inode.lock();
-        let start_group = if last_hint > 0 {
-            (((last_hint - 1) / inodes_per_group) as usize).min(num_groups - 1)
-        } else {
-            0
-        };
-
-        for pass in 0..2 {
-            let group_range = if pass == 0 {
-                start_group..num_groups
-            } else {
-                0..start_group
-            };
-
-            for g in group_range {
-                if gds[g].free_inodes_count(self.is_64bit) == 0 {
-                    continue;
-                }
-
-                let group_start_ino = (g as u32) * inodes_per_group + 1;
-                let group_inodes = if g == num_groups - 1 {
-                    total_inodes - (group_start_ino - 1)
-                } else {
-                    inodes_per_group
-                };
-
-                let start_bit = if pass == 0 && g == start_group && last_hint >= group_start_ino {
-                    (last_hint - group_start_ino).min(group_inodes)
-                } else {
-                    0
-                };
-
-                let gd = &mut gds[g];
-                let inode_bitmap_loc = gd.inode_bitmap(self.is_64bit);
-                let mut bitmap = alloc::vec![0u8; self.block_size as usize];
-                read_blocks(&*self.device, inode_bitmap_loc, &mut bitmap, self.block_size)?;
-
-                let found_bit = find_first_zero_bit(&bitmap, start_bit, group_inodes)
-                    .or_else(|| {
-                        if start_bit > 0 {
-                            find_first_zero_bit(&bitmap, 0, start_bit)
-                        } else {
-                            None
-                        }
-                    });
-
-                if let Some(i) = found_bit {
-                    let byte = (i / 8) as usize;
-                    let bit = i % 8;
-                    bitmap[byte] |= 1 << bit;
-
-                    write_blocks(&*self.device, inode_bitmap_loc, &bitmap, self.block_size)?;
-
-                    sb.s_free_inodes_count -= 1;
-                    gd.set_free_inodes_count(self.is_64bit, gd.free_inodes_count(self.is_64bit) - 1);
-                    if is_dir {
-                        gd.set_used_dirs_count(self.is_64bit, gd.used_dirs_count(self.is_64bit) + 1);
-                    }
-
-                    self.write_superblock(&sb)?;
-                    drop(gds);
-                    self.write_group_descriptors()?;
-
-                    let ino = group_start_ino + i;
-                    *self.last_alloc_inode.lock() = ino + 1;
-                    return Ok(ino);
-                }
+        let mut group_idx = None;
+        for (idx, gd) in gds.iter().enumerate() {
+            if gd.bg_free_inodes_count > 0 {
+                group_idx = Some(idx);
+                break;
             }
         }
+        let g = group_idx.ok_or("No free inodes found in group descriptors")?;
+        let group_inodes = if g == gds.len() - 1 {
+            sb.s_inodes_count - (g as u32) * inodes_per_group
+        } else {
+            inodes_per_group
+        };
 
+        let gd = &mut gds[g];
+        let mut bitmap = alloc::vec![0u8; self.block_size as usize];
+        read_blocks(
+            &*self.device,
+            gd.bg_inode_bitmap as u64,
+            &mut bitmap,
+            self.block_size,
+        )?;
+
+        for i in 0..group_inodes {
+            let byte = (i / 8) as usize;
+            let bit = i % 8;
+            if (bitmap[byte] & (1 << bit)) == 0 {
+                bitmap[byte] |= 1 << bit;
+                write_blocks(
+                    &*self.device,
+                    gd.bg_inode_bitmap as u64,
+                    &bitmap,
+                    self.block_size,
+                )?;
+
+                sb.s_free_inodes_count -= 1;
+                gd.bg_free_inodes_count -= 1;
+                if is_dir {
+                    gd.bg_used_dirs_count += 1;
+                }
+
+                self.write_superblock(&sb)?;
+                drop(gds);
+                self.write_group_descriptors()?;
+
+                let ino = (g as u32) * inodes_per_group + i + 1;
+                return Ok(ino);
+            }
+        }
         Err("No free inodes found in bitmap")
     }
 
@@ -394,55 +296,7 @@ impl ExtFileSystem {
         Ok(())
     }
 
-    fn deallocate_extent_node(&self, buf: &[u8]) {
-        if buf.len() < 12 {
-            return;
-        }
-        let header = unsafe {
-            core::ptr::read_unaligned(buf.as_ptr() as *const super::types::Ext4ExtentHeader)
-        };
-        if header.eh_magic != 0xF30A {
-            return;
-        }
-
-        let entries = header.eh_entries as usize;
-        let depth = header.eh_depth;
-
-        if depth == 0 {
-            let entry_size = core::mem::size_of::<super::types::Ext4Extent>();
-            for i in 0..entries {
-                let offset = 12 + i * entry_size;
-                if offset + entry_size <= buf.len() {
-                    let ext = unsafe {
-                        core::ptr::read_unaligned(buf[offset..].as_ptr() as *const super::types::Ext4Extent)
-                    };
-                    let start = ext.start_block();
-                    let len = ext.len() as u64;
-                    for b in 0..len {
-                        let _ = self.deallocate_block((start + b) as u32);
-                    }
-                }
-            }
-        } else {
-            let entry_size = core::mem::size_of::<super::types::Ext4ExtentIdx>();
-            for i in 0..entries {
-                let offset = 12 + i * entry_size;
-                if offset + entry_size <= buf.len() {
-                    let idx = unsafe {
-                        core::ptr::read_unaligned(buf[offset..].as_ptr() as *const super::types::Ext4ExtentIdx)
-                    };
-                    let child_block = idx.leaf_block();
-                    let mut child_buf = alloc::vec![0u8; self.block_size as usize];
-                    if read_blocks(&*self.device, child_block, &mut child_buf, self.block_size).is_ok() {
-                        self.deallocate_extent_node(&child_buf);
-                    }
-                    let _ = self.deallocate_block(child_block as u32);
-                }
-            }
-        }
-    }
-
-    /// Deallocate all data blocks (extents, direct, indirect, double-indirect) and the inode itself.
+    /// Deallocate all data blocks (direct, indirect, double-indirect) and the inode itself.
     pub fn deallocate_inode_and_blocks(
         &self,
         ino: u32,
@@ -453,81 +307,73 @@ impl ExtFileSystem {
         let is_fast_symlink = is_symlink && (raw_inode.i_size < 60 || raw_inode.i_blocks == 0);
 
         if !is_fast_symlink {
-            if (raw_inode.i_flags & super::types::EXT4_EXTENTS_FL) != 0 {
-                let mut root_buf = [0u8; 60];
-                for i in 0..15 {
-                    root_buf[i * 4..i * 4 + 4].copy_from_slice(&raw_inode.i_block[i].to_le_bytes());
+            // Copy array to avoid creating unaligned reference to packed struct field
+            let i_block = raw_inode.i_block;
+            for block in &i_block[0..12] {
+                if *block != 0 {
+                    let _ = self.deallocate_block(*block);
                 }
-                self.deallocate_extent_node(&root_buf);
-            } else {
-                // Copy array to avoid creating unaligned reference to packed struct field
-                let i_block = raw_inode.i_block;
-                for block in &i_block[0..12] {
-                    if *block != 0 {
-                        let _ = self.deallocate_block(*block);
-                    }
-                }
+            }
 
-                // Free indirect block if present
-                let sib = i_block[12];
-                if sib != 0 {
-                    let mut ind_buf = alloc::vec![0u8; self.block_size as usize];
-                    if read_blocks(&*self.device, sib as u64, &mut ind_buf, self.block_size).is_ok() {
-                        let refs_per_block = self.block_size / 4;
-                        for j in 0..refs_per_block {
-                            let ptr_offset = (j * 4) as usize;
-                            let phys_block = u32::from_le_bytes([
-                                ind_buf[ptr_offset],
-                                ind_buf[ptr_offset + 1],
-                                ind_buf[ptr_offset + 2],
-                                ind_buf[ptr_offset + 3],
-                            ]);
-                            if phys_block != 0 {
-                                let _ = self.deallocate_block(phys_block);
-                            }
+            // Free indirect block if present
+            let sib = i_block[12];
+            if sib != 0 {
+                let mut ind_buf = alloc::vec![0u8; self.block_size as usize];
+                if read_blocks(&*self.device, sib as u64, &mut ind_buf, self.block_size).is_ok() {
+                    let refs_per_block = self.block_size / 4;
+                    for j in 0..refs_per_block {
+                        let ptr_offset = (j * 4) as usize;
+                        let phys_block = u32::from_le_bytes([
+                            ind_buf[ptr_offset],
+                            ind_buf[ptr_offset + 1],
+                            ind_buf[ptr_offset + 2],
+                            ind_buf[ptr_offset + 3],
+                        ]);
+                        if phys_block != 0 {
+                            let _ = self.deallocate_block(phys_block);
                         }
                     }
-                    let _ = self.deallocate_block(sib);
                 }
+                let _ = self.deallocate_block(sib);
+            }
 
-                // Free double indirect block if present
-                let dib = i_block[13];
-                if dib != 0 {
-                    let mut dib_buf = alloc::vec![0u8; self.block_size as usize];
-                    if read_blocks(&*self.device, dib as u64, &mut dib_buf, self.block_size).is_ok() {
-                        let refs_per_block = self.block_size / 4;
-                        for i in 0..refs_per_block {
-                            let sib_offset = (i * 4) as usize;
-                            let sib = u32::from_le_bytes([
-                                dib_buf[sib_offset],
-                                dib_buf[sib_offset + 1],
-                                dib_buf[sib_offset + 2],
-                                dib_buf[sib_offset + 3],
-                            ]);
-                            if sib != 0 {
-                                let mut sib_buf = alloc::vec![0u8; self.block_size as usize];
-                                if read_blocks(&*self.device, sib as u64, &mut sib_buf, self.block_size)
-                                    .is_ok()
-                                {
-                                    for j in 0..refs_per_block {
-                                        let ptr_offset = (j * 4) as usize;
-                                        let phys_block = u32::from_le_bytes([
-                                            sib_buf[ptr_offset],
-                                            sib_buf[ptr_offset + 1],
-                                            sib_buf[ptr_offset + 2],
-                                            sib_buf[ptr_offset + 3],
-                                        ]);
-                                        if phys_block != 0 {
-                                            let _ = self.deallocate_block(phys_block);
-                                        }
+            // Free double indirect block if present
+            let dib = i_block[13];
+            if dib != 0 {
+                let mut dib_buf = alloc::vec![0u8; self.block_size as usize];
+                if read_blocks(&*self.device, dib as u64, &mut dib_buf, self.block_size).is_ok() {
+                    let refs_per_block = self.block_size / 4;
+                    for i in 0..refs_per_block {
+                        let sib_offset = (i * 4) as usize;
+                        let sib = u32::from_le_bytes([
+                            dib_buf[sib_offset],
+                            dib_buf[sib_offset + 1],
+                            dib_buf[sib_offset + 2],
+                            dib_buf[sib_offset + 3],
+                        ]);
+                        if sib != 0 {
+                            let mut sib_buf = alloc::vec![0u8; self.block_size as usize];
+                            if read_blocks(&*self.device, sib as u64, &mut sib_buf, self.block_size)
+                                .is_ok()
+                            {
+                                for j in 0..refs_per_block {
+                                    let ptr_offset = (j * 4) as usize;
+                                    let phys_block = u32::from_le_bytes([
+                                        sib_buf[ptr_offset],
+                                        sib_buf[ptr_offset + 1],
+                                        sib_buf[ptr_offset + 2],
+                                        sib_buf[ptr_offset + 3],
+                                    ]);
+                                    if phys_block != 0 {
+                                        let _ = self.deallocate_block(phys_block);
                                     }
                                 }
-                                let _ = self.deallocate_block(sib);
                             }
+                            let _ = self.deallocate_block(sib);
                         }
                     }
-                    let _ = self.deallocate_block(dib);
                 }
+                let _ = self.deallocate_block(dib);
             }
         }
 

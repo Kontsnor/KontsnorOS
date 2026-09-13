@@ -393,7 +393,6 @@ pub fn handle_packet(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, payload: &[u8]) {
                     listener.tcp_backlog.push(child.clone());
                     super::socket::register_socket(child);
                     listener.wait_queue.wake_all();
-                    crate::fs::epoll::wake_all_epolls();
 
                     // Release the listener lock before sending the SYN|ACK packet to prevent recursive lock deadlock
                     drop(listener);
@@ -449,7 +448,6 @@ fn process_segment(
                 sock.so_error = 111; // ECONNREFUSED
                 sock.tcp_state = TcpState::Closed;
                 sock.wait_queue.wake_all();
-                crate::fs::epoll::wake_all_epolls();
             } else if (flags & TCP_SYN != 0) && (flags & TCP_ACK != 0) {
                 sock.tcp_rcv_nxt = seq.wrapping_add(1);
                 sock.tcp_snd_una = ack;
@@ -459,7 +457,6 @@ fn process_segment(
                 let wnd = rcv_wnd(sock.tcp_recv_buf.len());
                 reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK, wnd));
                 sock.wait_queue.wake_all();
-                crate::fs::epoll::wake_all_epolls();
             }
         }
         TcpState::SynReceived => {
@@ -467,7 +464,6 @@ fn process_segment(
                 sock.tcp_snd_una = ack;
                 sock.tcp_state = TcpState::Established;
                 sock.wait_queue.wake_all();
-                crate::fs::epoll::wake_all_epolls();
             }
         }
         TcpState::Established => {
@@ -475,7 +471,6 @@ fn process_segment(
                 sock.so_error = 104; // ECONNRESET
                 sock.tcp_state = TcpState::Closed;
                 sock.wait_queue.wake_all();
-                crate::fs::epoll::wake_all_epolls();
                 return None;
             }
             if flags & TCP_ACK != 0 {
@@ -578,7 +573,6 @@ fn process_segment(
                         let wnd = rcv_wnd(sock.tcp_recv_buf.len());
                         reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK, wnd));
                         sock.wait_queue.wake_all();
-                        crate::fs::epoll::wake_all_epolls();
                     } else {
                         // Buffer full: ACK with window=0 to stop remote from sending.
                         let wnd = rcv_wnd(sock.tcp_recv_buf.len());
@@ -612,7 +606,6 @@ fn process_segment(
                 let wnd = rcv_wnd(sock.tcp_recv_buf.len());
                 reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK, wnd));
                 sock.wait_queue.wake_all();
-                crate::fs::epoll::wake_all_epolls();
             }
         }
         TcpState::FinWait1 => {
@@ -632,7 +625,6 @@ fn process_segment(
                 reply = Some((sock.tcp_snd_nxt, sock.tcp_rcv_nxt, TCP_ACK, 65535));
                 sock.tcp_state = TcpState::Closed;
                 sock.wait_queue.wake_all();
-                crate::fs::epoll::wake_all_epolls();
             }
         }
         _ => {}

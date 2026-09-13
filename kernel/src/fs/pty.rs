@@ -247,13 +247,11 @@ impl InodeOps for PtyMaster {
         }
 
         self.shared.wait_queue.wake_all();
-        crate::fs::epoll::wake_all_epolls();
 
         if let Some((pgid, sig)) = sig_to_deliver {
             if pgid != 0 {
                 deliver_signal_to_pgrp(pgid, sig);
             }
-            crate::fs::epoll::wake_all_epolls();
         }
 
         Ok(data.len())
@@ -662,51 +660,6 @@ fn pty_router_thread() {
             if byte == b'\r' {
                 byte = b'\n';
             }
-
-            let termios = crate::fs::tty::TTY_TERMIOS.lock();
-            let isig = (termios.c_lflag & 0x00000001) != 0;
-            drop(termios);
-
-            if isig {
-                if byte == 0x03 {
-                    // Ctrl+C -> SIGINT
-                    let mut pgid = *crate::fs::tty::TTY_FOREGROUND_PGID.lock();
-                    if pgid == 0 || pgid == 1 {
-                        pgid = find_foreground_pgid();
-                    }
-                    if pgid != 0 {
-                        deliver_signal_to_pgrp(pgid, 2);
-                    }
-                    crate::fs::epoll::wake_all_epolls();
-                    crate::process::scheduler::yield_now();
-                    continue;
-                } else if byte == 0x1C {
-                    // Ctrl+\ -> SIGQUIT
-                    let mut pgid = *crate::fs::tty::TTY_FOREGROUND_PGID.lock();
-                    if pgid == 0 || pgid == 1 {
-                        pgid = find_foreground_pgid();
-                    }
-                    if pgid != 0 {
-                        deliver_signal_to_pgrp(pgid, 3);
-                    }
-                    crate::fs::epoll::wake_all_epolls();
-                    crate::process::scheduler::yield_now();
-                    continue;
-                } else if byte == 0x1A {
-                    // Ctrl+Z -> SIGTSTP
-                    let mut pgid = *crate::fs::tty::TTY_FOREGROUND_PGID.lock();
-                    if pgid == 0 || pgid == 1 {
-                        pgid = find_foreground_pgid();
-                    }
-                    if pgid != 0 {
-                        deliver_signal_to_pgrp(pgid, 20);
-                    }
-                    crate::fs::epoll::wake_all_epolls();
-                    crate::process::scheduler::yield_now();
-                    continue;
-                }
-            }
-
             crate::drivers::keyboard::push_char(byte);
         }
 

@@ -483,11 +483,11 @@ struct SysInfo {
     totalswap: u64,
     freeswap: u64,
     procs: u16,
-    pad: [u8; 22],
+    pad: u16,
     totalhigh: u64,
     freehigh: u64,
     mem_unit: u32,
-    _pad2: [u8; 8],
+    _pad2: [u8; 4],
 }
 
 /// `sysinfo(info)` — Return overall system information.
@@ -510,11 +510,11 @@ pub fn sys_sysinfo(info: *mut u8) -> SyscallResult {
         totalswap: 0,
         freeswap: 0,
         procs: 1,
-        pad: [0u8; 22],
+        pad: 0,
         totalhigh: 0,
         freehigh: 0,
         mem_unit: 1,
-        _pad2: [0u8; 8],
+        _pad2: [0u8; 4],
     };
     unsafe {
         core::ptr::write(info as *mut SysInfo, si);

@@ -338,6 +338,7 @@ pub fn cleanup_address_space() {
         let old = task.address_space.clone();
         task.address_space = Arc::new(spin::Mutex::new(crate::process::task::AddressSpace {
             page_table_root: kernel_pml4,
+            start_brk: 0,
             brk: 0,
             mmap_bump: 0,
             mmap_regions: alloc::vec::Vec::new(),

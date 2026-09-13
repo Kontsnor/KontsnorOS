@@ -623,7 +623,7 @@ impl InodeOps for ProcFsProcessExe {
 
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
         let exe_path = if let Some((task_arc, _)) = resolve_target_task(self.target_pid) {
-            task_arc.lock().name.clone()
+            task_arc.lock().executable_path.clone()
         } else {
             String::from("/bin/sh")
         };

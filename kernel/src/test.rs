@@ -2057,6 +2057,15 @@ fn test_phase2_features() {
         .expect("read /dev/random failed");
     assert_eq!(r3, 16);
 
+    // --- 1.5. /proc/self/exe ---
+    kprintln!("[test] 1.5. Looking up /proc/self/exe");
+    let self_exe = crate::fs::vfs::lookup_follow("/proc/self/exe", false).expect("/proc/self/exe missing");
+    let mut exe_buf = [0u8; 128];
+    let exe_len = self_exe.read(0, &mut exe_buf).expect("readlink /proc/self/exe failed");
+    let exe_str = core::str::from_utf8(&exe_buf[..exe_len]).unwrap();
+    assert!(!exe_str.is_empty());
+    assert!(exe_str.starts_with('/'));
+
     // --- 2. /proc/self/fd ---
     kprintln!("[test] 2. Looking up /proc/self/fd");
     let fd_dir = crate::fs::vfs::lookup("/proc/self/fd").expect("/proc/self/fd missing");

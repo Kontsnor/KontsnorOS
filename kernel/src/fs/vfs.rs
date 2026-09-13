@@ -355,6 +355,95 @@ pub fn lookup_follow(path: &str, follow_last: bool) -> Option<Arc<dyn InodeOps>>
     VFS.read().as_ref()?.lookup_follow(path, follow_last)
 }
 
+/// Resolve a path to its canonical absolute path string with all symlinks resolved.
+pub fn resolve_canonical(path: &str) -> Option<String> {
+    let vfs = VFS.read();
+    let vfs_ref = vfs.as_ref()?;
+    let mut resolved_path = resolve_relative_path(path);
+    let mut symlink_count = 0;
+
+    loop {
+        let (fs, remaining_path) = vfs_ref.resolve_mount(&resolved_path)?;
+        let root = fs.root()?;
+
+        let mut current = root;
+        let components: Vec<&str> = remaining_path
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .collect();
+
+        let mount_path = if remaining_path == "/" {
+            resolved_path.as_str()
+        } else {
+            &resolved_path[..resolved_path.len() - remaining_path.len()]
+        };
+        let mut resolved_till_now = String::from(mount_path);
+
+        let n_comp = components.len();
+        let mut i = 0;
+        let mut symlink_target: Option<(String, String, Vec<&str>)> = None;
+
+        for component in &components {
+            if let Err(_) =
+                crate::fs::inode::check_permission(current.inode(), crate::fs::inode::MAY_EXEC)
+            {
+                return None;
+            }
+
+            i += 1;
+            let path_key = if resolved_till_now.is_empty() || resolved_till_now == "/" {
+                format!("/{}", component)
+            } else {
+                format!("{}/{}", resolved_till_now, component)
+            };
+
+            let next = current.lookup(component)?;
+
+            if next.inode().file_type == FileType::Symlink {
+                let mut target_buf = alloc::vec![0u8; 4096];
+                if let Ok(n) = next.read(0, &mut target_buf) {
+                    if let Ok(target_str) = core::str::from_utf8(&target_buf[..n]) {
+                        let remainder = components[i..].to_vec();
+                        symlink_target = Some((
+                            resolved_till_now.clone(),
+                            String::from(target_str),
+                            remainder,
+                        ));
+                        break;
+                    }
+                }
+                return None;
+            }
+
+            current = next;
+            resolved_till_now = path_key;
+        }
+
+        if let Some((dir_path, target, remainder)) = symlink_target {
+            symlink_count += 1;
+            if symlink_count > 20 {
+                return None;
+            }
+
+            let mut expanded = if target.starts_with('/') {
+                crate::fs::path::normalize(&target)
+            } else {
+                crate::fs::path::normalize(&crate::fs::path::join(&dir_path, &target))
+            };
+            for comp in remainder {
+                expanded = crate::fs::path::join(&expanded, comp);
+            }
+            resolved_path = crate::fs::path::normalize(&expanded);
+            continue;
+        }
+
+        if resolved_till_now.is_empty() {
+            resolved_till_now = String::from("/");
+        }
+        return Some(resolved_till_now);
+    }
+}
+
 /// Find the filesystem that handles the given path.
 pub fn resolve_mount(path: &str) -> Option<(Arc<dyn FileSystem>, String)> {
     VFS.read().as_ref()?.resolve_mount(path)

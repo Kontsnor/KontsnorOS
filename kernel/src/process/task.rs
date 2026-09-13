@@ -131,6 +131,7 @@ impl core::fmt::Debug for MappedRegion {
 
 pub struct AddressSpace {
     pub page_table_root: u64,
+    pub start_brk: u64,
     pub brk: u64,
     pub mmap_bump: u64,
     pub mmap_regions: Vec<MappedRegion>,
@@ -176,6 +177,9 @@ pub struct Task {
 
     /// Human-readable task name (for debugging).
     pub name: String,
+
+    /// Absolute path of the executed binary for `/proc/self/exe`.
+    pub executable_path: String,
 
     /// Current task state.
     pub state: TaskState,
@@ -319,7 +323,8 @@ impl Task {
 
         Self {
             pid,
-            name,
+            name: name.clone(),
+            executable_path: String::from("/bin/sh"),
             state: TaskState::Ready,
             priority: Priority::default(),
             context: CpuContext {
@@ -328,6 +333,7 @@ impl Task {
             },
             address_space: Arc::new(spin::Mutex::new(AddressSpace {
                 page_table_root,
+                start_brk: 0,
                 brk: 0,
                 mmap_bump: 0x0000_5000_0000_0000u64,
                 mmap_regions: Vec::new(),

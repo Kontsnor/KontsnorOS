@@ -87,6 +87,7 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
             // Copy address space metrics (fork does not share AddressSpace)
             let parent_vm = parent_task.address_space.lock();
             let mut child_vm = child_task.address_space.lock();
+            child_vm.start_brk = parent_vm.start_brk;
             child_vm.brk = parent_vm.brk;
             child_vm.mmap_bump = parent_vm.mmap_bump;
             child_vm.mmap_regions = parent_vm.mmap_regions.clone();
@@ -112,6 +113,7 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
             child_task.pgid = parent_task.pgid;
             child_task.rlimit_nofile_cur = parent_task.rlimit_nofile_cur;
             child_task.rlimit_nofile_max = parent_task.rlimit_nofile_max;
+            child_task.executable_path = parent_task.executable_path.clone();
             child_task.cmdline = parent_task.cmdline.clone();
             child_task.umask = parent_task.umask;
 
@@ -497,6 +499,10 @@ pub fn sys_execve(
         }
     };
 
+    // Resolve canonical absolute path for /proc/self/exe for the final binary
+    let canonical_exec_path = crate::fs::vfs::resolve_canonical(&path)
+        .unwrap_or_else(|| crate::fs::vfs::resolve_relative_path(&path));
+
     // Create a fresh user page table
     let new_page_table = match crate::memory::r#virtual::create_user_page_table() {
         Ok(pt) => pt,
@@ -776,6 +782,7 @@ pub fn sys_execve(
             drop(fd_table);
 
             task.name = path.clone();
+            task.executable_path = canonical_exec_path.clone();
             task.cmdline = argv.clone();
             task.sigaltstack = None; // Reset alternate signal stack on execve
 
@@ -794,6 +801,7 @@ pub fn sys_execve(
             // the old AddressSpace will be dropped and its page table root freed automatically.
             task.address_space = Arc::new(spin::Mutex::new(crate::process::task::AddressSpace {
                 page_table_root: new_page_table,
+                start_brk: initial_brk,
                 brk: initial_brk,
                 mmap_bump: 0x0000_5000_0000_0000u64,
                 mmap_regions: exec_mmap_regions,
@@ -1142,8 +1150,8 @@ pub fn sys_vfork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
 
 /// `brk(addr)` — Set the program break (end of data segment / heap top).
 ///
-/// If `addr` is 0, returns the current break. Otherwise extends the heap
-/// by mapping new pages up to `addr`.
+/// If `addr` is 0 or less than `start_brk`, returns the current break.
+/// Otherwise extends or shrinks the heap up to `addr`.
 pub fn sys_brk(addr: u64) -> SyscallResult {
     use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
     use x86_64::{PhysAddr, VirtAddr};
@@ -1153,71 +1161,106 @@ pub fn sys_brk(addr: u64) -> SyscallResult {
         None => return Errno::ESRCH.into(),
     };
 
-    // Read current brk and page table root
-    let (current_brk, page_table_root) = {
-        if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
-            let task = task_arc.lock();
-            let addr_space = task.address_space.lock();
-            (addr_space.brk, addr_space.page_table_root)
-        } else {
-            return Errno::ESRCH.into();
-        }
+    let task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
     };
 
-    if addr == 0 || addr <= current_brk {
+    let (current_brk, start_brk, page_table_root) = {
+        let task = task_arc.lock();
+        let addr_space = task.address_space.lock();
+        (
+            addr_space.brk,
+            addr_space.start_brk,
+            addr_space.page_table_root,
+        )
+    };
+
+    if addr == 0 || addr < start_brk {
         return current_brk as SyscallResult;
     }
 
-    let old_brk = current_brk;
-    let new_brk = (addr + 4095) & !4095; // page-align up
-
-    // Map pages from old_brk to new_brk
-    let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(old_brk));
-    let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(new_brk - 1));
-
-    let mut mapped_count = 0;
-    for page in Page::range_inclusive(start_page, end_page) {
-        if let Some(phys) = crate::memory::physical::allocate_frame() {
-            let frame = PhysFrame::containing_address(PhysAddr::new(phys));
-            let flags = PageTableFlags::PRESENT
-                | PageTableFlags::WRITABLE
-                | PageTableFlags::USER_ACCESSIBLE
-                | PageTableFlags::NO_EXECUTE;
-            let _ = unsafe {
-                crate::memory::r#virtual::map_user_page_no_shootdown(
-                    page_table_root,
-                    page,
-                    frame,
-                    flags,
-                )
-            };
-            // Zero the new page
-            let dest = (phys + crate::memory::r#virtual::phys_mem_offset()) as *mut u8;
-            unsafe {
-                core::ptr::write_bytes(dest, 0, 4096);
-            }
-            mapped_count += 1;
-        } else {
-            if mapped_count > 0 {
-                crate::arch::x86_64::smp::shootdown_tlb();
-            }
-            return Errno::ENOMEM.into();
-        }
+    if addr == current_brk {
+        return current_brk as SyscallResult;
     }
 
-    if mapped_count > 0 {
-        crate::arch::x86_64::smp::shootdown_tlb();
-    }
+    let aligned_new_brk = (addr + 4095) & !4095;
+    let aligned_current_brk = (current_brk + 4095) & !4095;
 
-    // Update the task's brk
-    {
-        if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+    if aligned_new_brk > aligned_current_brk {
+        // Check for overlap with existing mmap regions
+        {
             let task = task_arc.lock();
-            task.address_space.lock().brk = new_brk;
+            let addr_space = task.address_space.lock();
+            for r in &addr_space.mmap_regions {
+                let r_end = r.start.saturating_add(r.len as u64);
+                if aligned_current_brk < r_end && aligned_new_brk > r.start {
+                    return current_brk as SyscallResult;
+                }
+            }
+        }
+
+        let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(aligned_current_brk));
+        let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(aligned_new_brk - 1));
+
+        let mut mapped_count = 0;
+        for page in Page::range_inclusive(start_page, end_page) {
+            if let Some(phys) = crate::memory::physical::allocate_frame() {
+                let frame = PhysFrame::containing_address(PhysAddr::new(phys));
+                let flags = PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::USER_ACCESSIBLE
+                    | PageTableFlags::NO_EXECUTE;
+                let _ = unsafe {
+                    crate::memory::r#virtual::map_user_page_no_shootdown(
+                        page_table_root,
+                        page,
+                        frame,
+                        flags,
+                    )
+                };
+                let dest = (phys + crate::memory::r#virtual::phys_mem_offset()) as *mut u8;
+                unsafe {
+                    core::ptr::write_bytes(dest, 0, 4096);
+                }
+                mapped_count += 1;
+            } else {
+                if mapped_count > 0 {
+                    crate::arch::x86_64::smp::shootdown_tlb();
+                }
+                return current_brk as SyscallResult;
+            }
+        }
+
+        if mapped_count > 0 {
+            crate::arch::x86_64::smp::shootdown_tlb();
+        }
+    } else if aligned_new_brk < aligned_current_brk {
+        // Shrink heap
+        let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(aligned_new_brk));
+        let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(aligned_current_brk - 1));
+
+        let mut unmapped_count = 0;
+        for page in Page::range_inclusive(start_page, end_page) {
+            if let Ok(phys_addr) = unsafe {
+                crate::memory::r#virtual::unmap_user_page_no_shootdown(page_table_root, page)
+            } {
+                crate::memory::physical::deallocate_frame(phys_addr);
+                unmapped_count += 1;
+            }
+        }
+
+        if unmapped_count > 0 {
+            crate::arch::x86_64::smp::shootdown_tlb();
         }
     }
 
-    new_brk as SyscallResult
+    {
+        let task = task_arc.lock();
+        task.address_space.lock().brk = addr;
+    }
+
+    addr as SyscallResult
 }
 
 /// `arch_prctl()` — Set/get thread base registers (FS_BASE / GS_BASE).
@@ -1389,7 +1432,9 @@ pub fn sys_clone(
             if flags & 0x00000100 != 0 {
                 child_task.address_space = parent_task.address_space.clone();
             } else {
+                let parent_start_brk = parent_task.address_space.lock().start_brk;
                 let mut child_vm = child_task.address_space.lock();
+                child_vm.start_brk = parent_start_brk;
                 child_vm.brk = parent_brk;
                 child_vm.mmap_bump = parent_mmap_bump;
                 child_vm.mmap_regions = mmap_regions.clone();

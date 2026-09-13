@@ -798,13 +798,23 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
     kprintln!("[EXCEPTION] Unhandled Page Fault");
     kprintln!("  Accessed Address: {:#x}", fault_addr.as_u64());
     kprintln!("  Error Code bits: {:#x}", error_code.bits());
+    let user_rsp = stack_frame.stack_pointer.as_u64();
+    let mut return_addr_str = alloc::string::String::from("N/A");
+    if user_rsp != 0 {
+        if let Some(phys) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(user_rsp)) {
+            let virt = phys.as_u64() + crate::memory::r#virtual::phys_mem_offset();
+            let ret_addr = unsafe { *(virt as *const u64) };
+            return_addr_str = alloc::format!("{:#x}", ret_addr);
+        }
+    }
     kprintln!(
-        "  RIP: {:#x}, CS: {:#x}, RFLAGS: {:#x}, RSP: {:#x}, SS: {:#x}",
+        "  RIP: {:#x}, CS: {:#x}, RFLAGS: {:#x}, RSP: {:#x}, SS: {:#x}, RetAddr@RSP: {}",
         stack_frame.instruction_pointer.as_u64(),
         stack_frame.code_segment.0,
         stack_frame.cpu_flags,
-        stack_frame.stack_pointer.as_u64(),
-        stack_frame.stack_segment.0
+        user_rsp,
+        stack_frame.stack_segment.0,
+        return_addr_str
     );
     crate::memory::r#virtual::debug_dump_mapping(fault_addr.as_u64());
 

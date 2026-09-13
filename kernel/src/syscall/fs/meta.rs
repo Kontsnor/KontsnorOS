@@ -598,6 +598,9 @@ pub fn sys_rename_with_resolved_paths(resolved_old: String, resolved_new: String
         if let Some(node) = old_parent.unlink_entry(old_name) {
             let _ = new_parent.rmdir(new_name);
             if new_parent.link_entry(new_name, node.clone()).is_ok() {
+                crate::fs::dcache::dcache_invalidate_entry(old_parent.inode().ino, old_name);
+                crate::fs::dcache::dcache_invalidate_entry(new_parent.inode().ino, new_name);
+                crate::fs::dcache::dcache_insert(new_parent.inode().ino, new_name, node);
                 crate::fs::vfs::invalidate_dentry(&resolved_old);
                 crate::fs::vfs::invalidate_dentry(&resolved_new);
                 return 0;
@@ -673,6 +676,9 @@ pub fn sys_rename_with_resolved_paths(resolved_old: String, resolved_new: String
             // Remove target if it already exists per POSIX
             let _ = new_parent.unlink(new_name);
             if new_parent.link_entry(new_name, node.clone()).is_ok() {
+                crate::fs::dcache::dcache_invalidate_entry(old_parent.inode().ino, old_name);
+                crate::fs::dcache::dcache_invalidate_entry(new_parent.inode().ino, new_name);
+                crate::fs::dcache::dcache_insert(new_parent.inode().ino, new_name, node);
                 crate::fs::vfs::invalidate_dentry(&resolved_old);
                 crate::fs::vfs::invalidate_dentry(&resolved_new);
                 return 0;
@@ -712,6 +718,11 @@ pub fn sys_rename_with_resolved_paths(resolved_old: String, resolved_new: String
         let _ = old_parent.unlink(old_name);
     }
 
+    crate::fs::dcache::dcache_invalidate_entry(old_parent.inode().ino, old_name);
+    crate::fs::dcache::dcache_invalidate_entry(new_parent.inode().ino, new_name);
+    if let Some(new_node) = new_parent.lookup(new_name) {
+        crate::fs::dcache::dcache_insert(new_parent.inode().ino, new_name, new_node);
+    }
     crate::fs::vfs::invalidate_dentry(&resolved_old);
     crate::fs::vfs::invalidate_dentry(&resolved_new);
     0

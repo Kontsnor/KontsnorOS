@@ -1186,6 +1186,7 @@ impl InodeOps for ExtInode {
             return None;
         }
         self.remove_directory_entry(name).ok()?;
+        crate::fs::dcache::dcache_invalidate_entry(self.ino as u64, name);
         Some(node)
     }
 
@@ -1207,6 +1208,7 @@ impl InodeOps for ExtInode {
         raw.i_mtime = now;
         raw.i_ctime = now;
         let _ = self.fs.write_inode(self.ino, &raw);
+        crate::fs::dcache::dcache_insert(self.ino as u64, name, node);
         Ok(())
     }
 
@@ -1279,6 +1281,8 @@ impl FileSystem for ExtFileSystem {
                 let _ = crate::memory::page_cache::flush_all_for_inode(&inode);
             }
         }
+
+        let _ = self.device.flush();
     }
 
     fn statfs(&self) -> FsStats {

@@ -98,7 +98,7 @@ impl ExtFileSystem {
         let last_hint = *self.last_alloc_block.lock();
         let start_group = if last_hint >= first_data_block {
             let relative = last_hint - first_data_block;
-            (relative / blocks_per_group) as usize
+            (((relative / blocks_per_group) as usize)).min(num_groups - 1)
         } else {
             0
         };

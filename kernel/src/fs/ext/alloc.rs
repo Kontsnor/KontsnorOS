@@ -34,8 +34,13 @@ pub fn count_free_bits(bitmap: &[u8], total_count: u32) -> u32 {
 }
 
 impl ExtFileSystem {
-    /// Allocate a block from the filesystem block bitmap.
-    pub fn allocate_block(&self) -> Result<u32, &'static str> {
+    /// Allocate up to `count` contiguous blocks from the filesystem block bitmap.
+    /// Returns `(start_block_num, allocated_count)`.
+    pub fn allocate_blocks_contiguous(
+        &self,
+        preferred_block: u32,
+        count: u32,
+    ) -> Result<(u32, u32), &'static str> {
         let mut sb = self.superblock.lock();
         let mut gds = self.group_descriptors.lock();
 
@@ -45,8 +50,19 @@ impl ExtFileSystem {
 
         let blocks_per_group = sb.s_blocks_per_group;
         let num_groups = gds.len();
+        let requested = count.min(128).min(sb.s_free_blocks_count as u32);
+        if requested == 0 {
+            return Err("No free blocks");
+        }
 
-        for g in 0..num_groups {
+        let start_group = if preferred_block > sb.s_first_data_block {
+            (((preferred_block - sb.s_first_data_block) / blocks_per_group) as usize) % num_groups
+        } else {
+            0
+        };
+
+        for g_offset in 0..num_groups {
+            let g = (start_group + g_offset) % num_groups;
             if gds[g].bg_free_blocks_count == 0 {
                 continue;
             }
@@ -69,33 +85,72 @@ impl ExtFileSystem {
                 continue;
             }
 
+            let mut best_start = None;
+            let mut best_len = 0u32;
+            let mut curr_start = None;
+            let mut curr_len = 0u32;
+
             for i in 0..group_blocks {
                 let byte = (i / 8) as usize;
                 let bit = i % 8;
                 if (bitmap[byte] & (1 << bit)) == 0 {
-                    bitmap[byte] |= 1 << bit;
+                    if curr_start.is_none() {
+                        curr_start = Some(i);
+                        curr_len = 0;
+                    }
+                    curr_len += 1;
+                    if curr_len == requested {
+                        best_start = curr_start;
+                        best_len = curr_len;
+                        break;
+                    }
+                } else {
+                    if curr_len > best_len {
+                        best_start = curr_start;
+                        best_len = curr_len;
+                    }
+                    curr_start = None;
+                    curr_len = 0;
+                }
+            }
+            if curr_len > best_len {
+                best_start = curr_start;
+                best_len = curr_len;
+            }
+
+            if let Some(start_idx) = best_start {
+                if best_len > 0 {
+                    let alloc_len = best_len.min(requested);
+                    for i in start_idx..(start_idx + alloc_len) {
+                        let byte = (i / 8) as usize;
+                        let bit = i % 8;
+                        bitmap[byte] |= 1 << bit;
+                    }
                     write_blocks(&*self.device, block_bitmap_num, &bitmap, self.block_size)?;
 
-                    let block_num = (g as u32) * blocks_per_group + sb.s_first_data_block + i;
+                    let start_block_num = (g as u32) * blocks_per_group + sb.s_first_data_block + start_idx;
 
-                    sb.s_free_blocks_count = sb.s_free_blocks_count.saturating_sub(1);
-                    gds[g].bg_free_blocks_count = gds[g].bg_free_blocks_count.saturating_sub(1);
+                    let free_b = gds[g].free_blocks_count(self.is_64bit);
+                    gds[g].set_free_blocks_count(self.is_64bit, free_b.saturating_sub(alloc_len));
+                    let free_total = sb.free_blocks();
+                    sb.set_free_blocks(free_total.saturating_sub(alloc_len as u64));
 
                     self.write_superblock(&sb)?;
                     drop(gds);
                     self.write_group_descriptors()?;
 
-                    // Zero out the newly allocated block
-                    let zero_buf = alloc::vec![0u8; self.block_size as usize];
-                    write_blocks(&*self.device, block_num as u64, &zero_buf, self.block_size)?;
-
-                    return Ok(block_num);
+                    return Ok((start_block_num, alloc_len));
                 }
             }
             // Group bitmap was full despite descriptor; correct counter and check next group
             gds[g].bg_free_blocks_count = 0;
         }
         Err("No free blocks found in bitmap")
+    }
+
+    /// Allocate a single block from the filesystem block bitmap.
+    pub fn allocate_block(&self) -> Result<u32, &'static str> {
+        self.allocate_blocks_contiguous(0, 1).map(|(block, _)| block)
     }
 
     /// Deallocate a block back to the block bitmap.

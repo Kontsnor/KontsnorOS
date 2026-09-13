@@ -60,7 +60,7 @@ pub fn get_block_device(name: &str) -> Option<Arc<dyn BlockDevice>> {
 
 /// A registered filesystem type.
 pub struct FileSystemType {
-    /// Name of the filesystem (e.g., "tmpfs", "ext2", "devfs").
+    /// Name of the filesystem (e.g., "tmpfs", "ext4", "devfs").
     pub name: String,
     /// Create a new instance of this filesystem.
     pub mount_fn: fn() -> Arc<dyn FileSystem>,
@@ -68,7 +68,7 @@ pub struct FileSystemType {
 
 /// Trait for filesystem implementations.
 ///
-/// Each filesystem (tmpfs, devfs, ext2, etc.) implements this trait
+/// Each filesystem (tmpfs, devfs, ext4, etc.) implements this trait
 /// to provide file operations through a common interface.
 pub trait FileSystem: Send + Sync {
     /// Get the root inode of this filesystem.
@@ -174,6 +174,19 @@ impl Vfs {
     ///
     /// Returns the filesystem and the remaining path within it.
     pub fn resolve_mount(&self, path: &str) -> Option<(Arc<dyn FileSystem>, String)> {
+        // First check current task's private mount namespace if available
+        if let Some(pid) = crate::process::scheduler::current_pid() {
+            if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+                if let Some(task) = task_arc.try_lock() {
+                    let mount_ns = task.fs_ctx.read().mount_ns.clone();
+                    let guard = mount_ns.read();
+                    if let Some(res) = guard.resolve_mount(path) {
+                        return Some(res);
+                    }
+                }
+            }
+        }
+
         // Find the longest matching mount point
         let mut best_match: Option<(&str, &MountEntry)> = None;
 
@@ -533,11 +546,8 @@ pub fn resolve_relative_path(path: &str) -> String {
 
 /// Helper to resolve paths relative to a directory file descriptor.
 pub fn resolve_relative_path_at(dfd: i32, path: &str) -> Result<String, Errno> {
-    if path.starts_with('/') {
-        return Ok(crate::fs::path::normalize(path));
-    }
-    if dfd == -100 {
-        // AT_FDCWD
+    if path.starts_with('/') || dfd == -100 {
+        // AT_FDCWD or absolute path: resolve relative to current task's cwd and jail root.
         return Ok(resolve_relative_path(path));
     }
 
@@ -548,9 +558,8 @@ pub fn resolve_relative_path_at(dfd: i32, path: &str) -> Result<String, Errno> {
     }
 
     let desc_path = desc.path.as_deref().unwrap_or("/");
-    Ok(crate::fs::path::normalize(&crate::fs::path::join(
-        desc_path, path,
-    )))
+    let joined = crate::fs::path::join(desc_path, path);
+    Ok(resolve_relative_path(&joined))
 }
 
 /// Helper to get the current real-world timestamp in seconds.

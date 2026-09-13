@@ -310,14 +310,21 @@ fn gen_mounts() -> String {
         }
         // Device name: use "none" for virtual filesystems, otherwise the fs name.
         let device = match fsname.as_str() {
-            "ext2" | "ext4" => "/dev/vda",
+            "ext" | "ext2" | "ext4" => "/dev/vda",
             _ => "none",
         };
-        out.push_str(&format!("{} {} {} rw,relatime 0 0\n", device, mp, fsname));
+        let display_fs = match fsname.as_str() {
+            "ext" | "ext2" => "ext4",
+            other => other,
+        };
+        out.push_str(&format!(
+            "{} {} {} rw,relatime 0 0\n",
+            device, mp, display_fs
+        ));
     }
     if !has_root {
         // Guarantee a root entry so pacman's mount-point check never fails.
-        out.push_str("/dev/vda / ext2 rw,relatime 0 0\n");
+        out.push_str("/dev/vda / ext4 rw,relatime 0 0\n");
     }
     out
 }

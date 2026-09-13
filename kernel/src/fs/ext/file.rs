@@ -543,6 +543,94 @@ impl ExtInode {
         Ok(written_bytes)
     }
 
+    fn deallocate_extent_node(&self, buf: &[u8]) -> Result<(), &'static str> {
+        if buf.len() < 12 {
+            return Ok(());
+        }
+        // SAFETY: buf is verified to be at least 12 bytes, matching Ext4ExtentHeader layout.
+        let header = unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const Ext4ExtentHeader) };
+        if header.eh_magic != 0xF30A {
+            return Ok(());
+        }
+
+        let entries = header.eh_entries as usize;
+        let depth = header.eh_depth;
+
+        if depth == 0 {
+            let entry_size = core::mem::size_of::<Ext4Extent>();
+            for i in 0..entries {
+                let offset = 12 + i * entry_size;
+                if offset + entry_size <= buf.len() {
+                    // SAFETY: offset + entry_size is checked within buf bounds.
+                    let ext = unsafe {
+                        core::ptr::read_unaligned(buf[offset..].as_ptr() as *const Ext4Extent)
+                    };
+                    let start = ext.start_block();
+                    let len = ext.len() as u64;
+                    for b in 0..len {
+                        let _ = self.fs.deallocate_block((start + b) as u32);
+                    }
+                }
+            }
+        } else {
+            let entry_size = core::mem::size_of::<Ext4ExtentIdx>();
+            for i in 0..entries {
+                let offset = 12 + i * entry_size;
+                if offset + entry_size <= buf.len() {
+                    // SAFETY: offset + entry_size is checked within buf bounds.
+                    let idx = unsafe {
+                        core::ptr::read_unaligned(buf[offset..].as_ptr() as *const Ext4ExtentIdx)
+                    };
+                    let child_block = idx.leaf_block();
+                    let mut child_buf = alloc::vec![0u8; self.fs.block_size as usize];
+                    if read_blocks(
+                        &*self.fs.device,
+                        child_block,
+                        &mut child_buf,
+                        self.fs.block_size,
+                    )
+                    .is_ok()
+                    {
+                        let _ = self.deallocate_extent_node(&child_buf);
+                    }
+                    let _ = self.fs.deallocate_block(child_block as u32);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Deallocate all blocks in an Ext4 extent tree and reinitialize an empty extent root header.
+    pub fn deallocate_extent_tree(&self, i_block: &mut [u32; 15]) -> Result<(), &'static str> {
+        let mut root_buf = [0u8; 60];
+        for i in 0..15 {
+            root_buf[i * 4..i * 4 + 4].copy_from_slice(&i_block[i].to_le_bytes());
+        }
+        self.deallocate_extent_node(&root_buf)?;
+
+        let mut empty_header = [0u8; 60];
+        let eh = Ext4ExtentHeader {
+            eh_magic: 0xF30A,
+            eh_entries: 0,
+            eh_max: 4,
+            eh_depth: 0,
+            eh_generation: 0,
+        };
+        // SAFETY: Size of Ext4ExtentHeader is 12 bytes, fitting within the 60-byte empty_header buffer.
+        unsafe {
+            core::ptr::write_unaligned(empty_header.as_mut_ptr() as *mut Ext4ExtentHeader, eh);
+        }
+        for i in 0..15 {
+            i_block[i] = u32::from_le_bytes([
+                empty_header[i * 4],
+                empty_header[i * 4 + 1],
+                empty_header[i * 4 + 2],
+                empty_header[i * 4 + 3],
+            ]);
+        }
+        Ok(())
+    }
+
     /// Truncate file size to 0.
     pub fn truncate_file(&self, size: u64) -> Result<(), i32> {
         crate::memory::page_cache::page_cache_truncate_inode(
@@ -558,91 +646,98 @@ impl ExtInode {
             let is_fast_symlink = is_symlink && (raw.i_size < 60 || raw.i_blocks == 0);
 
             if !is_fast_symlink {
-                let mut i_block = raw.i_block;
-                for block in &mut i_block[0..12] {
-                    if *block != 0 {
-                        self.fs.deallocate_block(*block).map_err(|_| -5)?;
-                        *block = 0;
-                    }
-                }
-                raw.i_block = i_block;
-
-                let sib = raw.i_block[12];
-                if sib != 0 {
-                    let mut ind_buf = [0u8; 4096];
-                    let block_size = self.fs.block_size as usize;
-                    assert!(block_size <= 4096);
-                    read_blocks(
-                        &*self.fs.device,
-                        sib as u64,
-                        &mut ind_buf[..block_size],
-                        self.fs.block_size,
-                    )
-                    .map_err(|_| -5)?;
-                    let refs_per_block = self.fs.block_size / 4;
-                    for j in 0..refs_per_block {
-                        let ptr_offset = (j * 4) as usize;
-                        let phys_block = u32::from_le_bytes([
-                            ind_buf[ptr_offset],
-                            ind_buf[ptr_offset + 1],
-                            ind_buf[ptr_offset + 2],
-                            ind_buf[ptr_offset + 3],
-                        ]);
-                        if phys_block != 0 {
-                            self.fs.deallocate_block(phys_block).map_err(|_| -5)?;
+                let is_extents = (raw.i_flags & 0x80000) != 0;
+                if is_extents {
+                    let mut i_block = raw.i_block;
+                    let _ = self.deallocate_extent_tree(&mut i_block);
+                    raw.i_block = i_block;
+                } else {
+                    let mut i_block = raw.i_block;
+                    for block in &mut i_block[0..12] {
+                        if *block != 0 {
+                            self.fs.deallocate_block(*block).map_err(|_| -5)?;
+                            *block = 0;
                         }
                     }
-                    self.fs.deallocate_block(sib).map_err(|_| -5)?;
-                    raw.i_block[12] = 0;
-                }
+                    raw.i_block = i_block;
 
-                let dib = raw.i_block[13];
-                if dib != 0 {
-                    let mut dib_buf = [0u8; 4096];
-                    let block_size = self.fs.block_size as usize;
-                    assert!(block_size <= 4096);
-                    read_blocks(
-                        &*self.fs.device,
-                        dib as u64,
-                        &mut dib_buf[..block_size],
-                        self.fs.block_size,
-                    )
-                    .map_err(|_| -5)?;
-                    let refs_per_block = self.fs.block_size / 4;
-                    for i in 0..refs_per_block {
-                        let sib_offset = (i * 4) as usize;
-                        let sib = u32::from_le_bytes([
-                            dib_buf[sib_offset],
-                            dib_buf[sib_offset + 1],
-                            dib_buf[sib_offset + 2],
-                            dib_buf[sib_offset + 3],
-                        ]);
-                        if sib != 0 {
-                            let mut sib_buf = [0u8; 4096];
-                            read_blocks(
-                                &*self.fs.device,
-                                sib as u64,
-                                &mut sib_buf[..block_size],
-                                self.fs.block_size,
-                            )
-                            .map_err(|_| -5)?;
-                            for j in 0..refs_per_block {
-                                let ptr_offset = (j * 4) as usize;
-                                let phys_block = u32::from_le_bytes([
-                                    sib_buf[ptr_offset],
-                                    sib_buf[ptr_offset + 1],
-                                    sib_buf[ptr_offset + 2],
-                                    sib_buf[ptr_offset + 3],
-                                ]);
-                                if phys_block != 0 {
-                                    self.fs.deallocate_block(phys_block).map_err(|_| -5)?;
-                                }
+                    let sib = raw.i_block[12];
+                    if sib != 0 {
+                        let mut ind_buf = [0u8; 4096];
+                        let block_size = self.fs.block_size as usize;
+                        assert!(block_size <= 4096);
+                        read_blocks(
+                            &*self.fs.device,
+                            sib as u64,
+                            &mut ind_buf[..block_size],
+                            self.fs.block_size,
+                        )
+                        .map_err(|_| -5)?;
+                        let refs_per_block = self.fs.block_size / 4;
+                        for j in 0..refs_per_block {
+                            let ptr_offset = (j * 4) as usize;
+                            let phys_block = u32::from_le_bytes([
+                                ind_buf[ptr_offset],
+                                ind_buf[ptr_offset + 1],
+                                ind_buf[ptr_offset + 2],
+                                ind_buf[ptr_offset + 3],
+                            ]);
+                            if phys_block != 0 {
+                                self.fs.deallocate_block(phys_block).map_err(|_| -5)?;
                             }
-                            self.fs.deallocate_block(sib).map_err(|_| -5)?;
                         }
+                        self.fs.deallocate_block(sib).map_err(|_| -5)?;
+                        raw.i_block[12] = 0;
                     }
-                    self.fs.deallocate_block(dib).map_err(|_| -5)?;
-                    raw.i_block[13] = 0;
+
+                    let dib = raw.i_block[13];
+                    if dib != 0 {
+                        let mut dib_buf = [0u8; 4096];
+                        let block_size = self.fs.block_size as usize;
+                        assert!(block_size <= 4096);
+                        read_blocks(
+                            &*self.fs.device,
+                            dib as u64,
+                            &mut dib_buf[..block_size],
+                            self.fs.block_size,
+                        )
+                        .map_err(|_| -5)?;
+                        let refs_per_block = self.fs.block_size / 4;
+                        for i in 0..refs_per_block {
+                            let sib_offset = (i * 4) as usize;
+                            let sib = u32::from_le_bytes([
+                                dib_buf[sib_offset],
+                                dib_buf[sib_offset + 1],
+                                dib_buf[sib_offset + 2],
+                                dib_buf[sib_offset + 3],
+                            ]);
+                            if sib != 0 {
+                                let mut sib_buf = [0u8; 4096];
+                                read_blocks(
+                                    &*self.fs.device,
+                                    sib as u64,
+                                    &mut sib_buf[..block_size],
+                                    self.fs.block_size,
+                                )
+                                .map_err(|_| -5)?;
+                                for j in 0..refs_per_block {
+                                    let ptr_offset = (j * 4) as usize;
+                                    let phys_block = u32::from_le_bytes([
+                                        sib_buf[ptr_offset],
+                                        sib_buf[ptr_offset + 1],
+                                        sib_buf[ptr_offset + 2],
+                                        sib_buf[ptr_offset + 3],
+                                    ]);
+                                    if phys_block != 0 {
+                                        self.fs.deallocate_block(phys_block).map_err(|_| -5)?;
+                                    }
+                                }
+                                self.fs.deallocate_block(sib).map_err(|_| -5)?;
+                            }
+                        }
+                        self.fs.deallocate_block(dib).map_err(|_| -5)?;
+                        raw.i_block[13] = 0;
+                    }
                 }
             }
 

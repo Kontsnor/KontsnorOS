@@ -193,8 +193,13 @@ impl ExtInode {
                     break;
                 }
 
-                if inode != 0 && name_len == child_name.len() && ptr + 8 + name_len <= block_size as usize {
+                if inode != 0
+                    && name_len == child_name.len()
+                    && ptr + 8 + name_len <= block_size as usize
+                {
                     if &block_buf[ptr + 8..ptr + 8 + name_len] == child_name.as_bytes() {
+                        let zero_ino = 0u32;
+                        block_buf[ptr..ptr + 4].copy_from_slice(&zero_ino.to_le_bytes());
                         if let Some(prev) = prev_ptr {
                             let prev_rec_len =
                                 u16::from_le_bytes([block_buf[prev + 4], block_buf[prev + 5]])
@@ -202,17 +207,10 @@ impl ExtInode {
                             let merged_rec_len = (prev_rec_len + rec_len) as u16;
                             block_buf[prev + 4..prev + 6]
                                 .copy_from_slice(&merged_rec_len.to_le_bytes());
-                        } else {
-                            let zero_ino = 0u32;
-                            block_buf[ptr..ptr + 4].copy_from_slice(&zero_ino.to_le_bytes());
                         }
-                        write_blocks(
-                            &*self.fs.device,
-                            phys_block as u64,
-                            &block_buf,
-                            block_size,
-                        )?;
+                        write_blocks(&*self.fs.device, phys_block as u64, &block_buf, block_size)?;
                         crate::fs::dcache::dcache_invalidate_entry(self.ino as u64, child_name);
+                        crate::fs::dcache::dcache_insert_negative(self.ino as u64, child_name);
                         return Ok(inode);
                     }
                 }
@@ -480,10 +478,15 @@ impl ExtInode {
                     break;
                 }
 
-                if inode != 0 && name_len == target_len && ptr + 8 + name_len <= block_size as usize {
+                if inode != 0 && name_len == target_len && ptr + 8 + name_len <= block_size as usize
+                {
                     if &block_buf[ptr + 8..ptr + 8 + name_len] == target_bytes {
                         if let Ok(child_inode) = self.fs.get_inode(inode) {
-                            crate::fs::dcache::dcache_insert(self.ino as u64, name, child_inode.clone());
+                            crate::fs::dcache::dcache_insert(
+                                self.ino as u64,
+                                name,
+                                child_inode.clone(),
+                            );
                             return Some(child_inode);
                         }
                     }

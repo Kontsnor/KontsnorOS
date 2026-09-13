@@ -138,7 +138,7 @@ Signal handling matches the standard Linux x86_64 ABI:
 
 ## 4. Virtual File System (VFS) & Persistent Storage
 
-### 4.1 Ext4/Ext2 Storage Architecture
+### 4.1 Ext4 Storage Architecture
 - **Extents (`EXT4_FEATURE_INCOMPAT_EXTENTS`)**: Filesystem driver supports Ext4 extent trees, replacing indirect blocks with contiguous physical sector extents.
 - **Persistent Writes**: File writes allocate physical data blocks via block bitmaps, update inode size, `mtime`, and `ctime`, and commit group descriptors to persistent disk blocks.
 - **Hard Links & Fast Atomic Rename**: Supports multi-directory hard linking (`sys_linkat`) and POSIX atomic renames (`sys_renameat2`).

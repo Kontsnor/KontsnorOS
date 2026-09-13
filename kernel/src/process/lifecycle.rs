@@ -434,11 +434,7 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
 
     if let Some(ctid) = clear_ctid {
         run_with_scheduler_lock(|sched| {
-            crate::syscall::process::futex::clear_child_tid_wake_locked(
-                current_tgid,
-                ctid,
-                sched,
-            );
+            crate::syscall::process::futex::clear_child_tid_wake_locked(current_tgid, ctid, sched);
         });
     }
 

@@ -260,15 +260,6 @@ pub fn sys_connect(fd: i32, addr_ptr: *const SockAddrIn, addrlen: u32) -> Syscal
         65535,
         &[],
     ) {
-        crate::kprintln!(
-            "[sys_connect] Sending SYN: {}:{} -> {}:{}, seq={}, nonblocking={}",
-            local_ip,
-            local_port,
-            remote_ip,
-            remote_port,
-            tcp_snd_nxt,
-            nonblocking
-        );
         let _ = crate::net::ipv4::send_packet(
             local_ip,
             remote_ip,
@@ -278,7 +269,6 @@ pub fn sys_connect(fd: i32, addr_ptr: *const SockAddrIn, addrlen: u32) -> Syscal
     }
 
     if nonblocking {
-        crate::kprintln!("[sys_connect] Nonblocking, returning -EINPROGRESS");
         return -115; // -EINPROGRESS
     }
 

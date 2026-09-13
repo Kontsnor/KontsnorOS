@@ -31,7 +31,7 @@
 > - **Runs Unmodified Linux Userland**: Boots dynamic `glibc` & `musl` user-spaces, runs stock Arch Linux and Alpine Linux root filesystems, GNU Bash, Python, Coreutils, and our custom container runtime (`ctr_run`).
 > - True Symmetric Multiprocessing (SMP) across 8+ parallel CPU cores with Local APIC timers, IPI preemption, and batched TLB shootdowns.
 > - Full TCP/IP networking stack with Intel `e1000` Gigabit Ethernet DMA ring-buffers and BSD sockets.
-> - Modern persistent Ext2/Ext4 filesystem with extent trees, dirty page cache writeback, and mount-time self-healing FSCK.
+> - Modern persistent Ext4 filesystem with extent trees, dirty page cache writeback, and mount-time self-healing FSCK.
 >
 > *"I run Arch btw (in a namespace with my own kernel in QEMU on Ubuntu on WSL2 on Windows 11)."*
 
@@ -49,7 +49,7 @@ KontsnorOS is a **hybrid kernel** combining the direct-hardware performance of a
 - 📦 **Container Runtime & Linux Namespaces**: Native containerization engine (`ctr_run`) leveraging PID isolation, mount namespaces, `pivot_root`, and pseudo-filesystems (`devpts`, `procfs`, `sysfs`, `tmpfs`).
 - 🍷 **Wine Compatibility Primitives**: Kernel primitives enabling Windows PE binary execution through Wine (`ARCH_SET_GS`/`ARCH_GET_GS`, `MAP_FIXED_NOREPLACE`, Linux `ucontext_t` / `siginfo_t` stack frame construction, and alternate signal stacks).
 - ⚡ **True Parallel SMP Scheduling**: Dynamic ACPI core detection, Local APIC periodic timers, Inter-Processor Interrupts (IPIs) for preemption, lock-free CPU-local scratch registers (`gs:[16]`), and batched TLB shootdowns (Vector 36).
-- 💾 **Persistent Ext2 & Ext4 Storage**: Ext4 extents support (`EXT4_FEATURE_INCOMPAT_EXTENTS`), physical sector allocation, persistent file writes across reboots, dirty page cache writeback, hard links, symlinks, fast atomic rename, and mount-time FSCK self-healing.
+- 💾 **Persistent Ext4 Storage**: Native Ext4 extents support (`EXT4_FEATURE_INCOMPAT_EXTENTS`), 64-bit block numbers, physical sector allocation, persistent file writes across reboots, dirty page cache writeback, hard links, symlinks, fast atomic rename, and mount-time FSCK self-healing.
 - 🌐 **DMA Gigabit Networking & TCP/IP Stack**: Intel `82540EM` (`e1000`) PCI driver with ring-buffer DMA, zero-delay interrupt scheduling, 512KB dynamic receive window scaling, out-of-order TCP segment reassembly, and full BSD socket API.
 - 🖥️ **Interactive Terminal & PTY Subsystem**: Complete pseudo-terminal (`devpts`) driver, cooked (`ICANON`, `ECHO`, `ISIG`) and raw line discipline, process group signal routing (Ctrl+C / `SIGINT`), and session/job control (`TIOCSCTTY`, `TIOCSPGRP`).
 - 🔌 **Driver SDK**: Safe, trait-based driver development framework for character, block, network, and graphics devices under GPLv3.
@@ -80,7 +80,7 @@ KontsnorOS is a **hybrid kernel** combining the direct-hardware performance of a
 │  ┌───────────────┬───────────────────┼───────────────────┬───────────────┐  │
 │  │ SMP Scheduler │ Virtual Memory    │ Virtual File      │ Network Stack │  │
 │  │ Multi-Core    │ 4-Level PML4      │ System (VFS)      │ e1000 Gigabit │  │
-│  │ MLFQ Queues   │ MAP_SHARED / COW  │ Ext4 Extents/Ext2 │ TCP/IP Engine │  │
+│  │ MLFQ Queues   │ MAP_SHARED / COW  │ Ext4 Extents/VFS  │ TCP/IP Engine │  │
 │  │ Robust Futex  │ Page Cache & msync│ devpts / procfs   │ BSD Sockets   │  │
 │  │ APIC & IPI    │ Batched Shootdown │ Bulk Slice Pipes  │ 512KB Window  │  │
 │  └───────────────┴───────────────────┴───────────────────┴───────────────┘  │
@@ -103,7 +103,7 @@ KontsnorOS is a **hybrid kernel** combining the direct-hardware performance of a
   ```bash
   sudo apt install qemu-system-x86
   ```
-* **e2fsprogs** (provides `debugfs` and `mkfs.ext2` tools):
+* **e2fsprogs** (provides `debugfs` and `mkfs.ext4` / `mke2fs` tools):
   ```bash
   sudo apt install e2fsprogs
   ```
@@ -226,7 +226,7 @@ KontsnorOS/
 │       │   ├── signal.rs   # rt_sigaction, ucontext_t, sigaltstack, kill
 │       │   ├── net.rs      # BSD socket syscall routing
 │       │   └── ipc.rs      # System V IPC (shm, sem, msg) & POSIX MQ
-│       ├── fs/             # Virtual File System (Ext2/Ext4, devpts, procfs, sysfs, tmpfs, pipe)
+│       ├── fs/             # Virtual File System (Ext4, devpts, procfs, sysfs, tmpfs, pipe)
 │       ├── net/            # TCP/IP network stack (e1000 driver, ARP, IPv4, TCP, UDP, ICMP)
 │       ├── drivers/        # Built-in drivers (serial, ATA/IDE, keyboard, PCI)
 │       ├── sync/           # TicketLock, SpinMutex, WaitQueue synchronization primitives

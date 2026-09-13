@@ -801,7 +801,9 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
     let user_rsp = stack_frame.stack_pointer.as_u64();
     let mut return_addr_str = alloc::string::String::from("N/A");
     if user_rsp != 0 {
-        if let Some(phys) = crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(user_rsp)) {
+        if let Some(phys) =
+            crate::memory::r#virtual::translate_addr(x86_64::VirtAddr::new(user_rsp))
+        {
             let virt = phys.as_u64() + crate::memory::r#virtual::phys_mem_offset();
             let ret_addr = unsafe { *(virt as *const u64) };
             return_addr_str = alloc::format!("{:#x}", ret_addr);

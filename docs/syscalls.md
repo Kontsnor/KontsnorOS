@@ -93,7 +93,7 @@ The following tables document the 150+ actively handled Linux system calls in Ko
 | 155 | `pivot_root`| **Real** | Change root filesystem (used by container runtime) |
 | 161 | `chroot` | **Real** | Change process root directory |
 | 162 | `sync` | **Real** | Commit all dirty filesystem buffers to disk |
-| 165 | `mount` | **Real** | Mount filesystem (`procfs`, `sysfs`, `devpts`, `tmpfs`, `ext2`) |
+| 165 | `mount` | **Real** | Mount filesystem (`procfs`, `sysfs`, `devpts`, `tmpfs`, `ext4`) |
 | 166 | `umount2` | **Real** | Unmount mounted filesystem |
 | 187 | `readahead`| **Real** | Initiate page cache prefetching |
 | 188..199| `*xattr` | **Real** | Extended attributes get, set, list, and remove |

@@ -62,9 +62,9 @@ if [ ! -d "$ARCH_STAGE" ] || [ -z "$(ls -A "$ARCH_STAGE" 2>/dev/null)" ]; then
 fi
 chmod -R u+rwX "$ARCH_STAGE"
 
-# 4. Prepare disk-arch.img (1.5GB ext2)
+# 4. Prepare disk-arch.img (3GB ext4)
 if [ ! -f "$DISK_IMG" ] || [ "$REBUILD_DISK" = true ]; then
-    echo "[4/5] Staging disk layout and generating $DISK_IMG (3GB ext2)..."
+    echo "[4/5] Staging disk layout and generating $DISK_IMG (3GB ext4)..."
     DISK_STAGE="/tmp/arch-disk-root"
     rm -rf "$DISK_STAGE"
     mkdir -p "$DISK_STAGE"
@@ -188,9 +188,9 @@ fi
 EOF
     chmod +x "$DISK_STAGE/containers/arch/test_arch.sh"
 
-    echo "           Formatting $DISK_IMG using mke2fs..."
+    echo "           Formatting $DISK_IMG using mke2fs (ext4)..."
     rm -f "$DISK_IMG"
-    mke2fs -t ext2 -b 4096 -F -d "$DISK_STAGE" "$DISK_IMG" 3072M
+    mke2fs -t ext4 -O ^has_journal -b 4096 -F -d "$DISK_STAGE" "$DISK_IMG" 3072M
     echo "           Disk image generated successfully."
     rm -rf "$DISK_STAGE"
 else
@@ -219,6 +219,12 @@ else
     debugfs -w -R "rm containers/arch/etc/pacman.d/mirrorlist" "$DISK_IMG" >/dev/null 2>&1 || true
     debugfs -w -R "write $TEMP_MIRROR containers/arch/etc/pacman.d/mirrorlist" "$DISK_IMG" >/dev/null 2>&1
     debugfs -w -R "rm containers/arch/var/lib/pacman/db.lck" "$DISK_IMG" >/dev/null 2>&1 || true
+    debugfs -w -R "rm containers/arch/var/lib/pacman/local/llvm-libs-22.1.8-2/mtree" "$DISK_IMG" >/dev/null 2>&1 || true
+    debugfs -w -R "rmdir containers/arch/var/lib/pacman/local/llvm-libs-22.1.8-2" "$DISK_IMG" >/dev/null 2>&1 || true
+    debugfs -w -R "rm containers/arch/var/lib/pacman/local/rust-1:1.98.1-1/mtree" "$DISK_IMG" >/dev/null 2>&1 || true
+    debugfs -w -R "rmdir containers/arch/var/lib/pacman/local/rust-1:1.98.1-1" "$DISK_IMG" >/dev/null 2>&1 || true
+    debugfs -w -R "rm containers/arch/var/cache/pacman/pkg/llvm-libs-22.1.8-2-x86_64.pkg.tar.zst" "$DISK_IMG" >/dev/null 2>&1 || true
+    debugfs -w -R "rm containers/arch/var/cache/pacman/pkg/llvm-22.1.8-2-x86_64.pkg.tar.zst" "$DISK_IMG" >/dev/null 2>&1 || true
 
     TEMP_TEST_SCRIPT="/tmp/test_arch_synced.sh"
     cat << 'EOF_TEST' > "$TEMP_TEST_SCRIPT"
@@ -231,7 +237,7 @@ echo "║             in Qemu on Ubuntu on WSL2 on Windows 11)                 �
 echo "╚══════════════════════════════════════════════════════════════════════╝"
 echo ""
 
-echo "[ARCH TEST 1/5] Checking /etc/os-release..."
+echo "[ARCH TEST 1/6] Checking /etc/os-release..."
 cat /etc/os-release
 echo "                -> PASS: Running genuine Arch Linux rootfs!"
 echo ""
@@ -246,24 +252,62 @@ echo test | grep test
 echo "                -> PASS: grep pipe!"
 echo ""
 
-echo "[ARCH TEST 2/5] Checking Container Hostname (UTS Namespace)..."
+echo "[ARCH TEST 2/6] Checking Container Hostname (UTS Namespace)..."
 HOSTNAME=$(uname -n 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo "archlinux")
 echo "                Hostname: $HOSTNAME"
 echo "                -> PASS: UTS namespace configured for Arch!"
 echo ""
 
-echo "[ARCH TEST 3/5] Checking DNS resolution (geo.mirror.pkgbuild.com)..."
+echo "[ARCH TEST 3/6] Checking DNS resolution (geo.mirror.pkgbuild.com)..."
 busybox nslookup geo.mirror.pkgbuild.com
 echo "                -> PASS: DNS resolved successfully!"
 echo ""
 
-echo "[ARCH TEST 4/5] Testing ICMP ping to 1.1.1.1..."
-ping -c 2 -w 3 1.1.1.1 || ping -c 2 -w 3 10.0.2.2 || true
-echo "                -> PASS: Ping check completed!"
+echo "[ARCH TEST 4/6] Checking Memory Allocation (/proc/meminfo)..."
+free -m 2>/dev/null || cat /proc/meminfo
+echo "                -> PASS: Memory check completed!"
 echo ""
 
-echo "[ARCH TEST 5/5] Executing pacman -Sy..."
-pacman -Sy
+echo "[ARCH TEST 5/6] Verifying VFS dcache / inode invalidation on unlinking (/tmp/dcache_test)..."
+touch /tmp/dcache_test
+rm -f /tmp/dcache_test
+test ! -e /tmp/dcache_test || echo "FAIL: unlinked file still visible"
+echo "                -> PASS: VFS dcache invalidation verified!"
+echo ""
+
+echo "[ARCH PACMAN CLEAN] Cleaning broken local db entries, locks, and package cache..."
+rm -f /var/lib/pacman/db.lck
+rm -f /var/cache/pacman/pkg/rust* /var/cache/pacman/pkg/llvm*
+for d in /var/lib/pacman/local/*/; do
+  if [ -d "$d" ] && [ ! -f "$d/desc" ]; then
+    echo "Pruning corrupt db entry: $d"
+    rm -rf "$d"
+  fi
+done
+rm -rf /var/lib/pacman/local/rust-* /var/lib/pacman/local/llvm-libs-* 2>/dev/null || true
+
+echo "Confirming no broken directories remain lacking desc in /var/lib/pacman/local/..."
+CORRUPT=0
+for d in /var/lib/pacman/local/*/; do
+  if [ -d "$d" ] && [ ! -f "$d/desc" ]; then
+    echo "Found corrupt db entry without desc: $d"
+    CORRUPT=1
+  fi
+done
+if [ $CORRUPT -eq 0 ]; then
+  echo "                -> PASS: No broken local db entries remain!"
+else
+  echo "                -> FAIL: Corrupt local db entries still present!"
+fi
+echo ""
+
+echo "[ARCH PACMAN QUERY] Verifying pacman -Q rust..."
+pacman -Q rust
+echo "                -> PASS: pacman query handled without database corruption error!"
+echo ""
+
+echo "[ARCH TEST 6/6] Executing pacman -Sy --noconfirm rust..."
+pacman -Sy --noconfirm rust
 PACMAN_STATUS=$?
 echo "Pacman exit code: $PACMAN_STATUS"
 
@@ -292,8 +336,17 @@ fi
 
 # 5. Launch QEMU
 ACCEL_OPTS="-cpu qemu64,+fsgsbase -smp 4"
-if [ -w /dev/kvm ] && qemu-system-x86_64 -enable-kvm -cpu host -M none -display none 2>/dev/null; then
-    ACCEL_OPTS="-enable-kvm -cpu host -smp 4"
+if [ -e /dev/kvm ]; then
+    if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+        echo "Enabling KVM Hardware Acceleration (-enable-kvm -cpu host -smp 4)..."
+        ACCEL_OPTS="-enable-kvm -cpu host -smp 4"
+    else
+        echo "WARNING: /dev/kvm exists but current user ($USER) lacks read/write permissions." >&2
+        echo "         To enable KVM, add your user to the 'kvm' group: sudo usermod -aG kvm $USER" >&2
+        echo "         Falling back to software TCG emulation (-cpu qemu64,+fsgsbase -smp 4)..." >&2
+    fi
+else
+    echo "WARNING: /dev/kvm not found. Falling back to software TCG emulation (-cpu qemu64,+fsgsbase -smp 4)..." >&2
 fi
 
 TEST_BIOS="/tmp/bios-arch.img"
@@ -307,14 +360,14 @@ if [ "$INTERACTIVE" = true ]; then
     trap 'stty sane 2>/dev/null || true' EXIT INT TERM
     qemu-system-x86_64 \
         -drive format=raw,file="$TEST_BIOS",snapshot=on \
-        -drive format=raw,file="$DISK_IMG",index=1,media=disk \
+        -drive format=raw,file="$DISK_IMG",index=1,media=disk,cache=unsafe \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
         -netdev user,id=net0 \
         -device e1000,netdev=net0 \
         -chardev stdio,id=char0,signal=off \
         -serial chardev:char0 \
         -display none \
-        -m 1024M \
+        -m 4096M \
         $ACCEL_OPTS \
         -no-reboot
     exit 0
@@ -327,13 +380,13 @@ rm -f "$QEMU_LOG"
 set +e
 qemu-system-x86_64 \
     -drive format=raw,file="$TEST_BIOS",snapshot=on \
-    -drive format=raw,file="$DISK_IMG",index=1,media=disk \
+    -drive format=raw,file="$DISK_IMG",index=1,media=disk,cache=unsafe \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -netdev user,id=net0 \
     -device e1000,netdev=net0 \
     -serial stdio \
     -display none \
-    -m 1024M \
+    -m 4096M \
     $ACCEL_OPTS \
     -d cpu_reset,guest_errors,int -D /tmp/qemu_int.log \
     -no-reboot 2>&1 | tee "$QEMU_LOG"

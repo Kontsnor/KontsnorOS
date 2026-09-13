@@ -135,6 +135,7 @@ pub fn sys_open_with_resolved_path(resolved_path: String, flags: i32, _mode: u32
                     match parent_inode.create(name, crate::fs::inode::FileType::Regular) {
                         Some(new_i) => {
                             let _ = new_i.set_permissions(file_mode);
+                            crate::fs::vfs::invalidate_dentry(&resolved_path);
                             new_i
                         }
                         None => return Errno::EACCES.into(),

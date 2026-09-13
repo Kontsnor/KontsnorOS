@@ -30,6 +30,9 @@ impl ExtInode {
         child_name: &str,
         child_type: FileType,
     ) -> Result<(), &'static str> {
+        // Invalidate any dcache entry for this (parent_ino, child_name) pair
+        crate::fs::dcache::dcache_invalidate_entry(self.ino as u64, child_name);
+
         let mut raw = self.raw.lock();
         let mut vfs = self.vfs_inode.write();
 
@@ -231,6 +234,11 @@ impl ExtInode {
             return None;
         }
 
+        // Prevent duplicate directory entry creation if name already exists
+        if self.lookup_dir_entry(name).is_some() {
+            return None;
+        }
+
         let is_dir = file_type == FileType::Directory;
         let child_ino = self.fs.allocate_inode(is_dir).ok()?;
 
@@ -293,7 +301,9 @@ impl ExtInode {
             self.vfs_inode.write().nlink = parent_raw.i_links_count as u32;
         }
 
-        self.fs.get_inode(child_ino).ok()
+        let child_node = self.fs.get_inode(child_ino).ok()?;
+        crate::fs::dcache::dcache_insert(self.ino as u64, name, child_node.clone());
+        Some(child_node)
     }
 
     /// Implement VFS unlink.

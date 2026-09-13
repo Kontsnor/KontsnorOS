@@ -3197,5 +3197,26 @@ fn test_devfs_special_nodes() {
     let write_urandom = dev_urandom.write(0, &seed_data).expect("write /dev/urandom failed");
     assert_eq!(write_urandom, 32);
 
+    // 5. Verify directory read/write returns -EISDIR
+    let tmp_dir = crate::fs::vfs::lookup("/tmp").expect("/tmp missing");
+    let fd_dir = crate::process::fd::current_task_alloc_fd(tmp_dir)
+        .expect("Failed to allocate fd for /tmp");
+
+    let sys_read_dir_res = crate::syscall::fs::sys_read(fd_dir, buf.as_mut_ptr(), 16);
+    assert_eq!(
+        sys_read_dir_res,
+        crate::syscall::Errno::EISDIR as i64,
+        "read() on directory must return -EISDIR"
+    );
+
+    let sys_write_dir_res = crate::syscall::fs::sys_write(fd_dir, buf.as_ptr(), 16);
+    assert_eq!(
+        sys_write_dir_res,
+        crate::syscall::Errno::EISDIR as i64,
+        "write() on directory must return -EISDIR"
+    );
+
+    crate::process::fd::current_task_close_fd(fd_dir);
+
     kprintln!("[test] devfs special character device nodes test PASSED!");
 }

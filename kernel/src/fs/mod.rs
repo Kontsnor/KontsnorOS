@@ -168,5 +168,13 @@ pub fn init() {
         crate::fs::vfs::register_block_device(alloc::format!("nvme{}", idx), drive);
     }
 
+    // Auto-mount devfs on container rootfs /dev directories if they exist
+    if vfs::lookup("/containers/arch/dev").is_some() {
+        vfs::mount(alloc::string::String::from("/containers/arch/dev"), devfs::create_devfs());
+    }
+    if vfs::lookup("/containers/alpine/dev").is_some() {
+        vfs::mount(alloc::string::String::from("/containers/alpine/dev"), devfs::create_devfs());
+    }
+
     kprintln!("[fs] VFS initialized with devfs, tmpfs, procfs, ext.");
 }

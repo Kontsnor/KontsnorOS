@@ -229,6 +229,10 @@ pub fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
         None => return Errno::EBADF.into(),
     };
 
+    if file_desc.inode.inode().is_dir() {
+        return Errno::EISDIR.into();
+    }
+
     let mut total_read = 0;
     let mut temp_buf = [0u8; 4096];
 
@@ -276,6 +280,10 @@ pub fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
         Some(d) => d,
         None => return Errno::EBADF.into(),
     };
+
+    if file_desc.inode.inode().is_dir() {
+        return Errno::EISDIR.into();
+    }
 
     let is_pipe = file_desc.inode.inode().file_type == crate::fs::inode::FileType::Pipe;
     if is_pipe && crate::syscall::DEBUG_SYSCALLS {

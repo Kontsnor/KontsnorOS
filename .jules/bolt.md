@@ -7,3 +7,7 @@
 ## 2026-03-30 - Pipe Buffer Ring-Buffer Bulk Slice Copy Optimization
 **Learning:** Performing byte-by-byte loops and modulo operations in `PipeBuffer` (`push`/`pop`) incurs severe CPU overhead and branch mispredictions on large pipe read/write operations (e.g. 64 KiB buffers). Implementing `push_slice` and `pop_slice` with `copy_from_slice` reduces transfer overheads from O(N) loop iterations to at most two O(1) bulk memory copies (`rep movsb`).
 **Action:** When working with ring buffers or IPC stream channels, prefer slice-based contiguous chunk copies over element-by-element push/pop loops.
+
+## 2026-03-30 - Ticket Lock Atomic Memory Ordering Optimization
+**Learning:** Using `Ordering::SeqCst` across kernel spinlocks introduces full sequential consistency CPU memory fences on every lock acquisition and release. Transitioning `TicketLock` to acquire-release semantics (`Acquire` load in lock, `Release` store in unlock/drop, `Relaxed` for ticket allocation/CPU ID tracking) eliminates hardware memory barriers on hot paths while maintaining complete mutual exclusion safety.
+**Action:** Always prefer `Acquire`-`Release` ordering over `SeqCst` for lock/unlock primitives unless global synchronization order across unrelated atomic variables is strictly required.

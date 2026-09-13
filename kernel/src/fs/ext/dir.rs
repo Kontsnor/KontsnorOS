@@ -103,8 +103,9 @@ impl ExtInode {
                         return Ok(true);
                     }
                 } else {
-                    // Reuse deleted slot
-                    if rec_len >= new_entry_min_len {
+                    // Reuse deleted slot (skip checksum tail if present)
+                    let ft = block_buf[ptr + 7];
+                    if ft != 0xDE && rec_len >= new_entry_min_len {
                         block_buf[ptr..ptr + 4].copy_from_slice(&child_ino.to_le_bytes());
                         block_buf[ptr + 6] = child_name.len() as u8;
                         block_buf[ptr + 7] = file_type_byte;
@@ -140,15 +141,34 @@ impl ExtInode {
 
         let mut block_buf = alloc::vec![0u8; block_size as usize];
         block_buf[0..4].copy_from_slice(&child_ino.to_le_bytes());
-        let rec_len = block_size as u16;
+
+        let has_csum = (self.fs.superblock.lock().s_feature_ro_compat
+            & super::types::RO_COMPAT_METADATA_CSUM)
+            != 0;
+        let (rec_len, has_tail) = if has_csum && block_size >= 24 {
+            ((block_size - 12) as u16, true)
+        } else {
+            (block_size as u16, false)
+        };
+
         block_buf[4..6].copy_from_slice(&rec_len.to_le_bytes());
         block_buf[6] = child_name.len() as u8;
         block_buf[7] = file_type_byte;
         block_buf[8..8 + child_name.len()].copy_from_slice(child_name.as_bytes());
 
+        if has_tail {
+            let tail_ptr = (block_size - 12) as usize;
+            // inode = 0, rec_len = 12, name_len = 0, file_type = 0xDE
+            block_buf[tail_ptr..tail_ptr + 4].copy_from_slice(&0u32.to_le_bytes());
+            block_buf[tail_ptr + 4..tail_ptr + 6].copy_from_slice(&12u16.to_le_bytes());
+            block_buf[tail_ptr + 6] = 0;
+            block_buf[tail_ptr + 7] = 0xDE;
+        }
+
         write_blocks(&*self.fs.device, phys_block as u64, &block_buf, block_size)?;
 
         vfs.size += block_size as u64;
+        vfs.blocks = raw.i_blocks as u64;
         raw.i_size = vfs.size as u32;
         self.fs.write_inode(self.ino, &raw)?;
 
@@ -290,7 +310,16 @@ impl ExtInode {
 
         self.fs.write_inode(child_ino, &raw_child).ok()?;
 
-        self.add_directory_entry(child_ino, name, file_type).ok()?;
+        if let Err(e) = self.add_directory_entry(child_ino, name, file_type) {
+            crate::kprintln!(
+                "[create_dir_entry] Failed to add_directory_entry for '{}' (ino {}): {}",
+                name,
+                child_ino,
+                e
+            );
+            let _ = self.fs.deallocate_inode(child_ino, is_dir);
+            return None;
+        }
 
         if is_dir {
             let mut parent_raw = self.raw.lock();

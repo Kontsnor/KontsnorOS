@@ -389,7 +389,10 @@ pub fn sys_mkdir_with_resolved_path(resolved_path: String, _mode: u32) -> Syscal
     }
 
     match parent_inode.mkdir(name) {
-        Some(_) => 0,
+        Some(_) => {
+            crate::fs::vfs::invalidate_dentry(&resolved_path);
+            0
+        }
         None => Errno::EACCES.into(),
     }
 }

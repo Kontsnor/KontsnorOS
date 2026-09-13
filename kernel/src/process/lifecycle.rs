@@ -306,6 +306,15 @@ pub fn cleanup_address_space() {
         None => return,
     };
 
+    let is_shared = {
+        let task = task_arc.lock();
+        Arc::strong_count(&task.address_space) > 1
+    };
+
+    if is_shared {
+        return;
+    }
+
     // 1. Switch CR3 to kernel PML4 first to prevent page table use-after-free
     let kernel_pml4 = crate::memory::r#virtual::kernel_pml4_phys();
     unsafe {
@@ -423,18 +432,10 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
     }
 
     if let Some(ctid) = clear_ctid {
-        if crate::syscall::validation::validate_user_ptr_write(ctid as *mut u8, 4).is_ok() {
-            // SAFETY: validate_user_ptr_write verifies pointer lies in user memory and is writable
-            unsafe {
-                (ctid as *mut u32).write_volatile(0);
-            }
-        }
         run_with_scheduler_lock(|sched| {
-            crate::syscall::process::futex::futex_wake_locked(
+            crate::syscall::process::futex::clear_child_tid_wake_locked(
                 current_tgid,
                 ctid,
-                i32::MAX,
-                0xffffffff,
                 sched,
             );
         });

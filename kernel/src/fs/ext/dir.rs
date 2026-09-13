@@ -30,6 +30,9 @@ impl ExtInode {
         child_name: &str,
         child_type: FileType,
     ) -> Result<(), &'static str> {
+        // Invalidate any dcache entry for this (parent_ino, child_name) pair
+        crate::fs::dcache::dcache_invalidate_entry(self.ino as u64, child_name);
+
         let mut raw = self.raw.lock();
         let mut vfs = self.vfs_inode.write();
 
@@ -44,13 +47,14 @@ impl ExtInode {
         };
 
         let new_entry_min_len = ((8 + child_name.len() + 3) & !3) as usize;
-        let mut offset = 0u64;
 
-        while offset < file_size {
-            let file_block = (offset / block_size as u64) as u32;
-            let phys_block = self.resolve_block_with_raw(&raw, file_block)?;
+        // Fast path: try inserting into the LAST directory block first to avoid O(N^2) scans.
+        let total_blocks = (file_size / block_size as u64) as u32;
+
+        let try_insert_block = |file_block: u32, raw: &ExtRawInode| -> Result<bool, &'static str> {
+            let phys_block = self.resolve_block_with_raw(raw, file_block)?;
             if phys_block == 0 {
-                break;
+                return Ok(false);
             }
 
             let mut block_buf = alloc::vec![0u8; block_size as usize];
@@ -96,7 +100,7 @@ impl ExtInode {
                             .copy_from_slice(child_name.as_bytes());
 
                         write_blocks(&*self.fs.device, phys_block as u64, &block_buf, block_size)?;
-                        return Ok(());
+                        return Ok(true);
                     }
                 } else {
                     // Reuse deleted slot
@@ -108,12 +112,26 @@ impl ExtInode {
                             .copy_from_slice(child_name.as_bytes());
 
                         write_blocks(&*self.fs.device, phys_block as u64, &block_buf, block_size)?;
-                        return Ok(());
+                        return Ok(true);
                     }
                 }
                 ptr += rec_len;
             }
-            offset += block_size as u64;
+            Ok(false)
+        };
+
+        if total_blocks > 0 {
+            let last_file_block = total_blocks - 1;
+            if try_insert_block(last_file_block, &raw)? {
+                return Ok(());
+            }
+        }
+
+        // Fallback: search earlier blocks from end to start if last block had no space
+        for file_block in (0..total_blocks.saturating_sub(1)).rev() {
+            if try_insert_block(file_block, &raw)? {
+                return Ok(());
+            }
         }
 
         // Allocate a new block for the directory if no existing slots found
@@ -175,29 +193,27 @@ impl ExtInode {
                     break;
                 }
 
-                if inode != 0 && name_len == child_name.len() {
-                    let name_bytes = &block_buf[ptr + 8..ptr + 8 + name_len];
-                    if let Ok(name_str) = core::str::from_utf8(name_bytes) {
-                        if name_str == child_name {
-                            if let Some(prev) = prev_ptr {
-                                let prev_rec_len =
-                                    u16::from_le_bytes([block_buf[prev + 4], block_buf[prev + 5]])
-                                        as usize;
-                                let merged_rec_len = (prev_rec_len + rec_len) as u16;
-                                block_buf[prev + 4..prev + 6]
-                                    .copy_from_slice(&merged_rec_len.to_le_bytes());
-                            } else {
-                                let zero_ino = 0u32;
-                                block_buf[ptr..ptr + 4].copy_from_slice(&zero_ino.to_le_bytes());
-                            }
-                            write_blocks(
-                                &*self.fs.device,
-                                phys_block as u64,
-                                &block_buf,
-                                block_size,
-                            )?;
-                            return Ok(inode);
+                if inode != 0 && name_len == child_name.len() && ptr + 8 + name_len <= block_size as usize {
+                    if &block_buf[ptr + 8..ptr + 8 + name_len] == child_name.as_bytes() {
+                        if let Some(prev) = prev_ptr {
+                            let prev_rec_len =
+                                u16::from_le_bytes([block_buf[prev + 4], block_buf[prev + 5]])
+                                    as usize;
+                            let merged_rec_len = (prev_rec_len + rec_len) as u16;
+                            block_buf[prev + 4..prev + 6]
+                                .copy_from_slice(&merged_rec_len.to_le_bytes());
+                        } else {
+                            let zero_ino = 0u32;
+                            block_buf[ptr..ptr + 4].copy_from_slice(&zero_ino.to_le_bytes());
                         }
+                        write_blocks(
+                            &*self.fs.device,
+                            phys_block as u64,
+                            &block_buf,
+                            block_size,
+                        )?;
+                        crate::fs::dcache::dcache_invalidate_entry(self.ino as u64, child_name);
+                        return Ok(inode);
                     }
                 }
 
@@ -215,6 +231,11 @@ impl ExtInode {
             && file_type != FileType::Directory
             && file_type != FileType::Symlink
         {
+            return None;
+        }
+
+        // Prevent duplicate directory entry creation if name already exists
+        if self.lookup_dir_entry(name).is_some() {
             return None;
         }
 
@@ -280,7 +301,9 @@ impl ExtInode {
             self.vfs_inode.write().nlink = parent_raw.i_links_count as u32;
         }
 
-        self.fs.get_inode(child_ino).ok()
+        let child_node = self.fs.get_inode(child_ino).ok()?;
+        crate::fs::dcache::dcache_insert(self.ino as u64, name, child_node.clone());
+        Some(child_node)
     }
 
     /// Implement VFS unlink.
@@ -406,11 +429,73 @@ impl ExtInode {
 
     /// Implement VFS lookup.
     pub fn lookup_dir_entry(&self, name: &str) -> Option<Arc<dyn InodeOps>> {
-        for entry in self.readdir() {
-            if entry.name == name {
-                return self.fs.get_inode(entry.ino as u32).ok();
-            }
+        if let Some(cached) = crate::fs::dcache::dcache_lookup(self.ino as u64, name) {
+            return cached;
         }
+
+        let target_len = name.len();
+        let target_bytes = name.as_bytes();
+
+        let vfs = self.vfs_inode.read();
+        let file_size = vfs.size;
+        let block_size = self.fs.block_size;
+        drop(vfs);
+
+        let mut offset = 0u64;
+        while offset < file_size {
+            let file_block = (offset / block_size as u64) as u32;
+            let phys_block = match self.resolve_block(file_block) {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+
+            if phys_block == 0 {
+                break;
+            }
+
+            let mut block_buf = alloc::vec![0u8; block_size as usize];
+            if read_blocks(
+                &*self.fs.device,
+                phys_block as u64,
+                &mut block_buf,
+                block_size,
+            )
+            .is_err()
+            {
+                break;
+            }
+
+            let mut ptr = 0;
+            while ptr + 8 <= block_size as usize {
+                let inode = u32::from_le_bytes([
+                    block_buf[ptr],
+                    block_buf[ptr + 1],
+                    block_buf[ptr + 2],
+                    block_buf[ptr + 3],
+                ]);
+                let rec_len = u16::from_le_bytes([block_buf[ptr + 4], block_buf[ptr + 5]]) as usize;
+                let name_len = block_buf[ptr + 6] as usize;
+
+                if rec_len == 0 {
+                    break;
+                }
+
+                if inode != 0 && name_len == target_len && ptr + 8 + name_len <= block_size as usize {
+                    if &block_buf[ptr + 8..ptr + 8 + name_len] == target_bytes {
+                        if let Ok(child_inode) = self.fs.get_inode(inode) {
+                            crate::fs::dcache::dcache_insert(self.ino as u64, name, child_inode.clone());
+                            return Some(child_inode);
+                        }
+                    }
+                }
+
+                ptr += rec_len;
+            }
+
+            offset += block_size as u64;
+        }
+
+        crate::fs::dcache::dcache_insert_negative(self.ino as u64, name);
         None
     }
 }

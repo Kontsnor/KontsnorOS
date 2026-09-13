@@ -115,10 +115,7 @@ impl InodeOps for DevNull {
     }
 
     fn poll(&self, _events: u32) -> u32 {
-        super::inode::POLLIN
-            | super::inode::POLLOUT
-            | super::inode::POLLRDNORM
-            | super::inode::POLLWRNORM
+        super::inode::POLLIN | super::inode::POLLOUT
     }
 }
 
@@ -144,10 +141,7 @@ impl InodeOps for DevZero {
     }
 
     fn poll(&self, _events: u32) -> u32 {
-        super::inode::POLLIN
-            | super::inode::POLLOUT
-            | super::inode::POLLRDNORM
-            | super::inode::POLLWRNORM
+        super::inode::POLLIN | super::inode::POLLOUT
     }
 }
 
@@ -173,7 +167,7 @@ impl InodeOps for DevFull {
     }
 
     fn poll(&self, _events: u32) -> u32 {
-        super::inode::POLLIN | super::inode::POLLRDNORM
+        super::inode::POLLIN | super::inode::POLLOUT
     }
 }
 
@@ -223,23 +217,14 @@ impl InodeOps for DevRandom {
     }
 
     fn poll(&self, _events: u32) -> u32 {
-        super::inode::POLLIN
-            | super::inode::POLLOUT
-            | super::inode::POLLRDNORM
-            | super::inode::POLLWRNORM
+        super::inode::POLLIN | super::inode::POLLOUT
     }
-}
-
-/// Standard Linux makedev encoding for 64-bit rdev:
-/// rdev = ((major & 0xfff) << 8) | (minor & 0xff) | ((minor & !0xff) << 12)
-pub const fn makedev(major: u64, minor: u64) -> u64 {
-    ((major & 0xfff) << 8) | (minor & 0xff) | ((minor & !0xff) << 12)
 }
 
 /// Helper to create a character device inode with Major/Minor numbers and 0666 permissions.
 fn make_chardev_inode(ino: u64, major: u64, minor: u64) -> Inode {
     let mut inode = Inode::new(ino, FileType::CharDevice).with_dev(DEVFS_DEV_ID);
-    inode.rdev = makedev(major, minor);
+    inode.rdev = (major << 8) | (minor & 0xff);
     inode.permissions = super::inode::FilePermissions::new(0o666);
     inode
 }
@@ -325,11 +310,7 @@ pub fn init() {
     let devfs = create_devfs();
 
     // Mount at /dev
-    super::vfs::mount(String::from("/dev"), devfs.clone());
-
-    // Automatically mount devfs at container device locations if present
-    super::vfs::mount(String::from("/containers/arch/dev"), devfs.clone());
-    super::vfs::mount(String::from("/containers/alpine/dev"), devfs);
+    super::vfs::mount(String::from("/dev"), devfs);
 
     // Register TTY character devices: stdin, stdout, stderr, tty
     register_device("stdin", super::tty::make_stdin());

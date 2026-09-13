@@ -96,7 +96,7 @@ impl InodeOps for DevFsDir {
     }
 }
 
-/// `/dev/null` — discards all writes, reads return EOF.
+/// `/dev/null` — discards all writes, reads return EOF. (Major 1, Minor 3)
 struct DevNull {
     inode: Inode,
 }
@@ -113,9 +113,13 @@ impl InodeOps for DevNull {
     fn write(&self, _offset: u64, data: &[u8]) -> Result<usize, i32> {
         Ok(data.len()) // Discard all data
     }
+
+    fn poll(&self, _events: u32) -> u32 {
+        super::inode::POLLIN | super::inode::POLLOUT
+    }
 }
 
-/// `/dev/zero` — reads return zero bytes.
+/// `/dev/zero` — reads return zero bytes. (Major 1, Minor 5)
 struct DevZero {
     inode: Inode,
 }
@@ -135,6 +139,36 @@ impl InodeOps for DevZero {
     fn write(&self, _offset: u64, data: &[u8]) -> Result<usize, i32> {
         Ok(data.len())
     }
+
+    fn poll(&self, _events: u32) -> u32 {
+        super::inode::POLLIN | super::inode::POLLOUT
+    }
+}
+
+/// `/dev/full` — reads return zero bytes, writes fail with -ENOSPC. (Major 1, Minor 7)
+struct DevFull {
+    inode: Inode,
+}
+
+impl InodeOps for DevFull {
+    fn inode(&self) -> &Inode {
+        &self.inode
+    }
+
+    fn read(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
+        for byte in buf.iter_mut() {
+            *byte = 0;
+        }
+        Ok(buf.len())
+    }
+
+    fn write(&self, _offset: u64, _data: &[u8]) -> Result<usize, i32> {
+        Err(-28) // -ENOSPC: No space left on device
+    }
+
+    fn poll(&self, _events: u32) -> u32 {
+        super::inode::POLLIN | super::inode::POLLOUT
+    }
 }
 
 /// Dummy /dev/ptmx node so lookup succeeds
@@ -149,6 +183,7 @@ impl InodeOps for DevPtmxDummy {
 }
 
 /// `/dev/random` and `/dev/urandom` — reads return random bytes from the kernel CSPRNG.
+/// Major 1, Minor 8 (/dev/random) and Minor 9 (/dev/urandom).
 struct DevRandom {
     inode: Inode,
 }
@@ -162,13 +197,36 @@ impl InodeOps for DevRandom {
         if crate::crypto::prng::fill_bytes(buf) {
             Ok(buf.len())
         } else {
-            Err(-11) // EAGAIN
+            Err(-11) // -EAGAIN
         }
     }
 
     fn write(&self, _offset: u64, data: &[u8]) -> Result<usize, i32> {
-        Ok(data.len()) // Mock seed write, just accept it
+        if data.len() >= 32 {
+            let mut entropy = [0u8; 32];
+            entropy.copy_from_slice(&data[..32]);
+            crate::crypto::prng::reseed(&entropy);
+        } else if !data.is_empty() {
+            let mut entropy = [0u8; 32];
+            for (i, &b) in data.iter().enumerate() {
+                entropy[i] = b;
+            }
+            crate::crypto::prng::reseed(&entropy);
+        }
+        Ok(data.len())
     }
+
+    fn poll(&self, _events: u32) -> u32 {
+        super::inode::POLLIN | super::inode::POLLOUT
+    }
+}
+
+/// Helper to create a character device inode with Major/Minor numbers and 0666 permissions.
+fn make_chardev_inode(ino: u64, major: u64, minor: u64) -> Inode {
+    let mut inode = Inode::new(ino, FileType::CharDevice).with_dev(DEVFS_DEV_ID);
+    inode.rdev = (major << 8) | (minor & 0xff);
+    inode.permissions = super::inode::FilePermissions::new(0o666);
+    inode
 }
 
 /// Filesystem device ID for devfs.
@@ -179,31 +237,43 @@ pub fn create_devfs() -> Arc<DevFs> {
     let mut entries = BTreeMap::new();
 
     // Create standard device nodes
+    // /dev/null (Major 1, Minor 3)
     entries.insert(
         String::from("null"),
         Arc::new(DevNull {
-            inode: Inode::new(2, FileType::CharDevice).with_dev(DEVFS_DEV_ID),
+            inode: make_chardev_inode(2, 1, 3),
         }) as Arc<dyn InodeOps>,
     );
 
+    // /dev/zero (Major 1, Minor 5)
     entries.insert(
         String::from("zero"),
         Arc::new(DevZero {
-            inode: Inode::new(3, FileType::CharDevice).with_dev(DEVFS_DEV_ID),
+            inode: make_chardev_inode(3, 1, 5),
         }) as Arc<dyn InodeOps>,
     );
 
+    // /dev/full (Major 1, Minor 7)
+    entries.insert(
+        String::from("full"),
+        Arc::new(DevFull {
+            inode: make_chardev_inode(4, 1, 7),
+        }) as Arc<dyn InodeOps>,
+    );
+
+    // /dev/random (Major 1, Minor 8)
     entries.insert(
         String::from("random"),
         Arc::new(DevRandom {
-            inode: Inode::new(16, FileType::CharDevice).with_dev(DEVFS_DEV_ID),
+            inode: make_chardev_inode(16, 1, 8),
         }) as Arc<dyn InodeOps>,
     );
 
+    // /dev/urandom (Major 1, Minor 9)
     entries.insert(
         String::from("urandom"),
         Arc::new(DevRandom {
-            inode: Inode::new(17, FileType::CharDevice).with_dev(DEVFS_DEV_ID),
+            inode: make_chardev_inode(17, 1, 9),
         }) as Arc<dyn InodeOps>,
     );
 

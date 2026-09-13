@@ -49,3 +49,12 @@ pub fn init() {
     interface::init();
     kprintln!("[net] Network stack initialized.");
 }
+
+/// Returns true if the kernel's network stack supports active IPv6 routing.
+///
+/// Currently KontsnorOS runs purely on an IPv4 network stack. Sockets or connection
+/// attempts requesting IPv6 will fast-fail with -EAFNOSUPPORT or -ENETUNREACH
+/// so dual-stack network clients (e.g. libcurl) immediately fall back to IPv4.
+pub fn ipv6_supported() -> bool {
+    false
+}

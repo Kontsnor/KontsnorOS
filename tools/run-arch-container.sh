@@ -105,6 +105,11 @@ if [ ! -f "$DISK_IMG" ] || [ "$REBUILD_DISK" = true ]; then
     echo -e "nameserver 10.0.2.3\nnameserver 1.1.1.1\nnameserver 8.8.8.8" > "$DISK_STAGE/containers/arch/etc/resolv.conf"
     echo "Server = https://geo.mirror.pkgbuild.com/\$repo/os/\$arch" > "$DISK_STAGE/containers/arch/etc/pacman.d/mirrorlist"
 
+    # Prioritize IPv4 in getaddrinfo (RFC 3484 / RFC 6555)
+    sed -i 's/^#precedence ::ffff:0:0\/96  100/precedence ::ffff:0:0\/96 100/' "$DISK_STAGE/containers/arch/etc/gai.conf" 2>/dev/null || true
+    grep -q '^precedence ::ffff:0:0/96 100' "$DISK_STAGE/containers/arch/etc/gai.conf" 2>/dev/null || \
+        echo "precedence ::ffff:0:0/96 100" >> "$DISK_STAGE/containers/arch/etc/gai.conf"
+
     # /etc/mtab must point to /proc/mounts so pacman can determine mount points
     ln -sf /proc/mounts "$DISK_STAGE/containers/arch/etc/mtab"
 
@@ -170,7 +175,22 @@ fi
 echo "                -> PASS: Filesystem safely jailed at Arch root!"
 echo ""
 
-echo "[ARCH TEST 5/5] Executing pacman -Sy..."
+echo "[ARCH TEST 5/6] Stress-testing directory multi-block entry expansion (300 files)..."
+mkdir -p /tmp/stress_dir
+for i in $(seq 1 300); do
+  touch "/tmp/stress_dir/file_$i.txt" || { echo "Failed at $i"; exit 1; }
+done
+COUNT=$(ls /tmp/stress_dir | wc -l)
+echo "                Created files count: $COUNT"
+if [ "$COUNT" -ne 300 ]; then
+    echo "FAILED: Directory multi-block expansion test failed (expected 300, got $COUNT)"
+    exit 3
+fi
+rm -rf /tmp/stress_dir
+echo "                -> PASS: Multi-block directory expansion verified!"
+echo ""
+
+echo "[ARCH TEST 6/6] Executing pacman -Sy..."
 pacman -Sy
 PACMAN_STATUS=$?
 echo "Pacman exit code: $PACMAN_STATUS"
@@ -190,7 +210,7 @@ EOF
 
     echo "           Formatting $DISK_IMG using mke2fs (ext4)..."
     rm -f "$DISK_IMG"
-    mke2fs -t ext4 -O ^has_journal -b 4096 -F -d "$DISK_STAGE" "$DISK_IMG" 3072M
+    mke2fs -t ext4 -O ^has_journal,^metadata_csum -b 4096 -F -d "$DISK_STAGE" "$DISK_IMG" 3072M
     echo "           Disk image generated successfully."
     rm -rf "$DISK_STAGE"
 else
@@ -213,6 +233,17 @@ else
     echo -e "nameserver 10.0.2.3\nnameserver 1.1.1.1\nnameserver 8.8.8.8" > "$TEMP_RESOLV"
     debugfs -w -R "rm containers/arch/etc/resolv.conf" "$DISK_IMG" >/dev/null 2>&1 || true
     debugfs -w -R "write $TEMP_RESOLV containers/arch/etc/resolv.conf" "$DISK_IMG" >/dev/null 2>&1
+
+    TEMP_GAI="/tmp/gai_arch_fixed.conf"
+    if [ -f "$ARCH_STAGE/etc/gai.conf" ]; then
+        cp "$ARCH_STAGE/etc/gai.conf" "$TEMP_GAI"
+        sed -i 's/^#precedence ::ffff:0:0\/96  100/precedence ::ffff:0:0\/96 100/' "$TEMP_GAI"
+        grep -q '^precedence ::ffff:0:0/96 100' "$TEMP_GAI" || echo "precedence ::ffff:0:0/96 100" >> "$TEMP_GAI"
+    else
+        echo "precedence ::ffff:0:0/96 100" > "$TEMP_GAI"
+    fi
+    debugfs -w -R "rm containers/arch/etc/gai.conf" "$DISK_IMG" >/dev/null 2>&1 || true
+    debugfs -w -R "write $TEMP_GAI containers/arch/etc/gai.conf" "$DISK_IMG" >/dev/null 2>&1
 
     TEMP_MIRROR="/tmp/mirror_arch_fixed.conf"
     echo -e "Server = http://geo.mirror.pkgbuild.com/\$repo/os/\$arch\nServer = https://geo.mirror.pkgbuild.com/\$repo/os/\$arch" > "$TEMP_MIRROR"

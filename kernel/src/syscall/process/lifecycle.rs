@@ -112,6 +112,7 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
             child_task.pgid = parent_task.pgid;
             child_task.rlimit_nofile_cur = parent_task.rlimit_nofile_cur;
             child_task.rlimit_nofile_max = parent_task.rlimit_nofile_max;
+            child_task.executable_path = parent_task.executable_path.clone();
             child_task.cmdline = parent_task.cmdline.clone();
             child_task.umask = parent_task.umask;
 
@@ -356,6 +357,10 @@ pub fn sys_execve(
             envp.len()
         );
     }
+
+    // Resolve canonical absolute path for /proc/self/exe
+    let canonical_exec_path = crate::fs::vfs::resolve_canonical(&path)
+        .unwrap_or_else(|| crate::fs::vfs::resolve_relative_path(&path));
 
     // Look up the file in the VFS
     let inode = match crate::fs::vfs::lookup_follow(&path, true) {
@@ -776,6 +781,7 @@ pub fn sys_execve(
             drop(fd_table);
 
             task.name = path.clone();
+            task.executable_path = canonical_exec_path.clone();
             task.cmdline = argv.clone();
             task.sigaltstack = None; // Reset alternate signal stack on execve
 

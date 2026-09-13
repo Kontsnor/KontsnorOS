@@ -177,6 +177,9 @@ pub struct Task {
     /// Human-readable task name (for debugging).
     pub name: String,
 
+    /// Absolute path of the executed binary for `/proc/self/exe`.
+    pub executable_path: String,
+
     /// Current task state.
     pub state: TaskState,
 
@@ -319,7 +322,8 @@ impl Task {
 
         Self {
             pid,
-            name,
+            name: name.clone(),
+            executable_path: String::from("/bin/sh"),
             state: TaskState::Ready,
             priority: Priority::default(),
             context: CpuContext {

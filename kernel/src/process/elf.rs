@@ -487,8 +487,10 @@ pub fn construct_user_stack(
 
     // Allocate 16 bytes for AT_RANDOM value at the top of the stack
     str_pos -= 16;
-    for (i, b) in stack_buf[str_pos..str_pos + 16].iter_mut().enumerate() {
-        *b = (i as u8 + 42) ^ 0xAA;
+    if !crate::crypto::prng::fill_bytes(&mut stack_buf[str_pos..str_pos + 16]) {
+        for (i, b) in stack_buf[str_pos..str_pos + 16].iter_mut().enumerate() {
+            *b = (i as u8 + 42) ^ 0xAA;
+        }
     }
     let random_vaddr = base_vaddr + str_pos as u64;
 

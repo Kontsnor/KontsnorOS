@@ -204,7 +204,7 @@ impl Vfs {
         let mut symlink_count = 0;
 
         loop {
-            let (fs, remaining_path) = self.resolve_mount(&resolved_path)?;
+            let (fs, remaining_path) = resolve_mount(&resolved_path)?;
             let root = fs.root()?;
 
             let mut current = root;
@@ -357,6 +357,23 @@ pub fn lookup_follow(path: &str, follow_last: bool) -> Option<Arc<dyn InodeOps>>
 
 /// Find the filesystem that handles the given path.
 pub fn resolve_mount(path: &str) -> Option<(Arc<dyn FileSystem>, String)> {
+    if let Some(pid) = crate::process::scheduler::current_pid() {
+        if pid.as_u64() > 2 {
+            if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+                if let Some(task) = task_arc.try_lock() {
+                    let ns_arc = task.fs_ctx.read().mount_ns.clone();
+                    drop(task);
+                    let res = ns_arc.read().resolve_mount(path);
+                    if res.is_some() {
+                        return res;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(res) = crate::fs::namespace::INITIAL_MOUNT_NS.read().resolve_mount(path) {
+        return Some(res);
+    }
     VFS.read().as_ref()?.resolve_mount(path)
 }
 

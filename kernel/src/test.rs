@@ -2586,6 +2586,70 @@ fn test_ext_fast_symlink_and_unlinked_open_file() {
 }
 
 #[test_case]
+fn test_ext_small_file_creation_benchmark() {
+    kprintln!("[test] Starting ext small-file creation benchmark test (1,000 files)...");
+
+    let dir_path = b"/disk/bench_dir\0";
+    let dir_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    assert!(dir_addr > 0);
+    // SAFETY: dir_addr is mapped user memory.
+    unsafe {
+        core::ptr::copy_nonoverlapping(dir_path.as_ptr(), dir_addr as *mut u8, dir_path.len());
+    }
+
+    let mkdir_res = crate::syscall::fs::sys_mkdir(dir_addr as *const u8, 0o755);
+    assert_eq!(mkdir_res, 0, "mkdir /disk/bench_dir failed");
+
+    let start_ticks = crate::arch::x86_64::interrupts::timer_ticks();
+
+    let path_buf_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    let data_buf_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    let test_data = [0xABu8; 1024];
+    // SAFETY: data_buf_addr is mapped user memory.
+    unsafe {
+        core::ptr::copy_nonoverlapping(test_data.as_ptr(), data_buf_addr as *mut u8, test_data.len());
+    }
+
+    for i in 0..1000 {
+        let filename = alloc::format!("/disk/bench_dir/file_{}.txt\0", i);
+        let name_bytes = filename.as_bytes();
+        unsafe {
+            core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), path_buf_addr as *mut u8, name_bytes.len());
+        }
+
+        let fd = crate::syscall::fs::sys_open(path_buf_addr as *const u8, 0o102, 0o644); // O_CREAT | O_RDWR
+        assert!(fd >= 0, "open/create file failed");
+
+        let written = crate::syscall::fs::sys_write(fd as i32, data_buf_addr as *const u8, 1024);
+        assert_eq!(written, 1024);
+
+        let close_res = crate::syscall::fs::sys_close(fd as i32);
+        assert_eq!(close_res, 0);
+    }
+
+    let end_ticks = crate::arch::x86_64::interrupts::timer_ticks();
+    let elapsed_ms = (end_ticks.saturating_sub(start_ticks)) * 10;
+    kprintln!("[test] Created 1,000 files in {} ms", elapsed_ms);
+
+    // Clean up created benchmark files and directory
+    for i in 0..1000 {
+        let filename = alloc::format!("/disk/bench_dir/file_{}.txt\0", i);
+        let name_bytes = filename.as_bytes();
+        unsafe {
+            core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), path_buf_addr as *mut u8, name_bytes.len());
+        }
+        let _ = crate::syscall::fs::sys_unlink(path_buf_addr as *const u8);
+    }
+    let _ = crate::syscall::fs::sys_rmdir(dir_addr as *const u8);
+
+    crate::syscall::memory::sys_munmap(dir_addr, 4096);
+    crate::syscall::memory::sys_munmap(path_buf_addr, 4096);
+    crate::syscall::memory::sys_munmap(data_buf_addr, 4096);
+
+    kprintln!("[test] ext small-file creation benchmark test PASSED!");
+}
+
+#[test_case]
 fn test_acpi_find_table_edge_cases() {
     kprintln!("[test] Starting ACPI find_table edge cases test...");
 

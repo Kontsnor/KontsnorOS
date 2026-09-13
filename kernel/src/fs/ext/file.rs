@@ -584,8 +584,157 @@ impl ExtInode {
             return self.allocate_extent_block_chunk(raw, file_block, count);
         }
 
-        let phys = self.get_or_alloc_block(raw, file_block)?;
+        let phys = self.get_or_alloc_indirect_block(raw, file_block)?;
         Ok((phys, 1))
+    }
+
+    /// Helper to retrieve or allocate a block for legacy non-extent indirect files.
+    fn get_or_alloc_indirect_block(
+        &self,
+        raw: &mut ExtRawInode,
+        file_block: u32,
+    ) -> Result<u32, &'static str> {
+        if file_block < 12 {
+            let phys_block = raw.i_block[file_block as usize];
+
+            if phys_block != 0 {
+                return Ok(phys_block);
+            }
+            let new_block = self.fs.allocate_block()?;
+            raw.i_block[file_block as usize] = new_block;
+            raw.i_blocks += self.fs.block_size / 512;
+            self.fs.write_inode(self.ino, raw)?;
+            return Ok(new_block);
+        }
+
+        let indirect_index = file_block - 12;
+        let refs_per_block = self.fs.block_size / 4;
+        if indirect_index < refs_per_block {
+            let mut sib = raw.i_block[12];
+            if sib == 0 {
+                sib = self.fs.allocate_block()?;
+                raw.i_block[12] = sib;
+                raw.i_blocks += self.fs.block_size / 512;
+                self.fs.write_inode(self.ino, raw)?;
+            }
+
+            let mut ind_buf = [0u8; 4096];
+            let block_size = self.fs.block_size as usize;
+            assert!(block_size <= 4096);
+            read_blocks(
+                &*self.fs.device,
+                sib as u64,
+                &mut ind_buf[..block_size],
+                self.fs.block_size,
+            )?;
+
+            let ptr_offset = (indirect_index * 4) as usize;
+            let mut phys_block = u32::from_le_bytes([
+                ind_buf[ptr_offset],
+                ind_buf[ptr_offset + 1],
+                ind_buf[ptr_offset + 2],
+                ind_buf[ptr_offset + 3],
+            ]);
+
+            if phys_block == 0 {
+                phys_block = self.fs.allocate_block()?;
+                let bytes = phys_block.to_le_bytes();
+                ind_buf[ptr_offset..ptr_offset + 4].copy_from_slice(&bytes);
+                write_blocks(
+                    &*self.fs.device,
+                    sib as u64,
+                    &ind_buf[..block_size],
+                    self.fs.block_size,
+                )?;
+
+                raw.i_blocks += self.fs.block_size / 512;
+                self.fs.write_inode(self.ino, raw)?;
+            }
+
+            return Ok(phys_block);
+        }
+
+        let double_index = indirect_index - refs_per_block;
+        let max_double_blocks = refs_per_block * refs_per_block;
+        if double_index < max_double_blocks {
+            let mut dib = raw.i_block[13];
+            if dib == 0 {
+                dib = self.fs.allocate_block()?;
+                raw.i_block[13] = dib;
+                raw.i_blocks += self.fs.block_size / 512;
+                self.fs.write_inode(self.ino, raw)?;
+            }
+
+            let mut dib_buf = [0u8; 4096];
+            let block_size = self.fs.block_size as usize;
+            assert!(block_size <= 4096);
+            read_blocks(
+                &*self.fs.device,
+                dib as u64,
+                &mut dib_buf[..block_size],
+                self.fs.block_size,
+            )?;
+
+            let sib_index = double_index / refs_per_block;
+            let sib_ptr_offset = (sib_index * 4) as usize;
+            let mut sib = u32::from_le_bytes([
+                dib_buf[sib_ptr_offset],
+                dib_buf[sib_ptr_offset + 1],
+                dib_buf[sib_ptr_offset + 2],
+                dib_buf[sib_ptr_offset + 3],
+            ]);
+
+            if sib == 0 {
+                sib = self.fs.allocate_block()?;
+                let bytes = sib.to_le_bytes();
+                dib_buf[sib_ptr_offset..sib_ptr_offset + 4].copy_from_slice(&bytes);
+                write_blocks(
+                    &*self.fs.device,
+                    dib as u64,
+                    &dib_buf[..block_size],
+                    self.fs.block_size,
+                )?;
+
+                raw.i_blocks += self.fs.block_size / 512;
+                self.fs.write_inode(self.ino, raw)?;
+            }
+
+            let mut sib_buf = [0u8; 4096];
+            read_blocks(
+                &*self.fs.device,
+                sib as u64,
+                &mut sib_buf[..block_size],
+                self.fs.block_size,
+            )?;
+
+            let data_index = double_index % refs_per_block;
+            let data_ptr_offset = (data_index * 4) as usize;
+            let mut phys_block = u32::from_le_bytes([
+                sib_buf[data_ptr_offset],
+                sib_buf[data_ptr_offset + 1],
+                sib_buf[data_ptr_offset + 2],
+                sib_buf[data_ptr_offset + 3],
+            ]);
+
+            if phys_block == 0 {
+                phys_block = self.fs.allocate_block()?;
+                let bytes = phys_block.to_le_bytes();
+                sib_buf[data_ptr_offset..data_ptr_offset + 4].copy_from_slice(&bytes);
+                write_blocks(
+                    &*self.fs.device,
+                    sib as u64,
+                    &sib_buf[..block_size],
+                    self.fs.block_size,
+                )?;
+
+                raw.i_blocks += self.fs.block_size / 512;
+                self.fs.write_inode(self.ino, raw)?;
+            }
+
+            return Ok(phys_block);
+        }
+
+        Err("Triple indirect blocks are unsupported in this phase.")
     }
 
     /// Retrieve or dynamically allocate a physical disk block for a file block index.

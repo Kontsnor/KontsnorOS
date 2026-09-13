@@ -33,6 +33,53 @@ pub fn count_free_bits(bitmap: &[u8], total_count: u32) -> u32 {
     count
 }
 
+/// Find the index of the first 0 bit in bitmap starting from `start_bit`, up to `total_bits`.
+/// Uses 64-bit word scanning (`u64::from_le_bytes`) for O(1) skipping of full regions.
+fn find_first_zero_bit(bitmap: &[u8], start_bit: u32, total_bits: u32) -> Option<u32> {
+    if start_bit >= total_bits {
+        return None;
+    }
+
+    let mut current_bit = start_bit;
+
+    // 1. Bit-by-bit check until word-aligned (64-bit / 8-byte aligned) or target bit reached
+    while current_bit < total_bits && (current_bit % 64 != 0) {
+        let byte_idx = (current_bit / 8) as usize;
+        let bit_idx = current_bit % 8;
+        if byte_idx < bitmap.len() && (bitmap[byte_idx] & (1 << bit_idx)) == 0 {
+            return Some(current_bit);
+        }
+        current_bit += 1;
+    }
+
+    // 2. Scan word by word (64 bits at a time)
+    while current_bit + 64 <= total_bits {
+        let byte_idx = (current_bit / 8) as usize;
+        if byte_idx + 8 <= bitmap.len() {
+            let word = u64::from_le_bytes(bitmap[byte_idx..byte_idx + 8].try_into().unwrap());
+            if word != !0u64 {
+                let zero_bit = (!word).trailing_zeros();
+                return Some(current_bit + zero_bit);
+            }
+        } else {
+            break;
+        }
+        current_bit += 64;
+    }
+
+    // 3. Scan remaining bits byte/bit at a time
+    while current_bit < total_bits {
+        let byte_idx = (current_bit / 8) as usize;
+        let bit_idx = current_bit % 8;
+        if byte_idx < bitmap.len() && (bitmap[byte_idx] & (1 << bit_idx)) == 0 {
+            return Some(current_bit);
+        }
+        current_bit += 1;
+    }
+
+    None
+}
+
 impl ExtFileSystem {
     /// Allocate a block from the filesystem block bitmap.
     pub fn allocate_block(&self) -> Result<u32, &'static str> {
@@ -44,57 +91,84 @@ impl ExtFileSystem {
         }
 
         let blocks_per_group = sb.s_blocks_per_group;
-        let mut group_idx = None;
-        for (idx, gd) in gds.iter().enumerate() {
-            if gd.bg_free_blocks_count > 0 {
-                group_idx = Some(idx);
-                break;
-            }
-        }
-        let g = group_idx.ok_or("No free blocks found in group descriptors")?;
-        let group_blocks = if g == gds.len() - 1 {
-            sb.s_blocks_count - sb.s_first_data_block - (g as u32) * blocks_per_group
+        let num_groups = gds.len();
+        let first_data_block = sb.s_first_data_block;
+        let total_blocks = sb.s_blocks_count;
+
+        let last_hint = *self.last_alloc_block.lock();
+        let start_group = if last_hint >= first_data_block {
+            let relative = last_hint - first_data_block;
+            (relative / blocks_per_group) as usize
         } else {
-            blocks_per_group
+            0
         };
 
-        let gd = &mut gds[g];
-        let mut bitmap = alloc::vec![0u8; self.block_size as usize];
-        read_blocks(
-            &*self.device,
-            gd.bg_block_bitmap as u64,
-            &mut bitmap,
-            self.block_size,
-        )?;
+        for pass in 0..2 {
+            let group_range = if pass == 0 {
+                start_group..num_groups
+            } else {
+                0..start_group
+            };
 
-        for i in 0..group_blocks {
-            let byte = (i / 8) as usize;
-            let bit = i % 8;
-            if (bitmap[byte] & (1 << bit)) == 0 {
-                bitmap[byte] |= 1 << bit;
-                write_blocks(
-                    &*self.device,
-                    gd.bg_block_bitmap as u64,
-                    &bitmap,
-                    self.block_size,
-                )?;
+            for g in group_range {
+                if gds[g].free_blocks_count(self.is_64bit) == 0 {
+                    continue;
+                }
 
-                let block_num = (g as u32) * blocks_per_group + sb.s_first_data_block + i;
+                let group_start_block = (g as u32) * blocks_per_group + first_data_block;
+                let group_blocks = if g == num_groups - 1 {
+                    total_blocks - group_start_block
+                } else {
+                    blocks_per_group
+                };
 
-                sb.s_free_blocks_count -= 1;
-                gd.bg_free_blocks_count -= 1;
+                let start_bit = if pass == 0 && g == start_group && last_hint >= group_start_block {
+                    (last_hint - group_start_block).min(group_blocks)
+                } else {
+                    0
+                };
 
-                self.write_superblock(&sb)?;
-                drop(gds);
-                self.write_group_descriptors()?;
+                let gd = &mut gds[g];
+                let block_bitmap_loc = gd.block_bitmap(self.is_64bit);
+                let mut bitmap = alloc::vec![0u8; self.block_size as usize];
+                read_blocks(&*self.device, block_bitmap_loc, &mut bitmap, self.block_size)?;
 
-                // Zero out the newly allocated block
-                let zero_buf = alloc::vec![0u8; self.block_size as usize];
-                write_blocks(&*self.device, block_num as u64, &zero_buf, self.block_size)?;
+                let found_bit = find_first_zero_bit(&bitmap, start_bit, group_blocks)
+                    .or_else(|| {
+                        if start_bit > 0 {
+                            find_first_zero_bit(&bitmap, 0, start_bit)
+                        } else {
+                            None
+                        }
+                    });
 
-                return Ok(block_num);
+                if let Some(i) = found_bit {
+                    let byte = (i / 8) as usize;
+                    let bit = i % 8;
+                    bitmap[byte] |= 1 << bit;
+
+                    write_blocks(&*self.device, block_bitmap_loc, &bitmap, self.block_size)?;
+
+                    let block_num = group_start_block + i;
+                    *self.last_alloc_block.lock() = block_num + 1;
+
+                    let new_free = sb.free_blocks() - 1;
+                    sb.set_free_blocks(new_free);
+                    gd.set_free_blocks_count(self.is_64bit, gd.free_blocks_count(self.is_64bit) - 1);
+
+                    self.write_superblock(&sb)?;
+                    drop(gds);
+                    self.write_group_descriptors()?;
+
+                    // Zero out the newly allocated block
+                    let zero_buf = alloc::vec![0u8; self.block_size as usize];
+                    write_blocks(&*self.device, block_num as u64, &zero_buf, self.block_size)?;
+
+                    return Ok(block_num);
+                }
             }
         }
+
         Err("No free blocks found in bitmap")
     }
 
@@ -153,55 +227,79 @@ impl ExtFileSystem {
         }
 
         let inodes_per_group = self.inodes_per_group;
-        let mut group_idx = None;
-        for (idx, gd) in gds.iter().enumerate() {
-            if gd.bg_free_inodes_count > 0 {
-                group_idx = Some(idx);
-                break;
-            }
-        }
-        let g = group_idx.ok_or("No free inodes found in group descriptors")?;
-        let group_inodes = if g == gds.len() - 1 {
-            sb.s_inodes_count - (g as u32) * inodes_per_group
+        let num_groups = gds.len();
+        let total_inodes = sb.s_inodes_count;
+
+        let last_hint = *self.last_alloc_inode.lock();
+        let start_group = if last_hint > 0 {
+            (((last_hint - 1) / inodes_per_group) as usize).min(num_groups - 1)
         } else {
-            inodes_per_group
+            0
         };
 
-        let gd = &mut gds[g];
-        let mut bitmap = alloc::vec![0u8; self.block_size as usize];
-        read_blocks(
-            &*self.device,
-            gd.bg_inode_bitmap as u64,
-            &mut bitmap,
-            self.block_size,
-        )?;
+        for pass in 0..2 {
+            let group_range = if pass == 0 {
+                start_group..num_groups
+            } else {
+                0..start_group
+            };
 
-        for i in 0..group_inodes {
-            let byte = (i / 8) as usize;
-            let bit = i % 8;
-            if (bitmap[byte] & (1 << bit)) == 0 {
-                bitmap[byte] |= 1 << bit;
-                write_blocks(
-                    &*self.device,
-                    gd.bg_inode_bitmap as u64,
-                    &bitmap,
-                    self.block_size,
-                )?;
-
-                sb.s_free_inodes_count -= 1;
-                gd.bg_free_inodes_count -= 1;
-                if is_dir {
-                    gd.bg_used_dirs_count += 1;
+            for g in group_range {
+                if gds[g].free_inodes_count(self.is_64bit) == 0 {
+                    continue;
                 }
 
-                self.write_superblock(&sb)?;
-                drop(gds);
-                self.write_group_descriptors()?;
+                let group_start_ino = (g as u32) * inodes_per_group + 1;
+                let group_inodes = if g == num_groups - 1 {
+                    total_inodes - (group_start_ino - 1)
+                } else {
+                    inodes_per_group
+                };
 
-                let ino = (g as u32) * inodes_per_group + i + 1;
-                return Ok(ino);
+                let start_bit = if pass == 0 && g == start_group && last_hint >= group_start_ino {
+                    (last_hint - group_start_ino).min(group_inodes)
+                } else {
+                    0
+                };
+
+                let gd = &mut gds[g];
+                let inode_bitmap_loc = gd.inode_bitmap(self.is_64bit);
+                let mut bitmap = alloc::vec![0u8; self.block_size as usize];
+                read_blocks(&*self.device, inode_bitmap_loc, &mut bitmap, self.block_size)?;
+
+                let found_bit = find_first_zero_bit(&bitmap, start_bit, group_inodes)
+                    .or_else(|| {
+                        if start_bit > 0 {
+                            find_first_zero_bit(&bitmap, 0, start_bit)
+                        } else {
+                            None
+                        }
+                    });
+
+                if let Some(i) = found_bit {
+                    let byte = (i / 8) as usize;
+                    let bit = i % 8;
+                    bitmap[byte] |= 1 << bit;
+
+                    write_blocks(&*self.device, inode_bitmap_loc, &bitmap, self.block_size)?;
+
+                    sb.s_free_inodes_count -= 1;
+                    gd.set_free_inodes_count(self.is_64bit, gd.free_inodes_count(self.is_64bit) - 1);
+                    if is_dir {
+                        gd.set_used_dirs_count(self.is_64bit, gd.used_dirs_count(self.is_64bit) + 1);
+                    }
+
+                    self.write_superblock(&sb)?;
+                    drop(gds);
+                    self.write_group_descriptors()?;
+
+                    let ino = group_start_ino + i;
+                    *self.last_alloc_inode.lock() = ino + 1;
+                    return Ok(ino);
+                }
             }
         }
+
         Err("No free inodes found in bitmap")
     }
 

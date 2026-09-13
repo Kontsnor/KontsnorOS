@@ -224,6 +224,8 @@ pub struct ExtFileSystem {
     pub(crate) root_node: TicketLock<Option<Arc<dyn InodeOps>>>,
     pub(crate) self_weak: spin::Mutex<Option<::alloc::sync::Weak<ExtFileSystem>>>,
     pub(crate) inode_cache: TicketLock<BTreeMap<u32, Weak<ExtInode>>>,
+    pub(crate) last_alloc_inode: TicketLock<u32>,
+    pub(crate) last_alloc_block: TicketLock<u32>,
 }
 
 impl ExtFileSystem {
@@ -887,6 +889,8 @@ impl ExtFileSystem {
             root_node: TicketLock::new(None),
             self_weak: spin::Mutex::new(None),
             inode_cache: TicketLock::new(BTreeMap::new()),
+            last_alloc_inode: TicketLock::new(0),
+            last_alloc_block: TicketLock::new(0),
         });
 
         *fs.self_weak.lock() = Some(Arc::downgrade(&fs));

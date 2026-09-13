@@ -57,11 +57,25 @@ impl Drop for AlignedBuffer {
 struct CacheEntry {
     data: Vec<u8>,
     last_access: u64,
+    dirty: bool,
 }
 
 struct BlockCacheInner {
     entries: BTreeMap<u64, CacheEntry>,
     counter: u64,
+}
+
+impl BlockCache {
+    /// Flush a specific dirty cache block to the underlying device if present and dirty.
+    fn flush_entry_internal(device: &dyn BlockDevice, block: u64, entry: &mut CacheEntry) -> Result<(), DriverError> {
+        if entry.dirty {
+            let mut aligned_buf = AlignedBuffer::new(entry.data.len(), 512).ok_or(DriverError::IoError)?;
+            aligned_buf.as_mut_slice().copy_from_slice(&entry.data);
+            device.write_block(block, aligned_buf.as_slice())?;
+            entry.dirty = false;
+        }
+        Ok(())
+    }
 }
 
 /// A wrapper block device driver that caches reads and writes to an underlying block device.
@@ -147,7 +161,9 @@ impl BlockDevice for BlockCache {
                         }
                     }
                     if let Some(b) = lru_block {
-                        inner.entries.remove(&b);
+                        if let Some(mut entry) = inner.entries.remove(&b) {
+                            let _ = Self::flush_entry_internal(&*self.device, b, &mut entry);
+                        }
                     }
                 }
                 inner.entries.insert(
@@ -155,6 +171,7 @@ impl BlockDevice for BlockCache {
                     CacheEntry {
                         data: block_slice.to_vec(),
                         last_access: counter,
+                        dirty: false,
                     },
                 );
                 buf[offset..offset + block_size].copy_from_slice(block_slice);
@@ -175,11 +192,6 @@ impl BlockDevice for BlockCache {
         }
         let num_blocks = data.len() / block_size;
 
-        // Write-through: write the entire range to the physical device first via an aligned buffer
-        let mut aligned_buf = AlignedBuffer::new(data.len(), 512).ok_or(DriverError::IoError)?;
-        aligned_buf.as_mut_slice().copy_from_slice(data);
-        self.device.write_block(block, aligned_buf.as_slice())?;
-
         let mut inner = self.inner.lock();
         inner.counter += 1;
         let counter = inner.counter;
@@ -192,6 +204,7 @@ impl BlockDevice for BlockCache {
             if let Some(entry) = inner.entries.get_mut(&curr_block) {
                 entry.last_access = counter;
                 entry.data.copy_from_slice(block_slice);
+                entry.dirty = true;
             } else {
                 if inner.entries.len() >= self.max_blocks {
                     // Evict LRU entry
@@ -204,7 +217,9 @@ impl BlockDevice for BlockCache {
                         }
                     }
                     if let Some(b) = lru_block {
-                        inner.entries.remove(&b);
+                        if let Some(mut entry) = inner.entries.remove(&b) {
+                            let _ = Self::flush_entry_internal(&*self.device, b, &mut entry);
+                        }
                     }
                 }
                 inner.entries.insert(
@@ -212,6 +227,7 @@ impl BlockDevice for BlockCache {
                     CacheEntry {
                         data: block_slice.to_vec(),
                         last_access: counter,
+                        dirty: true,
                     },
                 );
             }
@@ -229,6 +245,10 @@ impl BlockDevice for BlockCache {
     }
 
     fn flush(&self) -> Result<(), DriverError> {
+        let mut inner = self.inner.lock();
+        for (&b, entry) in inner.entries.iter_mut() {
+            Self::flush_entry_internal(&*self.device, b, entry)?;
+        }
         self.device.flush()
     }
 

@@ -122,6 +122,7 @@ pub enum Errno {
     ENODEV = -19,
     ENOMSG = -42,
     EOPNOTSUPP = -95,
+    EAFNOSUPPORT = -97,
     ENOKEY = -126,
 }
 
@@ -1067,14 +1068,14 @@ pub fn dispatch(
             arg2 as *const *const u8,
             arg3 as *const *const u8,
         ), // execveat
-        323 => -(Errno::ENOSYS as i64),     // userfaultfd
+        323 => Errno::ENOSYS.into(),        // userfaultfd
         329 => memory::sys_mprotect(arg0, arg1 as usize, arg2 as i32), // pkey_mprotect
-        330 => -(Errno::ENOSYS as i64),     // pkey_alloc
+        330 => Errno::ENOSYS.into(),        // pkey_alloc
         331 => 0,                           // pkey_free
         333 => 0,                           // io_pgetevents
-        425 => -(Errno::ENOSYS as i64),     // io_uring_setup
-        426 => -(Errno::ENOSYS as i64),     // io_uring_enter
-        427 => -(Errno::ENOSYS as i64),     // io_uring_register
+        425 => Errno::ENOSYS.into(),        // io_uring_setup
+        426 => Errno::ENOSYS.into(),        // io_uring_enter
+        427 => Errno::ENOSYS.into(),        // io_uring_register
         // Identity
         102 => process::sys_getuid(),
         104 => process::sys_getgid(),
@@ -1146,9 +1147,9 @@ pub fn dispatch(
         ),
 
         // Landlock security subsystem (not implemented -> clean ENOSYS)
-        444 => -(Errno::ENOSYS as i64), // landlock_create_ruleset
-        445 => -(Errno::ENOSYS as i64), // landlock_add_rule
-        446 => -(Errno::ENOSYS as i64), // landlock_restrict_self
+        444 => Errno::ENOSYS.into(), // landlock_create_ruleset
+        445 => Errno::ENOSYS.into(), // landlock_add_rule
+        446 => Errno::ENOSYS.into(), // landlock_restrict_self
 
         _ => {
             kprintln!("[syscall] Unknown syscall: {}", syscall_num);

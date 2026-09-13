@@ -38,7 +38,7 @@ use super::vfs::FileSystem;
 pub const TMPFS_DEV_ID: u64 = 2;
 
 /// Counter for generating unique inode numbers.
-/// Starts at 0x1000_0000_0000_0000 so tmpfs inodes never collide with block device filesystems (e.g. ext2).
+/// Starts at 0x1000_0000_0000_0000 so tmpfs inodes never collide with block device filesystems (e.g. ext4).
 static NEXT_INO: AtomicU64 = AtomicU64::new(0x1000_0000_0000_0000);
 
 fn alloc_ino() -> u64 {

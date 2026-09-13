@@ -73,11 +73,7 @@ pub fn sys_mmap(
         false
     };
 
-    let file_desc = if is_dev_zero {
-        None
-    } else {
-        file_desc
-    };
+    let file_desc = if is_dev_zero { None } else { file_desc };
 
     let current_pid = match scheduler::current_pid() {
         Some(p) => p,

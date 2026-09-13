@@ -14,7 +14,7 @@ gantt
     dateFormat  YYYY-MM-DD
     section Foundational Milestones (Completed)
     True SMP & APIC Scheduling           :done, f1, 2026-01-01, 30d
-    Writable ext2 & VFS Layer            :done, f2, after f1, 25d
+    Writable ext4 & VFS Layer            :done, f2, after f1, 25d
     GNU Bash Shell Integration           :done, f3, after f2, 45d
     e1000 PCI Network Stack              :done, f4, after f3, 30d
     PID 1 Init System & VFS Permissions  :done, f5, after f4, 20d
@@ -48,7 +48,7 @@ gantt
 The initial foundations established the baseline stability of KontsnorOS:
 
 1. **Symmetric Multiprocessing (SMP):** Dynamic detection of logical cores via ACPI, real-mode AP trampoline (`0x8000`), Local APIC periodic timers, Inter-Processor Interrupts (IPIs) for scheduler preemption, fine-grained ticket spinlocks, and TLB Shootdown (Vector 36).
-2. **Writable ext2 Filesystem:** Fully functional `write`, `create`, `mkdir`, and `truncate` operations in VFS, LBA28 Port PIO IDE/ATA driver, and self-healing mount-time consistency check (FSCK) routines.
+2. **Writable Ext4 Filesystem:** Fully functional `write`, `create`, `mkdir`, and `truncate` operations in VFS, extent-tree traversal/allocation, LBA28 Port PIO IDE/ATA driver, and self-healing mount-time consistency check (FSCK) routines.
 3. **Bash Shell Integration:** `FS_BASE` model-specific register context switching, COW page-fault allocations, `sys_clone` context creation, non-polling `wait4` queues, TTY/Job Control terminal IOCTLs, and statically compiled GNU Bash execution.
 4. **Network Stack & Socket API:** Intel `82540EM` (e1000) Gigabit Ethernet PCI driver utilizing DMA ring-buffers, complete IP stack (ARP, IPv4, UDP, ICMP), loopback interface, and BSD-compliant socket syscalls (`socket`, `bind`, `connect`, `listen`, `accept`, `sendto`, `recvfrom`).
 5. **Init System & Security Bounds:** User-space Init daemon (`/sbin/init`) running as PID 1 with zombie process reaping, re-parenting mechanics, Unix-like permission checks on VFS lookups, and process credentials (`uid`, `gid`, `euid`, `egid`).
@@ -136,7 +136,7 @@ flowchart LR
 Inside QEMU, on an SMP x86_64 machine running KontsnorOS:
 - The native Rust toolchain (`cargo`, `rustc`, `rust-lld` targeting `x86_64-unknown-linux-musl`) successfully compiled all 18 dependency crates and linked `kontsnor-kernel` from scratch.
 - Handled millions of system calls across 8 SMP cores (`mmap`, `futex`, `clone`, `rt_sigaction`, `epoll`, `read`, `write`).
-- Resulted in a valid 3.2MB static-PIE ELF binary written directly to the Ext2/Ext4 disk image.
+- Resulted in a valid 3.2MB static-PIE ELF binary written directly to the Ext4 disk image.
 
 ### 2. 📦 Linux Container Runtime & Namespaces (`ctr_run`)
 - Container runtime running inside KontsnorOS providing mount namespace isolation, PID virtualization, root filesystem switching via `pivot_root` / `chroot`, and resource configuration.

@@ -68,10 +68,10 @@ fi
 
 # 4. Prepare disk-container.img if missing or requested
 if [ ! -f "$DISK_IMG" ] || [ "$REBUILD_DISK" = true ]; then
-    echo "[4/5] Formatting and populating $DISK_IMG (512MB ext2)..."
+    echo "[4/5] Formatting and populating $DISK_IMG (512MB ext4)..."
     rm -f "$DISK_IMG"
     dd if=/dev/zero of="$DISK_IMG" bs=1M count=512 status=none
-    mkfs.ext2 -b 4096 -F -q "$DISK_IMG"
+    mkfs.ext4 -O ^has_journal -b 4096 -F -q "$DISK_IMG"
 
     # Create the in-container test script
     cat << 'EOF' > /tmp/test_inside.sh
@@ -128,7 +128,7 @@ exit 0
 EOF
     chmod +x /tmp/test_inside.sh
 
-    echo "           Populating ext2 disk structure via debugfs..."
+    echo "           Populating ext4 disk structure via debugfs..."
     python3 - << 'PYEOF'
 import os, subprocess, sys
 
@@ -220,8 +220,17 @@ fi
 # 5. Boot QEMU with serial stdio and verify test output
 echo "[5/5] Launching QEMU to execute container integration test..."
 ACCEL_OPTS="-cpu qemu64,+fsgsbase -smp 4"
-if [ -w /dev/kvm ] && qemu-system-x86_64 -enable-kvm -cpu host -M none -display none 2>/dev/null; then
-    ACCEL_OPTS="-enable-kvm -cpu host -smp 4"
+if [ -e /dev/kvm ]; then
+    if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+        echo "Enabling KVM Hardware Acceleration (-enable-kvm -cpu host -smp 4)..."
+        ACCEL_OPTS="-enable-kvm -cpu host -smp 4"
+    else
+        echo "WARNING: /dev/kvm exists but current user ($USER) lacks read/write permissions." >&2
+        echo "         To enable KVM, add your user to the 'kvm' group: sudo usermod -aG kvm $USER" >&2
+        echo "         Falling back to software TCG emulation (-cpu qemu64,+fsgsbase -smp 4)..." >&2
+    fi
+else
+    echo "WARNING: /dev/kvm not found. Falling back to software TCG emulation (-cpu qemu64,+fsgsbase -smp 4)..." >&2
 fi
 
 QEMU_LOG="/tmp/qemu_container_test.log"
@@ -233,11 +242,11 @@ cp "$BIOS_IMG" "$TEST_BIOS"
 set +e
 qemu-system-x86_64 \
     -drive format=raw,file="$TEST_BIOS",snapshot=on \
-    -drive format=raw,file="$DISK_IMG",index=1,media=disk \
+    -drive format=raw,file="$DISK_IMG",index=1,media=disk,cache=unsafe \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -serial stdio \
     -display none \
-    -m 512M \
+    -m 4096M \
     $ACCEL_OPTS \
     -no-reboot \
     $GDB_FLAG 2>&1 | tee "$QEMU_LOG"

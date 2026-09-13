@@ -219,6 +219,11 @@ int main(int argc, char **argv) {
         syscall1(80, (long)"/"); // chdir to jailed root
         print("[container-init] Filesystem successfully jailed at container root.\n");
 
+        // Mount private container pseudo-filesystems inside jailed root
+        syscall5(165, (long)"proc", (long)"/proc", (long)"procfs", 0, 0);
+        syscall5(165, (long)"devtmpfs", (long)"/dev", (long)"devtmpfs", 0, 0);
+        syscall5(165, (long)"tmpfs", (long)"/tmp", (long)"tmpfs", 0, 0);
+
         // Ensure /etc/mtab -> /proc/mounts symlink exists so pacman can
         // determine filesystem mount points inside the container.
         syscall1(87, (long)"/etc/mtab");                         // unlink (ignore error if not present)

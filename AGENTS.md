@@ -39,10 +39,10 @@ graph TD
 * **Core Goal**: Implement fully writable, crash-consistent local filesystems.
 * **Responsibilities**:
   - Expanding the VFS layer with `write`, `create`, `mkdir`, `truncate`, and `fsync` support.
-  - Writing active block and inode allocators inside the `ext2` filesystem driver.
+  - Writing active block and inode allocators inside the `ext4` filesystem driver.
   - Designing physical PCI IDE/SATA AHCI hard disk block drivers.
   - Implementing write-ordering and metadata journaling to guarantee crash consistency.
-* **Assigned Skill**: [vfs-ext2/SKILL.md](file:///home/kontsnor/Projects/KontsnorOS/.antigravity/skills/vfs-ext2/SKILL.md)
+* **Assigned Skill**: [vfs-ext4/SKILL.md](file:///home/kontsnor/Projects/KontsnorOS/.antigravity/skills/vfs-ext4/SKILL.md)
 
 ### 3. 🌐 Network Stack Developer (`network`)
 * **Role**: Device-level DMA networking, core packet decoding pipelines, TCP/IP flow engines, and socket system calls.

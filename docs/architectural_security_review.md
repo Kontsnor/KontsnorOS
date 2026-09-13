@@ -9,9 +9,9 @@ This document presents a rigorous and detailed architectural and security review
 ### 1.1 Executive Summary
 KontsnorOS is a bare-metal, Unix-compatible hybrid kernel written in Rust. The kernel operates in Ring 0, while supporting loadable drivers and Ring 3 user-space processes. 
 
-The bootstrapping process utilizes the modern `bootloader_api` crate (which handles UEFI/BIOS boots, sets up an early GDT, identity maps the kernel, and passes a `BootInfo` memory map). The kernel initializes basic architecture setups (GDT, IDT, PIC, APIC, SMP), sets up physical and virtual memory managers, establishes a global dynamic heap allocator, mounts VFS filesystems (including a block-backed writable `ext2` implementation), and enters a Multi-Level Feedback Queue (MLFQ) scheduler to run kernel and Ring 3 user-space threads.
+The bootstrapping process utilizes the modern `bootloader_api` crate (which handles UEFI/BIOS boots, sets up an early GDT, identity maps the kernel, and passes a `BootInfo` memory map). The kernel initializes basic architecture setups (GDT, IDT, PIC, APIC, SMP), sets up physical and virtual memory managers, establishes a global dynamic heap allocator, mounts VFS filesystems (including a block-backed writable `ext4` implementation), and enters a Multi-Level Feedback Queue (MLFQ) scheduler to run kernel and Ring 3 user-space threads.
 
-While the kernel demonstrates high maturity in its filesystem implementation (a complete writable `ext2` driver with mount-time FSCK self-healing consistency checks) and robust syscall argument validation, it suffers from several severe architectural gaps and resource leaks. Specifically:
+While the kernel demonstrates high maturity in its filesystem implementation (a complete writable `ext4` driver with extent-tree support and mount-time FSCK self-healing consistency checks) and robust syscall argument validation, it suffers from several severe architectural gaps and resource leaks. Specifically:
 1. **Physical Memory Leakage:** Page tables and kernel stacks are never reclaimed when processes exit or undergo `execve`.
 2. **Incomplete SMP Bootstrapping:** Although ACPI tables are parsed and the CPU list is enumerated, the secondary cores (APs) are never booted.
 3. **Concurrency Race Hazards:** The `CPU_SCRATCH` base and `CORE_GDT` TSS mappings are designed globally, which would cause catastrophic stack corruption and data leaks under multi-core execution.
@@ -43,7 +43,7 @@ The following text-based block diagram illustrates how the core subsystems of th
                       |          +------+------+  +------+----------+
                       |          |   Physical  |  |  FS Drivers &   |
                       |          |  Allocator  |  |  Block Devices  |
-                      |          |  (Bitmaps)  |  | (ext2, ATA PIO) |
+                      |          |  (Bitmaps)  |  | (ext4, ATA PIO) |
                       |          +-------------+  +------+----------+
                       |                                  |
                       +-----------------+----------------+
@@ -102,7 +102,7 @@ The following text-based block diagram illustrates how the core subsystems of th
 ### 2.4 The VFS & POSIX Abstraction Layer
 
 *   **Current Implementation:**
-    *   **VFS (`fs::vfs`):** Resolves absolute and relative paths, matches the longest mount point prefix, and routes operations to filesystem-specific `InodeOps` implementations (`devfs`, `tmpfs`, `procfs`, `ext2`).
+    *   **VFS (`fs::vfs`):** Resolves absolute and relative paths, matches the longest mount point prefix, and routes operations to filesystem-specific `InodeOps` implementations (`devfs`, `tmpfs`, `procfs`, `ext4`).
     *   **File Descriptors (`process::fd`):** Open files are tracked in `Task::fd_table` as `Vec<Option<Arc<FileDescription>>>`. Multiple descriptors can point to the same `FileDescription` (sharing seek offset and flags) to satisfy POSIX offset sharing requirements across `dup2` and `fork`.
     *   **Syscall Dispatch (`syscall::mod`):** Uses the `syscall` CPU instruction. User-space pointers are validated against user-space memory limits (`0x0000_7FFF_FFFF_FFFF`) and verified for valid mapping in the active page directory before copy operations.
 *   **Rust Idiom & Safety Score: 8.8 / 10**
@@ -133,7 +133,7 @@ The following text-based block diagram illustrates how the core subsystems of th
 During the audit, we examined the serial console logs (`qemu_output.log`) from a test run. The kernel successfully booted and initialized the following subsystems:
 1. **GDT, IDT, PIC, APIC, SMP:** remap/disable PIC, enable Local APIC ID 0, set up periodic timer interrupts.
 2. **Memory:** Map physical memory, initialize the linked-list heap allocator (64 MiB).
-3. **VFS:** Mount `devfs`, `tmpfs`, `procfs`, and the `ext2` RAM disk.
+3. **VFS:** Mount `devfs`, `tmpfs`, `procfs`, and the `ext4` disk.
 4. **Multitasking:** Successfully spawned two kernel threads (`demo_1`, `demo_2`) which cooperatively yielded execution slices.
 5. **Ring 3 Launch:** Successfully cloned the page table and launched the freestanding C shell `/bin/sh` (PID 5).
 6. **Shell Verification:** Interactive commands, pipes, and redirects successfully executed, but termination happened via `SIGTERM` (QEMU shutdown) rather than a clean native shutdown.

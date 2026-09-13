@@ -138,7 +138,13 @@ pub fn sys_open_with_resolved_path(resolved_path: String, flags: i32, _mode: u32
                             crate::fs::vfs::invalidate_dentry(&resolved_path);
                             new_i
                         }
-                        None => return Errno::EACCES.into(),
+                        None => {
+                            log::warn!(
+                                "[sys_openat] create '{:?}' failed in parent directory",
+                                resolved_path
+                            );
+                            return Errno::ENOSPC.into();
+                        }
                     }
                 } else {
                     return Errno::ENOENT.into();

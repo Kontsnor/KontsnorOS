@@ -27,7 +27,7 @@
 //! VFS Layer:   path_resolve()           fd_table_lookup()
 //!                     │                          │
 //!                     ▼                          ▼
-//! FS Driver:   ext2_lookup()            ext2_read()
+//! FS Driver:   ext4_lookup()            ext4_read()
 //!                     │                          │
 //!                     ▼                          ▼
 //! Block Layer: block_device_read()      block_device_read()
@@ -81,7 +81,7 @@ pub fn init() {
         securityfs,
     );
 
-    // Create the RAM disk pre-populated with our ext2 filesystem
+    // Create the RAM disk pre-populated with our ext4 filesystem
     let ramdisk = crate::drivers::ramdisk::create_ext2_ramdisk();
     crate::fs::vfs::register_block_device(alloc::string::String::from("ramdisk"), ramdisk.clone());
 
@@ -97,7 +97,7 @@ pub fn init() {
         if ata_drive.read_block(2, &mut buf).is_ok() {
             let magic = u16::from_le_bytes([buf[56], buf[57]]);
             if magic != 0xEF53 {
-                kprintln!("[fs] ATA drive is unformatted (magic: {:#X}). Formatting with live ext2 image...", magic);
+                kprintln!("[fs] ATA drive is unformatted (magic: {:#X}). Formatting with live ext4 image...", magic);
                 let mut success = true;
                 for block_idx in 0..256 {
                     let mut block_data = [0u8; 512];

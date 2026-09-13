@@ -836,22 +836,11 @@ pub fn sys_execve(
 
 /// `exit(status)` — Terminate the calling process.
 pub fn sys_exit(status: i32) -> SyscallResult {
-    crate::kprintln!(
-        "[process exit] PID {:?} exiting with status {}",
-        scheduler::current_pid(),
-        status
-    );
     crate::process::scheduler::exit_current_thread(status);
 }
 
 /// `exit_group(status)` — Terminate all threads in the thread group.
 pub fn sys_exit_group(status: i32) -> SyscallResult {
-    crate::kprintln!(
-        "[process exit_group] PID {:?} exiting with status {}",
-        scheduler::current_pid(),
-        status
-    );
-
     let current_pid = match scheduler::current_pid() {
         Some(p) => p,
         None => {

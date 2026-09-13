@@ -26,17 +26,37 @@ cp "$KERNEL_BIN" "$STRIPPED_DIR/kontsnor-kernel"
 strip "$STRIPPED_DIR/kontsnor-kernel"
 bootloader_linker build "$STRIPPED_DIR/kontsnor-kernel" -o "$PROJECT_DIR/target" -s
 
+DISK_IMG="$PROJECT_DIR/disk.img"
+if [ ! -f "$DISK_IMG" ]; then
+    echo "Creating 6GB blank persistent hard drive image for test disk..."
+    dd if=/dev/zero of="$DISK_IMG" bs=1M count=6144 2>/dev/null
+fi
+
+ACCEL_OPTS="-cpu qemu64,+fsgsbase -smp 2"
+if [ -e /dev/kvm ]; then
+    if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+        echo "Enabling KVM Hardware Acceleration (-enable-kvm -cpu host -smp 2)..."
+        ACCEL_OPTS="-enable-kvm -cpu host -smp 2"
+    else
+        echo "WARNING: /dev/kvm exists but current user ($USER) lacks read/write permissions." >&2
+        echo "         To enable KVM, add your user to the 'kvm' group: sudo usermod -aG kvm $USER" >&2
+        echo "         Falling back to software TCG emulation (-cpu qemu64,+fsgsbase -smp 2)..." >&2
+    fi
+else
+    echo "WARNING: /dev/kvm not found. Falling back to software TCG emulation (-cpu qemu64,+fsgsbase -smp 2)..." >&2
+fi
+
 echo "Starting QEMU in test mode..."
 # Disable "exit on error" temporarily so we can capture the exit status from QEMU
 set +e
 qemu-system-x86_64 \
     -drive format=raw,file="$PROJECT_DIR/target/bios.img" \
+    -drive format=raw,file="$DISK_IMG",index=1,media=disk,cache=unsafe \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -serial stdio \
     -display none \
-    -m 512M \
-    -smp 2 \
-    -cpu qemu64,+fsgsbase \
+    -m 4096M \
+    $ACCEL_OPTS \
     -no-reboot
 QEMU_STATUS=$?
 set -e

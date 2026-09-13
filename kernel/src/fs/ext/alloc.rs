@@ -44,56 +44,56 @@ impl ExtFileSystem {
         }
 
         let blocks_per_group = sb.s_blocks_per_group;
-        let mut group_idx = None;
-        for (idx, gd) in gds.iter().enumerate() {
-            if gd.bg_free_blocks_count > 0 {
-                group_idx = Some(idx);
-                break;
+        let num_groups = gds.len();
+
+        for g in 0..num_groups {
+            if gds[g].bg_free_blocks_count == 0 {
+                continue;
             }
-        }
-        let g = group_idx.ok_or("No free blocks found in group descriptors")?;
-        let group_blocks = if g == gds.len() - 1 {
-            sb.s_blocks_count - sb.s_first_data_block - (g as u32) * blocks_per_group
-        } else {
-            blocks_per_group
-        };
+            let group_blocks = if g == num_groups - 1 {
+                sb.s_blocks_count - sb.s_first_data_block - (g as u32) * blocks_per_group
+            } else {
+                blocks_per_group
+            };
 
-        let gd = &mut gds[g];
-        let mut bitmap = alloc::vec![0u8; self.block_size as usize];
-        read_blocks(
-            &*self.device,
-            gd.bg_block_bitmap as u64,
-            &mut bitmap,
-            self.block_size,
-        )?;
-
-        for i in 0..group_blocks {
-            let byte = (i / 8) as usize;
-            let bit = i % 8;
-            if (bitmap[byte] & (1 << bit)) == 0 {
-                bitmap[byte] |= 1 << bit;
-                write_blocks(
-                    &*self.device,
-                    gd.bg_block_bitmap as u64,
-                    &bitmap,
-                    self.block_size,
-                )?;
-
-                let block_num = (g as u32) * blocks_per_group + sb.s_first_data_block + i;
-
-                sb.s_free_blocks_count -= 1;
-                gd.bg_free_blocks_count -= 1;
-
-                self.write_superblock(&sb)?;
-                drop(gds);
-                self.write_group_descriptors()?;
-
-                // Zero out the newly allocated block
-                let zero_buf = alloc::vec![0u8; self.block_size as usize];
-                write_blocks(&*self.device, block_num as u64, &zero_buf, self.block_size)?;
-
-                return Ok(block_num);
+            let block_bitmap_num = gds[g].bg_block_bitmap as u64;
+            let mut bitmap = alloc::vec![0u8; self.block_size as usize];
+            if read_blocks(
+                &*self.device,
+                block_bitmap_num,
+                &mut bitmap,
+                self.block_size,
+            )
+            .is_err()
+            {
+                continue;
             }
+
+            for i in 0..group_blocks {
+                let byte = (i / 8) as usize;
+                let bit = i % 8;
+                if (bitmap[byte] & (1 << bit)) == 0 {
+                    bitmap[byte] |= 1 << bit;
+                    write_blocks(&*self.device, block_bitmap_num, &bitmap, self.block_size)?;
+
+                    let block_num = (g as u32) * blocks_per_group + sb.s_first_data_block + i;
+
+                    sb.s_free_blocks_count = sb.s_free_blocks_count.saturating_sub(1);
+                    gds[g].bg_free_blocks_count = gds[g].bg_free_blocks_count.saturating_sub(1);
+
+                    self.write_superblock(&sb)?;
+                    drop(gds);
+                    self.write_group_descriptors()?;
+
+                    // Zero out the newly allocated block
+                    let zero_buf = alloc::vec![0u8; self.block_size as usize];
+                    write_blocks(&*self.device, block_num as u64, &zero_buf, self.block_size)?;
+
+                    return Ok(block_num);
+                }
+            }
+            // Group bitmap was full despite descriptor; correct counter and check next group
+            gds[g].bg_free_blocks_count = 0;
         }
         Err("No free blocks found in bitmap")
     }
@@ -153,54 +153,54 @@ impl ExtFileSystem {
         }
 
         let inodes_per_group = self.inodes_per_group;
-        let mut group_idx = None;
-        for (idx, gd) in gds.iter().enumerate() {
-            if gd.bg_free_inodes_count > 0 {
-                group_idx = Some(idx);
-                break;
+        let num_groups = gds.len();
+
+        for g in 0..num_groups {
+            if gds[g].bg_free_inodes_count == 0 {
+                continue;
             }
-        }
-        let g = group_idx.ok_or("No free inodes found in group descriptors")?;
-        let group_inodes = if g == gds.len() - 1 {
-            sb.s_inodes_count - (g as u32) * inodes_per_group
-        } else {
-            inodes_per_group
-        };
+            let group_inodes = if g == num_groups - 1 {
+                sb.s_inodes_count - (g as u32) * inodes_per_group
+            } else {
+                inodes_per_group
+            };
 
-        let gd = &mut gds[g];
-        let mut bitmap = alloc::vec![0u8; self.block_size as usize];
-        read_blocks(
-            &*self.device,
-            gd.bg_inode_bitmap as u64,
-            &mut bitmap,
-            self.block_size,
-        )?;
+            let inode_bitmap_num = gds[g].bg_inode_bitmap as u64;
+            let mut bitmap = alloc::vec![0u8; self.block_size as usize];
+            if read_blocks(
+                &*self.device,
+                inode_bitmap_num,
+                &mut bitmap,
+                self.block_size,
+            )
+            .is_err()
+            {
+                continue;
+            }
 
-        for i in 0..group_inodes {
-            let byte = (i / 8) as usize;
-            let bit = i % 8;
-            if (bitmap[byte] & (1 << bit)) == 0 {
-                bitmap[byte] |= 1 << bit;
-                write_blocks(
-                    &*self.device,
-                    gd.bg_inode_bitmap as u64,
-                    &bitmap,
-                    self.block_size,
-                )?;
+            for i in 0..group_inodes {
+                let byte = (i / 8) as usize;
+                let bit = i % 8;
+                if (bitmap[byte] & (1 << bit)) == 0 {
+                    bitmap[byte] |= 1 << bit;
+                    write_blocks(&*self.device, inode_bitmap_num, &bitmap, self.block_size)?;
 
-                sb.s_free_inodes_count -= 1;
-                gd.bg_free_inodes_count -= 1;
-                if is_dir {
-                    gd.bg_used_dirs_count += 1;
+                    sb.s_free_inodes_count = sb.s_free_inodes_count.saturating_sub(1);
+                    gds[g].bg_free_inodes_count = gds[g].bg_free_inodes_count.saturating_sub(1);
+                    if is_dir {
+                        gds[g].bg_used_dirs_count += 1;
+                    }
+
+                    self.write_superblock(&sb)?;
+                    drop(gds);
+                    self.write_group_descriptors()?;
+
+                    let ino = (g as u32) * inodes_per_group + i + 1;
+                    return Ok(ino);
                 }
-
-                self.write_superblock(&sb)?;
-                drop(gds);
-                self.write_group_descriptors()?;
-
-                let ino = (g as u32) * inodes_per_group + i + 1;
-                return Ok(ino);
             }
+            // Group bitmap had no free inodes despite descriptor; correct counter and check next group
+            gds[g].bg_free_inodes_count = 0;
         }
         Err("No free inodes found in bitmap")
     }

@@ -2059,9 +2059,12 @@ fn test_phase2_features() {
 
     // --- 1.5. /proc/self/exe ---
     kprintln!("[test] 1.5. Looking up /proc/self/exe");
-    let self_exe = crate::fs::vfs::lookup_follow("/proc/self/exe", false).expect("/proc/self/exe missing");
+    let self_exe =
+        crate::fs::vfs::lookup_follow("/proc/self/exe", false).expect("/proc/self/exe missing");
     let mut exe_buf = [0u8; 128];
-    let exe_len = self_exe.read(0, &mut exe_buf).expect("readlink /proc/self/exe failed");
+    let exe_len = self_exe
+        .read(0, &mut exe_buf)
+        .expect("readlink /proc/self/exe failed");
     let exe_str = core::str::from_utf8(&exe_buf[..exe_len]).unwrap();
     assert!(!exe_str.is_empty());
     assert!(exe_str.starts_with('/'));
@@ -2616,14 +2619,22 @@ fn test_ext_small_file_creation_benchmark() {
     let test_data = [0xABu8; 1024];
     // SAFETY: data_buf_addr is mapped user memory.
     unsafe {
-        core::ptr::copy_nonoverlapping(test_data.as_ptr(), data_buf_addr as *mut u8, test_data.len());
+        core::ptr::copy_nonoverlapping(
+            test_data.as_ptr(),
+            data_buf_addr as *mut u8,
+            test_data.len(),
+        );
     }
 
     for i in 0..1000 {
         let filename = alloc::format!("/disk/bench_dir/file_{}.txt\0", i);
         let name_bytes = filename.as_bytes();
         unsafe {
-            core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), path_buf_addr as *mut u8, name_bytes.len());
+            core::ptr::copy_nonoverlapping(
+                name_bytes.as_ptr(),
+                path_buf_addr as *mut u8,
+                name_bytes.len(),
+            );
         }
 
         let fd = crate::syscall::fs::sys_open(path_buf_addr as *const u8, 0o102, 0o644); // O_CREAT | O_RDWR
@@ -2645,7 +2656,11 @@ fn test_ext_small_file_creation_benchmark() {
         let filename = alloc::format!("/disk/bench_dir/file_{}.txt\0", i);
         let name_bytes = filename.as_bytes();
         unsafe {
-            core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), path_buf_addr as *mut u8, name_bytes.len());
+            core::ptr::copy_nonoverlapping(
+                name_bytes.as_ptr(),
+                path_buf_addr as *mut u8,
+                name_bytes.len(),
+            );
         }
         let _ = crate::syscall::fs::sys_unlink(path_buf_addr as *const u8);
     }
@@ -3140,11 +3155,19 @@ fn test_devfs_special_nodes() {
     let read_null = dev_null.read(0, &mut buf).expect("read /dev/null failed");
     assert_eq!(read_null, 0, "/dev/null read must return EOF (0 bytes)");
 
-    let write_null = dev_null.write(0, b"test_data").expect("write /dev/null failed");
-    assert_eq!(write_null, 9, "/dev/null write must discard all bytes and return count");
+    let write_null = dev_null
+        .write(0, b"test_data")
+        .expect("write /dev/null failed");
+    assert_eq!(
+        write_null, 9,
+        "/dev/null write must discard all bytes and return count"
+    );
 
     let poll_null = dev_null.poll(crate::fs::inode::POLLIN | crate::fs::inode::POLLOUT);
-    assert_eq!(poll_null, crate::fs::inode::POLLIN | crate::fs::inode::POLLOUT);
+    assert_eq!(
+        poll_null,
+        crate::fs::inode::POLLIN | crate::fs::inode::POLLOUT
+    );
 
     // 2. Verify /dev/zero
     let dev_zero = crate::fs::vfs::lookup("/dev/zero").expect("/dev/zero missing");
@@ -3157,11 +3180,16 @@ fn test_devfs_special_nodes() {
     assert_eq!(read_zero, 16);
     assert_eq!(buf, [0u8; 16], "/dev/zero read must yield zeroed buffer");
 
-    let write_zero = dev_zero.write(0, b"test_data").expect("write /dev/zero failed");
+    let write_zero = dev_zero
+        .write(0, b"test_data")
+        .expect("write /dev/zero failed");
     assert_eq!(write_zero, 9);
 
     let poll_zero = dev_zero.poll(crate::fs::inode::POLLIN | crate::fs::inode::POLLOUT);
-    assert_eq!(poll_zero, crate::fs::inode::POLLIN | crate::fs::inode::POLLOUT);
+    assert_eq!(
+        poll_zero,
+        crate::fs::inode::POLLIN | crate::fs::inode::POLLOUT
+    );
 
     // 3. Verify /dev/full
     let dev_full = crate::fs::vfs::lookup("/dev/full").expect("/dev/full missing");
@@ -3182,28 +3210,41 @@ fn test_devfs_special_nodes() {
     );
 
     let poll_full = dev_full.poll(crate::fs::inode::POLLIN | crate::fs::inode::POLLOUT);
-    assert_eq!(poll_full, crate::fs::inode::POLLIN | crate::fs::inode::POLLOUT);
+    assert_eq!(
+        poll_full,
+        crate::fs::inode::POLLIN | crate::fs::inode::POLLOUT
+    );
 
     // 4. Verify /dev/random & /dev/urandom
     let dev_random = crate::fs::vfs::lookup("/dev/random").expect("/dev/random missing");
     let inode_random = dev_random.inode();
-    assert_eq!(inode_random.file_type, crate::fs::inode::FileType::CharDevice);
+    assert_eq!(
+        inode_random.file_type,
+        crate::fs::inode::FileType::CharDevice
+    );
     assert_eq!(inode_random.rdev, (1 << 8) | 8);
     assert_eq!(inode_random.permissions.mode, 0o666);
 
     let dev_urandom = crate::fs::vfs::lookup("/dev/urandom").expect("/dev/urandom missing");
     let inode_urandom = dev_urandom.inode();
-    assert_eq!(inode_urandom.file_type, crate::fs::inode::FileType::CharDevice);
+    assert_eq!(
+        inode_urandom.file_type,
+        crate::fs::inode::FileType::CharDevice
+    );
     assert_eq!(inode_urandom.rdev, (1 << 8) | 9);
     assert_eq!(inode_urandom.permissions.mode, 0o666);
 
     let mut rand_buf = [0u8; 32];
-    let read_urandom = dev_urandom.read(0, &mut rand_buf).expect("read /dev/urandom failed");
+    let read_urandom = dev_urandom
+        .read(0, &mut rand_buf)
+        .expect("read /dev/urandom failed");
     assert_eq!(read_urandom, 32);
     assert_ne!(rand_buf, [0u8; 32]);
 
     let seed_data = [0x55u8; 32];
-    let write_urandom = dev_urandom.write(0, &seed_data).expect("write /dev/urandom failed");
+    let write_urandom = dev_urandom
+        .write(0, &seed_data)
+        .expect("write /dev/urandom failed");
     assert_eq!(write_urandom, 32);
 
     kprintln!("[test] devfs special character device nodes test PASSED!");

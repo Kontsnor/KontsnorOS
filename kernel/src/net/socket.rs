@@ -283,13 +283,6 @@ impl InodeOps for SocketInode {
             )
             .ok_or(-5)?; // EIO
 
-            crate::kprintln!(
-                "[SocketInode::write] Sending TCP payload: len={}, seq={}, ack={}",
-                payload.len(),
-                tcp_snd_nxt,
-                tcp_rcv_nxt
-            );
-
             super::ipv4::send_packet(
                 local_ip,
                 remote_ip,
@@ -305,7 +298,6 @@ impl InodeOps for SocketInode {
                 let mut sock = self.socket.lock();
                 sock.tcp_snd_nxt = sock.tcp_snd_nxt.wrapping_add(payload.len() as u32);
             }
-            crate::kprintln!("[SocketInode::write] payload sent successfully");
             Ok(payload.len())
         } else if sock_type == 2 {
             // SOCK_DGRAM (UDP)

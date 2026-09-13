@@ -1461,7 +1461,7 @@ pub struct LinuxStatfs {
 
 fn fs_stats_to_linux_statfs(stats: &crate::fs::vfs::FsStats, fs_name: &str) -> LinuxStatfs {
     let f_type = match fs_name {
-        "ext" | "ext2" => 0xEF53,
+        "ext" | "ext2" | "ext4" => 0xEF53,
         "tmpfs" => 0x01021994,
         "procfs" => 0x9fa0,
         "devfs" => 0x1373,

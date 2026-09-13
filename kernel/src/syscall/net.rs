@@ -78,12 +78,17 @@ pub fn sys_socket(domain: i32, sock_type: i32, protocol: i32) -> SyscallResult {
 
     // AF_NETLINK (16) -> return EAFNOSUPPORT so glibc gracefully falls back
     if domain == 16 {
-        return -97; // EAFNOSUPPORT
+        return Errno::EAFNOSUPPORT.into();
+    }
+
+    // AF_INET6 (10) -> return EAFNOSUPPORT if IPv6 is not supported
+    if domain == 10 && !crate::net::ipv6_supported() {
+        return Errno::EAFNOSUPPORT.into();
     }
 
     if domain != 2 {
         // Only support AF_INET (2)
-        return -97; // EAFNOSUPPORT
+        return Errno::EAFNOSUPPORT.into();
     }
 
     if base_type != 1 && base_type != 2 && base_type != 3 {
@@ -115,17 +120,35 @@ pub fn sys_bind(fd: i32, addr_ptr: *const SockAddrIn, addrlen: u32) -> SyscallRe
     if addr_ptr.is_null() {
         return Errno::EFAULT.into();
     }
-    if !validate_user_ptr(addr_ptr as *const u8, core::mem::size_of::<SockAddrIn>()) {
+    if addrlen < 2 {
+        return Errno::EINVAL.into();
+    }
+    if !validate_user_ptr(addr_ptr as *const u8, 2) {
         return Errno::EFAULT.into();
+    }
+
+    // Read family (first 2 bytes of any sockaddr)
+    // SAFETY: addr_ptr is non-null and validated for at least 2 bytes.
+    let family = unsafe { core::ptr::read_unaligned(addr_ptr as *const u16) };
+    if family == 10
+    /* AF_INET6 */
+    {
+        return Errno::EAFNOSUPPORT.into();
+    }
+    if family != 2
+    /* AF_INET */
+    {
+        return Errno::EINVAL.into();
     }
     if addrlen < 16 {
         return Errno::EINVAL.into();
     }
-
-    let addr = unsafe { core::ptr::read_volatile(addr_ptr) };
-    if addr.sin_family != 2 {
-        return Errno::EINVAL.into();
+    if !validate_user_ptr(addr_ptr as *const u8, core::mem::size_of::<SockAddrIn>()) {
+        return Errno::EFAULT.into();
     }
+
+    // SAFETY: addr_ptr is validated for size_of::<SockAddrIn>() bytes.
+    let addr = unsafe { core::ptr::read_unaligned(addr_ptr) };
 
     let socket = match get_socket(fd) {
         Some(s) => s,
@@ -161,17 +184,39 @@ pub fn sys_connect(fd: i32, addr_ptr: *const SockAddrIn, addrlen: u32) -> Syscal
     if addr_ptr.is_null() {
         return Errno::EFAULT.into();
     }
-    if !validate_user_ptr(addr_ptr as *const u8, core::mem::size_of::<SockAddrIn>()) {
+    if addrlen < 2 {
+        return Errno::EINVAL.into();
+    }
+    if !validate_user_ptr(addr_ptr as *const u8, 2) {
         return Errno::EFAULT.into();
     }
+
+    // Read address family (first 2 bytes of any sockaddr struct)
+    // SAFETY: addr_ptr is non-null and validated for at least 2 bytes.
+    let family = unsafe { core::ptr::read_unaligned(addr_ptr as *const u16) };
+    if family == 10
+    /* AF_INET6 */
+    {
+        // Fast-fail unroutable IPv6 connection attempts immediately.
+        // Returning -ENETUNREACH prompts dual-stack clients (e.g. curl/libcurl)
+        // to immediately fall back to IPv4 without hanging.
+        return Errno::ENETUNREACH.into();
+    }
+    if family != 2
+    /* AF_INET */
+    {
+        return Errno::EAFNOSUPPORT.into();
+    }
+
     if addrlen < 16 {
         return Errno::EINVAL.into();
     }
-
-    let addr = unsafe { core::ptr::read_volatile(addr_ptr) };
-    if addr.sin_family != 2 {
-        return Errno::EINVAL.into();
+    if !validate_user_ptr(addr_ptr as *const u8, core::mem::size_of::<SockAddrIn>()) {
+        return Errno::EFAULT.into();
     }
+
+    // SAFETY: addr_ptr is validated for size_of::<SockAddrIn>() bytes.
+    let addr = unsafe { core::ptr::read_unaligned(addr_ptr) };
 
     let socket = match get_socket(fd) {
         Some(s) => s,
@@ -185,6 +230,14 @@ pub fn sys_connect(fd: i32, addr_ptr: *const SockAddrIn, addrlen: u32) -> Syscal
         addr.sin_addr[3],
     );
     let remote_port = u16::from_be(addr.sin_port);
+
+    // Fast-fail unroutable IPv4 destinations
+    if remote_ip == Ipv4Addr::UNSPECIFIED {
+        return Errno::ENETUNREACH.into();
+    }
+    if !remote_ip.is_loopback() && crate::net::interface::get_first_ethernet_interface().is_none() {
+        return Errno::ENETUNREACH.into();
+    }
 
     let nonblocking = {
         let fd_desc = proc_fd::current_task_get_file_desc(fd);
@@ -260,15 +313,6 @@ pub fn sys_connect(fd: i32, addr_ptr: *const SockAddrIn, addrlen: u32) -> Syscal
         65535,
         &[],
     ) {
-        crate::kprintln!(
-            "[sys_connect] Sending SYN: {}:{} -> {}:{}, seq={}, nonblocking={}",
-            local_ip,
-            local_port,
-            remote_ip,
-            remote_port,
-            tcp_snd_nxt,
-            nonblocking
-        );
         let _ = crate::net::ipv4::send_packet(
             local_ip,
             remote_ip,
@@ -278,7 +322,6 @@ pub fn sys_connect(fd: i32, addr_ptr: *const SockAddrIn, addrlen: u32) -> Syscal
     }
 
     if nonblocking {
-        crate::kprintln!("[sys_connect] Nonblocking, returning -EINPROGRESS");
         return -115; // -EINPROGRESS
     }
 
@@ -440,17 +483,32 @@ pub fn sys_sendto(
 
     if let Some(socket) = file_desc.inode.as_socket() {
         if !dest_addr.is_null() {
-            if !validate_user_ptr(dest_addr as *const u8, core::mem::size_of::<SockAddrIn>()) {
+            if addrlen < 2 {
+                return Errno::EINVAL.into();
+            }
+            if !validate_user_ptr(dest_addr as *const u8, 2) {
                 return Errno::EFAULT.into();
+            }
+            // SAFETY: dest_addr is non-null and validated for at least 2 bytes.
+            let family = unsafe { core::ptr::read_unaligned(dest_addr as *const u16) };
+            if family == 10
+            /* AF_INET6 */
+            {
+                return Errno::ENETUNREACH.into();
+            }
+            if family != 2
+            /* AF_INET */
+            {
+                return Errno::EAFNOSUPPORT.into();
             }
             if addrlen < 16 {
                 return Errno::EINVAL.into();
             }
-            // SAFETY: dest_addr is validated above.
-            let addr = unsafe { core::ptr::read_volatile(dest_addr) };
-            if addr.sin_family != 2 {
-                return Errno::EINVAL.into();
+            if !validate_user_ptr(dest_addr as *const u8, core::mem::size_of::<SockAddrIn>()) {
+                return Errno::EFAULT.into();
             }
+            // SAFETY: dest_addr is validated above.
+            let addr = unsafe { core::ptr::read_unaligned(dest_addr) };
 
             let remote_ip = Ipv4Addr::new(
                 addr.sin_addr[0],
@@ -867,9 +925,13 @@ pub fn sys_socketpair(domain: i32, sock_type: i32, _protocol: i32, sv: *mut i32)
     if crate::syscall::fs::validate_user_ptr_write(sv as *mut u8, 8).is_err() {
         return Errno::EFAULT.into();
     }
+    // AF_INET6 (10) -> return EAFNOSUPPORT if IPv6 is not supported
+    if domain == 10 && !crate::net::ipv6_supported() {
+        return Errno::EAFNOSUPPORT.into();
+    }
     // Support AF_UNIX / AF_LOCAL (1) and AF_INET (2)
     if domain != 1 && domain != 2 {
-        return Errno::EINVAL.into();
+        return Errno::EAFNOSUPPORT.into();
     }
 
     let nonblock = (sock_type & 0x800) != 0;

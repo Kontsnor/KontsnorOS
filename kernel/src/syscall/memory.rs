@@ -64,6 +64,21 @@ pub fn sys_mmap(
         None
     };
 
+    // If mmap is called on /dev/zero (FileType::CharDevice with Major 1, Minor 5),
+    // treat it as an anonymous mapping in accordance with POSIX/Linux semantics.
+    let is_dev_zero = if let Some(ref d) = file_desc {
+        let inode = d.inode.inode();
+        inode.file_type == crate::fs::inode::FileType::CharDevice && inode.rdev == ((1 << 8) | 5)
+    } else {
+        false
+    };
+
+    let file_desc = if is_dev_zero {
+        None
+    } else {
+        file_desc
+    };
+
     let current_pid = match scheduler::current_pid() {
         Some(p) => p,
         None => return Errno::ESRCH.into(),

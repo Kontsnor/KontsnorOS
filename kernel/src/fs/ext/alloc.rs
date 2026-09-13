@@ -394,7 +394,55 @@ impl ExtFileSystem {
         Ok(())
     }
 
-    /// Deallocate all data blocks (direct, indirect, double-indirect) and the inode itself.
+    fn deallocate_extent_node(&self, buf: &[u8]) {
+        if buf.len() < 12 {
+            return;
+        }
+        let header = unsafe {
+            core::ptr::read_unaligned(buf.as_ptr() as *const super::types::Ext4ExtentHeader)
+        };
+        if header.eh_magic != 0xF30A {
+            return;
+        }
+
+        let entries = header.eh_entries as usize;
+        let depth = header.eh_depth;
+
+        if depth == 0 {
+            let entry_size = core::mem::size_of::<super::types::Ext4Extent>();
+            for i in 0..entries {
+                let offset = 12 + i * entry_size;
+                if offset + entry_size <= buf.len() {
+                    let ext = unsafe {
+                        core::ptr::read_unaligned(buf[offset..].as_ptr() as *const super::types::Ext4Extent)
+                    };
+                    let start = ext.start_block();
+                    let len = ext.len() as u64;
+                    for b in 0..len {
+                        let _ = self.deallocate_block((start + b) as u32);
+                    }
+                }
+            }
+        } else {
+            let entry_size = core::mem::size_of::<super::types::Ext4ExtentIdx>();
+            for i in 0..entries {
+                let offset = 12 + i * entry_size;
+                if offset + entry_size <= buf.len() {
+                    let idx = unsafe {
+                        core::ptr::read_unaligned(buf[offset..].as_ptr() as *const super::types::Ext4ExtentIdx)
+                    };
+                    let child_block = idx.leaf_block();
+                    let mut child_buf = alloc::vec![0u8; self.block_size as usize];
+                    if read_blocks(&*self.device, child_block, &mut child_buf, self.block_size).is_ok() {
+                        self.deallocate_extent_node(&child_buf);
+                    }
+                    let _ = self.deallocate_block(child_block as u32);
+                }
+            }
+        }
+    }
+
+    /// Deallocate all data blocks (extents, direct, indirect, double-indirect) and the inode itself.
     pub fn deallocate_inode_and_blocks(
         &self,
         ino: u32,
@@ -405,73 +453,81 @@ impl ExtFileSystem {
         let is_fast_symlink = is_symlink && (raw_inode.i_size < 60 || raw_inode.i_blocks == 0);
 
         if !is_fast_symlink {
-            // Copy array to avoid creating unaligned reference to packed struct field
-            let i_block = raw_inode.i_block;
-            for block in &i_block[0..12] {
-                if *block != 0 {
-                    let _ = self.deallocate_block(*block);
+            if (raw_inode.i_flags & super::types::EXT4_EXTENTS_FL) != 0 {
+                let mut root_buf = [0u8; 60];
+                for i in 0..15 {
+                    root_buf[i * 4..i * 4 + 4].copy_from_slice(&raw_inode.i_block[i].to_le_bytes());
                 }
-            }
-
-            // Free indirect block if present
-            let sib = i_block[12];
-            if sib != 0 {
-                let mut ind_buf = alloc::vec![0u8; self.block_size as usize];
-                if read_blocks(&*self.device, sib as u64, &mut ind_buf, self.block_size).is_ok() {
-                    let refs_per_block = self.block_size / 4;
-                    for j in 0..refs_per_block {
-                        let ptr_offset = (j * 4) as usize;
-                        let phys_block = u32::from_le_bytes([
-                            ind_buf[ptr_offset],
-                            ind_buf[ptr_offset + 1],
-                            ind_buf[ptr_offset + 2],
-                            ind_buf[ptr_offset + 3],
-                        ]);
-                        if phys_block != 0 {
-                            let _ = self.deallocate_block(phys_block);
-                        }
+                self.deallocate_extent_node(&root_buf);
+            } else {
+                // Copy array to avoid creating unaligned reference to packed struct field
+                let i_block = raw_inode.i_block;
+                for block in &i_block[0..12] {
+                    if *block != 0 {
+                        let _ = self.deallocate_block(*block);
                     }
                 }
-                let _ = self.deallocate_block(sib);
-            }
 
-            // Free double indirect block if present
-            let dib = i_block[13];
-            if dib != 0 {
-                let mut dib_buf = alloc::vec![0u8; self.block_size as usize];
-                if read_blocks(&*self.device, dib as u64, &mut dib_buf, self.block_size).is_ok() {
-                    let refs_per_block = self.block_size / 4;
-                    for i in 0..refs_per_block {
-                        let sib_offset = (i * 4) as usize;
-                        let sib = u32::from_le_bytes([
-                            dib_buf[sib_offset],
-                            dib_buf[sib_offset + 1],
-                            dib_buf[sib_offset + 2],
-                            dib_buf[sib_offset + 3],
-                        ]);
-                        if sib != 0 {
-                            let mut sib_buf = alloc::vec![0u8; self.block_size as usize];
-                            if read_blocks(&*self.device, sib as u64, &mut sib_buf, self.block_size)
-                                .is_ok()
-                            {
-                                for j in 0..refs_per_block {
-                                    let ptr_offset = (j * 4) as usize;
-                                    let phys_block = u32::from_le_bytes([
-                                        sib_buf[ptr_offset],
-                                        sib_buf[ptr_offset + 1],
-                                        sib_buf[ptr_offset + 2],
-                                        sib_buf[ptr_offset + 3],
-                                    ]);
-                                    if phys_block != 0 {
-                                        let _ = self.deallocate_block(phys_block);
+                // Free indirect block if present
+                let sib = i_block[12];
+                if sib != 0 {
+                    let mut ind_buf = alloc::vec![0u8; self.block_size as usize];
+                    if read_blocks(&*self.device, sib as u64, &mut ind_buf, self.block_size).is_ok() {
+                        let refs_per_block = self.block_size / 4;
+                        for j in 0..refs_per_block {
+                            let ptr_offset = (j * 4) as usize;
+                            let phys_block = u32::from_le_bytes([
+                                ind_buf[ptr_offset],
+                                ind_buf[ptr_offset + 1],
+                                ind_buf[ptr_offset + 2],
+                                ind_buf[ptr_offset + 3],
+                            ]);
+                            if phys_block != 0 {
+                                let _ = self.deallocate_block(phys_block);
+                            }
+                        }
+                    }
+                    let _ = self.deallocate_block(sib);
+                }
+
+                // Free double indirect block if present
+                let dib = i_block[13];
+                if dib != 0 {
+                    let mut dib_buf = alloc::vec![0u8; self.block_size as usize];
+                    if read_blocks(&*self.device, dib as u64, &mut dib_buf, self.block_size).is_ok() {
+                        let refs_per_block = self.block_size / 4;
+                        for i in 0..refs_per_block {
+                            let sib_offset = (i * 4) as usize;
+                            let sib = u32::from_le_bytes([
+                                dib_buf[sib_offset],
+                                dib_buf[sib_offset + 1],
+                                dib_buf[sib_offset + 2],
+                                dib_buf[sib_offset + 3],
+                            ]);
+                            if sib != 0 {
+                                let mut sib_buf = alloc::vec![0u8; self.block_size as usize];
+                                if read_blocks(&*self.device, sib as u64, &mut sib_buf, self.block_size)
+                                    .is_ok()
+                                {
+                                    for j in 0..refs_per_block {
+                                        let ptr_offset = (j * 4) as usize;
+                                        let phys_block = u32::from_le_bytes([
+                                            sib_buf[ptr_offset],
+                                            sib_buf[ptr_offset + 1],
+                                            sib_buf[ptr_offset + 2],
+                                            sib_buf[ptr_offset + 3],
+                                        ]);
+                                        if phys_block != 0 {
+                                            let _ = self.deallocate_block(phys_block);
+                                        }
                                     }
                                 }
+                                let _ = self.deallocate_block(sib);
                             }
-                            let _ = self.deallocate_block(sib);
                         }
                     }
+                    let _ = self.deallocate_block(dib);
                 }
-                let _ = self.deallocate_block(dib);
             }
         }
 

@@ -2586,6 +2586,46 @@ fn test_ext_fast_symlink_and_unlinked_open_file() {
 }
 
 #[test_case]
+fn test_ext_unlink_and_stat_verification() {
+    kprintln!("[test] Starting ext unlink and stat verification test...");
+
+    let file_path = b"/disk/unlink_stat_test.txt\0";
+    let file_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    assert!(file_addr > 0);
+    // SAFETY: file_addr is a newly mmapped page
+    unsafe {
+        core::ptr::copy_nonoverlapping(file_path.as_ptr(), file_addr as *mut u8, file_path.len());
+    }
+
+    // 1. Create file
+    let fd = crate::syscall::fs::sys_open(file_addr as *const u8, 0o102, 0o644); // O_CREAT | O_RDWR
+    assert!(fd >= 0, "Failed to create test file");
+    let test_data = b"unlink_test_data";
+    let written = crate::syscall::fs::sys_write(fd as i32, file_addr as *const u8, test_data.len());
+    assert_eq!(written, test_data.len() as i64);
+    assert_eq!(crate::syscall::fs::sys_close(fd as i32), 0);
+
+    // Verify stat returns 0 (success)
+    let mut stat_buf = crate::syscall::fs::meta::LinuxStat::default();
+    let stat_res1 = crate::syscall::fs::sys_stat(file_addr as *const u8, &mut stat_buf);
+    assert_eq!(stat_res1, 0, "stat failed before unlink");
+
+    // 2. Unlink file
+    let unlink_res = crate::syscall::fs::sys_unlink(file_addr as *const u8);
+    assert_eq!(unlink_res, 0, "unlink failed");
+
+    // 3. Verify stat immediately returns -ENOENT (-2)
+    let stat_res2 = crate::syscall::fs::sys_stat(file_addr as *const u8, &mut stat_buf);
+    assert_eq!(stat_res2, -2, "stat should return -ENOENT (-2) after unlink");
+
+    // Verify lookup returns None
+    assert!(crate::fs::vfs::lookup("/disk/unlink_stat_test.txt").is_none());
+
+    crate::syscall::memory::sys_munmap(file_addr, 4096);
+    kprintln!("[test] ext unlink and stat verification test PASSED!");
+}
+
+#[test_case]
 fn test_acpi_find_table_edge_cases() {
     kprintln!("[test] Starting ACPI find_table edge cases test...");
 

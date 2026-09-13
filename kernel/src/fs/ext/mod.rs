@@ -1166,6 +1166,15 @@ impl InodeOps for ExtInode {
         }
         self.vfs_inode.write().nlink = raw.i_links_count as u32;
         self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?;
+        if raw.i_links_count == 0 {
+            let is_dir = (raw.i_mode & 0xF000) == 0x4000;
+            let raw_copy = *raw;
+            drop(raw);
+            crate::memory::page_cache::page_cache_invalidate_inode(EXT_DEV_ID, self.ino as u64);
+            let _ = self
+                .fs
+                .deallocate_inode_and_blocks(self.ino, &raw_copy, is_dir);
+        }
         Ok(())
     }
 

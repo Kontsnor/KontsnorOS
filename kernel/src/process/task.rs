@@ -131,6 +131,7 @@ impl core::fmt::Debug for MappedRegion {
 
 pub struct AddressSpace {
     pub page_table_root: u64,
+    pub start_brk: u64,
     pub brk: u64,
     pub mmap_bump: u64,
     pub mmap_regions: Vec<MappedRegion>,
@@ -332,6 +333,7 @@ impl Task {
             },
             address_space: Arc::new(spin::Mutex::new(AddressSpace {
                 page_table_root,
+                start_brk: 0,
                 brk: 0,
                 mmap_bump: 0x0000_5000_0000_0000u64,
                 mmap_regions: Vec::new(),

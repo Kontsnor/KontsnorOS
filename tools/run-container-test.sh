@@ -219,18 +219,18 @@ fi
 
 # 5. Boot QEMU with serial stdio and verify test output
 echo "[5/5] Launching QEMU to execute container integration test..."
-ACCEL_OPTS="-cpu qemu64,+fsgsbase -smp 4"
+ACCEL_OPTS="-cpu qemu64,+fsgsbase -smp 4,sockets=1,cores=4,threads=1"
 if [ -e /dev/kvm ]; then
     if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-        echo "Enabling KVM Hardware Acceleration (-enable-kvm -cpu host -smp 4)..."
-        ACCEL_OPTS="-enable-kvm -cpu host -smp 4"
+        echo "Enabling KVM Hardware Acceleration (-enable-kvm -cpu host -smp 4,sockets=1,cores=4,threads=1)..."
+        ACCEL_OPTS="-enable-kvm -cpu host -smp 4,sockets=1,cores=4,threads=1"
     else
         echo "WARNING: /dev/kvm exists but current user ($USER) lacks read/write permissions." >&2
         echo "         To enable KVM, add your user to the 'kvm' group: sudo usermod -aG kvm $USER" >&2
-        echo "         Falling back to software TCG emulation (-cpu qemu64,+fsgsbase -smp 4)..." >&2
+        echo "         Falling back to software TCG emulation (-cpu qemu64,+fsgsbase -smp 4,sockets=1,cores=4,threads=1)..." >&2
     fi
 else
-    echo "WARNING: /dev/kvm not found. Falling back to software TCG emulation (-cpu qemu64,+fsgsbase -smp 4)..." >&2
+    echo "WARNING: /dev/kvm not found. Falling back to software TCG emulation (-cpu qemu64,+fsgsbase -smp 4,sockets=1,cores=4,threads=1)..." >&2
 fi
 
 QEMU_LOG="/tmp/qemu_container_test.log"
@@ -242,7 +242,8 @@ cp "$BIOS_IMG" "$TEST_BIOS"
 set +e
 qemu-system-x86_64 \
     -drive format=raw,file="$TEST_BIOS",snapshot=on \
-    -drive format=raw,file="$DISK_IMG",index=1,media=disk,cache=unsafe \
+    -drive file="$DISK_IMG",format=raw,index=1,media=disk,cache=unsafe,aio=threads,discard=unmap,detect-zeroes=unmap \
+    -rtc base=utc,clock=host \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -serial stdio \
     -display none \

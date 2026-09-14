@@ -32,18 +32,18 @@ if [ ! -f "$DISK_IMG" ]; then
     dd if=/dev/zero of="$DISK_IMG" bs=1M count=6144 2>/dev/null
 fi
 
-ACCEL_OPTS="-cpu qemu64,+fsgsbase -smp 2"
+ACCEL_OPTS="-cpu qemu64,+fsgsbase -smp 4,sockets=1,cores=4,threads=1"
 if [ -e /dev/kvm ]; then
     if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-        echo "Enabling KVM Hardware Acceleration (-enable-kvm -cpu host -smp 2)..."
-        ACCEL_OPTS="-enable-kvm -cpu host -smp 2"
+        echo "Enabling KVM Hardware Acceleration (-enable-kvm -cpu host -smp 4,sockets=1,cores=4,threads=1)..."
+        ACCEL_OPTS="-enable-kvm -cpu host -smp 4,sockets=1,cores=4,threads=1"
     else
         echo "WARNING: /dev/kvm exists but current user ($USER) lacks read/write permissions." >&2
         echo "         To enable KVM, add your user to the 'kvm' group: sudo usermod -aG kvm $USER" >&2
-        echo "         Falling back to software TCG emulation (-cpu qemu64,+fsgsbase -smp 2)..." >&2
+        echo "         Falling back to software TCG emulation (-cpu qemu64,+fsgsbase -smp 4,sockets=1,cores=4,threads=1)..." >&2
     fi
 else
-    echo "WARNING: /dev/kvm not found. Falling back to software TCG emulation (-cpu qemu64,+fsgsbase -smp 2)..." >&2
+    echo "WARNING: /dev/kvm not found. Falling back to software TCG emulation (-cpu qemu64,+fsgsbase -smp 4,sockets=1,cores=4,threads=1)..." >&2
 fi
 
 echo "Starting QEMU in test mode..."
@@ -51,7 +51,8 @@ echo "Starting QEMU in test mode..."
 set +e
 qemu-system-x86_64 \
     -drive format=raw,file="$PROJECT_DIR/target/bios.img" \
-    -drive format=raw,file="$DISK_IMG",index=1,media=disk,cache=unsafe \
+    -drive file="$DISK_IMG",format=raw,index=1,media=disk,cache=unsafe,aio=threads,discard=unmap,detect-zeroes=unmap \
+    -rtc base=utc,clock=host \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -serial stdio \
     -display none \

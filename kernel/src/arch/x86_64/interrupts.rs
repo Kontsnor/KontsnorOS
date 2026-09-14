@@ -430,19 +430,6 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                                                     // Flush local TLB for this virtual address
                                                     x86_64::instructions::tlb::flush(fault_addr);
                                                     return; // Fault resolved!
-                                                } else {
-                                                    // Physical frame allocation failed (OOM)
-                                                    crate::kprintln!(
-                                                        "[OOM] Physical frame allocation failed during Copy-On-Write for PID {:?} at vaddr {:#x}",
-                                                        crate::process::scheduler::current_pid(),
-                                                        fault_addr.as_u64()
-                                                    );
-                                                    if is_user {
-                                                        let _ = crate::syscall::process::sys_exit_group(139);
-                                                        loop {
-                                                            x86_64::instructions::hlt();
-                                                        }
-                                                    }
                                                 }
                                             }
                                         }
@@ -471,9 +458,7 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
         }
     }
 
-    if !error_code.contains(x86_64::structures::idt::PageFaultErrorCode::PROTECTION_VIOLATION)
-        && fault_addr.as_u64() < 0x0000_8000_0000_0000
-    {
+    if fault_addr.as_u64() < 0x0000_8000_0000_0000 {
         let resolved = crate::process::scheduler::current_pid()
             .and_then(|pid| crate::process::scheduler::get_task_arc(pid))
             .and_then(|task_arc| {

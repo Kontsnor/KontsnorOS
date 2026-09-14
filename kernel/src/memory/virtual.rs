@@ -664,17 +664,6 @@ pub fn free_user_page_table(pml4_phys: u64) -> Result<(), &'static str> {
                 continue;
             }
 
-            if pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-                if let Ok(frame) = pdpt_entry.frame() {
-                    let phys = frame.start_address().as_u64();
-                    for offset in (0..1024 * 1024 * 1024).step_by(4096) {
-                        super::physical::deallocate_frame(phys + offset);
-                        freed_pages += 1;
-                    }
-                }
-                continue;
-            }
-
             let pd_phys = pdpt_entry
                 .frame()
                 .map_err(|_| "Invalid frame in PDPT")?
@@ -686,17 +675,6 @@ pub fn free_user_page_table(pml4_phys: u64) -> Result<(), &'static str> {
             for k in 0..512 {
                 let pd_entry = &pd[k];
                 if pd_entry.is_unused() {
-                    continue;
-                }
-
-                if pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-                    if let Ok(frame) = pd_entry.frame() {
-                        let phys = frame.start_address().as_u64();
-                        for offset in (0..2 * 1024 * 1024).step_by(4096) {
-                            super::physical::deallocate_frame(phys + offset);
-                            freed_pages += 1;
-                        }
-                    }
                     continue;
                 }
 

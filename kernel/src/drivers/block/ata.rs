@@ -230,11 +230,31 @@ impl AtaDrive {
                 return Err("ATA DMA: physical address exceeds 32-bit");
             }
 
-            unsafe {
-                let entry = &mut *prdt_virt.add(entry_idx);
-                entry.phys_addr = phys_addr as u32;
-                entry.byte_count_eot = chunk_size as u32;
-                entry_idx += 1;
+            let mut coalesced = false;
+            if entry_idx > 0 {
+                unsafe {
+                    let prev_entry = &mut *prdt_virt.add(entry_idx - 1);
+                    let prev_phys = prev_entry.phys_addr as u64;
+                    let prev_count = (prev_entry.byte_count_eot & 0xFFFF) as usize;
+                    let real_prev_count = if prev_count == 0 { 65536 } else { prev_count };
+
+                    if prev_phys + (real_prev_count as u64) == phys_addr
+                        && real_prev_count + chunk_size <= 65536
+                    {
+                        let new_count = real_prev_count + chunk_size;
+                        prev_entry.byte_count_eot = (new_count & 0xFFFF) as u32;
+                        coalesced = true;
+                    }
+                }
+            }
+
+            if !coalesced {
+                unsafe {
+                    let entry = &mut *prdt_virt.add(entry_idx);
+                    entry.phys_addr = phys_addr as u32;
+                    entry.byte_count_eot = (chunk_size & 0xFFFF) as u32;
+                    entry_idx += 1;
+                }
             }
 
             virt_addr += chunk_size as u64;

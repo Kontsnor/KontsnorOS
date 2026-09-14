@@ -487,6 +487,37 @@ impl Scheduler {
 
         self.queues[priority].push_back(pid);
     }
+
+    /// Remove a mock or test task from the global task registry and this scheduler's queues.
+    pub fn remove_mock_task(&mut self, pid: Pid) {
+        let idx = pid.as_u64() as usize;
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut tasks = TASKS.write();
+            if idx < tasks.len() {
+                tasks[idx] = None;
+            }
+            if idx < TASK_TGIDS.len() {
+                TASK_TGIDS[idx].store(0, core::sync::atomic::Ordering::Release);
+            }
+        });
+        for queue in &mut self.queues {
+            queue.retain(|&p| p != pid);
+        }
+    }
+}
+
+/// Remove a mock or test task from the global task registry.
+pub fn remove_mock_task(pid: Pid) {
+    let idx = pid.as_u64() as usize;
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut tasks = TASKS.write();
+        if idx < tasks.len() {
+            tasks[idx] = None;
+        }
+        if idx < TASK_TGIDS.len() {
+            TASK_TGIDS[idx].store(0, core::sync::atomic::Ordering::Release);
+        }
+    });
 }
 
 #[unsafe(naked)]

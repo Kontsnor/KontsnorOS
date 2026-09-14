@@ -75,31 +75,118 @@ fn read_vbe(index: u16) -> u16 {
     }
 }
 
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
 /// The low-level Bochs VBE GPU state.
 pub struct BochsGpu {
     pub lfb_phys: u64,
     pub lfb_virt: u64,
-    pub width: u32,
-    pub height: u32,
-    pub bpp: u32,
-    pub size: u64,
+    pub width: AtomicU32,
+    pub height: AtomicU32,
+    pub bpp: AtomicU32,
+    pub size: AtomicU64,
     pub backbuffer: Mutex<Vec<u32>>,
 }
 
 impl BochsGpu {
+    pub fn width(&self) -> u32 {
+        self.width.load(Ordering::Relaxed)
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height.load(Ordering::Relaxed)
+    }
+
+    pub fn bpp(&self) -> u32 {
+        self.bpp.load(Ordering::Relaxed)
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size.load(Ordering::Relaxed)
+    }
+
     /// Copy the backbuffer to the physical linear frame buffer.
     pub fn blit(&self) {
+        let w = self.width() as usize;
+        let h = self.height() as usize;
         // SAFETY: We copy the pixels from our heap-allocated backbuffer (with length matching the active screen dimensions)
         // to the mapped graphics framebuffer virtual address space `self.lfb_virt`.
         unsafe {
             let dest = self.lfb_virt as *mut u32;
             let back = self.backbuffer.lock();
-            core::ptr::copy_nonoverlapping(
-                back.as_ptr(),
-                dest,
-                (self.width * self.height) as usize,
-            );
+            let count = core::cmp::min(back.len(), w * h);
+            core::ptr::copy_nonoverlapping(back.as_ptr(), dest, count);
         }
+    }
+}
+
+/// Global Arc to the active BochsGpu state.
+pub static BOCHS_GPU: Mutex<Option<alloc::sync::Arc<BochsGpu>>> = Mutex::new(None);
+
+/// Set Bochs VBE video mode via Dispi register writes.
+pub fn set_video_mode(width: u16, height: u16, bpp: u16) -> Result<(), DriverError> {
+    write_vbe(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
+    write_vbe(VBE_DISPI_INDEX_XRES, width);
+    write_vbe(VBE_DISPI_INDEX_YRES, height);
+    write_vbe(VBE_DISPI_INDEX_BPP, bpp);
+    write_vbe(
+        VBE_DISPI_INDEX_ENABLE,
+        VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED,
+    );
+
+    let bytes_per_pixel = ((bpp as u64 + 7) / 8).max(1);
+    let size = (width as u64) * (height as u64) * bytes_per_pixel;
+
+    if let Some(ref gpu) = *BOCHS_GPU.lock() {
+        gpu.width.store(width as u32, Ordering::SeqCst);
+        gpu.height.store(height as u32, Ordering::SeqCst);
+        gpu.bpp.store(bpp as u32, Ordering::SeqCst);
+        gpu.size.store(size, Ordering::SeqCst);
+
+        let mut back = gpu.backbuffer.lock();
+        back.resize((width as usize) * (height as usize), 0);
+    }
+    crate::kprintln!(
+        "[gpu] Switched Bochs VBE display mode to {}x{}x{}bpp",
+        width,
+        height,
+        bpp
+    );
+    Ok(())
+}
+
+/// Get the physical address of the linear framebuffer.
+pub fn get_lfb_phys() -> u64 {
+    if let Some(ref gpu) = *BOCHS_GPU.lock() {
+        gpu.lfb_phys
+    } else {
+        0xfd00_0000
+    }
+}
+
+/// Get current framebuffer size in bytes.
+pub fn get_lfb_size() -> u64 {
+    if let Some(ref gpu) = *BOCHS_GPU.lock() {
+        gpu.size()
+    } else {
+        16 * 1024 * 1024
+    }
+}
+
+/// Check if a physical address falls within the VRAM BAR range.
+pub fn is_vram_addr(phys: u64) -> bool {
+    let base = get_lfb_phys();
+    (phys >= base && phys < base + 16 * 1024 * 1024)
+        || (phys >= 0xe000_0000 && phys < 0xe000_0000 + 16 * 1024 * 1024)
+        || (phys >= 0xfd00_0000 && phys < 0xfd00_0000 + 16 * 1024 * 1024)
+}
+
+/// Get current active mode dimensions (width, height, bpp).
+pub fn get_current_mode() -> (u32, u32, u32) {
+    if let Some(ref gpu) = *BOCHS_GPU.lock() {
+        (gpu.width(), gpu.height(), gpu.bpp())
+    } else {
+        (320, 200, 32)
     }
 }
 
@@ -123,34 +210,30 @@ impl GpuDevice for BochsGpuDevice {
             name: String::from("VGA-0"),
             connected: true,
             modes: vec![DisplayMode {
-                width: self.gpu.0.width,
-                height: self.gpu.0.height,
+                width: self.gpu.0.width(),
+                height: self.gpu.0.height(),
                 refresh_rate: 60,
-                bpp: self.gpu.0.bpp,
+                bpp: self.gpu.0.bpp(),
             }],
         }]
     }
 
     fn set_mode(&self, _display: u32, mode: &DisplayMode) -> Result<(), DriverError> {
-        write_vbe(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
-        write_vbe(VBE_DISPI_INDEX_XRES, mode.width as u16);
-        write_vbe(VBE_DISPI_INDEX_YRES, mode.height as u16);
-        write_vbe(VBE_DISPI_INDEX_BPP, mode.bpp as u16);
-        write_vbe(
-            VBE_DISPI_INDEX_ENABLE,
-            VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED,
-        );
-        Ok(())
+        set_video_mode(mode.width as u16, mode.height as u16, mode.bpp as u16)
     }
 
     fn get_framebuffer(&self, _display: u32) -> Result<FramebufferInfo, DriverError> {
+        let w = self.gpu.0.width();
+        let h = self.gpu.0.height();
+        let b = self.gpu.0.bpp();
+        let stride = w * ((b + 7) / 8);
         Ok(FramebufferInfo {
             phys_addr: self.gpu.0.lfb_phys,
-            size: self.gpu.0.size,
-            stride: self.gpu.0.width * 4,
-            width: self.gpu.0.width,
-            height: self.gpu.0.height,
-            bpp: self.gpu.0.bpp,
+            size: self.gpu.0.size(),
+            stride,
+            width: w,
+            height: h,
+            bpp: b,
         })
     }
 
@@ -200,8 +283,8 @@ impl GraphicsConsole {
         let font_data = include_bytes!("font_8x16.bin");
         let char_offset = (c as usize) * 16;
         let mut back = self.gpu.backbuffer.lock();
-        let width = self.gpu.width as usize;
-        let height = self.gpu.height as usize;
+        let width = self.gpu.width() as usize;
+        let height = self.gpu.height() as usize;
 
         for y_offset in 0..16 {
             let pixel_y = y + y_offset;
@@ -236,8 +319,8 @@ impl GraphicsConsole {
 
     /// Draw a character glyph onto the backbuffer at character coordinates (col, row).
     pub fn draw_char_at(&self, col: usize, row: usize, c: u8) {
-        let cols = self.gpu.width as usize / 8;
-        let rows = self.gpu.height as usize / 16;
+        let cols = self.gpu.width() as usize / 8;
+        let rows = self.gpu.height() as usize / 16;
         if col >= cols || row >= rows {
             return;
         }
@@ -247,7 +330,7 @@ impl GraphicsConsole {
     /// Advance cursor and handle scrolling.
     pub fn newline(&mut self) {
         self.cursor_x = 0;
-        let rows = self.gpu.height as usize / 16;
+        let rows = self.gpu.height() as usize / 16;
         if self.cursor_y < rows - 1 {
             self.cursor_y += 1;
         } else {
@@ -258,9 +341,9 @@ impl GraphicsConsole {
     /// Scroll console up by 1 line (16 pixels).
     pub fn scroll_up(&mut self) {
         let mut back = self.gpu.backbuffer.lock();
-        let width = self.gpu.width as usize;
-        let height = self.gpu.height as usize;
-        let lines_to_copy = height - 16;
+        let width = self.gpu.width() as usize;
+        let height = self.gpu.height() as usize;
+        let lines_to_copy = height.saturating_sub(16);
         // SAFETY: We copy the pixels within the bounds of the backbuffer size (width * height).
         // The pointer additions and copy are fully checked against the pointer boundaries and bounds.
         unsafe {
@@ -281,6 +364,8 @@ impl GraphicsConsole {
         let font_data = include_bytes!("font_8x16.bin");
         let mut curr_x = x;
         let mut back = self.gpu.backbuffer.lock();
+        let width = self.gpu.width() as usize;
+        let height = self.gpu.height() as usize;
 
         for &c in s.as_bytes() {
             let char_offset = (c as usize) * 16;
@@ -295,8 +380,11 @@ impl GraphicsConsole {
                             for sx in 0..scale {
                                 let px = curr_x + x_offset * scale + sx;
                                 let py = y + y_offset * scale + sy;
-                                if px < 1024 && py < 768 {
-                                    back[py * 1024 + px] = color.to_argb32();
+                                if px < width && py < height {
+                                    let idx = py * width + px;
+                                    if idx < back.len() {
+                                        back[idx] = color.to_argb32();
+                                    }
                                 }
                             }
                         }
@@ -319,18 +407,23 @@ impl GraphicsConsole {
     ) {
         let mut back = self.gpu.backbuffer.lock();
         let fill_w = (w * progress_percent) / 100;
+        let width = self.gpu.width() as usize;
+        let height = self.gpu.height() as usize;
 
         for dy in 0..h {
             for dx in 0..w {
                 let px = x + dx;
                 let py = y + dy;
-                if px < 1024 && py < 768 {
+                if px < width && py < height {
                     let pixel_color = if dx < fill_w {
                         color.to_argb32()
                     } else {
                         Color::rgb(50, 70, 100).to_argb32()
                     };
-                    back[py * 1024 + px] = pixel_color;
+                    let idx = py * width + px;
+                    if idx < back.len() {
+                        back[idx] = pixel_color;
+                    }
                 }
             }
         }
@@ -339,45 +432,68 @@ impl GraphicsConsole {
     /// Render a beautiful boot splash screen.
     pub fn draw_splash(&mut self) {
         self.clear(Color::rgb(10, 20, 35));
+        let w = self.gpu.width() as usize;
+        let h = self.gpu.height() as usize;
 
         // Horizontal borders
         {
             let mut back = self.gpu.backbuffer.lock();
             let blue_val = Color::BRAND_BLUE.to_argb32();
-            for y in 0..5 {
-                for x in 0..1024 {
-                    back[y * 1024 + x] = blue_val;
-                    back[(763 + y) * 1024 + x] = blue_val;
+            let border_h = 5.min(h / 10);
+            for y in 0..border_h {
+                for x in 0..w {
+                    if y * w + x < back.len() {
+                        back[y * w + x] = blue_val;
+                    }
+                    if h >= border_h && (h - border_h + y) * w + x < back.len() {
+                        back[(h - border_h + y) * w + x] = blue_val;
+                    }
                 }
             }
         }
 
-        // Draw system title and description
-        self.draw_string_scaled(200, 250, "KontsnorOS", 4, Color::BRAND_ACCENT);
-        self.draw_string_scaled(
-            200,
-            330,
-            "A Unix-Compatible Hybrid Kernel in Rust",
-            1,
-            Color::WHITE,
-        );
-
-        // Draw loading bar
-        self.draw_progress_bar(200, 380, 624, 6, 60, Color::BRAND_BLUE);
-
-        // Subtext
-        self.draw_string_scaled(
-            200,
-            410,
-            "Initializing hardware subsystems...",
-            1,
-            Color::rgb(150, 170, 190),
-        );
+        if w >= 640 && h >= 400 {
+            // Draw system title and description
+            self.draw_string_scaled(w / 4, h / 3, "KontsnorOS", 4, Color::BRAND_ACCENT);
+            self.draw_string_scaled(
+                w / 4,
+                h / 3 + 60,
+                "A Unix-Compatible Hybrid Kernel in Rust",
+                1,
+                Color::WHITE,
+            );
+            self.draw_progress_bar(w / 4, h / 3 + 100, w / 2, 6, 60, Color::BRAND_BLUE);
+            self.draw_string_scaled(
+                w / 4,
+                h / 3 + 120,
+                "Initializing hardware subsystems...",
+                1,
+                Color::rgb(150, 170, 190),
+            );
+        } else {
+            self.draw_string_scaled(20, 20, "KontsnorOS", 2, Color::BRAND_ACCENT);
+            self.draw_string_scaled(20, 55, "Unix-Compatible Hybrid Kernel", 1, Color::WHITE);
+            self.draw_progress_bar(
+                20,
+                85,
+                (w.saturating_sub(40)).max(10),
+                4,
+                60,
+                Color::BRAND_BLUE,
+            );
+            self.draw_string_scaled(
+                20,
+                105,
+                "Hardware initialization ready",
+                1,
+                Color::rgb(150, 170, 190),
+            );
+        }
     }
 
     /// Write a character byte, parsing ANSI escapes.
     pub fn write_char(&mut self, c: u8) {
-        let cols = self.gpu.width as usize / 8;
+        let cols = self.gpu.width() as usize / 8;
         match self.ansi_state.clone() {
             AnsiState::Normal => {
                 if c == b'\x1b' {
@@ -542,15 +658,11 @@ pub fn init() {
     let bar0 = crate::drivers::bus::pci::read_config(dev.bus, dev.device, dev.function, 0x10);
     let lfb_phys = (bar0 & 0xFFFFFFF0) as u64;
 
-    let width = 1024;
-    let height = 768;
-    let bpp = 32;
-    let size = (width as u64) * (height as u64) * 4;
-
-    // Map the physical framebuffer memory range (BAR 0) into the higher-half virtual address space.
+    // Map 16MB of VRAM so any mode up to 1920x1080 is accessible
+    let vram_total_size = 16 * 1024 * 1024;
     let lfb_virt = 0xffff_c000_0000_0000u64;
     let page_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
-    let num_pages = (size + 4095) / 4096;
+    let num_pages = (vram_total_size + 4095) / 4096;
     for i in 0..num_pages {
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(lfb_virt + i * 4096));
         let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(lfb_phys + i * 4096));
@@ -563,15 +675,11 @@ pub fn init() {
         }
     }
 
-    // Configure video mode: 1024x768x32
-    write_vbe(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
-    write_vbe(VBE_DISPI_INDEX_XRES, width as u16);
-    write_vbe(VBE_DISPI_INDEX_YRES, height as u16);
-    write_vbe(VBE_DISPI_INDEX_BPP, bpp as u16);
-    write_vbe(
-        VBE_DISPI_INDEX_ENABLE,
-        VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED,
-    );
+    // Default mode: 320x200x32
+    let width = 320;
+    let height = 200;
+    let bpp = 32;
+    let size = (width as u64) * (height as u64) * 4;
 
     let mut backbuffer = Vec::with_capacity((width * height) as usize);
     backbuffer.resize((width * height) as usize, 0);
@@ -579,12 +687,17 @@ pub fn init() {
     let gpu = alloc::sync::Arc::new(BochsGpu {
         lfb_phys,
         lfb_virt,
-        width,
-        height,
-        bpp,
-        size,
+        width: AtomicU32::new(width),
+        height: AtomicU32::new(height),
+        bpp: AtomicU32::new(bpp),
+        size: AtomicU64::new(size),
         backbuffer: Mutex::new(backbuffer),
     });
+
+    *BOCHS_GPU.lock() = Some(gpu.clone());
+
+    // Switch hardware to 320x200x32
+    let _ = set_video_mode(width as u16, height as u16, bpp as u16);
 
     let mut console = GraphicsConsole {
         gpu: gpu.clone(),

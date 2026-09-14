@@ -320,6 +320,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     kprintln!();
 
     // Enable interrupts and enter the scheduler
+    crate::arch::x86_64::smp::BOOT_COMPLETE.store(true, core::sync::atomic::Ordering::Relaxed);
     x86_64::instructions::interrupts::enable();
     kprintln!("[kernel] Interrupts enabled. Yielding to ready threads...");
 

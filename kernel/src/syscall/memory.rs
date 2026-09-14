@@ -73,6 +73,13 @@ pub fn sys_mmap(
         false
     };
 
+    let is_dev_fb0 = if let Some(ref d) = file_desc {
+        let inode = d.inode.inode();
+        inode.file_type == crate::fs::inode::FileType::CharDevice && inode.rdev == (29 << 8)
+    } else {
+        false
+    };
+
     let file_desc = if is_dev_zero { None } else { file_desc };
 
     let current_pid = match scheduler::current_pid() {
@@ -163,7 +170,9 @@ pub fn sys_mmap(
                     crate::memory::r#virtual::unmap_user_page_no_shootdown(page_table_root, page)
                 };
                 if let Ok(phys_addr) = result {
-                    crate::memory::physical::deallocate_frame(phys_addr);
+                    if !crate::drivers::gpu::bochs::is_vram_addr(phys_addr) {
+                        crate::memory::physical::deallocate_frame(phys_addr);
+                    }
                     unmapped_any = true;
                 }
             }
@@ -283,6 +292,40 @@ pub fn sys_mmap(
                 is_stack: false,
             });
 
+        if is_dev_fb0 {
+            use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
+            use x86_64::{PhysAddr, VirtAddr};
+            let page_table_root = addr_space.page_table_root;
+            let vram_phys_base = crate::drivers::gpu::bochs::get_lfb_phys() + (offset as u64);
+            let num_pages = aligned_len / 4096;
+            let page_flags = PageTableFlags::PRESENT
+                | PageTableFlags::USER_ACCESSIBLE
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::WRITE_THROUGH;
+
+            for i in 0..num_pages {
+                let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+                    resolved + (i as u64) * 4096,
+                ));
+                let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(
+                    vram_phys_base + (i as u64) * 4096,
+                ));
+                // SAFETY: We map the hardware framebuffer BAR0 memory range directly into user address space.
+                unsafe {
+                    crate::memory::r#virtual::ensure_directory_permissions(
+                        page_table_root,
+                        VirtAddr::new(resolved + (i as u64) * 4096),
+                    );
+                    let _ = crate::memory::r#virtual::map_user_page_no_shootdown(
+                        page_table_root,
+                        page,
+                        frame,
+                        page_flags,
+                    );
+                }
+            }
+        }
+
         if crate::syscall::DEBUG_SYSCALLS {
             crate::kprintln!(
                 "[mmap] pid={:?} start={:#x} len={:#x} prot={:#x} total={}",
@@ -360,7 +403,9 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
             };
 
             if let Ok(phys_addr) = result {
-                crate::memory::physical::deallocate_frame(phys_addr);
+                if !crate::drivers::gpu::bochs::is_vram_addr(phys_addr) {
+                    crate::memory::physical::deallocate_frame(phys_addr);
+                }
                 count += 1;
             }
         }

@@ -19,7 +19,7 @@ use crate::kprintln;
 use spin::Mutex;
 
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 global_asm!(
     r#"
@@ -186,6 +186,9 @@ static TLB_SHOOTDOWN_LOCK: Mutex<()> = Mutex::new(());
 /// Global atomic counter for tracking TLB shootdown acknowledgements.
 static TLB_SHOOTDOWN_ACKS: AtomicU32 = AtomicU32::new(0);
 
+/// Global atomic flag indicating whether kernel initialization has finished and interrupts are enabled.
+pub static BOOT_COMPLETE: AtomicBool = AtomicBool::new(false);
+
 /// Initialize the CPU manager using core enumeration from the MADT.
 pub fn init() {
     let mut manager = CPU_MANAGER.lock();
@@ -266,9 +269,10 @@ pub fn shootdown_tlb() {
     }
 
     if target_count > 0 {
-        // F-08: Ensure we are not in an interrupt context under SMP
+        // F-08: Ensure we are not in an interrupt context under SMP (exempting early boot driver init)
         debug_assert!(
-            x86_64::instructions::interrupts::are_enabled(),
+            x86_64::instructions::interrupts::are_enabled()
+                || !BOOT_COMPLETE.load(Ordering::Relaxed),
             "shootdown_tlb called with interrupts disabled (potential deadlock)"
         );
 

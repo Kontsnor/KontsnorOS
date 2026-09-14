@@ -32,6 +32,7 @@
 > - True Symmetric Multiprocessing (SMP) across 8+ parallel CPU cores with Local APIC timers, IPI preemption, and batched TLB shootdowns.
 > - Full TCP/IP networking stack with Intel `e1000` Gigabit Ethernet DMA ring-buffers and BSD sockets.
 > - Modern persistent Ext4 filesystem with extent trees, dirty page cache writeback, and mount-time self-healing FSCK.
+> - Oh, and it also runs Doom. Because of course it does.
 >
 > *"I run Arch btw (in a namespace with my own kernel in QEMU on Ubuntu on WSL2 on Windows 11)."*
 
@@ -53,6 +54,7 @@ KontsnorOS is a **hybrid kernel** combining the direct-hardware performance of a
 - 🌐 **DMA Gigabit Networking & TCP/IP Stack**: Intel `82540EM` (`e1000`) PCI driver with ring-buffer DMA, zero-delay interrupt scheduling, 512KB dynamic receive window scaling, out-of-order TCP segment reassembly, and full BSD socket API.
 - 🖥️ **Interactive Terminal & PTY Subsystem**: Complete pseudo-terminal (`devpts`) driver, cooked (`ICANON`, `ECHO`, `ISIG`) and raw line discipline, process group signal routing (Ctrl+C / `SIGINT`), and session/job control (`TIOCSCTTY`, `TIOCSPGRP`).
 - 🔌 **Driver SDK**: Safe, trait-based driver development framework for character, block, network, and graphics devices under GPLv3.
+- 🎮 **Oh, It Also Runs Doom**: Naturally. With Bochs VBE modesetting, `/dev/fb0` Linux framebuffer support, and direct physical VRAM `mmap` backing, stock `fbdoom` runs right inside an Arch Linux container.
 
 ---
 

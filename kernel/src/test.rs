@@ -3269,3 +3269,125 @@ fn test_devfs_special_nodes() {
 
     kprintln!("[test] devfs special character device nodes test PASSED!");
 }
+
+#[test_case]
+fn test_mouse_driver_and_dev_input_nodes() {
+    kprintln!("[test] Starting PS/2 mouse driver and /dev/input test...");
+
+    // 1. Lookup /dev/input directory and device nodes
+    let input_dir = crate::fs::vfs::lookup("/dev/input").expect("/dev/input directory missing");
+    assert_eq!(input_dir.inode().file_type, crate::fs::inode::FileType::Directory);
+
+    let dev_mice = crate::fs::vfs::lookup("/dev/input/mice").expect("/dev/input/mice missing");
+    let inode_mice = dev_mice.inode();
+    assert_eq!(inode_mice.file_type, crate::fs::inode::FileType::CharDevice);
+    assert_eq!(inode_mice.rdev, (13 << 8) | 63);
+
+    let dev_event0 = crate::fs::vfs::lookup("/dev/input/event0").expect("/dev/input/event0 missing");
+    let inode_event0 = dev_event0.inode();
+    assert_eq!(inode_event0.file_type, crate::fs::inode::FileType::CharDevice);
+    assert_eq!(inode_event0.rdev, (13 << 8) | 64);
+
+    // 2. Simulate raw PS/2 mouse packet: left button pressed, dx = +10, dy = +5 (PS/2 UP)
+    // b0 = 0x08 (bit 3 set) | 0x01 (left button) = 0x09
+    crate::drivers::mouse::push_mouse_byte(0x09);
+    crate::drivers::mouse::push_mouse_byte(10);
+    crate::drivers::mouse::push_mouse_byte(5);
+
+    // 3. Read raw 3-byte packet from /dev/input/mice
+    let mut mice_buf = [0u8; 3];
+    let n_mice = dev_mice.read(0, &mut mice_buf).expect("read /dev/input/mice failed");
+    assert_eq!(n_mice, 3);
+    assert_eq!(mice_buf, [0x09, 10, 5]);
+
+    // 4. Read InputEvent structs from /dev/input/event0
+    let ev_size = core::mem::size_of::<crate::drivers::mouse::InputEvent>();
+    let mut ev_buf = [0u8; 24 * 8];
+    let n_ev_bytes = dev_event0.read(0, &mut ev_buf).expect("read /dev/input/event0 failed");
+    assert!(n_ev_bytes >= ev_size * 4); // REL_X, REL_Y, BTN_LEFT, SYN_REPORT
+
+    let ev_count = n_ev_bytes / ev_size;
+    let events = unsafe {
+        core::slice::from_raw_parts(
+            ev_buf.as_ptr() as *const crate::drivers::mouse::InputEvent,
+            ev_count,
+        )
+    };
+
+    let mut found_rel_x = false;
+    let mut found_rel_y = false;
+    let mut found_btn_left = false;
+    let mut found_syn = false;
+
+    for ev in events {
+        match ev.type_ {
+            crate::drivers::mouse::EV_REL => {
+                if ev.code == crate::drivers::mouse::REL_X {
+                    assert_eq!(ev.value, 10);
+                    found_rel_x = true;
+                } else if ev.code == crate::drivers::mouse::REL_Y {
+                    assert_eq!(ev.value, -5); // Linux REL_Y is inverted relative to PS/2
+                    found_rel_y = true;
+                }
+            }
+            crate::drivers::mouse::EV_KEY => {
+                if ev.code == crate::drivers::mouse::BTN_LEFT {
+                    assert_eq!(ev.value, 1);
+                    found_btn_left = true;
+                }
+            }
+            crate::drivers::mouse::EV_SYN => {
+                if ev.code == crate::drivers::mouse::SYN_REPORT {
+                    found_syn = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(found_rel_x, "REL_X event missing");
+    assert!(found_rel_y, "REL_Y event missing");
+    assert!(found_btn_left, "BTN_LEFT event missing");
+    assert!(found_syn, "SYN_REPORT event missing");
+
+    // 5. Test evdev ioctl calls on /dev/input/event0
+    // EVIOCGVERSION (0x80044501)
+    let mut version: u32 = 0;
+    let res_ver = dev_event0.ioctl(0x80044501, &mut version as *mut u32 as u64).expect("EVIOCGVERSION failed");
+    assert_eq!(res_ver, 0);
+    assert_eq!(version, 0x010001);
+
+    // EVIOCGNAME (0x80154506 for size 21)
+    let mut name_buf = [0u8; 32];
+    let req_name = 0x80154506; // 'E' (0x45), cmd 0x06, size 21
+    let res_name = dev_event0.ioctl(req_name, name_buf.as_mut_ptr() as u64).expect("EVIOCGNAME failed");
+    assert!(res_name > 0);
+    let name_str = core::str::from_utf8(&name_buf[..res_name as usize]).unwrap();
+    assert!(name_str.starts_with("KontsnorOS PS/2 Mouse"));
+
+    // Unknown ioctl -> should return -ENOTTY (-25)
+    let res_unknown = dev_event0.ioctl(0x12345678, 0);
+    assert_eq!(res_unknown, Err(-25));
+
+    // 6. Test Framebuffer /dev/fb0 ioctls
+    let dev_fb0 = crate::fs::vfs::lookup("/dev/fb0").expect("/dev/fb0 missing");
+    let mut var_info = crate::fs::devfs::FbVarScreeninfo::default();
+    let res_fb_get = dev_fb0.ioctl(0x4600, &mut var_info as *mut _ as u64).expect("FBIOGET_VSCREENINFO failed");
+    assert_eq!(res_fb_get, 0);
+    assert!(var_info.xres > 0);
+    assert!(var_info.yres > 0);
+    assert_eq!(var_info.bits_per_pixel, 32);
+    assert_eq!(var_info.red.offset, 16);
+    assert_eq!(var_info.green.offset, 8);
+    assert_eq!(var_info.blue.offset, 0);
+    assert_eq!(var_info.transp.offset, 24);
+
+    // Stubs: FBIOPAN_DISPLAY (0x4606), FBIO_WAITFORVSYNC (0x4620)
+    assert_eq!(dev_fb0.ioctl(0x4606, 0), Ok(0));
+    assert_eq!(dev_fb0.ioctl(0x4620, 0), Ok(0));
+
+    // Unknown fb ioctl -> should return -ENOTTY (-25)
+    assert_eq!(dev_fb0.ioctl(0x99999999, 0), Err(-25));
+
+    kprintln!("[test] PS/2 mouse driver and /dev/input test PASSED!");
+}

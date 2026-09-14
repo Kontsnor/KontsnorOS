@@ -344,7 +344,9 @@ impl InodeOps for DevFb0 {
         const FBIOGET_FSCREENINFO: u64 = 0x4602;
         const FBIOGETCMAP: u64 = 0x4604;
         const FBIOPUTCMAP: u64 = 0x4605;
+        const FBIOPAN_DISPLAY: u64 = 0x4606;
         const FBIOBLANK: u64 = 0x4611;
+        const FBIO_WAITFORVSYNC: u64 = 0x4620;
 
         match request {
             FBIOGET_FSCREENINFO => {
@@ -551,13 +553,187 @@ impl InodeOps for DevFb0 {
                 }
                 Ok(0)
             }
-            FBIOBLANK => Ok(0),
-            _ => Err(-22), // EINVAL
+            FBIOPAN_DISPLAY | FBIO_WAITFORVSYNC | FBIOBLANK => Ok(0),
+            _ => Err(-25), // ENOTTY
         }
     }
 
     fn poll(&self, _events: u32) -> u32 {
         super::inode::POLLIN | super::inode::POLLOUT
+    }
+}
+
+/// `/dev/input/mice` — Legacy PS/2 mouse character device (Major 13, Minor 63).
+pub struct DevMice {
+    pub inode: Inode,
+}
+
+impl InodeOps for DevMice {
+    fn inode(&self) -> &Inode {
+        &self.inode
+    }
+
+    fn read(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let nonblock = super::inode::is_inode_nonblocking(self);
+
+        loop {
+            if crate::drivers::mouse::mice_has_data() {
+                let n = crate::drivers::mouse::try_read_mice_bytes(buf);
+                if n > 0 {
+                    return Ok(n);
+                }
+            }
+
+            if nonblock {
+                return Err(-11); // -EAGAIN
+            }
+
+            // Block on mouse wait queue
+            crate::drivers::mouse::MOUSE_WAIT_QUEUE.wait();
+        }
+    }
+
+    fn poll(&self, _events: u32) -> u32 {
+        if crate::drivers::mouse::mice_has_data() {
+            super::inode::POLLIN | 0x0040 // POLLIN | POLLRDNORM
+        } else {
+            0
+        }
+    }
+
+    fn ioctl(&self, _request: u64, _arg: u64) -> Result<u64, i32> {
+        Err(-25) // -ENOTTY
+    }
+}
+
+/// `/dev/input/event0` — Linux evdev mouse event character device (Major 13, Minor 64).
+pub struct DevEvent0 {
+    pub inode: Inode,
+}
+
+impl InodeOps for DevEvent0 {
+    fn inode(&self) -> &Inode {
+        &self.inode
+    }
+
+    fn read(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
+        let ev_size = core::mem::size_of::<crate::drivers::mouse::InputEvent>();
+        if buf.len() < ev_size {
+            return Err(-22); // -EINVAL
+        }
+
+        let nonblock = super::inode::is_inode_nonblocking(self);
+        let max_events = buf.len() / ev_size;
+
+        loop {
+            if crate::drivers::mouse::event0_has_data() {
+                // Read input events into user buffer
+                let events_slice = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        buf.as_mut_ptr() as *mut crate::drivers::mouse::InputEvent,
+                        max_events,
+                    )
+                };
+                let n = crate::drivers::mouse::try_read_events(events_slice);
+                if n > 0 {
+                    return Ok(n * ev_size);
+                }
+            }
+
+            if nonblock {
+                return Err(-11); // -EAGAIN
+            }
+
+            // Block on mouse wait queue
+            crate::drivers::mouse::MOUSE_WAIT_QUEUE.wait();
+        }
+    }
+
+    fn poll(&self, _events: u32) -> u32 {
+        if crate::drivers::mouse::event0_has_data() {
+            super::inode::POLLIN | 0x0040 // POLLIN | POLLRDNORM
+        } else {
+            0
+        }
+    }
+
+    fn ioctl(&self, request: u64, arg: u64) -> Result<u64, i32> {
+        let cmd = (request & 0xFF) as u8;
+        let size = ((request >> 16) & 0x1FFF) as usize;
+        let magic = ((request >> 8) & 0xFF) as u8;
+
+        if magic == b'E' {
+            match cmd {
+                0x01 => {
+                    // EVIOCGVERSION
+                    if arg == 0 {
+                        return Err(-14); // -EFAULT
+                    }
+                    crate::syscall::validation::validate_user_ptr_write(arg as *mut u8, 4)
+                        .map_err(|_| -14)?;
+                    // EV_VERSION: 0x010001 (1.0.1)
+                    unsafe {
+                        *(arg as *mut u32) = 0x010001;
+                    }
+                    return Ok(0);
+                }
+                0x06 => {
+                    // EVIOCGNAME(len)
+                    if arg == 0 || size == 0 {
+                        return Err(-14); // -EFAULT
+                    }
+                    crate::syscall::validation::validate_user_ptr_write(arg as *mut u8, size)
+                        .map_err(|_| -14)?;
+                    let name = b"KontsnorOS PS/2 Mouse\0";
+                    let to_copy = name.len().min(size);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(name.as_ptr(), arg as *mut u8, to_copy);
+                    }
+                    return Ok(to_copy as u64);
+                }
+                cmd if (0x20..=0x3F).contains(&cmd) => {
+                    // EVIOCGBIT(ev_type, len)
+                    let ev_type = (cmd - 0x20) as u16;
+                    if arg == 0 || size == 0 {
+                        return Err(-14); // -EFAULT
+                    }
+                    crate::syscall::validation::validate_user_ptr_write(arg as *mut u8, size)
+                        .map_err(|_| -14)?;
+
+                    let mut mask = [0u8; 64];
+                    match ev_type {
+                        0 => {
+                            // EV_SYN (0), EV_KEY (1), EV_REL (2)
+                            mask[0] = (1 << 0) | (1 << 1) | (1 << 2);
+                        }
+                        1 => {
+                            // EV_KEY: BTN_LEFT (272), BTN_RIGHT (273), BTN_MIDDLE (274)
+                            mask[272 / 8] |= 1 << (272 % 8);
+                            mask[273 / 8] |= 1 << (273 % 8);
+                            mask[274 / 8] |= 1 << (274 % 8);
+                        }
+                        2 => {
+                            // EV_REL: REL_X (0), REL_Y (1)
+                            mask[0] = (1 << 0) | (1 << 1);
+                        }
+                        _ => {}
+                    }
+
+                    let to_copy = mask.len().min(size);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(mask.as_ptr(), arg as *mut u8, to_copy);
+                    }
+                    return Ok(to_copy as u64);
+                }
+                _ => {}
+            }
+        }
+
+        Err(-25) // -ENOTTY
     }
 }
 
@@ -641,6 +817,28 @@ pub fn create_devfs() -> Arc<DevFs> {
             inode: make_chardev_inode(18, 29, 0),
         }) as Arc<dyn InodeOps>,
     );
+
+    // Create /dev/input directory and nodes (/dev/input/mice & /dev/input/event0)
+    let input_entries = RwLock::new(BTreeMap::new());
+    input_entries.write().insert(
+        String::from("mice"),
+        Arc::new(DevMice {
+            inode: make_chardev_inode(20, 13, 63),
+        }) as Arc<dyn InodeOps>,
+    );
+    input_entries.write().insert(
+        String::from("event0"),
+        Arc::new(DevEvent0 {
+            inode: make_chardev_inode(21, 13, 64),
+        }) as Arc<dyn InodeOps>,
+    );
+
+    let input_dir = Arc::new(DevFsDir {
+        inode: Inode::new(19, FileType::Directory).with_dev(DEVFS_DEV_ID),
+        entries: input_entries,
+    });
+
+    entries.insert(String::from("input"), input_dir as Arc<dyn InodeOps>);
 
     let root = Arc::new(DevFsDir {
         inode: Inode::new(1, FileType::Directory).with_dev(DEVFS_DEV_ID),

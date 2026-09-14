@@ -72,6 +72,8 @@ pub enum InterruptIndex {
     IpiTlbShootdown = 36,
     /// Network interrupt (IRQ 11, vector 43).
     Network = 43,
+    /// Mouse interrupt (IRQ 12, vector 44).
+    Mouse = 44,
 }
 
 impl InterruptIndex {
@@ -116,6 +118,7 @@ lazy_static! {
         idt[InterruptIndex::IpiHalt.as_u8()].set_handler_fn(ipi_halt_handler);
         idt[InterruptIndex::IpiTlbShootdown.as_u8()].set_handler_fn(ipi_tlb_shootdown_handler);
         idt[InterruptIndex::Network.as_u8()].set_handler_fn(network_interrupt_handler);
+        idt[InterruptIndex::Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
         idt[255].set_handler_fn(spurious_interrupt_handler);
 
         idt
@@ -274,6 +277,35 @@ extern "x86-interrupt" fn page_fault_handler(
     }
 
     page_fault_handler_inner(stack_frame, error_code);
+
+    if swap_needed {
+        // SAFETY: Swap back to user GS base before returning
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        }
+    }
+}
+
+extern "x86-interrupt" fn mouse_interrupt_handler(stack_frame: InterruptStackFrame) {
+    let swap_needed = stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3;
+    if swap_needed {
+        // SAFETY: Swap to kernel GS base if entering from user space
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        }
+    }
+
+    use x86_64::instructions::port::Port;
+
+    let mut port = Port::new(0x60);
+    // SAFETY: Port 0x60 is the standard PS/2 mouse data port on x86.
+    let byte: u8 = unsafe { port.read() };
+
+    // Buffer mouse byte
+    crate::drivers::mouse::push_mouse_byte(byte);
+
+    // SAFETY: Acknowledge the mouse interrupt to the Local APIC.
+    super::apic::lapic_eoi();
 
     if swap_needed {
         // SAFETY: Swap back to user GS base before returning

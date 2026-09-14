@@ -398,8 +398,9 @@ if [ "$INTERACTIVE" = true ]; then
         -device e1000,netdev=net0 \
         -chardev stdio,id=char0,signal=off \
         -serial chardev:char0 \
-        -display none \
         -m 4096M \
+        -vga std \
+        -vnc :0 \
         $ACCEL_OPTS \
         -no-reboot
     exit 0

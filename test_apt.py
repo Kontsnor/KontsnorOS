@@ -23,12 +23,13 @@ def main():
     cmd = [
         'qemu-system-x86_64',
         '-drive', 'format=raw,file=/home/kontsnor/Projects/KontsnorOS/bios.img',
-        '-drive', 'format=raw,file=/home/kontsnor/Projects/KontsnorOS/disk-ubuntu.img,index=1,media=disk',
+        '-drive', 'file=/home/kontsnor/Projects/KontsnorOS/disk-ubuntu.img,format=raw,index=1,media=disk,cache=unsafe,aio=threads,discard=unmap,detect-zeroes=unmap',
+        '-rtc', 'base=utc,clock=host',
         '-serial', 'stdio',
         '-display', 'none',
-        '-m', '4G',
+        '-m', '4096M',
         '-qmp', 'unix:/tmp/qmp-kontsnor.sock,server,nowait',
-        '-enable-kvm', '-cpu', 'host', '-smp', '8',
+        '-enable-kvm', '-cpu', 'host', '-smp', '4,sockets=1,cores=4,threads=1',
         '-netdev', 'user,id=net0',
         '-device', 'e1000,netdev=net0',
         '-no-reboot', '-no-shutdown'

@@ -458,9 +458,7 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
         }
     }
 
-    if !error_code.contains(x86_64::structures::idt::PageFaultErrorCode::PROTECTION_VIOLATION)
-        && fault_addr.as_u64() < 0x0000_8000_0000_0000
-    {
+    if fault_addr.as_u64() < 0x0000_8000_0000_0000 {
         let resolved = crate::process::scheduler::current_pid()
             .and_then(|pid| crate::process::scheduler::get_task_arc(pid))
             .and_then(|task_arc| {

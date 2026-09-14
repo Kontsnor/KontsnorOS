@@ -236,7 +236,60 @@ pub fn spawn_user_process_with_pid(name: alloc::string::String, elf_data: &[u8],
 
     // Create new process TCB
     let mut task = Task::new(pid, name, page_table_root);
-    task.address_space.lock().brk = initial_brk;
+    {
+        let mut addr_space = task.address_space.lock();
+        addr_space.brk = initial_brk;
+
+        // Register ELF segments in mmap_regions
+        for segment in &elf_info.segments {
+            let vaddr = segment.vaddr + main_bias;
+            let mem_size = segment.mem_size;
+            let file_offset = segment.file_offset;
+
+            if mem_size == 0 {
+                continue;
+            }
+
+            let mut prot = 0;
+            if segment.flags.read {
+                prot |= 1;
+            }
+            if segment.flags.write {
+                prot |= 2;
+            }
+            if segment.flags.execute {
+                prot |= 4;
+            }
+
+            let page_start = vaddr & !4095;
+            let page_offset = file_offset & !4095;
+            let page_end = (vaddr + mem_size + 4095) & !4095;
+            let page_len = (page_end - page_start) as usize;
+
+            addr_space.mmap_regions.push(crate::process::task::MappedRegion {
+                start: page_start,
+                len: page_len,
+                inode: None,
+                offset: page_offset,
+                is_shared: false,
+                prot,
+                pathname: None,
+                is_stack: false,
+            });
+        }
+
+        // Register user stack in mmap_regions
+        addr_space.mmap_regions.push(crate::process::task::MappedRegion {
+            start: stack_bottom,
+            len: stack_size as usize,
+            inode: None,
+            offset: 0,
+            is_shared: false,
+            prot: 3, // PROT_READ | PROT_WRITE
+            pathname: Some(alloc::string::String::from("[stack]")),
+            is_stack: true,
+        });
+    }
 
     // Allocate kernel stack
     let kernel_stack_layout =
@@ -337,7 +390,7 @@ pub fn cleanup_address_space() {
         let mut task = task_arc.lock();
         let old = task.address_space.clone();
         task.address_space = Arc::new(spin::Mutex::new(crate::process::task::AddressSpace {
-            page_table_root: kernel_pml4,
+            page_table_root: 0,
             start_brk: 0,
             brk: 0,
             mmap_bump: 0,

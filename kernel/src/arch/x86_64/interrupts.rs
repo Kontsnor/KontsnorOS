@@ -430,6 +430,19 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                                                     // Flush local TLB for this virtual address
                                                     x86_64::instructions::tlb::flush(fault_addr);
                                                     return; // Fault resolved!
+                                                } else {
+                                                    // Physical frame allocation failed (OOM)
+                                                    crate::kprintln!(
+                                                        "[OOM] Physical frame allocation failed during Copy-On-Write for PID {:?} at vaddr {:#x}",
+                                                        crate::process::scheduler::current_pid(),
+                                                        fault_addr.as_u64()
+                                                    );
+                                                    if is_user {
+                                                        let _ = crate::syscall::process::sys_exit_group(139);
+                                                        loop {
+                                                            x86_64::instructions::hlt();
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }

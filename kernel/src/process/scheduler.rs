@@ -356,17 +356,34 @@ impl Scheduler {
                 }
 
                 if !is_thread {
-                    let addr_space = task.address_space.clone();
-                    let space = addr_space.lock();
-                    for r in &space.mmap_regions {
-                        if r.is_shared && r.inode.is_some() {
-                            crate::memory::page_cache::sync_mapped_region(
-                                space.page_table_root,
-                                r,
-                                r.start,
-                                r.start.saturating_add(r.len as u64),
-                            );
+                    let kernel_pml4 = crate::memory::r#virtual::kernel_pml4_phys();
+                    let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
+                    let active_cr3 = cr3_frame.start_address().as_u64();
+
+                    let old_addr_space = task.address_space.clone();
+                    let old_pt_root = old_addr_space.lock().page_table_root;
+
+                    if old_pt_root != 0 && old_pt_root != kernel_pml4 {
+                        if active_cr3 == old_pt_root {
+                            unsafe {
+                                x86_64::registers::control::Cr3::write(
+                                    x86_64::structures::paging::PhysFrame::containing_address(
+                                        x86_64::PhysAddr::new(kernel_pml4),
+                                    ),
+                                    x86_64::registers::control::Cr3Flags::empty(),
+                                );
+                            }
                         }
+
+                        // Replace address space with dummy empty AddressSpace.
+                        // This drops the old Arc<Mutex<AddressSpace>> and frees all user page tables and physical frames immediately.
+                        task.address_space = Arc::new(spin::Mutex::new(crate::process::task::AddressSpace {
+                            page_table_root: 0,
+                            start_brk: 0,
+                            brk: 0,
+                            mmap_bump: 0,
+                            mmap_regions: Vec::new(),
+                        }));
                     }
                 }
             }

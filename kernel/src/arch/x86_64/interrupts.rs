@@ -509,14 +509,25 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
 
                 let (phys, do_cow) = match region.inode {
                     Some(ref inode) => {
-                        let file_offset = region.offset + page_offset;
-                        match crate::memory::page_cache::get_or_create_page(inode, file_offset) {
-                            Ok(p) => {
-                                let cow = !is_shared && (prot & 2) != 0;
-                                (p, cow)
-                            }
-                            Err(_) => {
-                                return Some(Err((-5, page_vaddr))); // EIO
+                        let ino = inode.inode();
+                        if ino.file_type == crate::fs::inode::FileType::CharDevice
+                            && ino.rdev == (29 << 8)
+                        {
+                            let vram_phys = crate::drivers::gpu::bochs::get_lfb_phys()
+                                + region.offset
+                                + page_offset;
+                            (vram_phys, false)
+                        } else {
+                            let file_offset = region.offset + page_offset;
+                            match crate::memory::page_cache::get_or_create_page(inode, file_offset)
+                            {
+                                Ok(p) => {
+                                    let cow = !is_shared && (prot & 2) != 0;
+                                    (p, cow)
+                                }
+                                Err(_) => {
+                                    return Some(Err((-5, page_vaddr))); // EIO
+                                }
                             }
                         }
                     }
@@ -549,7 +560,7 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                 let frame = PhysFrame::containing_address(PhysAddr::new(phys));
 
                 unsafe {
-                    if region.inode.is_some() {
+                    if region.inode.is_some() && !crate::drivers::gpu::bochs::is_vram_addr(phys) {
                         crate::memory::physical::increment_ref(phys);
                     }
 
@@ -567,19 +578,23 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
                         Ok(()) => {}
                         Err("PageAlreadyMapped") => {
                             // Another core mapped this page concurrently. Deallocate our unused frame and succeed!
-                            if region.inode.is_some() {
-                                crate::memory::physical::decrement_ref(phys);
-                            } else {
-                                crate::memory::physical::deallocate_frame(phys);
+                            if !crate::drivers::gpu::bochs::is_vram_addr(phys) {
+                                if region.inode.is_some() {
+                                    crate::memory::physical::decrement_ref(phys);
+                                } else {
+                                    crate::memory::physical::deallocate_frame(phys);
+                                }
                             }
                             x86_64::instructions::tlb::flush(VirtAddr::new(page_vaddr));
                             return Some(Ok(()));
                         }
                         Err(_e) => {
-                            if region.inode.is_some() {
-                                crate::memory::physical::decrement_ref(phys);
-                            } else {
-                                crate::memory::physical::deallocate_frame(phys);
+                            if !crate::drivers::gpu::bochs::is_vram_addr(phys) {
+                                if region.inode.is_some() {
+                                    crate::memory::physical::decrement_ref(phys);
+                                } else {
+                                    crate::memory::physical::deallocate_frame(phys);
+                                }
                             }
                             return Some(Err((-12, page_vaddr)));
                         }

@@ -180,6 +180,10 @@ fn test_scheduler_priority_queues() {
     assert_eq!(sched.pick_next(), None);
     kprintln!("[test] pick_next asserted");
 
+    sched.remove_mock_task(pid_high);
+    sched.remove_mock_task(pid_normal);
+    sched.remove_mock_task(pid_low);
+
     kprintln!("[test] Scheduler priority queues test PASSED!");
 }
 
@@ -216,6 +220,10 @@ fn test_orphan_reparenting() {
         crate::process::scheduler::get_task_arc(pid_parent).expect("Parent task missing");
     let parent = parent_arc.lock();
     assert_eq!(parent.state, crate::process::task::TaskState::Zombie);
+    drop(parent);
+
+    sched.remove_mock_task(pid_parent);
+    sched.remove_mock_task(pid_child);
 
     kprintln!("[test] Orphan reparenting test PASSED!");
 }
@@ -557,6 +565,9 @@ fn test_dirty_page_flush() {
     let fd = crate::process::fd::current_task_alloc_fd(inode.clone())
         .expect("Failed to allocate file descriptor");
     kprintln!("[test] Allocated fd: {}", fd);
+
+    // Sync the initial zero-fill to disk so disk backing has zeros before dirty mmap write
+    crate::syscall::fs::sys_fsync(fd);
 
     // Map MAP_SHARED
     let addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x01, fd, 0);
@@ -1575,6 +1586,9 @@ fn test_thread_clone_vm() {
         assert_eq!(t2.address_space.lock().brk, 0x1000);
     }
 
+    sched.remove_mock_task(pid1);
+    sched.remove_mock_task(pid2);
+
     kprintln!("[test] Thread Shared VM test PASSED!");
 }
 
@@ -2461,6 +2475,10 @@ fn test_ext_file_write_persistence() {
     let written = crate::syscall::fs::sys_write(fd as i32, buf_addr as *const u8, test_data.len());
     assert_eq!(written, test_data.len() as i64, "Short write");
 
+    // Commit page cache dirty pages to disk
+    let fsync_res = crate::syscall::fs::sys_fsync(fd as i32);
+    assert_eq!(fsync_res, 0);
+
     // Close the file (triggers FileDescription::drop and flush)
     let close_res = crate::syscall::fs::sys_close(fd as i32);
     assert_eq!(close_res, 0);
@@ -2917,6 +2935,7 @@ fn test_git_pack_write_and_trailer_pread() {
         assert_eq!(res, chunk_len as i64, "Short write in packfile");
         written_total += chunk_len;
     }
+    assert_eq!(crate::syscall::fs::sys_fsync(pack_fd as i32), 0);
     assert_eq!(crate::syscall::fs::sys_close(pack_fd as i32), 0);
 
     // 2. Create adjacent index file to trigger adjacent inode table allocation and writes
@@ -2937,6 +2956,7 @@ fn test_git_pack_write_and_trailer_pread() {
         idx_content.len(),
     );
     assert_eq!(idx_written, idx_content.len() as i64);
+    assert_eq!(crate::syscall::fs::sys_fsync(idx_fd as i32), 0);
     assert_eq!(crate::syscall::fs::sys_close(idx_fd as i32), 0);
 
     // 3. Open packfile read-only and verify trailer with pread64 (matching open_packed_git_1)

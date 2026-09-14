@@ -128,7 +128,8 @@ impl ExtFileSystem {
                     }
                     write_blocks(&*self.device, block_bitmap_num, &bitmap, self.block_size)?;
 
-                    let start_block_num = (g as u32) * blocks_per_group + sb.s_first_data_block + start_idx;
+                    let start_block_num =
+                        (g as u32) * blocks_per_group + sb.s_first_data_block + start_idx;
 
                     let free_b = gds[g].free_blocks_count(self.is_64bit);
                     gds[g].set_free_blocks_count(self.is_64bit, free_b.saturating_sub(alloc_len));
@@ -150,7 +151,8 @@ impl ExtFileSystem {
 
     /// Allocate a single block from the filesystem block bitmap.
     pub fn allocate_block(&self) -> Result<u32, &'static str> {
-        self.allocate_blocks_contiguous(0, 1).map(|(block, _)| block)
+        self.allocate_blocks_contiguous(0, 1)
+            .map(|(block, _)| block)
     }
 
     /// Deallocate a block back to the block bitmap.

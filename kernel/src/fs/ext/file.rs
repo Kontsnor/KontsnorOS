@@ -1186,8 +1186,8 @@ impl ExtInode {
                 cached_phys_start + (file_block - cached_start_file_block)
             } else {
                 let remaining_bytes = buf.len() - written_bytes;
-                let needed_blocks =
-                    ((remaining_bytes + self.fs.block_size as usize - 1) / self.fs.block_size as usize) as u32;
+                let needed_blocks = ((remaining_bytes + self.fs.block_size as usize - 1)
+                    / self.fs.block_size as usize) as u32;
                 let chunk_req = needed_blocks.clamp(32, 128);
 
                 let (p_start, p_count) = self

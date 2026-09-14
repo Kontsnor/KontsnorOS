@@ -1248,16 +1248,8 @@ impl InodeOps for ExtInode {
         if raw.i_links_count > 0 {
             raw.i_links_count -= 1;
         }
-        let is_zero = raw.i_links_count == 0;
-        let is_dir = (raw.i_mode & 0xF000) == 0x4000;
         self.vfs_inode.write().nlink = raw.i_links_count as u32;
         self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?;
-        drop(raw);
-
-        if is_zero {
-            let _ = self.truncate_file(0);
-            let _ = self.fs.deallocate_inode(self.ino, is_dir);
-        }
         Ok(())
     }
 

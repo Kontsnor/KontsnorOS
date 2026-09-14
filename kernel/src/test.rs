@@ -3249,3 +3249,39 @@ fn test_devfs_special_nodes() {
 
     kprintln!("[test] devfs special character device nodes test PASSED!");
 }
+
+#[test_case]
+fn test_path_normalization_fastpath() {
+    kprintln!("[test] Starting path normalization fast-path and join test...");
+
+    use crate::fs::path::{join, normalize};
+
+    // 1. Already-normalized absolute paths
+    assert_eq!(normalize("/"), "/");
+    assert_eq!(normalize("/usr/bin/bash"), "/usr/bin/bash");
+    assert_eq!(normalize("/a/b/c/d/e"), "/a/b/c/d/e");
+
+    // 2. Already-normalized relative paths
+    assert_eq!(normalize("foo"), "foo");
+    assert_eq!(
+        normalize("foo/bar/baz"),
+        "foo/bar/bash".replace("bash", "baz")
+    );
+
+    // 3. Paths requiring normalization
+    assert_eq!(normalize("/usr/./local/../bin"), "/usr/bin");
+    assert_eq!(normalize("///foo//bar"), "/foo/bar");
+    assert_eq!(normalize("/foo/bar/"), "/foo/bar");
+    assert_eq!(normalize("/a/b/c/."), "/a/b/c");
+    assert_eq!(normalize("/a/b/c/.."), "/a/b");
+    assert_eq!(normalize("."), "/");
+    assert_eq!(normalize(".."), "/");
+    assert_eq!(normalize(""), "/");
+
+    // 4. Path joining with exact capacity
+    assert_eq!(join("/usr/local", "bin"), "/usr/local/bin");
+    assert_eq!(join("/usr/local/", "bin"), "/usr/local/bin");
+    assert_eq!(join("/usr", "/bin"), "/bin");
+
+    kprintln!("[test] path normalization fast-path and join test PASSED!");
+}

@@ -33,6 +33,7 @@ pub mod bus;
 pub mod console;
 pub mod gpu;
 pub mod keyboard;
+pub mod mouse;
 pub mod net;
 pub mod ramdisk;
 pub mod traits;
@@ -53,6 +54,7 @@ pub fn init() {
 
     // Initialize built-in drivers
     keyboard::init();
+    mouse::init();
     console::init();
     gpu::init();
     net::init();

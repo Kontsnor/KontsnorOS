@@ -162,14 +162,48 @@ pub fn sys_getppid() -> SyscallResult {
 
 /// `setpgid(pid, pgid)` — Set the process group ID of a process.
 pub fn sys_setpgid(pid: i32, pgid: i32) -> SyscallResult {
+    if pid < 0 || pgid < 0 {
+        return Errno::EINVAL.into();
+    }
+
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+
     let target_pid = if pid == 0 {
-        match scheduler::current_pid() {
-            Some(p) => p,
-            None => return Errno::ESRCH.into(),
-        }
+        current_pid
     } else {
         Pid::from_raw(pid as u64)
     };
+
+    let calling_task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
+    };
+    let calling_sid = calling_task_arc.lock().sid;
+
+    let target_task_arc = match scheduler::get_task_arc(target_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
+    };
+
+    let mut target_task = target_task_arc.lock();
+
+    // Must be calling process or a child process
+    if target_pid != current_pid && target_task.parent_pid != current_pid {
+        return Errno::ESRCH.into();
+    }
+
+    // Session leader cannot change PGID
+    if target_task.sid == target_pid.as_u64() {
+        return Errno::EPERM.into();
+    }
+
+    // Must belong to the same session
+    if target_task.sid != calling_sid {
+        return Errno::EPERM.into();
+    }
 
     let new_pgid = if pgid == 0 {
         target_pid.as_u64()
@@ -177,11 +211,27 @@ pub fn sys_setpgid(pid: i32, pgid: i32) -> SyscallResult {
         pgid as u64
     };
 
-    if let Some(task_arc) = scheduler::get_task_arc(target_pid) {
-        task_arc.lock().pgid = new_pgid;
-        return 0;
+    if new_pgid != target_pid.as_u64() {
+        // Verify target process group belongs to the same session
+        let tasks = scheduler::TASKS.read();
+        let valid_pgrp = tasks.iter().any(|slot| {
+            if let Some(t_arc) = slot {
+                if let Some(t) = t_arc.try_lock() {
+                    t.pgid == new_pgid && t.sid == calling_sid
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        });
+        if !valid_pgrp {
+            return Errno::EPERM.into();
+        }
     }
-    Errno::ESRCH.into()
+
+    target_task.pgid = new_pgid;
+    0
 }
 
 /// `getpgid(pid)` — Get the process group ID of a process.

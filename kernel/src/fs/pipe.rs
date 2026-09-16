@@ -201,7 +201,7 @@ impl InodeOps for PipeReader {
             self.non_blocking.store(val != 0, Ordering::SeqCst);
             Ok(0)
         } else {
-            Err(-22) // EINVAL
+            Err(-25) // ENOTTY
         }
     }
 
@@ -324,7 +324,7 @@ impl InodeOps for PipeWriter {
             self.non_blocking.store(val != 0, Ordering::SeqCst);
             Ok(0)
         } else {
-            Err(-22) // EINVAL
+            Err(-25) // ENOTTY
         }
     }
 

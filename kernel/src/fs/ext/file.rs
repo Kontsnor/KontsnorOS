@@ -295,8 +295,28 @@ impl ExtInode {
                     ee_start_hi: ((new_phys_start as u64) >> 32) as u16,
                     ee_start_lo: new_phys_start as u32,
                 };
-                let offset =
-                    12 + (root_hdr.eh_entries as usize) * core::mem::size_of::<Ext4Extent>();
+                let num_entries = root_hdr.eh_entries as usize;
+                let mut insert_idx = num_entries;
+                for i in 0..num_entries {
+                    let ext_offset = 12 + i * core::mem::size_of::<Ext4Extent>();
+                    // SAFETY: Reading valid extent within bounds
+                    let cur_ext = unsafe {
+                        core::ptr::read_unaligned(
+                            root_buf[ext_offset..].as_ptr() as *const Ext4Extent
+                        )
+                    };
+                    if cur_ext.ee_block > file_block {
+                        insert_idx = i;
+                        break;
+                    }
+                }
+                for i in (insert_idx..num_entries).rev() {
+                    let src = 12 + i * core::mem::size_of::<Ext4Extent>();
+                    let dst = 12 + (i + 1) * core::mem::size_of::<Ext4Extent>();
+                    root_buf.copy_within(src..src + core::mem::size_of::<Ext4Extent>(), dst);
+                }
+                let offset = 12 + insert_idx * core::mem::size_of::<Ext4Extent>();
+                // SAFETY: offset is within root_buf
                 unsafe {
                     core::ptr::write_unaligned(
                         root_buf[offset..].as_mut_ptr() as *mut Ext4Extent,
@@ -399,18 +419,33 @@ impl ExtInode {
             raw.i_blocks += (self.fs.block_size / 512) * (1 + alloc_count);
             self.fs.write_inode(self.ino, raw)?;
             return Ok((new_phys_start, alloc_count));
-        } else if root_hdr.eh_depth == 1 {
+        } else if root_hdr.eh_depth >= 1 {
             let num_indices = root_hdr.eh_entries as usize;
             if num_indices == 0 {
-                return Err("Corrupted Ext4 extent index: 0 entries at depth 1");
+                return Err("Corrupted Ext4 extent index: 0 entries at depth >= 1");
             }
-            let last_idx_offset = 12 + (num_indices - 1) * core::mem::size_of::<Ext4ExtentIdx>();
-            let last_idx = unsafe {
+            let mut target_idx_pos = 0;
+            let mut best_block = 0;
+            for i in 0..num_indices {
+                let offset = 12 + i * core::mem::size_of::<Ext4ExtentIdx>();
+                // SAFETY: Reading index entry within root_buf
+                let idx = unsafe {
+                    core::ptr::read_unaligned(root_buf[offset..].as_ptr() as *const Ext4ExtentIdx)
+                };
+                if idx.ei_block <= file_block {
+                    if i == 0 || idx.ei_block >= best_block {
+                        best_block = idx.ei_block;
+                        target_idx_pos = i;
+                    }
+                }
+            }
+            let target_idx_offset = 12 + target_idx_pos * core::mem::size_of::<Ext4ExtentIdx>();
+            let target_idx = unsafe {
                 core::ptr::read_unaligned(
-                    root_buf[last_idx_offset..].as_ptr() as *const Ext4ExtentIdx
+                    root_buf[target_idx_offset..].as_ptr() as *const Ext4ExtentIdx
                 )
             };
-            let leaf_block = last_idx.leaf_block();
+            let leaf_block = target_idx.leaf_block();
             let mut leaf_buf = alloc::vec![0u8; self.fs.block_size as usize];
             read_blocks(
                 &*self.fs.device,
@@ -426,24 +461,23 @@ impl ExtInode {
             }
 
             if leaf_hdr.eh_depth == 0 {
-                if leaf_hdr.eh_entries > 0 {
-                    let last_ext_idx = (leaf_hdr.eh_entries - 1) as usize;
-                    let ext_offset = 12 + last_ext_idx * core::mem::size_of::<Ext4Extent>();
-                    let mut last_ext = unsafe {
+                for i in 0..leaf_hdr.eh_entries as usize {
+                    let ext_offset = 12 + i * core::mem::size_of::<Ext4Extent>();
+                    let mut ext = unsafe {
                         core::ptr::read_unaligned(
                             leaf_buf[ext_offset..].as_ptr() as *const Ext4Extent
                         )
                     };
-                    let last_len = last_ext.len() as u32;
-                    if last_ext.ee_block + last_len == file_block
-                        && last_ext.start_block() + (last_len as u64) == new_phys_start as u64
-                        && (last_ext.ee_len as u32 + alloc_count) <= 32767
+                    let ext_len = ext.len() as u32;
+                    if ext.ee_block + ext_len == file_block
+                        && ext.start_block() + (ext_len as u64) == new_phys_start as u64
+                        && (ext.ee_len as u32 + alloc_count) <= 32767
                     {
-                        last_ext.ee_len += alloc_count as u16;
+                        ext.ee_len += alloc_count as u16;
                         unsafe {
                             core::ptr::write_unaligned(
                                 leaf_buf[ext_offset..].as_mut_ptr() as *mut Ext4Extent,
-                                last_ext,
+                                ext,
                             );
                         }
                         write_blocks(&*self.fs.device, leaf_block, &leaf_buf, self.fs.block_size)?;
@@ -460,8 +494,26 @@ impl ExtInode {
                         ee_start_hi: ((new_phys_start as u64) >> 32) as u16,
                         ee_start_lo: new_phys_start as u32,
                     };
-                    let ext_offset =
-                        12 + (leaf_hdr.eh_entries as usize) * core::mem::size_of::<Ext4Extent>();
+                    let num_leaf_extents = leaf_hdr.eh_entries as usize;
+                    let mut insert_pos = num_leaf_extents;
+                    for i in 0..num_leaf_extents {
+                        let offset = 12 + i * core::mem::size_of::<Ext4Extent>();
+                        let cur_ext = unsafe {
+                            core::ptr::read_unaligned(
+                                leaf_buf[offset..].as_ptr() as *const Ext4Extent
+                            )
+                        };
+                        if cur_ext.ee_block > file_block {
+                            insert_pos = i;
+                            break;
+                        }
+                    }
+                    for i in (insert_pos..num_leaf_extents).rev() {
+                        let src = 12 + i * core::mem::size_of::<Ext4Extent>();
+                        let dst = 12 + (i + 1) * core::mem::size_of::<Ext4Extent>();
+                        leaf_buf.copy_within(src..src + core::mem::size_of::<Ext4Extent>(), dst);
+                    }
+                    let ext_offset = 12 + insert_pos * core::mem::size_of::<Ext4Extent>();
                     unsafe {
                         core::ptr::write_unaligned(
                             leaf_buf[ext_offset..].as_mut_ptr() as *mut Ext4Extent,
@@ -481,6 +533,7 @@ impl ExtInode {
                     return Ok((new_phys_start, alloc_count));
                 }
 
+                // Leaf is full! Allocate a new leaf block
                 if root_hdr.eh_entries < root_hdr.eh_max {
                     let new_leaf_block = self.fs.allocate_block()?;
                     let mut new_leaf_buf = alloc::vec![0u8; self.fs.block_size as usize];
@@ -523,8 +576,27 @@ impl ExtInode {
                         ei_leaf_hi: ((new_leaf_block as u64) >> 32) as u16,
                         ei_unused: 0,
                     };
+                    let num_root_indices = root_hdr.eh_entries as usize;
+                    let mut insert_idx_pos = num_root_indices;
+                    for i in 0..num_root_indices {
+                        let offset = 12 + i * core::mem::size_of::<Ext4ExtentIdx>();
+                        let cur_idx = unsafe {
+                            core::ptr::read_unaligned(
+                                root_buf[offset..].as_ptr() as *const Ext4ExtentIdx
+                            )
+                        };
+                        if cur_idx.ei_block > file_block {
+                            insert_idx_pos = i;
+                            break;
+                        }
+                    }
+                    for i in (insert_idx_pos..num_root_indices).rev() {
+                        let src = 12 + i * core::mem::size_of::<Ext4ExtentIdx>();
+                        let dst = 12 + (i + 1) * core::mem::size_of::<Ext4ExtentIdx>();
+                        root_buf.copy_within(src..src + core::mem::size_of::<Ext4ExtentIdx>(), dst);
+                    }
                     let new_idx_offset =
-                        12 + (root_hdr.eh_entries as usize) * core::mem::size_of::<Ext4ExtentIdx>();
+                        12 + insert_idx_pos * core::mem::size_of::<Ext4ExtentIdx>();
                     unsafe {
                         core::ptr::write_unaligned(
                             root_buf[new_idx_offset..].as_mut_ptr() as *mut Ext4ExtentIdx,
@@ -549,6 +621,77 @@ impl ExtInode {
                     raw.i_blocks += (self.fs.block_size / 512) * (1 + alloc_count);
                     self.fs.write_inode(self.ino, raw)?;
                     return Ok((new_phys_start, alloc_count));
+                } else {
+                    // Root is full! Grow extent tree to depth + 1
+                    let new_idx_block = self.fs.allocate_block()?;
+                    let mut new_idx_buf = alloc::vec![0u8; self.fs.block_size as usize];
+                    let max_idx_entries = ((self.fs.block_size - 12) / 12) as u16;
+                    let new_idx_hdr = Ext4ExtentHeader {
+                        eh_magic: 0xF30A,
+                        eh_entries: root_hdr.eh_entries,
+                        eh_max: max_idx_entries,
+                        eh_depth: root_hdr.eh_depth,
+                        eh_generation: 0,
+                    };
+                    unsafe {
+                        core::ptr::write_unaligned(
+                            new_idx_buf.as_mut_ptr() as *mut Ext4ExtentHeader,
+                            new_idx_hdr,
+                        );
+                    }
+                    new_idx_buf[12..60].copy_from_slice(&root_buf[12..60]);
+                    write_blocks(
+                        &*self.fs.device,
+                        new_idx_block as u64,
+                        &new_idx_buf,
+                        self.fs.block_size,
+                    )?;
+
+                    // Reset root to depth + 1 with 1 entry pointing to new_idx_block
+                    root_buf.fill(0);
+                    let first_idx_block =
+                        unsafe {
+                            core::ptr::read_unaligned(
+                                new_idx_buf[12..].as_ptr() as *const Ext4ExtentIdx
+                            )
+                        }
+                        .ei_block;
+                    let new_root_hdr = Ext4ExtentHeader {
+                        eh_magic: 0xF30A,
+                        eh_entries: 1,
+                        eh_max: 4,
+                        eh_depth: root_hdr.eh_depth + 1,
+                        eh_generation: 0,
+                    };
+                    unsafe {
+                        core::ptr::write_unaligned(
+                            root_buf.as_mut_ptr() as *mut Ext4ExtentHeader,
+                            new_root_hdr,
+                        );
+                    }
+                    let root_idx = Ext4ExtentIdx {
+                        ei_block: first_idx_block,
+                        ei_leaf_lo: new_idx_block as u32,
+                        ei_leaf_hi: ((new_idx_block as u64) >> 32) as u16,
+                        ei_unused: 0,
+                    };
+                    unsafe {
+                        core::ptr::write_unaligned(
+                            root_buf[12..].as_mut_ptr() as *mut Ext4ExtentIdx,
+                            root_idx,
+                        );
+                    }
+                    for i in 0..15 {
+                        raw.i_block[i] = u32::from_le_bytes([
+                            root_buf[i * 4],
+                            root_buf[i * 4 + 1],
+                            root_buf[i * 4 + 2],
+                            root_buf[i * 4 + 3],
+                        ]);
+                    }
+                    raw.i_blocks += self.fs.block_size / 512;
+                    self.fs.write_inode(self.ino, raw)?;
+                    return self.allocate_extent_block_chunk(raw, file_block, alloc_count);
                 }
             }
         }
@@ -613,6 +756,14 @@ impl ExtInode {
             let mut sib = raw.i_block[12];
             if sib == 0 {
                 sib = self.fs.allocate_block()?;
+                let zero_buf = [0u8; 4096];
+                let block_size = self.fs.block_size as usize;
+                write_blocks(
+                    &*self.fs.device,
+                    sib as u64,
+                    &zero_buf[..block_size],
+                    self.fs.block_size,
+                )?;
                 raw.i_block[12] = sib;
                 raw.i_blocks += self.fs.block_size / 512;
                 self.fs.write_inode(self.ino, raw)?;
@@ -657,17 +808,25 @@ impl ExtInode {
         let double_index = indirect_index - refs_per_block;
         let max_double_blocks = refs_per_block * refs_per_block;
         if double_index < max_double_blocks {
+            let block_size = self.fs.block_size as usize;
+            assert!(block_size <= 4096);
+
             let mut dib = raw.i_block[13];
             if dib == 0 {
                 dib = self.fs.allocate_block()?;
+                let zero_buf = [0u8; 4096];
+                write_blocks(
+                    &*self.fs.device,
+                    dib as u64,
+                    &zero_buf[..block_size],
+                    self.fs.block_size,
+                )?;
                 raw.i_block[13] = dib;
                 raw.i_blocks += self.fs.block_size / 512;
                 self.fs.write_inode(self.ino, raw)?;
             }
 
             let mut dib_buf = [0u8; 4096];
-            let block_size = self.fs.block_size as usize;
-            assert!(block_size <= 4096);
             read_blocks(
                 &*self.fs.device,
                 dib as u64,
@@ -686,6 +845,13 @@ impl ExtInode {
 
             if sib == 0 {
                 sib = self.fs.allocate_block()?;
+                let zero_buf = [0u8; 4096];
+                write_blocks(
+                    &*self.fs.device,
+                    sib as u64,
+                    &zero_buf[..block_size],
+                    self.fs.block_size,
+                )?;
                 let bytes = sib.to_le_bytes();
                 dib_buf[sib_ptr_offset..sib_ptr_offset + 4].copy_from_slice(&bytes);
                 write_blocks(

@@ -43,18 +43,28 @@ pub struct PtyShared {
     pub foreground_pgid: Mutex<u64>,
     /// Pending EOF flag (Ctrl+D on empty input in canonical mode).
     pub eof_pending: core::sync::atomic::AtomicBool,
-    pub wait_queue: crate::sync::wait_queue::WaitQueue,
+    pub wait_queue: Arc<crate::sync::wait_queue::WaitQueue>,
 }
 
 /// The PTY master device node.
 pub struct PtyMaster {
     inode: Inode,
     shared: Arc<PtyShared>,
+    pub non_blocking: core::sync::atomic::AtomicBool,
 }
 
 impl InodeOps for PtyMaster {
     fn inode(&self) -> &Inode {
         &self.inode
+    }
+
+    fn wait_queue(&self) -> Option<Arc<crate::sync::wait_queue::WaitQueue>> {
+        Some(self.shared.wait_queue.clone())
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) {
+        self.non_blocking
+            .store(nonblocking, core::sync::atomic::Ordering::SeqCst);
     }
 
     /// Read data written by the slave (program output).
@@ -80,10 +90,23 @@ impl InodeOps for PtyMaster {
                 }
             }
 
-            // Yield cooperatively to let writing tasks run
-            crate::process::scheduler::yield_now();
+            if self.non_blocking.load(core::sync::atomic::Ordering::SeqCst) {
+                return Err(-11); // -EAGAIN
+            }
 
             // Interruptible by signals
+            if let Some(current_pid) = crate::process::scheduler::current_pid() {
+                if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+                    let task = task_arc.lock();
+                    let unblocked = task.pending_signals & !task.blocked_signals;
+                    if unblocked != 0 {
+                        return Err(-4); // EINTR
+                    }
+                }
+            }
+
+            self.shared.wait_queue.wait();
+
             if let Some(current_pid) = crate::process::scheduler::current_pid() {
                 if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
                     let task = task_arc.lock();
@@ -300,7 +323,17 @@ impl InodeOps for PtyMaster {
                 }
                 Ok(0)
             }
-            _ => Err(-22), // EINVAL
+            0x5421 => {
+                // FIONBIO
+                if !crate::syscall::fs::validate_user_ptr(arg as *const u8, 4) {
+                    return Err(-14); // EFAULT
+                }
+                let val = unsafe { *(arg as *const i32) };
+                self.non_blocking
+                    .store(val != 0, core::sync::atomic::Ordering::SeqCst);
+                Ok(0)
+            }
+            _ => Err(-25), // ENOTTY
         }
     }
 }
@@ -309,11 +342,21 @@ impl InodeOps for PtyMaster {
 pub struct PtySlave {
     inode: Inode,
     shared: Arc<PtyShared>,
+    pub non_blocking: core::sync::atomic::AtomicBool,
 }
 
 impl InodeOps for PtySlave {
     fn inode(&self) -> &Inode {
         &self.inode
+    }
+
+    fn wait_queue(&self) -> Option<Arc<crate::sync::wait_queue::WaitQueue>> {
+        Some(self.shared.wait_queue.clone())
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) {
+        self.non_blocking
+            .store(nonblocking, core::sync::atomic::Ordering::SeqCst);
     }
 
     /// Read data written by the master (keyboard input).
@@ -355,10 +398,23 @@ impl InodeOps for PtySlave {
                 }
             }
 
-            // Yield cooperatively to wait for master writes
-            crate::process::scheduler::yield_now();
+            if self.non_blocking.load(core::sync::atomic::Ordering::SeqCst) {
+                return Err(-11); // -EAGAIN
+            }
 
             // Interruptible by signals
+            if let Some(current_pid) = crate::process::scheduler::current_pid() {
+                if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+                    let task = task_arc.lock();
+                    let unblocked = task.pending_signals & !task.blocked_signals;
+                    if unblocked != 0 {
+                        return Err(-4); // EINTR
+                    }
+                }
+            }
+
+            self.shared.wait_queue.wait();
+
             if let Some(current_pid) = crate::process::scheduler::current_pid() {
                 if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
                     let task = task_arc.lock();
@@ -496,7 +552,17 @@ impl InodeOps for PtySlave {
                 }
                 Ok(0)
             }
-            _ => Err(-22), // EINVAL
+            0x5421 => {
+                // FIONBIO
+                if !crate::syscall::fs::validate_user_ptr(arg as *const u8, 4) {
+                    return Err(-14); // EFAULT
+                }
+                let val = unsafe { *(arg as *const i32) };
+                self.non_blocking
+                    .store(val != 0, core::sync::atomic::Ordering::SeqCst);
+                Ok(0)
+            }
+            _ => Err(-25), // ENOTTY
         }
     }
 }
@@ -595,17 +661,19 @@ pub fn allocate_new_pty() -> Result<Arc<dyn InodeOps>, i32> {
         }),
         foreground_pgid: Mutex::new(0),
         eof_pending: core::sync::atomic::AtomicBool::new(false),
-        wait_queue: crate::sync::wait_queue::WaitQueue::new(),
+        wait_queue: Arc::new(crate::sync::wait_queue::WaitQueue::new()),
     });
 
     let master = Arc::new(PtyMaster {
         inode: Inode::new(10000 + id as u64 * 2, FileType::CharDevice),
         shared: shared.clone(),
+        non_blocking: core::sync::atomic::AtomicBool::new(false),
     });
 
     let slave = Arc::new(PtySlave {
         inode: Inode::new(10000 + id as u64 * 2 + 1, FileType::CharDevice),
         shared,
+        non_blocking: core::sync::atomic::AtomicBool::new(false),
     });
 
     // Register slave device in devfs under "/dev/pts/<id>"

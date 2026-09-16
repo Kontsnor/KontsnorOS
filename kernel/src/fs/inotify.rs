@@ -64,6 +64,10 @@ impl InodeOps for InotifyInstance {
         &self.inode
     }
 
+    fn wait_queue(&self) -> Option<Arc<WaitQueue>> {
+        Some(self.wait_queue.clone())
+    }
+
     fn read(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
         let mut events = self.events.lock();
         if events.is_empty() {

@@ -1363,6 +1363,14 @@ impl FileSystem for ExtFileSystem {
                 let _ = crate::memory::page_cache::flush_all_for_inode(&inode);
             }
         }
+
+        // Flush metadata: updated superblock and all group descriptors
+        let sb = *self.superblock.lock();
+        let _ = self.write_superblock(&sb);
+        let _ = self.write_group_descriptors();
+
+        // Issue cache flush barrier to the underlying block device
+        let _ = self.device.flush();
     }
 
     fn statfs(&self) -> FsStats {

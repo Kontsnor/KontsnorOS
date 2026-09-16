@@ -173,10 +173,12 @@ extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFram
     panic!("Unhandled invalid opcode");
 }
 
-extern "x86-interrupt" fn device_not_available_handler(stack_frame: InterruptStackFrame) {
-    kprintln!("[EXCEPTION] Device Not Available");
-    kprintln!("{:#?}", stack_frame);
-    panic!("Unhandled device not available");
+extern "x86-interrupt" fn device_not_available_handler(_stack_frame: InterruptStackFrame) {
+    // Clear CR0.TS (Task Switched bit) so SIMD/FPU instructions can execute
+    // SAFETY: Privileged instruction executed in ring 0 interrupt handler.
+    unsafe {
+        core::arch::asm!("clts", options(nomem, nostack));
+    }
 }
 
 extern "x86-interrupt" fn x87_floating_point_handler(stack_frame: InterruptStackFrame) {
@@ -231,9 +233,9 @@ extern "x86-interrupt" fn general_protection_fault_handler(
         // Terminate the faulting process group with SIGSEGV exit code (139)
         // rather than crashing the entire kernel.
         let _ = crate::syscall::process::sys_exit_group(139);
-        // sys_exit_group does not return; but if somehow we continue, halt.
+        // sys_exit_group does not return; but if somehow we continue, halt with interrupts enabled.
         loop {
-            x86_64::instructions::hlt();
+            x86_64::instructions::interrupts::enable_and_hlt();
         }
     }
 
@@ -654,15 +656,28 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
         /// Hard limit: refuse to grow beyond 8 MiB in either direction.
         const MAX_STACK_SIZE: u64 = 8 * 1024 * 1024;
 
-        if is_user
+        let fault_vaddr = fault_addr.as_u64();
+        let is_user_space_addr = fault_vaddr < 0x0000_8000_0000_0000;
+
+        if (is_user || is_user_space_addr)
             && !error_code
                 .contains(x86_64::structures::idt::PageFaultErrorCode::PROTECTION_VIOLATION)
         {
-            let fault_vaddr = fault_addr.as_u64();
-            let rsp = stack_frame.stack_pointer.as_u64();
+            let rsp = if is_user {
+                stack_frame.stack_pointer.as_u64()
+            } else {
+                let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
+                if apic_id < 32 {
+                    // SAFETY: Read user_rsp from active CPU scratch space
+                    unsafe { crate::syscall::CPU_SCRATCHES[apic_id].user_rsp }
+                } else {
+                    0
+                }
+            };
 
             // The fault must be within STACK_GUARD_THRESHOLD of the current RSP.
-            let near_rsp = fault_vaddr >= rsp.saturating_sub(STACK_GUARD_THRESHOLD)
+            let near_rsp = rsp != 0
+                && fault_vaddr >= rsp.saturating_sub(STACK_GUARD_THRESHOLD)
                 && fault_vaddr <= rsp.saturating_add(STACK_GUARD_THRESHOLD);
 
             if near_rsp {
@@ -852,14 +867,17 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
             }
         }
         kprintln!(
-            "[page_fault] Process PID {:?} caused unhandled page fault at {:#x} (RIP={:#x}) — terminating task",
+            "[page_fault] Process PID {:?} caused unhandled page fault at {:#x} (RIP={:#x}) — dispatching SIGSEGV",
             crate::process::scheduler::current_pid(),
             fault_addr.as_u64(),
             stack_frame.instruction_pointer.as_u64()
         );
+        if let Some(pid) = crate::process::scheduler::current_pid() {
+            crate::syscall::signal::deliver_signal(pid, 11);
+        }
         let _ = crate::syscall::process::sys_exit_group(139);
         loop {
-            x86_64::instructions::hlt();
+            x86_64::instructions::interrupts::enable_and_hlt();
         }
     }
 
@@ -883,7 +901,7 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
             );
             let _ = crate::syscall::process::sys_exit_group(139);
             loop {
-                x86_64::instructions::hlt();
+                x86_64::instructions::interrupts::enable_and_hlt();
             }
         }
     }
@@ -938,11 +956,17 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
 
     // Trigger rescheduling to enable preemption when returning to user mode (Ring 3),
     // or when the CPU is running an idle task (PID >= 900) in Ring 0.
-    if swap_needed {
+    let is_idle = crate::process::scheduler::current_pid()
+        .map(|p| p.as_u64() >= 900)
+        .unwrap_or(false);
+
+    if swap_needed || is_idle {
         crate::process::scheduler::schedule();
-        // SAFETY: Swap back to user GS base before returning
-        unsafe {
-            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        if swap_needed {
+            // SAFETY: Swap back to user GS base before returning
+            unsafe {
+                core::arch::asm!("swapgs", options(nostack, preserves_flags));
+            }
         }
     }
 }
@@ -991,11 +1015,17 @@ extern "x86-interrupt" fn ipi_reschedule_handler(stack_frame: InterruptStackFram
     }
 
     super::apic::lapic_eoi();
-    if swap_needed {
+    let is_idle = crate::process::scheduler::current_pid()
+        .map(|p| p.as_u64() >= 900)
+        .unwrap_or(false);
+
+    if swap_needed || is_idle {
         crate::process::scheduler::schedule();
-        // SAFETY: Swap back to user GS base before returning
-        unsafe {
-            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        if swap_needed {
+            // SAFETY: Swap back to user GS base before returning
+            unsafe {
+                core::arch::asm!("swapgs", options(nostack, preserves_flags));
+            }
         }
     }
 }

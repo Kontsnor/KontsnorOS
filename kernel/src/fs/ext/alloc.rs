@@ -136,9 +136,8 @@ impl ExtFileSystem {
                     let free_total = sb.free_blocks();
                     sb.set_free_blocks(free_total.saturating_sub(alloc_len as u64));
 
-                    self.write_superblock(&sb)?;
                     drop(gds);
-                    self.write_group_descriptors()?;
+                    drop(sb);
 
                     return Ok((start_block_num, alloc_len));
                 }

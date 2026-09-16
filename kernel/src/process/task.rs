@@ -152,6 +152,7 @@ impl Drop for AddressSpace {
                     );
                 }
             }
+            crate::memory::page_cache::unregister_shared_mmaps_for_page_table(self.page_table_root);
             let _ = crate::memory::r#virtual::free_user_page_table(self.page_table_root);
         }
     }
@@ -231,6 +232,9 @@ pub struct Task {
 
     /// Wait queue for child process state changes (e.g. wait4).
     pub child_wait_queue: Arc<crate::sync::wait_queue::WaitQueue>,
+
+    /// Dedicated pre-allocated wait queue for poll/select/epoll multiplexing.
+    pub poll_wait_queue: Arc<crate::sync::wait_queue::WaitQueue>,
 
     /// Tracks whether this task is currently queued in the scheduler priority queues.
     pub in_queue: bool,
@@ -359,6 +363,7 @@ impl Task {
                 }; 64],
             )),
             child_wait_queue: Arc::new(crate::sync::wait_queue::WaitQueue::new()),
+            poll_wait_queue: Arc::new(crate::sync::wait_queue::WaitQueue::new()),
             pgid: pid.as_u64(),
             tgid: pid,
             in_queue: false,

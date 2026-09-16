@@ -997,26 +997,48 @@ struct PollFd {
 }
 
 /// `poll(fds, nfds, timeout)` — Wait for events on file descriptors.
-struct PollWaitGuard {
-    wq: alloc::sync::Arc<crate::sync::wait_queue::WaitQueue>,
+struct PollSubscriptionGuard {
+    watched_wqs: alloc::vec::Vec<alloc::sync::Arc<crate::sync::wait_queue::WaitQueue>>,
+    listener: alloc::sync::Arc<crate::sync::wait_queue::WaitQueue>,
+    pub has_unmonitored: bool,
 }
 
-impl PollWaitGuard {
-    fn new() -> Self {
-        let wq = alloc::sync::Arc::new(crate::sync::wait_queue::WaitQueue::new());
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            crate::fs::epoll::EPOLL_WAIT_QUEUES.lock().push(wq.clone());
-        });
-        Self { wq }
+impl PollSubscriptionGuard {
+    fn new(
+        fds: &[PollFd],
+        listener: &alloc::sync::Arc<crate::sync::wait_queue::WaitQueue>,
+    ) -> Self {
+        crate::fs::epoll::register_epoll_wait_queue(listener);
+        let mut watched_wqs = alloc::vec::Vec::new();
+        let mut has_unmonitored = false;
+        for pfd in fds {
+            if pfd.fd >= 0 {
+                if let Some(inode) = proc_fd::current_task_read_fd(pfd.fd) {
+                    if let Some(wq) = inode.wait_queue() {
+                        if !watched_wqs.iter().any(|w| alloc::sync::Arc::ptr_eq(w, &wq)) {
+                            wq.add_listener(listener);
+                            watched_wqs.push(wq);
+                        }
+                    } else {
+                        has_unmonitored = true;
+                    }
+                }
+            }
+        }
+        Self {
+            watched_wqs,
+            listener: listener.clone(),
+            has_unmonitored,
+        }
     }
 }
 
-impl Drop for PollWaitGuard {
+impl Drop for PollSubscriptionGuard {
     fn drop(&mut self) {
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            let mut wqs = crate::fs::epoll::EPOLL_WAIT_QUEUES.lock();
-            wqs.retain(|w| !alloc::sync::Arc::ptr_eq(w, &self.wq));
-        });
+        crate::fs::epoll::unregister_epoll_wait_queue(&self.listener);
+        for wq in &self.watched_wqs {
+            wq.remove_listener(&self.listener);
+        }
     }
 }
 
@@ -1035,10 +1057,32 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, timeout: i32) -> SyscallResult {
         return Errno::EFAULT.into();
     }
 
-    let mut local_fds = alloc::vec![PollFd { fd: 0, events: 0, revents: 0 }; nfds as usize];
+    let mut stack_fds = [PollFd {
+        fd: 0,
+        events: 0,
+        revents: 0,
+    }; 16];
+    let mut heap_fds;
+    let local_fds: &mut [PollFd] = if (nfds as usize) <= stack_fds.len() {
+        &mut stack_fds[..(nfds as usize)]
+    } else {
+        heap_fds = alloc::vec![PollFd { fd: 0, events: 0, revents: 0 }; nfds as usize];
+        &mut heap_fds[..]
+    };
+
     unsafe {
         core::ptr::copy_nonoverlapping(fds as *const PollFd, local_fds.as_mut_ptr(), nfds as usize);
     }
+
+    let current_pid = match crate::process::scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+
+    let poll_wq = match crate::process::scheduler::get_task_arc(current_pid) {
+        Some(task_arc) => task_arc.lock().poll_wait_queue.clone(),
+        None => return Errno::ESRCH.into(),
+    };
 
     let start_ticks = crate::arch::x86_64::interrupts::timer_ticks();
     // timeout < 0  → wait forever (no deadline)
@@ -1051,17 +1095,16 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, timeout: i32) -> SyscallResult {
     };
     let wait_forever = timeout < 0;
 
-    // ── Register the wait-queue BEFORE the first poll check ──────────────────
-    // This closes the missed-wakeup race: if an event (e.g. TCP data arriving)
-    // fires wake_all_epolls() between the empty-buffer check and wq.wait(), the
-    // wakeup is NOT lost because the guard is already in EPOLL_WAIT_QUEUES.
-    // For timeout=0 (immediate) we still skip the wait, but registration is
-    // harmless and avoids a special-case branch.
-    let poll_guard = if timeout != 0 {
-        Some(PollWaitGuard::new())
+    // Register on the specific inode wait queues before checking readiness to prevent missed wakeups
+    let sub_guard = if timeout != 0 {
+        Some(PollSubscriptionGuard::new(local_fds, &poll_wq))
     } else {
         None
     };
+    let has_unmonitored = sub_guard
+        .as_ref()
+        .map(|g| g.has_unmonitored)
+        .unwrap_or(false);
 
     loop {
         let mut ready = 0i64;
@@ -1108,10 +1151,6 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, timeout: i32) -> SyscallResult {
         }
 
         // Handle pending signals — return EINTR if any unblocked signal is pending.
-        let current_pid = match crate::process::scheduler::current_pid() {
-            Some(p) => p,
-            None => return Errno::ESRCH.into(),
-        };
         if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
             let task = task_arc.lock();
             let unblocked = task.pending_signals & !task.blocked_signals;
@@ -1121,21 +1160,21 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, timeout: i32) -> SyscallResult {
         }
 
         // Sleep until an event fires or a deadline expires.
-        // The guard is already registered in EPOLL_WAIT_QUEUES, so any
-        // wake_all_epolls() call (from TCP receive, pipe write, etc.) will
-        // unblock us. We then loop back to re-check all fds.
-        if let Some(ref guard) = poll_guard {
-            if !wait_forever {
-                if let Some(limit) = timeout_ticks {
-                    crate::fs::epoll::add_sleep_timeout(current_pid, start_ticks + limit);
-                }
+        let effective_limit = if has_unmonitored {
+            match timeout_ticks {
+                Some(limit) => Some(limit.min(1)),
+                None => Some(1),
             }
-            guard.wq.wait();
-            if !wait_forever {
-                if timeout_ticks.is_some() {
-                    crate::fs::epoll::remove_sleep_timeout(current_pid);
-                }
-            }
+        } else {
+            timeout_ticks
+        };
+
+        if let Some(limit) = effective_limit {
+            crate::fs::epoll::add_sleep_timeout(current_pid, start_ticks + limit);
+        }
+        poll_wq.wait();
+        if effective_limit.is_some() {
+            crate::fs::epoll::remove_sleep_timeout(current_pid);
         }
     }
 }
@@ -1212,17 +1251,87 @@ pub fn sys_pselect6(
         None
     };
 
+    struct SelectSubscriptionGuard {
+        watched_wqs: alloc::vec::Vec<alloc::sync::Arc<crate::sync::wait_queue::WaitQueue>>,
+        listener: alloc::sync::Arc<crate::sync::wait_queue::WaitQueue>,
+        pub has_unmonitored: bool,
+    }
+
+    impl SelectSubscriptionGuard {
+        fn new(
+            nfds: i32,
+            in_read: &[u64],
+            in_write: &[u64],
+            in_except: &[u64],
+            listener: &alloc::sync::Arc<crate::sync::wait_queue::WaitQueue>,
+        ) -> Self {
+            crate::fs::epoll::register_epoll_wait_queue(listener);
+            let mut watched_wqs = alloc::vec::Vec::new();
+            let mut has_unmonitored = false;
+            for fd in 0..nfds {
+                let word_idx = (fd as usize) / 64;
+                let bit_idx = (fd as usize) % 64;
+                let mask = 1u64 << bit_idx;
+                if (in_read[word_idx] & mask) != 0
+                    || (in_write[word_idx] & mask) != 0
+                    || (in_except[word_idx] & mask) != 0
+                {
+                    if let Some(inode) = proc_fd::current_task_read_fd(fd) {
+                        if let Some(wq) = inode.wait_queue() {
+                            if !watched_wqs.iter().any(|w| alloc::sync::Arc::ptr_eq(w, &wq)) {
+                                wq.add_listener(listener);
+                                watched_wqs.push(wq);
+                            }
+                        } else {
+                            has_unmonitored = true;
+                        }
+                    }
+                }
+            }
+            Self {
+                watched_wqs,
+                listener: listener.clone(),
+                has_unmonitored,
+            }
+        }
+    }
+
+    impl Drop for SelectSubscriptionGuard {
+        fn drop(&mut self) {
+            crate::fs::epoll::unregister_epoll_wait_queue(&self.listener);
+            for wq in &self.watched_wqs {
+                wq.remove_listener(&self.listener);
+            }
+        }
+    }
+
+    let current_pid = match crate::process::scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+
+    let poll_wq = match crate::process::scheduler::get_task_arc(current_pid) {
+        Some(task_arc) => task_arc.lock().poll_wait_queue.clone(),
+        None => return Errno::ESRCH.into(),
+    };
+
     let start_ticks = crate::arch::x86_64::interrupts::timer_ticks();
     let timeout_ticks = timeout_ms.map(|ms| if ms > 0 { ((ms as u64) + 9) / 10 } else { 0 });
     let wait_forever = timeout.is_null(); // NULL timeout = block until event
 
     // Pre-register the poll wait-queue before the first fd check to close the
-    // missed-wakeup race (same fix as sys_poll).
-    let pselect_guard = if timeout_ticks != Some(0) {
-        Some(PollWaitGuard::new())
+    // missed-wakeup race.
+    let select_guard = if timeout_ticks != Some(0) {
+        Some(SelectSubscriptionGuard::new(
+            nfds, &in_read, &in_write, &in_except, &poll_wq,
+        ))
     } else {
         None
     };
+    let has_unmonitored = select_guard
+        .as_ref()
+        .map(|g| g.has_unmonitored)
+        .unwrap_or(false);
 
     loop {
         let mut out_read = [0u64; 16];
@@ -1308,10 +1417,6 @@ pub fn sys_pselect6(
             }
         }
 
-        let current_pid = match crate::process::scheduler::current_pid() {
-            Some(p) => p,
-            None => return Errno::ESRCH.into(),
-        };
         if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
             let task = task_arc.lock();
             let unblocked = task.pending_signals & !task.blocked_signals;
@@ -1320,18 +1425,21 @@ pub fn sys_pselect6(
             }
         }
 
-        if let Some(ref guard) = pselect_guard {
-            if !wait_forever {
-                if let Some(limit) = timeout_ticks {
-                    crate::fs::epoll::add_sleep_timeout(current_pid, start_ticks + limit);
-                }
+        let effective_limit = if has_unmonitored {
+            match timeout_ticks {
+                Some(limit) => Some(limit.min(1)),
+                None => Some(1),
             }
-            guard.wq.wait();
-            if !wait_forever {
-                if timeout_ticks.is_some() {
-                    crate::fs::epoll::remove_sleep_timeout(current_pid);
-                }
-            }
+        } else {
+            timeout_ticks
+        };
+
+        if let Some(limit) = effective_limit {
+            crate::fs::epoll::add_sleep_timeout(current_pid, start_ticks + limit);
+        }
+        poll_wq.wait();
+        if effective_limit.is_some() {
+            crate::fs::epoll::remove_sleep_timeout(current_pid);
         }
     }
 }

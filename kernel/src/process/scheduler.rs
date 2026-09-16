@@ -63,7 +63,7 @@ static mut DUMMY_CONTEXTS: [super::context::CpuContext; 32] = [super::context::C
     fs_base: 0,
     gs_base: 0,
     kernel_gs_base: 0,
-    _reserved: 0,
+    fpu_used: 0,
     fxsave: [0u8; 512],
 }; 32];
 
@@ -93,6 +93,44 @@ pub fn get_task_arc(pid: Pid) -> Option<Arc<spin::Mutex<Task>>> {
     let tasks = TASKS.read();
     let idx = pid.as_u64() as usize;
     tasks.get(idx)?.as_ref().cloned()
+}
+
+/// A hardware timer-backed sleep deadline for a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SleepTimer {
+    pub deadline_ns: u64,
+    pub pid: Pid,
+}
+
+pub static SLEEP_TIMER_QUEUE: spin::Mutex<alloc::vec::Vec<SleepTimer>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
+
+/// Register a task to sleep until `deadline_ns` (monotonic).
+pub fn register_sleep_timer(pid: Pid, deadline_ns: u64) {
+    let mut timers = SLEEP_TIMER_QUEUE.lock();
+    timers.retain(|t| t.pid != pid);
+    timers.push(SleepTimer { deadline_ns, pid });
+    // Sort descending by deadline_ns so the earliest expiring timer is always at the end (O(1) pop)
+    timers.sort_by(|a, b| b.deadline_ns.cmp(&a.deadline_ns));
+}
+
+/// Remove a task from the sleep timer queue.
+pub fn remove_sleep_timer(pid: Pid) {
+    let mut timers = SLEEP_TIMER_QUEUE.lock();
+    timers.retain(|t| t.pid != pid);
+}
+
+/// Check and wake expired sleep timers during timer tick.
+pub fn check_sleep_timers_locked(sched: &mut Scheduler, current_time_ns: u64) {
+    let mut timers = SLEEP_TIMER_QUEUE.lock();
+    while let Some(last) = timers.last() {
+        if current_time_ns >= last.deadline_ns {
+            let timer = timers.pop().unwrap();
+            sched.wake_task(timer.pid);
+        } else {
+            break;
+        }
+    }
 }
 
 impl Scheduler {
@@ -184,27 +222,9 @@ impl Scheduler {
         // Check for timed futex expirations
         crate::syscall::process::futex::check_futex_timeouts_locked(self);
 
-        // Every 50 ticks (~0.5s), rescue any runnable tasks not currently in queues
-        if self.ticks_since_boost % 50 == 0 {
-            let tasks = TASKS.read();
-            for task_opt in tasks.iter() {
-                if let Some(task_arc) = task_opt {
-                    if let Some(mut task) = task_arc.try_lock() {
-                        if task.state == TaskState::Ready && !task.is_idle {
-                            if !self.current_cpus.iter().any(|&c| c == Some(task.pid))
-                                && !self.suspending_tasks.iter().any(|&s| s == Some(task.pid))
-                            {
-                                let prio = task.priority as usize;
-                                if !self.queues[prio].iter().any(|&p| p == task.pid) {
-                                    self.queues[prio].push_back(task.pid);
-                                }
-                                task.in_queue = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Check for hardware timer-backed sleep expirations
+        let now_ns = crate::syscall::process::get_monotonic_ns();
+        check_sleep_timers_locked(self, now_ns);
 
         // Periodic priority boost to prevent starvation
         if self.ticks_since_boost >= BOOST_INTERVAL {
@@ -260,23 +280,6 @@ impl Scheduler {
                 }
                 // If try_lock failed or task is not Ready, put it back in its original queue
                 self.queues[prio].push_back(pid);
-            }
-        }
-
-        // Also ensure any stranded ready tasks that are not running or in queue get requeued
-        for task_opt in tasks.iter() {
-            if let Some(task_arc) = task_opt {
-                if let Some(mut task) = task_arc.try_lock() {
-                    if task.state == TaskState::Ready && !task.in_queue && !task.is_idle {
-                        if !self.current_cpus.iter().any(|&c| c == Some(task.pid))
-                            && !self.suspending_tasks.iter().any(|&s| s == Some(task.pid))
-                        {
-                            let prio = task.priority as usize;
-                            self.queues[prio].push_back(task.pid);
-                            task.in_queue = true;
-                        }
-                    }
-                }
             }
         }
     }
@@ -806,70 +809,27 @@ pub fn schedule() {
             next_pid
         );
 
-        // Disarm the RAII lock guard before switching stacks so it doesn't double-unlock when we resume later
-        core::mem::forget(sched_lock);
+        // Explicitly release global scheduler lock before context switch to eliminate serialization across cores
+        drop(sched_lock);
 
         // Perform raw context switch directly
+        // SAFETY: Both context pointers point to valid CpuContext instances in kernel heap or dummy structures.
         unsafe {
             super::context::switch_context(old_ctx_ptr, new_ctx_ptr);
         }
 
-        // Re-read apic_id and get a fresh reference to Scheduler from memory to bypass register caching
+        // Re-read apic_id and perform post-switch queue reconciliation
         let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
-        let mut zombie_to_reap = None;
-        unsafe {
-            if let Some(ref mut scheduler) = *SCHEDULER.get_mut_unchecked() {
-                if let Some(suspended_pid) = scheduler.suspending_tasks[apic_id].take() {
-                    let idx = suspended_pid.as_u64() as usize;
-                    let tasks = TASKS.read();
-                    let is_zombie_thread = if let Some(Some(suspended_task_arc)) = tasks.get(idx) {
-                        let mut suspended_task = suspended_task_arc.lock();
-                        if suspended_task.state == TaskState::Ready {
-                            if !suspended_task.is_idle && !suspended_task.in_queue {
-                                let prio = suspended_task.priority as usize;
-                                scheduler.queues[prio].push_back(suspended_pid);
-                                suspended_task.in_queue = true;
-                            }
-                            false
-                        } else {
-                            suspended_task.state == TaskState::Zombie
-                                && suspended_task.tgid != suspended_pid
-                        }
-                    } else {
-                        false
-                    };
-                    drop(tasks);
-
-                    if is_zombie_thread {
-                        zombie_to_reap = Some(idx);
-                    }
-                }
-            }
-            SCHEDULER.force_unlock();
-        }
-
-        if let Some(idx) = zombie_to_reap {
-            let mut tasks_write = TASKS.write();
-            if let Some(slot) = tasks_write.get_mut(idx) {
-                slot.take();
-            }
-            if idx < TASK_TGIDS.len() {
-                TASK_TGIDS[idx].store(0, core::sync::atomic::Ordering::Release);
-            }
-        }
+        post_context_switch(apic_id);
     });
 }
 
-/// Release the scheduler lock and enable interrupts after context switch in trampolines.
-///
-/// # Safety
-/// This is unsafe because it manually releases the global scheduler lock and enables interrupts.
-#[no_mangle]
-pub unsafe extern "C" fn scheduler_unlock_after_switch() {
+/// Perform post-context-switch cleanup: re-enqueue the suspended task if ready, or reap zombie threads.
+pub fn post_context_switch(apic_id: usize) {
     let mut zombie_to_reap = None;
-    unsafe {
-        if let Some(ref mut scheduler) = *SCHEDULER.get_mut_unchecked() {
-            let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
+    {
+        let mut sched_lock = SCHEDULER.lock();
+        if let Some(ref mut scheduler) = *sched_lock {
             if let Some(suspended_pid) = scheduler.suspending_tasks[apic_id].take() {
                 let idx = suspended_pid.as_u64() as usize;
                 let tasks = TASKS.read();
@@ -896,19 +856,28 @@ pub unsafe extern "C" fn scheduler_unlock_after_switch() {
                 }
             }
         }
-        SCHEDULER.force_unlock();
-        x86_64::instructions::interrupts::enable();
+    }
 
-        if let Some(idx) = zombie_to_reap {
-            let mut tasks_write = TASKS.write();
-            if let Some(slot) = tasks_write.get_mut(idx) {
-                slot.take();
-            }
-            if idx < TASK_TGIDS.len() {
-                TASK_TGIDS[idx].store(0, core::sync::atomic::Ordering::Release);
-            }
+    if let Some(idx) = zombie_to_reap {
+        let mut tasks_write = TASKS.write();
+        if let Some(slot) = tasks_write.get_mut(idx) {
+            slot.take();
+        }
+        if idx < TASK_TGIDS.len() {
+            TASK_TGIDS[idx].store(0, core::sync::atomic::Ordering::Release);
         }
     }
+}
+
+/// Finish context switch cleanup and enable interrupts after context switch in trampolines.
+///
+/// # Safety
+/// Called in naked trampolines after switching into a newly created task for the first time.
+#[no_mangle]
+pub unsafe extern "C" fn scheduler_unlock_after_switch() {
+    let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
+    post_context_switch(apic_id);
+    x86_64::instructions::interrupts::enable();
 }
 
 /// Register the current boot thread as a running task in the scheduler (PID 1).

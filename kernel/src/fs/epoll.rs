@@ -42,11 +42,13 @@ pub struct EpollInstance {
 
 impl EpollInstance {
     pub fn new() -> Self {
+        let wq = Arc::new(WaitQueue::new());
+        register_epoll_wait_queue(&wq);
         Self {
             inode: Inode::new(0, FileType::Regular),
             monitored: Mutex::new(BTreeMap::new()),
             last_ready: Mutex::new(BTreeMap::new()),
-            wait_queue: Arc::new(WaitQueue::new()),
+            wait_queue: wq,
         }
     }
 }
@@ -60,6 +62,10 @@ impl InodeOps for EpollInstance {
         Some(self)
     }
 
+    fn wait_queue(&self) -> Option<Arc<WaitQueue>> {
+        Some(self.wait_queue.clone())
+    }
+
     fn readdir(&self) -> Vec<DirEntry> {
         Vec::new()
     }
@@ -67,47 +73,41 @@ impl InodeOps for EpollInstance {
 
 impl Drop for EpollInstance {
     fn drop(&mut self) {
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            let mut wqs = EPOLL_WAIT_QUEUES.lock();
-            wqs.retain(|wq| !Arc::ptr_eq(wq, &self.wait_queue));
-        });
+        unregister_epoll_wait_queue(&self.wait_queue);
     }
 }
 
-pub static EPOLL_WAIT_QUEUES: Mutex<Vec<Arc<WaitQueue>>> = Mutex::new(Vec::new());
+pub static EPOLL_WAIT_QUEUES: Mutex<Vec<alloc::sync::Weak<WaitQueue>>> = Mutex::new(Vec::new());
 
-pub fn wake_all_epolls() {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        if let Some(mut sched_lock) = crate::process::scheduler::SCHEDULER.try_lock() {
-            if let Some(ref mut sched) = *sched_lock {
-                let wqs = EPOLL_WAIT_QUEUES.lock();
-                for wq in wqs.iter() {
-                    wq.wake_all_locked(sched);
-                }
-            }
+/// Register a wait queue to receive global epoll/poll wakeups as a fallback.
+pub fn register_epoll_wait_queue(wq: &Arc<WaitQueue>) {
+    let mut list = EPOLL_WAIT_QUEUES.lock();
+    if !list.iter().any(|w| w.as_ptr() == Arc::as_ptr(wq)) {
+        list.push(Arc::downgrade(wq));
+    }
+}
+
+/// Unregister a wait queue from global epoll/poll wakeups.
+pub fn unregister_epoll_wait_queue(wq: &Arc<WaitQueue>) {
+    let mut list = EPOLL_WAIT_QUEUES.lock();
+    list.retain(|w| {
+        if let Some(upgraded) = w.upgrade() {
+            !Arc::ptr_eq(&upgraded, wq)
         } else {
-            let apic_id = crate::arch::x86_64::smp::current_lapic_id() as u32;
-            if crate::process::scheduler::SCHEDULER.holding_cpu_id() == apic_id {
-                // SAFETY: The current CPU already holds SCHEDULER exclusively
-                unsafe {
-                    if let Some(ref mut sched) =
-                        *crate::process::scheduler::SCHEDULER.get_mut_unchecked()
-                    {
-                        let wqs = EPOLL_WAIT_QUEUES.lock();
-                        for wq in wqs.iter() {
-                            wq.wake_all_locked(sched);
-                        }
-                    }
-                }
-            } else {
-                let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
-                if let Some(ref mut sched) = *sched_lock {
-                    let wqs = EPOLL_WAIT_QUEUES.lock();
-                    for wq in wqs.iter() {
-                        wq.wake_all_locked(sched);
-                    }
-                }
-            }
+            false
+        }
+    });
+}
+
+/// Wake all tasks waiting in poll/select or epoll wait queues.
+pub fn wake_all_epolls() {
+    let mut list = EPOLL_WAIT_QUEUES.lock();
+    list.retain(|w| {
+        if let Some(wq) = w.upgrade() {
+            wq.wake_all();
+            true
+        } else {
+            false
         }
     });
 }
@@ -115,6 +115,12 @@ pub fn wake_all_epolls() {
 pub static SLEEP_TIMEOUTS: Mutex<Vec<(crate::process::pid::Pid, u64)>> = Mutex::new(Vec::new());
 
 pub fn add_sleep_timeout(pid: crate::process::pid::Pid, expire_ticks: u64) {
+    let current_ticks = crate::arch::x86_64::interrupts::timer_ticks();
+    let now_ns = crate::syscall::process::get_monotonic_ns();
+    let remaining_ticks = expire_ticks.saturating_sub(current_ticks);
+    let deadline_ns = now_ns.saturating_add(remaining_ticks.saturating_mul(10_000_000));
+    crate::process::scheduler::register_sleep_timer(pid, deadline_ns);
+
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut timeouts = SLEEP_TIMEOUTS.lock();
         timeouts.retain(|&(p, _)| p != pid);
@@ -123,6 +129,7 @@ pub fn add_sleep_timeout(pid: crate::process::pid::Pid, expire_ticks: u64) {
 }
 
 pub fn remove_sleep_timeout(pid: crate::process::pid::Pid) {
+    crate::process::scheduler::remove_sleep_timer(pid);
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut timeouts = SLEEP_TIMEOUTS.lock();
         timeouts.retain(|&(p, _)| p != pid);
@@ -158,9 +165,6 @@ pub fn sys_epoll_create1(flags: i32) -> SyscallResult {
     }
 
     let epoll = Arc::new(EpollInstance::new());
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        EPOLL_WAIT_QUEUES.lock().push(epoll.wait_queue.clone());
-    });
 
     match crate::process::fd::current_task_alloc_fd_with_flags(
         epoll,
@@ -187,10 +191,10 @@ pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const EpollEvent) -> S
         None => return Errno::EINVAL.into(),
     };
 
-    // Verify target fd is valid
-    if crate::process::fd::current_task_read_fd(fd).is_none() {
-        return Errno::EBADF.into();
-    }
+    let target_inode = match crate::process::fd::current_task_read_fd(fd) {
+        Some(i) => i,
+        None => return Errno::EBADF.into(),
+    };
 
     match op {
         1 => {
@@ -211,6 +215,9 @@ pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const EpollEvent) -> S
             }
             monitored.insert(fd, ev);
             epoll.last_ready.lock().insert(fd, 0);
+            if let Some(target_wq) = target_inode.wait_queue() {
+                target_wq.add_listener(&epoll.wait_queue);
+            }
             0
         }
         2 => {
@@ -221,6 +228,9 @@ pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const EpollEvent) -> S
             }
             monitored.remove(&fd);
             epoll.last_ready.lock().remove(&fd);
+            if let Some(target_wq) = target_inode.wait_queue() {
+                target_wq.remove_listener(&epoll.wait_queue);
+            }
             0
         }
         3 => {

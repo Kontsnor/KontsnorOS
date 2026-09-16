@@ -47,6 +47,10 @@ impl InodeOps for EventFd {
         &self.inode
     }
 
+    fn wait_queue(&self) -> Option<Arc<WaitQueue>> {
+        Some(self.wait_queue.clone())
+    }
+
     fn as_eventfd(&self) -> Option<&EventFd> {
         Some(self)
     }

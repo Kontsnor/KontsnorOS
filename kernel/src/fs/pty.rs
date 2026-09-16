@@ -133,15 +133,33 @@ impl InodeOps for PtyMaster {
             let echo = (termios.c_lflag & 0x00000008) != 0;
             let isig = (termios.c_lflag & 0x00000001) != 0;
 
-            for &byte in data {
-                let mut byte = byte;
+            let icrnl = (termios.c_iflag & 0x00000100) != 0;
+            let igncr = (termios.c_iflag & 0x00000080) != 0;
+            let inlcr = (termios.c_iflag & 0x00000040) != 0;
+
+            let vintr = termios.c_cc[0];
+            let vquit = termios.c_cc[1];
+            let verase = termios.c_cc[2];
+            let vkill = termios.c_cc[3];
+            let veof = termios.c_cc[4];
+            let vsusp = termios.c_cc[10];
+            let vwerase = termios.c_cc[14];
+
+            for &b in data {
+                let mut byte = b;
                 if byte == b'\r' {
-                    byte = b'\n';
+                    if igncr {
+                        continue;
+                    } else if icrnl {
+                        byte = b'\n';
+                    }
+                } else if byte == b'\n' && inlcr {
+                    byte = b'\r';
                 }
 
                 // 1. Interactive terminal signals when ISIG is enabled
                 if isig {
-                    if byte == 0x03 {
+                    if vintr != 0 && byte == vintr {
                         // Ctrl+C -> SIGINT (signal 2)
                         if echo {
                             master_read.push_back(b'^');
@@ -155,7 +173,7 @@ impl InodeOps for PtyMaster {
                         }
                         sig_to_deliver = Some((pgid, 2));
                         continue;
-                    } else if byte == 0x1C {
+                    } else if vquit != 0 && byte == vquit {
                         // Ctrl+\ -> SIGQUIT (signal 3)
                         if echo {
                             master_read.push_back(b'^');
@@ -169,7 +187,7 @@ impl InodeOps for PtyMaster {
                         }
                         sig_to_deliver = Some((pgid, 3));
                         continue;
-                    } else if byte == 0x1A {
+                    } else if vsusp != 0 && byte == vsusp {
                         // Ctrl+Z -> SIGTSTP (signal 20)
                         if echo {
                             master_read.push_back(b'^');
@@ -187,7 +205,7 @@ impl InodeOps for PtyMaster {
 
                 // 2. Canonical mode line discipline
                 if icanon {
-                    if byte == 0x04 {
+                    if veof != 0 && byte == veof {
                         // Ctrl+D (EOF in canonical mode)
                         if raw_input.is_empty() {
                             self.shared
@@ -200,7 +218,7 @@ impl InodeOps for PtyMaster {
                             }
                         }
                         continue;
-                    } else if byte == 0x15 {
+                    } else if vkill != 0 && byte == vkill {
                         // Ctrl+U (Line Kill)
                         while let Some(popped) = raw_input.pop_back() {
                             if echo && popped != b'\n' {
@@ -210,7 +228,7 @@ impl InodeOps for PtyMaster {
                             }
                         }
                         continue;
-                    } else if byte == 0x17 {
+                    } else if vwerase != 0 && byte == vwerase {
                         // Ctrl+W (Word Erase)
                         // Skip trailing whitespace
                         while let Some(&last) = raw_input.back() {
@@ -239,7 +257,7 @@ impl InodeOps for PtyMaster {
                             }
                         }
                         continue;
-                    } else if byte == 0x7F || byte == b'\x08' {
+                    } else if (verase != 0 && byte == verase) || byte == 0x7F || byte == b'\x08' {
                         if let Some(popped) = raw_input.pop_back() {
                             if echo {
                                 if popped != b'\n' {
@@ -365,11 +383,38 @@ impl InodeOps for PtySlave {
             return Ok(0);
         }
 
-        loop {
-            {
-                let mut queue = self.shared.slave_read_queue.lock();
-                if !queue.is_empty() {
-                    let mut count = 0;
+        // 1. Background read check -> SIGTTIN
+        if let Some(current_pid) = crate::process::scheduler::current_pid() {
+            if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+                let task_pgid = task_arc.lock().pgid;
+                let fg_pgid = *self.shared.foreground_pgid.lock();
+                if fg_pgid == 0 {
+                    *self.shared.foreground_pgid.lock() = task_pgid;
+                } else if task_pgid != fg_pgid {
+                    deliver_signal_to_pgrp(task_pgid, 21); // SIGTTIN = 21
+                    return Err(-4); // EINTR
+                }
+            }
+        }
+
+        let is_nonblocking = self.non_blocking.load(core::sync::atomic::Ordering::SeqCst)
+            || crate::fs::inode::is_inode_nonblocking(self);
+
+        let (icanon, vmin, vtime) = {
+            let t = self.shared.termios.lock();
+            (
+                (t.c_lflag & 0x00000002) != 0,
+                t.c_cc[6] as usize,
+                t.c_cc[5] as u64,
+            )
+        };
+
+        if icanon || (vmin > 0 && vtime == 0) {
+            let target = if icanon { 1 } else { core::cmp::min(vmin, buf.len()) };
+            let mut count = 0;
+            loop {
+                {
+                    let mut queue = self.shared.slave_read_queue.lock();
                     while count < buf.len() {
                         if let Some(ch) = queue.pop_front() {
                             buf[count] = ch;
@@ -378,57 +423,166 @@ impl InodeOps for PtySlave {
                             break;
                         }
                     }
-                    return Ok(count);
+                    if count >= target {
+                        return Ok(count);
+                    }
+                    if self
+                        .shared
+                        .eof_pending
+                        .swap(false, core::sync::atomic::Ordering::AcqRel)
+                    {
+                        return Ok(count);
+                    }
                 }
-                if self
-                    .shared
-                    .eof_pending
-                    .swap(false, core::sync::atomic::Ordering::AcqRel)
-                {
-                    return Ok(0); // EOF
-                }
-            }
 
-            // Track reader pgid as foreground if not currently set
-            if *self.shared.foreground_pgid.lock() == 0 {
+                if is_nonblocking {
+                    if count > 0 {
+                        return Ok(count);
+                    } else {
+                        return Err(-11); // -EAGAIN
+                    }
+                }
+
                 if let Some(current_pid) = crate::process::scheduler::current_pid() {
                     if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
-                        *self.shared.foreground_pgid.lock() = task_arc.lock().pgid;
+                        let task = task_arc.lock();
+                        if (task.pending_signals & !task.blocked_signals) != 0 {
+                            if count > 0 {
+                                return Ok(count);
+                            } else {
+                                return Err(-4); // EINTR
+                            }
+                        }
                     }
                 }
-            }
 
-            if self.non_blocking.load(core::sync::atomic::Ordering::SeqCst) {
-                return Err(-11); // -EAGAIN
+                self.shared.wait_queue.wait();
             }
-
-            // Interruptible by signals
-            if let Some(current_pid) = crate::process::scheduler::current_pid() {
-                if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
-                    let task = task_arc.lock();
-                    let unblocked = task.pending_signals & !task.blocked_signals;
-                    if unblocked != 0 {
-                        return Err(-4); // EINTR
+        } else if vmin == 0 && vtime > 0 {
+            // Wait up to vtime * 10 ticks for at least 1 byte
+            let timeout_ticks = vtime * 10;
+            let start_ticks = crate::arch::x86_64::interrupts::timer_ticks();
+            loop {
+                {
+                    let mut queue = self.shared.slave_read_queue.lock();
+                    if !queue.is_empty() {
+                        let mut count = 0;
+                        while count < buf.len() {
+                            if let Some(ch) = queue.pop_front() {
+                                buf[count] = ch;
+                                count += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        return Ok(count);
                     }
                 }
-            }
-
-            self.shared.wait_queue.wait();
-
-            if let Some(current_pid) = crate::process::scheduler::current_pid() {
-                if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
-                    let task = task_arc.lock();
-                    let unblocked = task.pending_signals & !task.blocked_signals;
-                    if unblocked != 0 {
-                        return Err(-4); // EINTR
+                if crate::arch::x86_64::interrupts::timer_ticks() >= start_ticks + timeout_ticks {
+                    return Ok(0);
+                }
+                if is_nonblocking {
+                    return Err(-11);
+                }
+                if let Some(current_pid) = crate::process::scheduler::current_pid() {
+                    if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+                        let task = task_arc.lock();
+                        if (task.pending_signals & !task.blocked_signals) != 0 {
+                            return Err(-4);
+                        }
                     }
                 }
+                crate::process::scheduler::yield_now();
             }
+        } else if vmin > 0 && vtime > 0 {
+            let target = core::cmp::min(vmin, buf.len());
+            let mut count = 0;
+            // Wait for 1st byte
+            loop {
+                {
+                    let mut queue = self.shared.slave_read_queue.lock();
+                    while count < buf.len() {
+                        if let Some(ch) = queue.pop_front() {
+                            buf[count] = ch;
+                            count += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if count > 0 {
+                        break;
+                    }
+                }
+                if is_nonblocking {
+                    return Err(-11);
+                }
+                if let Some(current_pid) = crate::process::scheduler::current_pid() {
+                    if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+                        let task = task_arc.lock();
+                        if (task.pending_signals & !task.blocked_signals) != 0 {
+                            return Err(-4);
+                        }
+                    }
+                }
+                self.shared.wait_queue.wait();
+            }
+            // Inter-byte timer
+            let gap_ticks = vtime * 10;
+            let mut last_ticks = crate::arch::x86_64::interrupts::timer_ticks();
+            while count < target {
+                {
+                    let mut queue = self.shared.slave_read_queue.lock();
+                    let before = count;
+                    while count < buf.len() {
+                        if let Some(ch) = queue.pop_front() {
+                            buf[count] = ch;
+                            count += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if count > before {
+                        last_ticks = crate::arch::x86_64::interrupts::timer_ticks();
+                    }
+                }
+                if crate::arch::x86_64::interrupts::timer_ticks() >= last_ticks + gap_ticks {
+                    break;
+                }
+                crate::process::scheduler::yield_now();
+            }
+            Ok(count)
+        } else {
+            // vmin == 0 && vtime == 0
+            let mut queue = self.shared.slave_read_queue.lock();
+            let mut count = 0;
+            while count < buf.len() {
+                if let Some(ch) = queue.pop_front() {
+                    buf[count] = ch;
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+            Ok(count)
         }
     }
 
     /// Write data to the master (program output).
     fn write(&self, _offset: u64, data: &[u8]) -> Result<usize, i32> {
+        if let Some(current_pid) = crate::process::scheduler::current_pid() {
+            if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+                let task_pgid = task_arc.lock().pgid;
+                let fg_pgid = *self.shared.foreground_pgid.lock();
+                let termios = self.shared.termios.lock();
+                let tostop = (termios.c_lflag & 0x00000100) != 0; // TOSTOP = 0x100
+                drop(termios);
+                if fg_pgid != 0 && task_pgid != fg_pgid && tostop {
+                    deliver_signal_to_pgrp(task_pgid, 22); // SIGTTOU = 22
+                    return Err(-4); // EINTR
+                }
+            }
+        }
+
         let mut master_read = self.shared.master_read_queue.lock();
         for &byte in data {
             master_read.push_back(byte);
@@ -540,6 +694,28 @@ impl InodeOps for PtySlave {
                     return Err(-14); // EFAULT
                 }
                 let pgid = unsafe { core::ptr::read(arg as *const i32) } as u64;
+                if let Some(calling_pid) = crate::process::scheduler::current_pid() {
+                    if let Some(calling_task) = crate::process::scheduler::get_task_arc(calling_pid) {
+                        let calling_sid = calling_task.lock().sid;
+                        if pgid != 0 {
+                            let tasks = crate::process::scheduler::TASKS.read();
+                            let valid = tasks.iter().any(|slot| {
+                                if let Some(t_arc) = slot {
+                                    if let Some(t) = t_arc.try_lock() {
+                                        t.pgid == pgid && t.sid == calling_sid
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            });
+                            if !valid {
+                                return Err(-1); // EPERM
+                            }
+                        }
+                    }
+                }
                 *self.shared.foreground_pgid.lock() = pgid;
                 Ok(0)
             }
@@ -646,12 +822,12 @@ pub fn allocate_new_pty() -> Result<Arc<dyn InodeOps>, i32> {
         slave_read_queue: Mutex::new(VecDeque::new()),
         raw_input_queue: Mutex::new(VecDeque::new()),
         termios: Mutex::new(Termios {
-            c_iflag: 0,
-            c_oflag: 0,
-            c_cflag: 0,
-            c_lflag: 0x00000002 | 0x00000008 | 0x00000001, // ICANON | ECHO | ISIG
+            c_iflag: 0x00000100, // ICRNL
+            c_oflag: 0x00000005, // OPOST | ONLCR
+            c_cflag: 0x000000bf,
+            c_lflag: 0x00000002 | 0x00000008 | 0x00000001 | 0x00008000 | 0x00000010 | 0x00000020,
             c_line: 0,
-            c_cc: [0; 19],
+            c_cc: crate::fs::tty::DEFAULT_C_CC,
         }),
         winsize: Mutex::new(Winsize {
             ws_row: 24,

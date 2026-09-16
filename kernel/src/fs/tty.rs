@@ -47,15 +47,37 @@ pub struct Winsize {
     pub ws_ypixel: u16,
 }
 
+pub const DEFAULT_C_CC: [u8; 19] = [
+    3,   // 0: VINTR (Ctrl+C)
+    28,  // 1: VQUIT (Ctrl+\)
+    127, // 2: VERASE (Backspace)
+    21,  // 3: VKILL (Ctrl+U)
+    4,   // 4: VEOF (Ctrl+D)
+    0,   // 5: VTIME
+    1,   // 6: VMIN
+    0,   // 7: VSWTC
+    17,  // 8: VSTART (Ctrl+Q)
+    19,  // 9: VSTOP (Ctrl+S)
+    26,  // 10: VSUSP (Ctrl+Z)
+    0,   // 11: VEOL
+    18,  // 12: VREPRINT (Ctrl+R)
+    23,  // 13: VDISCARD (Ctrl+O)
+    23,  // 14: VWERASE (Ctrl+W)
+    22,  // 15: VLNEXT (Ctrl+V)
+    0,   // 16: VEOL2
+    0,
+    0,
+];
+
 /// Global active TTY termios settings.
-/// Default: ICANON (0x02) | ECHO (0x08) | ISIG (0x01)
+/// Default: ICANON | ECHO | ISIG | IEXTEN | ECHOE | ECHOK
 pub static TTY_TERMIOS: Mutex<Termios> = Mutex::new(Termios {
-    c_iflag: 0,
-    c_oflag: 0,
-    c_cflag: 0,
-    c_lflag: 0x00000002 | 0x00000008 | 0x00000001,
+    c_iflag: 0x00000100, // ICRNL
+    c_oflag: 0x00000005, // OPOST | ONLCR
+    c_cflag: 0x000000bf,
+    c_lflag: 0x00000002 | 0x00000008 | 0x00000001 | 0x00008000 | 0x00000010 | 0x00000020,
     c_line: 0,
-    c_cc: [0; 19],
+    c_cc: DEFAULT_C_CC,
 });
 
 /// Global active TTY foreground process group ID.
@@ -86,6 +108,8 @@ impl InodeOps for DevStdin {
             return Ok(0);
         }
 
+        let is_nonblocking = crate::fs::inode::is_inode_nonblocking(self);
+
         // Wait cooperatively for input
         loop {
             let mut got_input = false;
@@ -102,6 +126,12 @@ impl InodeOps for DevStdin {
                 let echo = (termios.c_lflag & 0x00000008) != 0;
                 let isig = (termios.c_lflag & 0x00000001) != 0;
                 drop(termios);
+
+                if !icanon && crate::drivers::keyboard::has_input() {
+                    got_input = true;
+                } else if icanon && crate::drivers::keyboard::has_newline() {
+                    got_input = true;
+                }
 
                 // Check if any character is available on serial
                 if let Some(mut byte) = crate::arch::x86_64::serial::try_read_byte() {
@@ -233,8 +263,12 @@ impl InodeOps for DevStdin {
                 break;
             }
 
-            // Yield to avoid hard locking
-            crate::process::scheduler::yield_now();
+            if is_nonblocking {
+                return Err(-11); // -EAGAIN
+            }
+
+            // Sleep cooperatively on wait queue
+            crate::drivers::keyboard::stdin_wait_queue().wait();
 
             // Cooperatively exit on signals
             if let Some(current_pid) = crate::process::scheduler::current_pid() {
@@ -349,6 +383,28 @@ impl InodeOps for DevStdin {
                     return Err(-14); // EFAULT
                 }
                 let pgid = unsafe { core::ptr::read(arg as *const i32) } as u64;
+                if let Some(calling_pid) = crate::process::scheduler::current_pid() {
+                    if let Some(calling_task) = crate::process::scheduler::get_task_arc(calling_pid) {
+                        let calling_sid = calling_task.lock().sid;
+                        if pgid != 0 {
+                            let tasks = crate::process::scheduler::TASKS.read();
+                            let valid = tasks.iter().any(|slot| {
+                                if let Some(t_arc) = slot {
+                                    if let Some(t) = t_arc.try_lock() {
+                                        t.pgid == pgid && t.sid == calling_sid
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            });
+                            if !valid {
+                                return Err(-1); // EPERM
+                            }
+                        }
+                    }
+                }
                 *TTY_FOREGROUND_PGID.lock() = pgid;
                 Ok(0)
             }
@@ -361,7 +417,7 @@ impl InodeOps for DevStdin {
                 }
                 Ok(0)
             }
-            _ => Err(-22), // EINVAL
+            _ => Err(-25), // ENOTTY
         }
     }
 
@@ -401,6 +457,19 @@ impl InodeOps for DevStdout {
     }
 
     fn write(&self, _offset: u64, data: &[u8]) -> Result<usize, i32> {
+        if let Some(current_pid) = crate::process::scheduler::current_pid() {
+            if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+                let task_pgid = task_arc.lock().pgid;
+                let fg_pgid = *TTY_FOREGROUND_PGID.lock();
+                let termios = TTY_TERMIOS.lock();
+                let tostop = (termios.c_lflag & 0x00000100) != 0;
+                drop(termios);
+                if fg_pgid != 0 && task_pgid != fg_pgid && tostop {
+                    crate::fs::pty::deliver_signal_to_pgrp(task_pgid, 22); // SIGTTOU = 22
+                    return Err(-4); // EINTR
+                }
+            }
+        }
         for &byte in data {
             crate::arch::x86_64::serial::write_byte(byte);
         }

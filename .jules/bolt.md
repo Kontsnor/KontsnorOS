@@ -7,3 +7,7 @@
 ## 2026-03-30 - Pipe Buffer Ring-Buffer Bulk Slice Copy Optimization
 **Learning:** Performing byte-by-byte loops and modulo operations in `PipeBuffer` (`push`/`pop`) incurs severe CPU overhead and branch mispredictions on large pipe read/write operations (e.g. 64 KiB buffers). Implementing `push_slice` and `pop_slice` with `copy_from_slice` reduces transfer overheads from O(N) loop iterations to at most two O(1) bulk memory copies (`rep movsb`).
 **Action:** When working with ring buffers or IPC stream channels, prefer slice-based contiguous chunk copies over element-by-element push/pop loops.
+
+## 2026-03-30 - Sharded Dentry Cache Lock Contention Reduction
+**Learning:** In `kernel/src/fs/dcache.rs`, a single global `TicketLock` guarding all dcache lookup/insert operations creates severe lock contention under multi-core/multi-process VFS path lookups. Partitioning the cache into 64 independent `TicketLock` shards and replacing guarded counter updates with lock-free `AtomicU64` atomics reduces global lock contention by up to 64x without lock overhead on diagnostic counter updates.
+**Action:** For hot global kernel caches (such as dcache and page cache), prefer sharded locks indexed by hash or offset over single global spinlocks.

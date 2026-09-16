@@ -405,7 +405,11 @@ pub fn handle_interrupt() {
         }
     }
 
+    let had_packets = !packets.is_empty();
     for packet in packets {
         crate::net::ethernet::handle_packet(&packet);
+    }
+    if had_packets {
+        crate::fs::epoll::wake_all_epolls();
     }
 }

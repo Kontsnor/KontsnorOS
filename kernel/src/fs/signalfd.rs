@@ -89,6 +89,10 @@ impl InodeOps for SignalFd {
         &self.inode
     }
 
+    fn wait_queue(&self) -> Option<Arc<WaitQueue>> {
+        Some(self.wait_queue.clone())
+    }
+
     fn as_signalfd(&self) -> Option<&SignalFd> {
         Some(self)
     }

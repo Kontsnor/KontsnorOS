@@ -338,6 +338,26 @@ pub trait InodeOps: Send + Sync {
         events
     }
 
+    /// Return the wait queue associated with this inode for event monitoring (poll / epoll).
+    fn wait_queue(&self) -> Option<alloc::sync::Arc<crate::sync::wait_queue::WaitQueue>> {
+        if let Some(s) = self.as_socket() {
+            return Some(s.lock().wait_queue.clone());
+        }
+        if let Some(t) = self.as_timerfd() {
+            return Some(t.wait_queue.clone());
+        }
+        if let Some(e) = self.as_eventfd() {
+            return Some(e.wait_queue.clone());
+        }
+        if let Some(s) = self.as_signalfd() {
+            return Some(s.wait_queue.clone());
+        }
+        if let Some(ep) = self.as_epoll() {
+            return Some(ep.wait_queue.clone());
+        }
+        None
+    }
+
     /// Downcast helpers
     fn as_epoll(&self) -> Option<&crate::fs::epoll::EpollInstance> {
         None

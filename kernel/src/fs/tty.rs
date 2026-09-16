@@ -76,6 +76,10 @@ impl InodeOps for DevStdin {
         &self.inode
     }
 
+    fn wait_queue(&self) -> Option<alloc::sync::Arc<crate::sync::wait_queue::WaitQueue>> {
+        Some(crate::drivers::keyboard::stdin_wait_queue())
+    }
+
     /// Read characters based on ICANON, ECHO, and ISIG termios flags.
     fn read(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
         if buf.is_empty() {
@@ -472,6 +476,10 @@ pub struct DevTty {
 impl InodeOps for DevTty {
     fn inode(&self) -> &Inode {
         &self.inode
+    }
+
+    fn wait_queue(&self) -> Option<alloc::sync::Arc<crate::sync::wait_queue::WaitQueue>> {
+        Some(crate::drivers::keyboard::stdin_wait_queue())
     }
 
     fn read(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, i32> {

@@ -43,7 +43,7 @@ pub struct PtyShared {
     pub foreground_pgid: Mutex<u64>,
     /// Pending EOF flag (Ctrl+D on empty input in canonical mode).
     pub eof_pending: core::sync::atomic::AtomicBool,
-    pub wait_queue: crate::sync::wait_queue::WaitQueue,
+    pub wait_queue: Arc<crate::sync::wait_queue::WaitQueue>,
 }
 
 /// The PTY master device node.
@@ -56,6 +56,10 @@ pub struct PtyMaster {
 impl InodeOps for PtyMaster {
     fn inode(&self) -> &Inode {
         &self.inode
+    }
+
+    fn wait_queue(&self) -> Option<Arc<crate::sync::wait_queue::WaitQueue>> {
+        Some(self.shared.wait_queue.clone())
     }
 
     fn set_nonblocking(&self, nonblocking: bool) {
@@ -344,6 +348,10 @@ pub struct PtySlave {
 impl InodeOps for PtySlave {
     fn inode(&self) -> &Inode {
         &self.inode
+    }
+
+    fn wait_queue(&self) -> Option<Arc<crate::sync::wait_queue::WaitQueue>> {
+        Some(self.shared.wait_queue.clone())
     }
 
     fn set_nonblocking(&self, nonblocking: bool) {
@@ -653,7 +661,7 @@ pub fn allocate_new_pty() -> Result<Arc<dyn InodeOps>, i32> {
         }),
         foreground_pgid: Mutex::new(0),
         eof_pending: core::sync::atomic::AtomicBool::new(false),
-        wait_queue: crate::sync::wait_queue::WaitQueue::new(),
+        wait_queue: Arc::new(crate::sync::wait_queue::WaitQueue::new()),
     });
 
     let master = Arc::new(PtyMaster {

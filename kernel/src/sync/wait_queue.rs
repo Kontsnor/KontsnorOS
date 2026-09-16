@@ -20,10 +20,13 @@ use crate::process::scheduler;
 use crate::process::task::TaskState;
 use crate::sync::spinlock::TicketLock;
 use alloc::collections::VecDeque;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 
 /// A queue of task PIDs waiting for an event or resource.
 pub struct WaitQueue {
     pids: TicketLock<VecDeque<Pid>>,
+    listeners: TicketLock<Vec<Weak<WaitQueue>>>,
 }
 
 impl WaitQueue {
@@ -31,7 +34,28 @@ impl WaitQueue {
     pub const fn new() -> Self {
         Self {
             pids: TicketLock::new(VecDeque::new()),
+            listeners: TicketLock::new(Vec::new()),
         }
+    }
+
+    /// Attach a listener wait queue (e.g. epoll or poll) to receive wakeups from this queue.
+    pub fn add_listener(&self, listener: &Arc<WaitQueue>) {
+        let mut list = self.listeners.lock();
+        if !list.iter().any(|w| w.as_ptr() == Arc::as_ptr(listener)) {
+            list.push(Arc::downgrade(listener));
+        }
+    }
+
+    /// Detach a listener wait queue.
+    pub fn remove_listener(&self, listener: &Arc<WaitQueue>) {
+        let mut list = self.listeners.lock();
+        list.retain(|w| {
+            if let Some(upgraded) = w.upgrade() {
+                !Arc::ptr_eq(&upgraded, listener)
+            } else {
+                false
+            }
+        });
     }
 
     /// Sleep the current task on this wait queue.
@@ -80,10 +104,7 @@ impl WaitQueue {
         x86_64::instructions::interrupts::without_interrupts(|| {
             if let Some(mut sched_lock) = scheduler::SCHEDULER.try_lock() {
                 if let Some(ref mut sched) = *sched_lock {
-                    let mut pids = self.pids.lock();
-                    while let Some(pid) = pids.pop_front() {
-                        sched.wake_task(pid);
-                    }
+                    self.wake_all_locked(sched);
                 }
             } else {
                 let apic_id = crate::arch::x86_64::smp::current_lapic_id() as u32;
@@ -91,33 +112,38 @@ impl WaitQueue {
                     // SAFETY: The current CPU already holds SCHEDULER exclusively
                     unsafe {
                         if let Some(ref mut sched) = *scheduler::SCHEDULER.get_mut_unchecked() {
-                            let mut pids = self.pids.lock();
-                            while let Some(pid) = pids.pop_front() {
-                                sched.wake_task(pid);
-                            }
+                            self.wake_all_locked(sched);
                         }
                     }
                 } else {
                     let mut sched_lock = scheduler::SCHEDULER.lock();
                     if let Some(ref mut sched) = *sched_lock {
-                        let mut pids = self.pids.lock();
-                        while let Some(pid) = pids.pop_front() {
-                            sched.wake_task(pid);
-                        }
+                        self.wake_all_locked(sched);
                     }
                 }
             }
         });
-        crate::fs::epoll::wake_all_epolls();
     }
 
-    /// Wake up all tasks currently sleeping on this wait queue.
+    /// Wake up all tasks currently sleeping on this wait queue and propagate to attached listeners.
     /// The caller must already hold the scheduler lock.
     pub fn wake_all_locked(&self, sched: &mut scheduler::Scheduler) {
         let mut pids = self.pids.lock();
         while let Some(pid) = pids.pop_front() {
             sched.wake_task(pid);
         }
+        drop(pids);
+
+        // Propagate wakeup to any attached listener queues (e.g. epoll, poll)
+        let mut listeners = self.listeners.lock();
+        listeners.retain(|weak_wq| {
+            if let Some(child_wq) = weak_wq.upgrade() {
+                child_wq.wake_all_locked(sched);
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// Register a task on this wait queue without locking the scheduler.

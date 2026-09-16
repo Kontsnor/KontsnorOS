@@ -112,7 +112,7 @@ pub struct PipeState {
     buffer: Mutex<PipeBuffer>,
     readers: AtomicUsize,
     writers: AtomicUsize,
-    pub wait_queue: crate::sync::wait_queue::WaitQueue,
+    pub wait_queue: Arc<crate::sync::wait_queue::WaitQueue>,
 }
 
 impl PipeState {
@@ -121,7 +121,7 @@ impl PipeState {
             buffer: Mutex::new(PipeBuffer::new()),
             readers: AtomicUsize::new(1),
             writers: AtomicUsize::new(1),
-            wait_queue: crate::sync::wait_queue::WaitQueue::new(),
+            wait_queue: Arc::new(crate::sync::wait_queue::WaitQueue::new()),
         }
     }
 }
@@ -136,6 +136,10 @@ pub struct PipeReader {
 impl InodeOps for PipeReader {
     fn inode(&self) -> &Inode {
         &self.inode
+    }
+
+    fn wait_queue(&self) -> Option<Arc<crate::sync::wait_queue::WaitQueue>> {
+        Some(self.state.wait_queue.clone())
     }
 
     fn read(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
@@ -174,6 +178,16 @@ impl InodeOps for PipeReader {
 
             // Sleep on wait queue until data is written or writers close
             self.state.wait_queue.wait();
+
+            // Interrupted by signal
+            if let Some(current_pid) = crate::process::scheduler::current_pid() {
+                if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+                    let task = task_arc.lock();
+                    if (task.pending_signals & !task.blocked_signals) != 0 {
+                        return Err(-4); // EINTR
+                    }
+                }
+            }
         }
     }
 
@@ -236,6 +250,10 @@ impl InodeOps for PipeWriter {
         &self.inode
     }
 
+    fn wait_queue(&self) -> Option<Arc<crate::sync::wait_queue::WaitQueue>> {
+        Some(self.state.wait_queue.clone())
+    }
+
     fn write(&self, _offset: u64, data: &[u8]) -> Result<usize, i32> {
         if data.is_empty() {
             return Ok(0);
@@ -280,6 +298,16 @@ impl InodeOps for PipeWriter {
                 }
                 // Sleep on wait queue until space is freed or readers close
                 self.state.wait_queue.wait();
+
+                // Interrupted by signal
+                if let Some(current_pid) = crate::process::scheduler::current_pid() {
+                    if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+                        let task = task_arc.lock();
+                        if (task.pending_signals & !task.blocked_signals) != 0 {
+                            return Err(-4); // EINTR
+                        }
+                    }
+                }
             }
         }
 
@@ -354,11 +382,16 @@ pub struct UnixSocket {
     pub inode: Inode,
     pub reader: Arc<dyn InodeOps>,
     pub writer: Arc<dyn InodeOps>,
+    pub wait_queue: Arc<crate::sync::wait_queue::WaitQueue>,
 }
 
 impl InodeOps for UnixSocket {
     fn inode(&self) -> &Inode {
         &self.inode
+    }
+
+    fn wait_queue(&self) -> Option<Arc<crate::sync::wait_queue::WaitQueue>> {
+        Some(self.wait_queue.clone())
     }
 
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
@@ -400,16 +433,34 @@ pub fn make_socketpair(nonblock: bool) -> (Arc<dyn InodeOps>, Arc<dyn InodeOps>)
         w2.set_nonblocking(true);
     }
 
+    let wq_a = Arc::new(crate::sync::wait_queue::WaitQueue::new());
+    let wq_b = Arc::new(crate::sync::wait_queue::WaitQueue::new());
+
+    if let Some(w) = r1.wait_queue() {
+        w.add_listener(&wq_a);
+    }
+    if let Some(w) = w2.wait_queue() {
+        w.add_listener(&wq_a);
+    }
+    if let Some(w) = r2.wait_queue() {
+        w.add_listener(&wq_b);
+    }
+    if let Some(w) = w1.wait_queue() {
+        w.add_listener(&wq_b);
+    }
+
     let sock_a = Arc::new(UnixSocket {
         inode: Inode::new(0, FileType::Socket),
         reader: r1,
         writer: w2,
+        wait_queue: wq_a,
     });
 
     let sock_b = Arc::new(UnixSocket {
         inode: Inode::new(0, FileType::Socket),
         reader: r2,
         writer: w1,
+        wait_queue: wq_b,
     });
 
     (sock_a, sock_b)

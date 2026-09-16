@@ -173,10 +173,12 @@ extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFram
     panic!("Unhandled invalid opcode");
 }
 
-extern "x86-interrupt" fn device_not_available_handler(stack_frame: InterruptStackFrame) {
-    kprintln!("[EXCEPTION] Device Not Available");
-    kprintln!("{:#?}", stack_frame);
-    panic!("Unhandled device not available");
+extern "x86-interrupt" fn device_not_available_handler(_stack_frame: InterruptStackFrame) {
+    // Clear CR0.TS (Task Switched bit) so SIMD/FPU instructions can execute
+    // SAFETY: Privileged instruction executed in ring 0 interrupt handler.
+    unsafe {
+        core::arch::asm!("clts", options(nomem, nostack));
+    }
 }
 
 extern "x86-interrupt" fn x87_floating_point_handler(stack_frame: InterruptStackFrame) {
@@ -954,11 +956,17 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
 
     // Trigger rescheduling to enable preemption when returning to user mode (Ring 3),
     // or when the CPU is running an idle task (PID >= 900) in Ring 0.
-    if swap_needed {
+    let is_idle = crate::process::scheduler::current_pid()
+        .map(|p| p.as_u64() >= 900)
+        .unwrap_or(false);
+
+    if swap_needed || is_idle {
         crate::process::scheduler::schedule();
-        // SAFETY: Swap back to user GS base before returning
-        unsafe {
-            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        if swap_needed {
+            // SAFETY: Swap back to user GS base before returning
+            unsafe {
+                core::arch::asm!("swapgs", options(nostack, preserves_flags));
+            }
         }
     }
 }
@@ -1007,11 +1015,17 @@ extern "x86-interrupt" fn ipi_reschedule_handler(stack_frame: InterruptStackFram
     }
 
     super::apic::lapic_eoi();
-    if swap_needed {
+    let is_idle = crate::process::scheduler::current_pid()
+        .map(|p| p.as_u64() >= 900)
+        .unwrap_or(false);
+
+    if swap_needed || is_idle {
         crate::process::scheduler::schedule();
-        // SAFETY: Swap back to user GS base before returning
-        unsafe {
-            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        if swap_needed {
+            // SAFETY: Swap back to user GS base before returning
+            unsafe {
+                core::arch::asm!("swapgs", options(nostack, preserves_flags));
+            }
         }
     }
 }

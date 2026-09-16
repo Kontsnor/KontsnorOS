@@ -61,6 +61,10 @@ impl InodeOps for TimerFd {
         &self.inode
     }
 
+    fn wait_queue(&self) -> Option<Arc<WaitQueue>> {
+        Some(self.wait_queue.clone())
+    }
+
     fn as_timerfd(&self) -> Option<&TimerFd> {
         Some(self)
     }

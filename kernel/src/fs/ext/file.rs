@@ -756,6 +756,14 @@ impl ExtInode {
             let mut sib = raw.i_block[12];
             if sib == 0 {
                 sib = self.fs.allocate_block()?;
+                let zero_buf = [0u8; 4096];
+                let block_size = self.fs.block_size as usize;
+                write_blocks(
+                    &*self.fs.device,
+                    sib as u64,
+                    &zero_buf[..block_size],
+                    self.fs.block_size,
+                )?;
                 raw.i_block[12] = sib;
                 raw.i_blocks += self.fs.block_size / 512;
                 self.fs.write_inode(self.ino, raw)?;
@@ -800,17 +808,25 @@ impl ExtInode {
         let double_index = indirect_index - refs_per_block;
         let max_double_blocks = refs_per_block * refs_per_block;
         if double_index < max_double_blocks {
+            let block_size = self.fs.block_size as usize;
+            assert!(block_size <= 4096);
+
             let mut dib = raw.i_block[13];
             if dib == 0 {
                 dib = self.fs.allocate_block()?;
+                let zero_buf = [0u8; 4096];
+                write_blocks(
+                    &*self.fs.device,
+                    dib as u64,
+                    &zero_buf[..block_size],
+                    self.fs.block_size,
+                )?;
                 raw.i_block[13] = dib;
                 raw.i_blocks += self.fs.block_size / 512;
                 self.fs.write_inode(self.ino, raw)?;
             }
 
             let mut dib_buf = [0u8; 4096];
-            let block_size = self.fs.block_size as usize;
-            assert!(block_size <= 4096);
             read_blocks(
                 &*self.fs.device,
                 dib as u64,
@@ -829,6 +845,13 @@ impl ExtInode {
 
             if sib == 0 {
                 sib = self.fs.allocate_block()?;
+                let zero_buf = [0u8; 4096];
+                write_blocks(
+                    &*self.fs.device,
+                    sib as u64,
+                    &zero_buf[..block_size],
+                    self.fs.block_size,
+                )?;
                 let bytes = sib.to_le_bytes();
                 dib_buf[sib_ptr_offset..sib_ptr_offset + 4].copy_from_slice(&bytes);
                 write_blocks(

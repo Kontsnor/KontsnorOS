@@ -508,7 +508,14 @@ pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: *const u8) -> Syscal
             0
         }
         LINUX_REBOOT_CMD_HALT | LINUX_REBOOT_CMD_POWER_OFF => {
-            crate::kprintln!("[kernel] System power off requested via reboot()");
+            let caller_name = crate::process::scheduler::get_task_arc(current_pid)
+                .map(|t| t.lock().name.clone())
+                .unwrap_or_default();
+            crate::kprintln!(
+                "[kernel] System power off requested via reboot() by PID {} ({})",
+                current_pid,
+                caller_name
+            );
             crate::fs::vfs::sync_all();
             // Allow pending PTY router and serial queues to drain to console
             for _ in 0..100 {

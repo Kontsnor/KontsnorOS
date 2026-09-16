@@ -13,45 +13,49 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Dentry Cache (dcache) — O(1) VFS path component lookup.
+//! Dentry Cache (dcache) — Sharded O(1) VFS path component lookup.
 //!
 //! ## Purpose
 //!
 //! Every `vfs::lookup()` call must resolve path components one at a time,
 //! which means acquiring and releasing filesystem locks for each component.
 //! For a path like `/usr/bin/bash` this is four lock acquisitions minimum.
-//! Under Ubuntu with apt/cargo/dpkg running, `open()` is the hottest syscall
-//! by far, and naive per-component lookup is a major bottleneck.
+//! Under multi-threaded or multi-core workloads (e.g. running cargo, dpkg, or shell pipelines),
+//! `open()` is the hottest syscall by far, and a single global lock on dcache
+//! becomes a major contention bottleneck.
 //!
-//! The dcache maps `(parent_inode_number, component_name)` → `Arc<dyn InodeOps>`
-//! so that repeated lookups of the same path component are O(1) with no
-//! filesystem lock needed.
+//! The sharded dcache maps `(parent_inode_number, component_name)` → `Arc<dyn InodeOps>`
+//! across 64 independent hash shards, so lookups for different paths proceed concurrently
+//! without lock contention.
 //!
 //! ## Design
 //!
-//! - Fixed-capacity hash table with `DCACHE_BUCKETS` buckets.
-//! - Each bucket is an `Option<DcacheEntry>` — simple open addressing is
-//!   avoided in favour of a flat bucket array for cache-friendliness.
+//! - 64 independent shards behind separate `TicketLock`s.
+//! - Each shard contains a flat bucket array of size `BUCKETS_PER_SHARD` (64 buckets per shard, 4096 total).
+//! - Shard and bucket selection uses bitwise masking (`parent_ino` xor/mix with FNV-1a `name_hash`).
+//! - Atomic `DCACHE_HITS` and `DCACHE_MISSES` counters allow lock-free diagnostics without lock contention.
 //! - LRU eviction: each entry carries a `generation` counter. When a bucket
-//!   is occupied and we need to insert a new entry, we always evict the
-//!   existing entry (simplified LRU: last-write-wins per bucket).
-//! - Invalidation: call `dcache_invalidate_inode(parent_ino)` on any
-//!   `unlink`, `rename`, `mkdir`, `rmdir` — this scans and clears all
-//!   entries whose parent matches, which is O(DCACHE_BUCKETS) but rare.
+//!   is occupied and we need to insert a new entry, we overwrite the existing bucket (last-write-wins per bucket).
+//! - Invalidation: call `dcache_invalidate_inode(parent_ino)` on directory mutations — this scans
+//!   and clears matching entries across all shards.
 //!
-//! ## Safety
+//! ## Performance & Concurrency Rationale
 //!
-//! All access is guarded by a single `TicketLock` on the global dcache.
-//! Fine-grained per-bucket locking is left as a future optimisation
-//! (see plan item 3.3 for the analogous page cache sharding).
+//! - Sharding by 64 divides global lock contention by up to 64x under parallel VFS path lookups.
+//! - Atomic hit/miss counters eliminate write cacheline bounces on the dcache lock during read-heavy workloads.
 
 use crate::fs::inode::InodeOps;
 use crate::sync::spinlock::TicketLock;
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Number of hash buckets in the dcache.
-/// Must be a power of two for the cheap modulo via bit-AND.
-const DCACHE_BUCKETS: usize = 4096;
+/// Number of independent dcache shards.
+/// Must be a power of two for cheap bitwise AND masking.
+const DCACHE_SHARD_COUNT: usize = 64;
+
+/// Number of hash buckets per shard.
+/// Must be a power of two for cheap bitwise AND masking.
+const BUCKETS_PER_SHARD: usize = 64;
 
 /// A single dentry cache entry.
 struct DcacheEntry {
@@ -65,34 +69,34 @@ struct DcacheEntry {
     generation: u64,
 }
 
-/// The global dentry cache.
-struct Dcache {
-    buckets: [Option<DcacheEntry>; DCACHE_BUCKETS],
-    /// Monotonically increasing generation counter.
+/// A single dcache shard protecting `BUCKETS_PER_SHARD` entries.
+struct DcacheShard {
+    buckets: [Option<DcacheEntry>; BUCKETS_PER_SHARD],
+    /// Generation counter for the shard.
     generation: u64,
-    /// Hits since last reset (diagnostic).
-    hits: u64,
-    /// Misses since last reset (diagnostic).
-    misses: u64,
 }
 
-impl Dcache {
-    /// Create an empty dcache. Uses `const` default since arrays of non-Copy
-    /// types cannot be zero-initialised in Rust stable without unsafe.
+impl DcacheShard {
+    /// Create an empty dcache shard.
     const fn new() -> Self {
-        // SAFETY: `Option<DcacheEntry>` is valid when all bytes are zero
-        // because `None` is represented as the null discriminant.
         Self {
-            // SAFETY: DcacheEntry contains only primitive and Arc fields.
-            // We initialise the array manually below because Rust requires
-            // const-constructible elements for `[T; N]` array initialisers.
-            buckets: [const { None }; DCACHE_BUCKETS],
+            buckets: [const { None }; BUCKETS_PER_SHARD],
             generation: 0,
-            hits: 0,
-            misses: 0,
         }
     }
 }
+
+/// Global sharded dentry cache instance (64 independent lock shards).
+static DCACHE_SHARDS: [TicketLock<DcacheShard>; DCACHE_SHARD_COUNT] = {
+    const SHARD: TicketLock<DcacheShard> = TicketLock::new(DcacheShard::new());
+    [SHARD; DCACHE_SHARD_COUNT]
+};
+
+/// Lock-free atomic cache hit counter.
+static DCACHE_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Lock-free atomic cache miss counter.
+static DCACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// FNV-1a 64-bit hash of a byte string.
 #[inline(always)]
@@ -107,18 +111,16 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Compute the bucket index for a `(parent_ino, name)` pair.
+/// Compute the `(shard_index, bucket_index)` pair for a `(parent_ino, name_hash)` tuple.
 #[inline(always)]
-fn bucket_index(parent_ino: u64, name_hash: u64) -> usize {
-    // Mix parent_ino and name_hash together then reduce to bucket range.
-    let combined = parent_ino
+fn locate_bucket(parent_ino: u64, name_hash: u64) -> (usize, usize) {
+    let mixed = parent_ino
         .wrapping_mul(2_654_435_761)
         .wrapping_add(name_hash);
-    (combined as usize) & (DCACHE_BUCKETS - 1)
+    let shard_idx = (mixed as usize) & (DCACHE_SHARD_COUNT - 1);
+    let bucket_idx = ((mixed >> 6) as usize) & (BUCKETS_PER_SHARD - 1);
+    (shard_idx, bucket_idx)
 }
-
-/// Global dentry cache instance.
-static DCACHE: TicketLock<Dcache> = TicketLock::new(Dcache::new());
 
 /// Look up a path component in the dcache.
 ///
@@ -128,17 +130,19 @@ static DCACHE: TicketLock<Dcache> = TicketLock::new(Dcache::new());
 /// - `None` — cache miss: the caller must perform a filesystem lookup.
 pub fn dcache_lookup(parent_ino: u64, name: &str) -> Option<Option<Arc<dyn InodeOps>>> {
     let name_hash = fnv1a(name.as_bytes());
-    let idx = bucket_index(parent_ino, name_hash);
+    let (shard_idx, bucket_idx) = locate_bucket(parent_ino, name_hash);
 
-    let mut cache = DCACHE.lock();
-    if let Some(ref entry) = cache.buckets[idx] {
+    let shard_guard = DCACHE_SHARDS[shard_idx].lock();
+    if let Some(ref entry) = shard_guard.buckets[bucket_idx] {
         if entry.parent_ino == parent_ino && entry.name_hash == name_hash {
             let inode = entry.inode.clone();
-            cache.hits += 1;
+            drop(shard_guard);
+            DCACHE_HITS.fetch_add(1, Ordering::Relaxed);
             return Some(inode);
         }
     }
-    cache.misses += 1;
+    drop(shard_guard);
+    DCACHE_MISSES.fetch_add(1, Ordering::Relaxed);
     None
 }
 
@@ -148,12 +152,12 @@ pub fn dcache_lookup(parent_ino: u64, name: &str) -> Option<Option<Arc<dyn Inode
 /// lookups of the same `(parent_ino, name)` pair can be served from cache.
 pub fn dcache_insert(parent_ino: u64, name: &str, inode: Arc<dyn InodeOps>) {
     let name_hash = fnv1a(name.as_bytes());
-    let idx = bucket_index(parent_ino, name_hash);
+    let (shard_idx, bucket_idx) = locate_bucket(parent_ino, name_hash);
 
-    let mut cache = DCACHE.lock();
-    let gen = cache.generation;
-    cache.generation = gen.wrapping_add(1);
-    cache.buckets[idx] = Some(DcacheEntry {
+    let mut shard_guard = DCACHE_SHARDS[shard_idx].lock();
+    let gen = shard_guard.generation;
+    shard_guard.generation = gen.wrapping_add(1);
+    shard_guard.buckets[bucket_idx] = Some(DcacheEntry {
         parent_ino,
         name_hash,
         inode: Some(inode),
@@ -168,12 +172,12 @@ pub fn dcache_insert(parent_ino: u64, name: &str, inode: Arc<dyn InodeOps>) {
 /// without hitting the filesystem.
 pub fn dcache_insert_negative(parent_ino: u64, name: &str) {
     let name_hash = fnv1a(name.as_bytes());
-    let idx = bucket_index(parent_ino, name_hash);
+    let (shard_idx, bucket_idx) = locate_bucket(parent_ino, name_hash);
 
-    let mut cache = DCACHE.lock();
-    let gen = cache.generation;
-    cache.generation = gen.wrapping_add(1);
-    cache.buckets[idx] = Some(DcacheEntry {
+    let mut shard_guard = DCACHE_SHARDS[shard_idx].lock();
+    let gen = shard_guard.generation;
+    shard_guard.generation = gen.wrapping_add(1);
+    shard_guard.buckets[bucket_idx] = Some(DcacheEntry {
         parent_ino,
         name_hash,
         inode: None,
@@ -185,15 +189,14 @@ pub fn dcache_insert_negative(parent_ino: u64, name: &str) {
 ///
 /// Must be called after any mutation to a directory:
 /// `unlink`, `rename`, `mkdir`, `rmdir`, `create`.
-///
-/// This is O(DCACHE_BUCKETS) but directory mutations are rare compared to
-/// lookups, so the cost is acceptable.
 pub fn dcache_invalidate_inode(parent_ino: u64) {
-    let mut cache = DCACHE.lock();
-    for bucket in cache.buckets.iter_mut() {
-        if let Some(ref entry) = *bucket {
-            if entry.parent_ino == parent_ino {
-                *bucket = None;
+    for shard in &DCACHE_SHARDS {
+        let mut shard_guard = shard.lock();
+        for bucket in shard_guard.buckets.iter_mut() {
+            if let Some(ref entry) = *bucket {
+                if entry.parent_ino == parent_ino {
+                    *bucket = None;
+                }
             }
         }
     }
@@ -205,26 +208,30 @@ pub fn dcache_invalidate_inode(parent_ino: u64) {
 /// changes (e.g., a single file is unlinked).
 pub fn dcache_invalidate_entry(parent_ino: u64, name: &str) {
     let name_hash = fnv1a(name.as_bytes());
-    let idx = bucket_index(parent_ino, name_hash);
+    let (shard_idx, bucket_idx) = locate_bucket(parent_ino, name_hash);
 
-    let mut cache = DCACHE.lock();
-    if let Some(ref entry) = cache.buckets[idx] {
+    let mut shard_guard = DCACHE_SHARDS[shard_idx].lock();
+    if let Some(ref entry) = shard_guard.buckets[bucket_idx] {
         if entry.parent_ino == parent_ino && entry.name_hash == name_hash {
-            cache.buckets[idx] = None;
+            shard_guard.buckets[bucket_idx] = None;
         }
     }
 }
 
 /// Flush the entire dcache (e.g., after unmounting a filesystem).
 pub fn dcache_flush_all() {
-    let mut cache = DCACHE.lock();
-    for bucket in cache.buckets.iter_mut() {
-        *bucket = None;
+    for shard in &DCACHE_SHARDS {
+        let mut shard_guard = shard.lock();
+        for bucket in shard_guard.buckets.iter_mut() {
+            *bucket = None;
+        }
     }
 }
 
 /// Return dcache hit/miss statistics: `(hits, misses)`.
 pub fn dcache_stats() -> (u64, u64) {
-    let cache = DCACHE.lock();
-    (cache.hits, cache.misses)
+    (
+        DCACHE_HITS.load(Ordering::Relaxed),
+        DCACHE_MISSES.load(Ordering::Relaxed),
+    )
 }

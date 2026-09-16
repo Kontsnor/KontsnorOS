@@ -83,6 +83,14 @@ pub static TTY_TERMIOS: Mutex<Termios> = Mutex::new(Termios {
 /// Global active TTY foreground process group ID.
 pub static TTY_FOREGROUND_PGID: Mutex<u64> = Mutex::new(1);
 
+/// Global active TTY window dimensions.
+pub static TTY_WINSIZE: Mutex<Winsize> = Mutex::new(Winsize {
+    ws_row: 25,
+    ws_col: 80,
+    ws_xpixel: 0,
+    ws_ypixel: 0,
+});
+
 // ── /dev/stdin ────────────────────────────────────────────────────────────────
 
 /// Global lock to serialize reads from `/dev/stdin`.
@@ -341,14 +349,23 @@ impl InodeOps for DevStdin {
                 ) {
                     return Err(-14); // EFAULT
                 }
-                let ws = Winsize {
-                    ws_row: 24,
-                    ws_col: 80,
-                    ws_xpixel: 0,
-                    ws_ypixel: 0,
-                };
+                let ws = TTY_WINSIZE.lock();
                 unsafe {
-                    core::ptr::write(arg as *mut Winsize, ws);
+                    core::ptr::write(arg as *mut Winsize, *ws);
+                }
+                Ok(0)
+            }
+            0x5414 => {
+                // TIOCSWINSZ
+                if !crate::syscall::fs::validate_user_ptr(
+                    arg as *const u8,
+                    core::mem::size_of::<Winsize>(),
+                ) {
+                    return Err(-14); // EFAULT
+                }
+                let mut ws = TTY_WINSIZE.lock();
+                unsafe {
+                    *ws = core::ptr::read(arg as *const Winsize);
                 }
                 Ok(0)
             }

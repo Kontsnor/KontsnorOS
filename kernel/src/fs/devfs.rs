@@ -660,11 +660,13 @@ pub fn init() {
     // Mount at /dev
     super::vfs::mount(String::from("/dev"), devfs);
 
-    // Register TTY character devices: stdin, stdout, stderr, tty
+    // Register TTY character devices: stdin, stdout, stderr, tty, console, tty0
     register_device("stdin", super::tty::make_stdin());
     register_device("stdout", super::tty::make_stdout());
     register_device("stderr", super::tty::make_stderr());
     register_device("tty", super::tty::make_tty());
+    register_device("console", super::tty::make_tty());
+    register_device("tty0", super::tty::make_tty());
 }
 
 /// Register a new device node in devfs.

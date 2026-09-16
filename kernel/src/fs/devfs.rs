@@ -552,7 +552,7 @@ impl InodeOps for DevFb0 {
                 Ok(0)
             }
             FBIOBLANK => Ok(0),
-            _ => Err(-22), // EINVAL
+            _ => Err(-25), // ENOTTY
         }
     }
 

@@ -61,15 +61,41 @@ pub unsafe fn enable_sse() {
     }
 }
 
-pub unsafe fn enable_fsgsbase() {
-    // SAFETY: Enabling FSGSBASE CR4 bit is safe on x86_64 processors
+/// Query CPUID.(EAX=07H, ECX=0H):EBX[bit 0] to check if FSGSBASE is supported by the processor.
+pub fn has_fsgsbase() -> bool {
+    let ebx: u32;
+    // SAFETY: CPUID instruction with leaf 7, sub-leaf 0 is standard and safe on all x86_64 CPUs.
     unsafe {
         core::arch::asm!(
-            "mov rax, cr4",
-            "or rax, 0x10000", // Bit 16 (FSGSBASE)
-            "mov cr4, rax",
-            out("rax") _,
+            "push rbx",
+            "mov eax, 7",
+            "xor ecx, ecx",
+            "cpuid",
+            "mov {0:e}, ebx",
+            "pop rbx",
+            out(reg) ebx,
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+            options(nomem, preserves_flags),
         );
+    }
+    (ebx & 1) != 0
+}
+
+pub unsafe fn enable_fsgsbase() {
+    if has_fsgsbase() {
+        // SAFETY: CR4 bit 16 (FSGSBASE) is verified to be supported via CPUID before enabling.
+        unsafe {
+            core::arch::asm!(
+                "mov rax, cr4",
+                "or rax, 0x10000", // Bit 16 (FSGSBASE)
+                "mov cr4, rax",
+                out("rax") _,
+            );
+        }
+    } else {
+        crate::kprintln!("[cpu] FSGSBASE not supported by CPU (CPUID.(7,0):EBX.0 = 0)");
     }
 }
 

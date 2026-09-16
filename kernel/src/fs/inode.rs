@@ -327,7 +327,7 @@ pub trait InodeOps: Send + Sync {
 
     /// Device-specific I/O control.
     fn ioctl(&self, _request: u64, _arg: u64) -> Result<u64, i32> {
-        Err(-22) // EINVAL
+        Err(-25) // ENOTTY
     }
 
     /// Set non-blocking state of the inode.

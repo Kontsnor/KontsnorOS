@@ -916,7 +916,7 @@ pub fn sys_exit_group(status: i32) -> SyscallResult {
     scheduler::schedule();
 
     loop {
-        x86_64::instructions::hlt();
+        x86_64::instructions::interrupts::enable_and_hlt();
     }
 }
 

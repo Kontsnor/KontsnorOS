@@ -33,7 +33,7 @@ fn ensure_page_mapped(vaddr: u64) -> bool {
         .and_then(|pid| crate::process::scheduler::get_task_arc(pid))
         .and_then(|task_arc| {
             let task = task_arc.lock();
-            let addr_space = task.address_space.lock();
+            let mut addr_space = task.address_space.lock();
             let page_vaddr = vaddr & !4095;
 
             // Find if page_vaddr falls inside any mapped region
@@ -44,6 +44,26 @@ fn ensure_page_mapped(vaddr: u64) -> bool {
                     page_vaddr >= region.start && page_vaddr < region.start + region.len as u64
                 })
                 .cloned();
+
+            let region_opt = if let Some(r) = region_opt {
+                Some(r)
+            } else if let Some(stack_idx) = addr_space.mmap_regions.iter().position(|r| r.is_stack)
+            {
+                let stack_low = addr_space.mmap_regions[stack_idx].start;
+                let stack_high = stack_low + addr_space.mmap_regions[stack_idx].len as u64;
+                let stack_low_limit = stack_high.saturating_sub(8 * 1024 * 1024);
+                if page_vaddr < stack_low && page_vaddr >= stack_low_limit {
+                    let new_start = page_vaddr & !4095;
+                    let additional = (stack_low - new_start) as usize;
+                    addr_space.mmap_regions[stack_idx].start = new_start;
+                    addr_space.mmap_regions[stack_idx].len += additional;
+                    Some(addr_space.mmap_regions[stack_idx].clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             region_opt.map(|region| {
                 use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};

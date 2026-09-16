@@ -567,10 +567,12 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
         let frame_size = core::mem::size_of::<RtSigFrame>() as u64;
         let new_user_sp = (user_sp.saturating_sub(frame_size) & !0xF).saturating_sub(8);
 
-        if !crate::syscall::fs::validate_user_ptr(
-            new_user_sp as *const u8,
+        if crate::syscall::validation::validate_user_ptr_write(
+            new_user_sp as *mut u8,
             core::mem::size_of::<RtSigFrame>(),
-        ) {
+        )
+        .is_err()
+        {
             kprintln!("[signal] Invalid user stack for signal delivery. Exiting task group.");
             terminate_group_and_exit(current_pid, 11 | 128); // SIGSEGV
         }
@@ -635,6 +637,14 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
             + 8
             + core::mem::size_of::<crate::syscall::process::lifecycle::SigInfo>() as u64;
 
+        // SAFETY: Probe the user stack pages to verify write accessibility before writing the full frame.
+        unsafe {
+            core::ptr::write_volatile(new_user_sp as *mut u8, 0);
+            core::ptr::write_volatile((new_user_sp + frame_size - 1) as *mut u8, 0);
+        }
+
+        // SAFETY: The stack pointer new_user_sp was validated with validate_user_ptr_write and probed.
+        // regs points to the valid SavedRegisters structure on the current task's kernel stack.
         unsafe {
             core::ptr::write(new_user_sp as *mut RtSigFrame, frame);
             (*regs).rsp = new_user_sp;
@@ -669,9 +679,17 @@ pub fn sys_rt_sigreturn(regs: *mut super::SavedRegisters) -> SyscallResult {
         return Errno::EFAULT.into();
     }
 
+    // SAFETY: frame_ptr was verified with validate_user_ptr.
+    let frame = unsafe { &*frame_ptr };
+    let mctx = &frame.uc.uc_mcontext;
+
+    // Enforce canonical user-space address checks to prevent Ring 0 #GP or kernel space execution
+    if mctx.rip >= 0x0000_8000_0000_0000 || mctx.rsp >= 0x0000_8000_0000_0000 {
+        return Errno::EFAULT.into();
+    }
+
+    // SAFETY: regs points to the valid SavedRegisters structure on the current task's kernel stack.
     unsafe {
-        let frame = &*frame_ptr;
-        let mctx = &frame.uc.uc_mcontext;
         (*regs).rflags = (mctx.eflags & !0x3000) | 0x202; // Strip IOPL, enable interrupts
         (*regs).rip = mctx.rip;
         (*regs).rax = mctx.rax;

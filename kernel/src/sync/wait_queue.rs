@@ -57,6 +57,16 @@ impl WaitQueue {
             drop(sched_lock);
         });
 
+        // Verify state validity before descheduling: if a concurrent wake_all() already
+        // transitioned the task to Ready, clean up and return immediately to avoid a missed wakeup.
+        if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+            if task_arc.lock().state != TaskState::Blocked {
+                let mut pids = self.pids.lock();
+                pids.retain(|&x| x != current_pid);
+                return;
+            }
+        }
+
         // Yield CPU control to execute other tasks
         scheduler::schedule();
 

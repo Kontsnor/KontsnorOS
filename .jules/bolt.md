@@ -11,3 +11,7 @@
 ## 2026-03-30 - Sharded Dentry Cache Lock Contention Reduction
 **Learning:** In `kernel/src/fs/dcache.rs`, a single global `TicketLock` guarding all dcache lookup/insert operations creates severe lock contention under multi-core/multi-process VFS path lookups. Partitioning the cache into 64 independent `TicketLock` shards and replacing guarded counter updates with lock-free `AtomicU64` atomics reduces global lock contention by up to 64x without lock overhead on diagnostic counter updates.
 **Action:** For hot global kernel caches (such as dcache and page cache), prefer sharded locks indexed by hash or offset over single global spinlocks.
+
+## 2026-03-30 - Zero-Allocation Fast-Path Scanner for VFS Path Normalization
+**Learning:** In `kernel/src/fs/path.rs`, `normalize` was allocating temporary `Vec<&str>` slices and performing component splits and string joins on every VFS path lookup, even when paths were already clean and normalized. Adding a zero-allocation `is_normalized` scanner allows clean paths to immediately bypass splitting/allocations, and pre-allocating string capacities in `normalize`, `join`, and `normalize_jailed` eliminates heap re-allocations on hot path lookups.
+**Action:** Before performing allocating transformations on strings or collections in hot path operations, use a lightweight zero-allocation inspection scan to fast-path already-clean inputs.

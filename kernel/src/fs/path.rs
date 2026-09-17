@@ -21,6 +21,59 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+/// Check if a path is already clean and normalized without heap allocations.
+///
+/// Returns `true` if the path contains no duplicate slashes (`//`), no `.` or `..`
+/// path components, and (for non-root paths) no trailing slash.
+pub fn is_normalized(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    if path == "/" {
+        return true;
+    }
+
+    let bytes = path.as_bytes();
+    let len = bytes.len();
+
+    // Trailing slash on non-root paths is not normalized
+    if len > 1 && bytes[len - 1] == b'/' {
+        return false;
+    }
+
+    let is_abs = bytes[0] == b'/';
+    let mut i = if is_abs { 1 } else { 0 };
+
+    while i < len {
+        // Find end of current component
+        let start = i;
+        while i < len && bytes[i] != b'/' {
+            i += 1;
+        }
+        let comp_len = i - start;
+
+        // Empty component means consecutive slashes (e.g., "//")
+        if comp_len == 0 {
+            return false;
+        }
+
+        // Check for "." or ".."
+        if comp_len == 1 && bytes[start] == b'.' {
+            return false;
+        }
+        if comp_len == 2 && bytes[start] == b'.' && bytes[start + 1] == b'.' {
+            return false;
+        }
+
+        // Skip the slash separating components
+        if i < len {
+            i += 1;
+        }
+    }
+
+    true
+}
+
 /// Normalize a path by resolving `.` and `..` components.
 ///
 /// # Examples
@@ -30,8 +83,13 @@ use alloc::vec::Vec;
 /// assert_eq!(normalize("///foo//bar"), "/foo/bar");
 /// ```
 pub fn normalize(path: &str) -> String {
-    let mut components: Vec<&str> = Vec::new();
+    // Fast path: if already normalized, return String copy directly (zero component allocation)
+    if is_normalized(path) {
+        return String::from(path);
+    }
+
     let is_absolute = path.starts_with('/');
+    let mut components: Vec<&str> = Vec::new();
 
     for component in path.split('/') {
         match component {
@@ -45,11 +103,17 @@ pub fn normalize(path: &str) -> String {
         }
     }
 
-    let mut result = String::new();
+    let mut result = String::with_capacity(path.len());
     if is_absolute {
         result.push('/');
     }
-    result.push_str(&components.join("/"));
+
+    for (i, comp) in components.iter().enumerate() {
+        if i > 0 {
+            result.push('/');
+        }
+        result.push_str(comp);
+    }
 
     if result.is_empty() {
         result.push('/');
@@ -93,8 +157,14 @@ pub fn normalize_jailed(path: &str, root: &str) -> String {
         components = root_parts;
     }
 
-    let mut result = String::from("/");
-    result.push_str(&components.join("/"));
+    let mut result = String::with_capacity(path.len().max(root.len()) + 1);
+    result.push('/');
+    for (i, comp) in components.iter().enumerate() {
+        if i > 0 {
+            result.push('/');
+        }
+        result.push_str(comp);
+    }
     result
 }
 
@@ -137,8 +207,10 @@ pub fn join(base: &str, name: &str) -> String {
         return String::from(name);
     }
 
-    let mut result = String::from(base);
-    if !result.ends_with('/') {
+    let extra = if base.ends_with('/') { 0 } else { 1 };
+    let mut result = String::with_capacity(base.len() + extra + name.len());
+    result.push_str(base);
+    if extra == 1 {
         result.push('/');
     }
     result.push_str(name);

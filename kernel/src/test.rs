@@ -104,6 +104,42 @@ fn test_memory_allocator() {
 }
 
 #[test_case]
+fn test_path_normalization() {
+    kprintln!("[test] Starting path normalization test...");
+
+    use crate::fs::path::{is_normalized, join, normalize, normalize_jailed};
+
+    // 1. Test is_normalized
+    assert!(is_normalized("/"));
+    assert!(is_normalized("/usr/bin"));
+    assert!(is_normalized("/a/b/c"));
+    assert!(is_normalized("foo/bar"));
+    assert!(!is_normalized(""));
+    assert!(!is_normalized("//usr/bin"));
+    assert!(!is_normalized("/usr/bin/"));
+    assert!(!is_normalized("/usr/./bin"));
+    assert!(!is_normalized("/usr/../bin"));
+
+    // 2. Test normalize fast-path and component resolution
+    assert_eq!(normalize("/usr/bin"), "/usr/bin");
+    assert_eq!(normalize("/usr/./local/../bin"), "/usr/bin");
+    assert_eq!(normalize("///foo//bar"), "/foo/bar");
+    assert_eq!(normalize("a/b/../c"), "a/c");
+    assert_eq!(normalize(""), "/");
+
+    // 3. Test join with pre-allocated capacity
+    assert_eq!(join("/usr", "bin"), "/usr/bin");
+    assert_eq!(join("/usr/", "bin"), "/usr/bin");
+    assert_eq!(join("/usr", "/bin"), "/bin");
+
+    // 4. Test normalize_jailed
+    assert_eq!(normalize_jailed("/jail/a/b/../../c", "/jail"), "/jail/c");
+    assert_eq!(normalize_jailed("/jail/../../..", "/jail"), "/jail");
+
+    kprintln!("[test] Path normalization test PASSED!");
+}
+
+#[test_case]
 fn test_vfs_path_resolution() {
     kprintln!("[test] Starting VFS path resolution test...");
     // Lookup non-existent path

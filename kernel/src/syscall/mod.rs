@@ -106,6 +106,7 @@ pub enum Errno {
     EMFILE = -24,
     EFBIG = -27,
     ENOSPC = -28,
+    ESPIPE = -29,
     EROFS = -30,
     ENOSYS = -38,
     ENOTEMPTY = -39,

@@ -158,6 +158,7 @@ struct linux_dirent64 {
 
 // Signal handling
 void sig_handler(int sig) {
+    (void)sig;
     print("\n[Signal] Received SIGINT (Ctrl+C)!\n");
 }
 
@@ -502,6 +503,265 @@ void exec_cmd(char *argv[]) {
     }
 }
 
+// ── Command History & Interactive Line Editing ──────────────────────────────
+
+#define HISTORY_MAX 50
+static char history[HISTORY_MAX][256];
+static int history_count = 0;
+static int history_head = 0;
+
+void history_add(const char *cmd) {
+    if (!cmd || cmd[0] == '\0') return;
+    if (history_count > 0) {
+        int last_idx = (history_head - 1 + HISTORY_MAX) % HISTORY_MAX;
+        if (strcmp(history[last_idx], cmd) == 0) return;
+    }
+    int len = strlen(cmd);
+    if (len >= 256) len = 255;
+    for (int i = 0; i < len; i++) {
+        history[history_head][i] = cmd[i];
+    }
+    history[history_head][len] = '\0';
+    history_head = (history_head + 1) % HISTORY_MAX;
+    if (history_count < HISTORY_MAX) {
+        history_count++;
+    }
+}
+
+const char *history_get(int offset_from_newest) {
+    if (offset_from_newest < 0 || offset_from_newest >= history_count) return 0;
+    int idx = (history_head - 1 - offset_from_newest + HISTORY_MAX * 2) % HISTORY_MAX;
+    return history[idx];
+}
+
+struct termios_raw_t {
+    unsigned int c_iflag;
+    unsigned int c_oflag;
+    unsigned int c_cflag;
+    unsigned int c_lflag;
+    unsigned char c_line;
+    unsigned char c_cc[19];
+};
+
+void do_tab_completion(char *buf, int *pos_ptr, int max_len) {
+    int pos = *pos_ptr;
+    int token_start = pos;
+    while (token_start > 0 && buf[token_start - 1] != ' ' && buf[token_start - 1] != '\t') {
+        token_start--;
+    }
+    const char *prefix = &buf[token_start];
+    int prefix_len = pos - token_start;
+
+    long fd = syscall3(2, (long)".", 0, 0); // open(".", O_RDONLY)
+    if (fd < 0) return;
+
+    char dent_buf[1024];
+    long nread = syscall3(217, fd, (long)dent_buf, sizeof(dent_buf)); // getdents64
+    syscall1(3, fd); // close(fd)
+    if (nread <= 0) return;
+
+    int match_count = 0;
+    char match_name[256];
+    match_name[0] = '\0';
+    int match_is_dir = 0;
+
+    long d_pos = 0;
+    while (d_pos < nread) {
+        struct linux_dirent64 *d = (struct linux_dirent64 *)(dent_buf + d_pos);
+        if (d->d_ino != 0) {
+            // Ignore "." and ".." unless prefix starts with "."
+            if (strcmp(d->d_name, ".") == 0 || strcmp(d->d_name, "..") == 0) {
+                if (prefix_len == 0 || prefix[0] != '.') {
+                    d_pos += d->d_reclen;
+                    continue;
+                }
+            }
+
+            if (prefix_len == 0 || strncmp(d->d_name, prefix, prefix_len) == 0) {
+                match_count++;
+                if (match_count == 1) {
+                    int nlen = strlen(d->d_name);
+                    if (nlen >= 255) nlen = 255;
+                    for (int i = 0; i < nlen; i++) match_name[i] = d->d_name[i];
+                    match_name[nlen] = '\0';
+                    match_is_dir = (d->d_type == 4);
+                }
+            }
+        }
+        d_pos += d->d_reclen;
+    }
+
+    if (match_count == 1) {
+        // Complete the remainder of match_name
+        int nlen = strlen(match_name);
+        for (int i = prefix_len; i < nlen && pos < max_len - 2; i++) {
+            char c = match_name[i];
+            buf[pos++] = c;
+            syscall3(1, 1, (long)&c, 1);
+        }
+        if (match_is_dir && pos < max_len - 1) {
+            char slash = '/';
+            buf[pos++] = slash;
+            syscall3(1, 1, (long)&slash, 1);
+        }
+        buf[pos] = '\0';
+        *pos_ptr = pos;
+    } else if (match_count > 1) {
+        // Display candidate list
+        print("\n");
+        d_pos = 0;
+        while (d_pos < nread) {
+            struct linux_dirent64 *d = (struct linux_dirent64 *)(dent_buf + d_pos);
+            if (d->d_ino != 0) {
+                if (strcmp(d->d_name, ".") == 0 || strcmp(d->d_name, "..") == 0) {
+                    if (prefix_len == 0 || prefix[0] != '.') {
+                        d_pos += d->d_reclen;
+                        continue;
+                    }
+                }
+                if (prefix_len == 0 || strncmp(d->d_name, prefix, prefix_len) == 0) {
+                    print(d->d_name);
+                    if (d->d_type == 4) print("/");
+                    print("  ");
+                }
+            }
+            d_pos += d->d_reclen;
+        }
+        print("\n\x1b[36mkontsnorsh-c#\x1b[0m ");
+        print(buf);
+    }
+}
+
+int read_line_interactive(char *buf, int max_len) {
+    struct termios_raw_t orig_termios, raw_termios;
+    int is_tty = (syscall3(16, 0, 0x5401, (long)&orig_termios) == 0); // TCGETS
+
+    if (is_tty) {
+        raw_termios = orig_termios;
+        raw_termios.c_lflag &= ~(0x00000002 | 0x00000008); // disable ICANON (0x2) and ECHO (0x8)
+        syscall3(16, 0, 0x5402, (long)&raw_termios); // TCSETS
+    } else {
+        // Fallback for non-interactive / non-TTY
+        long bytes = syscall3(0, 0, (long)buf, max_len - 1);
+        if (bytes <= 0) return (int)bytes;
+        if (buf[bytes - 1] == '\n') buf[bytes - 1] = '\0';
+        else buf[bytes] = '\0';
+        return strlen(buf);
+    }
+
+    int pos = 0;
+    buf[0] = '\0';
+    int history_browse = -1; // -1 = current buffer, 0 = most recent, 1 = older
+    char saved_draft[256];
+    saved_draft[0] = '\0';
+
+    int esc_state = 0; // 0=NORMAL, 1=ESC (\x1b), 2=BRACKET (\x1b[)
+
+    while (1) {
+        char c;
+        long n = syscall3(0, 0, (long)&c, 1);
+        if (n <= 0) break;
+
+        if (esc_state == 0) {
+            if (c == '\x1b') {
+                esc_state = 1;
+                continue;
+            }
+        } else if (esc_state == 1) {
+            if (c == '[') {
+                esc_state = 2;
+                continue;
+            }
+            esc_state = 0;
+            continue;
+        } else if (esc_state == 2) {
+            esc_state = 0;
+            if (c == 'A') {
+                // UP Arrow: navigate to older history
+                if (history_browse + 1 < history_count) {
+                    if (history_browse == -1) {
+                        int draft_len = strlen(buf);
+                        for (int i = 0; i <= draft_len; i++) saved_draft[i] = buf[i];
+                    }
+                    history_browse++;
+                    const char *h = history_get(history_browse);
+                    if (h) {
+                        print("\r\x1b[K\x1b[36mkontsnorsh-c#\x1b[0m ");
+                        pos = strlen(h);
+                        for (int i = 0; i <= pos; i++) buf[i] = h[i];
+                        print(buf);
+                    }
+                }
+                continue;
+            } else if (c == 'B') {
+                // DOWN Arrow: navigate to newer history
+                if (history_browse > 0) {
+                    history_browse--;
+                    const char *h = history_get(history_browse);
+                    if (h) {
+                        print("\r\x1b[K\x1b[36mkontsnorsh-c#\x1b[0m ");
+                        pos = strlen(h);
+                        for (int i = 0; i <= pos; i++) buf[i] = h[i];
+                        print(buf);
+                    }
+                } else if (history_browse == 0) {
+                    history_browse = -1;
+                    print("\r\x1b[K\x1b[36mkontsnorsh-c#\x1b[0m ");
+                    pos = strlen(saved_draft);
+                    for (int i = 0; i <= pos; i++) buf[i] = saved_draft[i];
+                    print(buf);
+                }
+                continue;
+            }
+            continue;
+        }
+
+        // Regular character handling
+        if (c == '\n' || c == '\r') {
+            print("\n");
+            buf[pos] = '\0';
+            break;
+        } else if (c == '\t') {
+            // Tab completion
+            do_tab_completion(buf, &pos, max_len);
+        } else if (c == '\b' || c == 0x7F) {
+            // Backspace
+            if (pos > 0) {
+                pos--;
+                buf[pos] = '\0';
+                print("\b \b");
+            }
+        } else if (c == 0x03) {
+            // Ctrl+C: cancel current line
+            print("^C\n\x1b[36mkontsnorsh-c#\x1b[0m ");
+            pos = 0;
+            buf[0] = '\0';
+            history_browse = -1;
+        } else if (c == 0x04) {
+            // Ctrl+D: EOF if buffer is empty
+            if (pos == 0) {
+                buf[0] = '\0';
+                break;
+            }
+        } else if (c >= 32 && c <= 126) {
+            if (pos < max_len - 1) {
+                buf[pos++] = c;
+                buf[pos] = '\0';
+                syscall3(1, 1, (long)&c, 1);
+            }
+        }
+    }
+
+    if (is_tty) {
+        syscall3(16, 0, 0x5402, (long)&orig_termios); // Restore terminal
+    }
+
+    if (pos > 0) {
+        history_add(buf);
+    }
+    return pos;
+}
+
 // Shell Entry Point
 void _start() {
     char input_buf[256];
@@ -516,14 +776,9 @@ void _start() {
         // Clean buffer
         for (int i = 0; i < 256; i++) input_buf[i] = '\0';
         
-        long bytes_read = syscall3(0, 0, (long)input_buf, 255); // read(0, buf, 255)
-        if (bytes_read <= 0) {
+        int len = read_line_interactive(input_buf, 256);
+        if (len <= 0) {
             continue;
-        }
-        
-        // Remove trailing newline
-        if (bytes_read > 0 && input_buf[bytes_read - 1] == '\n') {
-            input_buf[bytes_read - 1] = '\0';
         }
         
         if (strlen(input_buf) == 0) {

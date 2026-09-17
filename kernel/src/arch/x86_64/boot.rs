@@ -41,6 +41,7 @@ pub fn init() {
     unsafe {
         enable_sse();
         enable_fsgsbase();
+        init_pat();
     }
 }
 
@@ -97,6 +98,26 @@ pub unsafe fn enable_fsgsbase() {
     } else {
         crate::kprintln!("[cpu] FSGSBASE not supported by CPU (CPUID.(7,0):EBX.0 = 0)");
     }
+}
+
+/// Configure IA32_PAT (MSR 0x277).
+///
+/// Default PAT layout:
+///   PA0=WB(06), PA1=WT(04), PA2=UC-(07), PA3=UC(00),
+///   PA4=WB(06), PA5=WT(04), PA6=UC-(07), PA7=UC(00)
+///
+/// We update PA1 (bits [15:8]) to WC (Write-Combining = 0x01):
+///   Value = 0x0007_0406_0007_0106
+///
+/// With this configuration, PageTableFlags::WRITE_THROUGH (PWT=1, PCD=0, PAT=0)
+/// selects PAT entry 1 = Write-Combining, which enables write-combining buffers
+/// for MMIO framebuffer access (~3x speedup).
+pub unsafe fn init_pat() {
+    // SAFETY: Writing to IA32_PAT MSR (0x277) with valid memory type encoding.
+    unsafe {
+        x86_64::registers::model_specific::Msr::new(0x277).write(0x0007_0406_0007_0106);
+    }
+    crate::kprintln!("[boot] IA32_PAT configured (PA1 = Write-Combining)");
 }
 
 // ── CMOS Real-Time Clock reader ───────────────────────────────────────────────

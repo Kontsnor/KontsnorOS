@@ -484,11 +484,12 @@ pub extern "C" fn ap_entry() -> ! {
     // 2. Load IDT
     super::interrupts::init_idt();
 
-    // 3. Enable SSE and FSGSBASE
-    // SAFETY: SSE is safe on x86_64 CPUs; FSGSBASE validates CPUID.(7,0):EBX[0] before setting CR4.
+    // 3. Enable SSE, FSGSBASE, and PAT Write-Combining
+    // SAFETY: SSE is safe on x86_64 CPUs; FSGSBASE validates CPUID.(7,0):EBX[0] before setting CR4; PAT MSR is standard on x86_64.
     unsafe {
         super::boot::enable_sse();
         super::boot::enable_fsgsbase();
+        super::boot::init_pat();
     }
 
     // 4. Configure syscall MSR registers (STAR, LSTAR, FMASK, GS_BASE, KERNEL_GS_BASE)

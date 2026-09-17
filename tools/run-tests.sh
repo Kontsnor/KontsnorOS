@@ -46,12 +46,27 @@ else
     echo "WARNING: /dev/kvm not found. Falling back to software TCG emulation (-cpu qemu64,+fsgsbase -smp 4,sockets=1,cores=4,threads=1)..." >&2
 fi
 
+USE_NVME=false
+for arg in "$@"; do
+    case "$arg" in
+        --nvme)
+            USE_NVME=true
+            ;;
+    esac
+done
+
+STORAGE_OPTS="-drive file=$DISK_IMG,format=raw,index=1,media=disk,cache=unsafe,aio=threads,discard=unmap,detect-zeroes=unmap"
+if [ "$USE_NVME" = true ]; then
+    echo "Running test suite with NVMe PCIe device attached..."
+    STORAGE_OPTS="-drive file=$DISK_IMG,if=none,id=nvm,format=raw,cache=unsafe,aio=threads,discard=unmap,detect-zeroes=unmap -device nvme,serial=kontsnor-nvme0,drive=nvm"
+fi
+
 echo "Starting QEMU in test mode..."
 # Disable "exit on error" temporarily so we can capture the exit status from QEMU
 set +e
 qemu-system-x86_64 \
     -drive format=raw,file="$PROJECT_DIR/target/bios.img" \
-    -drive file="$DISK_IMG",format=raw,index=1,media=disk,cache=unsafe,aio=threads,discard=unmap,detect-zeroes=unmap \
+    $STORAGE_OPTS \
     -rtc base=utc,clock=host \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -serial stdio \

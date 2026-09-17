@@ -50,6 +50,11 @@ pub static BLOCK_DEVICES: RwLock<BTreeMap<String, Arc<dyn BlockDevice>>> =
 /// Register a block device in the VFS drive map.
 pub fn register_block_device(name: String, device: Arc<dyn BlockDevice>) {
     kprintln!("[vfs] Registered block device: {}", name);
+    // Expose block device node in devfs
+    crate::fs::devfs::register_block_device_node(&name, device.clone());
+    if name == "nvme0" {
+        crate::fs::devfs::register_block_device_node("nvme0n1", device.clone());
+    }
     BLOCK_DEVICES.write().insert(name, device);
 }
 

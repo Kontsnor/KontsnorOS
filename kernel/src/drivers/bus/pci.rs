@@ -76,7 +76,10 @@ impl PciDevice {
             (0x01, 0x00) => "SCSI Bus Controller",
             (0x01, 0x01) => "IDE Controller",
             (0x01, 0x06) => "SATA Controller",
-            (0x01, 0x08) => "NVMe Controller",
+            (0x01, 0x08) => match self.prog_if {
+                0x02 => "NVM Express (NVMe) Controller",
+                _ => "Non-Volatile Memory Controller",
+            },
             (0x01, _) => "Mass Storage Controller",
             (0x02, 0x00) => "Ethernet Controller",
             (0x02, _) => "Network Controller",
@@ -193,6 +196,10 @@ fn enumerate_bus() -> Vec<PciDevice> {
 
 /// Initialize PCI bus enumeration.
 pub fn init() {
+    let mut devices_guard = PCI_DEVICES.lock();
+    if !devices_guard.is_empty() {
+        return;
+    }
     let devices = enumerate_bus();
     let count = devices.len();
 
@@ -210,7 +217,7 @@ pub fn init() {
         );
     }
 
-    *PCI_DEVICES.lock() = devices;
+    *devices_guard = devices;
 }
 
 /// Get all discovered PCI devices.
@@ -234,6 +241,16 @@ pub fn find_by_class(class_code: u8, subclass: u8) -> Vec<PciDevice> {
         .lock()
         .iter()
         .filter(|d| d.class_code == class_code && d.subclass == subclass)
+        .cloned()
+        .collect()
+}
+
+/// Find PCI devices by class code, subclass, and programming interface.
+pub fn find_by_class_progif(class_code: u8, subclass: u8, prog_if: u8) -> Vec<PciDevice> {
+    PCI_DEVICES
+        .lock()
+        .iter()
+        .filter(|d| d.class_code == class_code && d.subclass == subclass && d.prog_if == prog_if)
         .cloned()
         .collect()
 }

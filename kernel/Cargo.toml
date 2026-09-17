@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "KontsnorOS kernel — highly experimental Unix-compatible hybrid kernel written in Rust (built with Antigravity IDE & Gemini 3.5/3.6)"
+repository.workspace = true
+description.workspace = true
 
 [dependencies]
 # Workspace dependencies
@@ -23,9 +24,6 @@ pic8259 = "0.11"
 
 # Kernel heap allocator
 linked_list_allocator = "0.10"
-
-# Volatile memory access (for MMIO)
-volatile = "0.6"
 
 # Port I/O
 # (provided by x86_64 crate)

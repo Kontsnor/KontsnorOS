@@ -41,6 +41,7 @@ pub mod epoll;
 pub mod eventfd;
 pub mod ext;
 pub mod file;
+pub mod flusher;
 pub mod inode;
 pub mod inotify;
 pub mod kstats;

@@ -20,6 +20,7 @@ use crate::fs::inode::{DirEntry, FilePermissions, FileType, Inode, InodeOps};
 use crate::fs::vfs::{FileSystem, FsStats};
 use crate::kprintln;
 use crate::sync::spinlock::TicketLock;
+use crate::syscall::Errno;
 use ::alloc::collections::BTreeMap;
 use ::alloc::sync::{Arc, Weak};
 use ::alloc::vec::Vec;
@@ -237,6 +238,7 @@ pub struct ExtFileSystem {
     pub(crate) root_node: TicketLock<Option<Arc<dyn InodeOps>>>,
     pub(crate) self_weak: spin::Mutex<Option<::alloc::sync::Weak<ExtFileSystem>>>,
     pub(crate) inode_cache: TicketLock<BTreeMap<u32, Weak<ExtInode>>>,
+    pub(crate) metadata_dirty: core::sync::atomic::AtomicBool,
 }
 
 impl ExtFileSystem {
@@ -974,6 +976,7 @@ impl ExtFileSystem {
             root_node: TicketLock::new(None),
             self_weak: spin::Mutex::new(None),
             inode_cache: TicketLock::new(BTreeMap::new()),
+            metadata_dirty: core::sync::atomic::AtomicBool::new(false),
         });
 
         *fs.self_weak.lock() = Some(Arc::downgrade(&fs));
@@ -1159,6 +1162,19 @@ impl ExtFileSystem {
         }
         Ok(())
     }
+
+    /// Flush modified superblock and group descriptors to disk if metadata is marked dirty.
+    pub fn sync_metadata(&self) -> Result<(), &'static str> {
+        if self
+            .metadata_dirty
+            .swap(false, core::sync::atomic::Ordering::AcqRel)
+        {
+            let sb = *self.superblock.lock();
+            self.write_superblock(&sb)?;
+            self.write_group_descriptors()?;
+        }
+        Ok(())
+    }
 }
 
 /// ext Inode wrapper implementing InodeOps.
@@ -1198,6 +1214,26 @@ impl InodeOps for ExtInode {
 
     fn write_direct(&self, offset: u64, data: &[u8]) -> Result<usize, i32> {
         self.write_file(offset, data)
+    }
+
+    fn fsync(&self) -> Result<(), Errno> {
+        // 1. Flush all dirty pages for this inode from the page cache
+        crate::memory::page_cache::flush_all_for_inode_inner(self)?;
+
+        // 2. Persist updated raw inode to disk (size, extents, timestamps, blocks)
+        let raw = self.raw.lock();
+        self.fs
+            .write_inode(self.ino, &raw)
+            .map_err(|_| Errno::EIO)?;
+        drop(raw);
+
+        // 3. Flush dirty metadata (superblock and group descriptors) if modified
+        let _ = self.fs.sync_metadata();
+
+        // 4. Issue cache flush barrier to the underlying block storage device
+        self.fs.device.flush().map_err(|_| Errno::EIO)?;
+
+        Ok(())
     }
 
     fn set_permissions(&self, mode: u16) -> Result<(), i32> {
@@ -1360,14 +1396,12 @@ impl FileSystem for ExtFileSystem {
 
         for ino in dirty_inodes {
             if let Ok(inode) = self_arc.get_inode(ino as u32) {
-                let _ = crate::memory::page_cache::flush_all_for_inode(&inode);
+                let _ = inode.fsync();
             }
         }
 
-        // Flush metadata: updated superblock and all group descriptors
-        let sb = *self.superblock.lock();
-        let _ = self.write_superblock(&sb);
-        let _ = self.write_group_descriptors();
+        // Flush any remaining modified superblock and group descriptors
+        let _ = self.sync_metadata();
 
         // Issue cache flush barrier to the underlying block device
         let _ = self.device.flush();

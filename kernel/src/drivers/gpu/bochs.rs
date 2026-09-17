@@ -164,21 +164,20 @@ pub fn get_lfb_phys() -> u64 {
     }
 }
 
-/// Get current framebuffer size in bytes.
+/// Total VRAM size allocated to the Bochs linear framebuffer (16 MiB).
+pub const BOCHS_VRAM_SIZE: u64 = 16 * 1024 * 1024;
+
+/// Get current framebuffer size in bytes (16 MiB linear framebuffer BAR size).
 pub fn get_lfb_size() -> u64 {
-    if let Some(ref gpu) = *BOCHS_GPU.lock() {
-        gpu.size()
-    } else {
-        16 * 1024 * 1024
-    }
+    BOCHS_VRAM_SIZE
 }
 
 /// Check if a physical address falls within the VRAM BAR range.
 pub fn is_vram_addr(phys: u64) -> bool {
     let base = get_lfb_phys();
-    (phys >= base && phys < base + 16 * 1024 * 1024)
-        || (phys >= 0xe000_0000 && phys < 0xe000_0000 + 16 * 1024 * 1024)
-        || (phys >= 0xfd00_0000 && phys < 0xfd00_0000 + 16 * 1024 * 1024)
+    (phys >= base && phys < base + BOCHS_VRAM_SIZE)
+        || (phys >= 0xe000_0000 && phys < 0xe000_0000 + BOCHS_VRAM_SIZE)
+        || (phys >= 0xfd00_0000 && phys < 0xfd00_0000 + BOCHS_VRAM_SIZE)
 }
 
 /// Get current active mode dimensions (width, height, bpp).
@@ -186,7 +185,7 @@ pub fn get_current_mode() -> (u32, u32, u32) {
     if let Some(ref gpu) = *BOCHS_GPU.lock() {
         (gpu.width(), gpu.height(), gpu.bpp())
     } else {
-        (320, 200, 32)
+        (1024, 768, 32)
     }
 }
 
@@ -659,7 +658,7 @@ pub fn init() {
     let lfb_phys = (bar0 & 0xFFFFFFF0) as u64;
 
     // Map 16MB of VRAM so any mode up to 1920x1080 is accessible
-    let vram_total_size = 16 * 1024 * 1024;
+    let vram_total_size = BOCHS_VRAM_SIZE;
     let lfb_virt = 0xffff_c000_0000_0000u64;
     let page_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
     let num_pages = (vram_total_size + 4095) / 4096;
@@ -675,9 +674,9 @@ pub fn init() {
         }
     }
 
-    // Default mode: 320x200x32
-    let width = 320;
-    let height = 200;
+    // Default mode: 1024x768x32
+    let width = 1024;
+    let height = 768;
     let bpp = 32;
     let size = (width as u64) * (height as u64) * 4;
 
@@ -696,7 +695,7 @@ pub fn init() {
 
     *BOCHS_GPU.lock() = Some(gpu.clone());
 
-    // Switch hardware to 320x200x32
+    // Switch hardware to 1024x768x32
     let _ = set_video_mode(width as u16, height as u16, bpp as u16);
 
     let mut console = GraphicsConsole {

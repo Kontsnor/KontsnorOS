@@ -93,6 +93,13 @@ pub fn sys_mmap(
         None => return Errno::EINVAL.into(),
     };
 
+    if is_dev_fb0 {
+        let vram_total = crate::drivers::gpu::bochs::get_lfb_size();
+        if (offset as u64).saturating_add(aligned_len as u64) > vram_total {
+            return Errno::EINVAL.into();
+        }
+    }
+
     let is_fixed = (flags & 0x10) != 0;
     let is_fixed_noreplace = (flags & 0x100000) != 0;
 
@@ -313,10 +320,13 @@ pub fn sys_mmap(
             let page_table_root = addr_space.page_table_root;
             let vram_phys_base = crate::drivers::gpu::bochs::get_lfb_phys() + (offset as u64);
             let num_pages = aligned_len / 4096;
+            // VRAM MMIO must not be write-through coalesced into the cache hierarchy.
+            // NO_CACHE is safe and correct. Future work: upgrade to PAT Write-Combining
+            // for ~3× throughput improvement (requires PAT MSR setup at BSP boot).
             let page_flags = PageTableFlags::PRESENT
                 | PageTableFlags::USER_ACCESSIBLE
                 | PageTableFlags::WRITABLE
-                | PageTableFlags::WRITE_THROUGH;
+                | PageTableFlags::NO_CACHE;
 
             for i in 0..num_pages {
                 let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
@@ -339,6 +349,8 @@ pub fn sys_mmap(
                     );
                 }
             }
+            // Ensure all CPUs see the new VRAM page table entries.
+            crate::arch::x86_64::smp::shootdown_tlb();
         }
 
         if crate::syscall::DEBUG_SYSCALLS {

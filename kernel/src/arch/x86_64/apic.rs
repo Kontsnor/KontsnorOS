@@ -229,6 +229,9 @@ pub fn init() {
     // Route IRQ 11 (e1000 PCI NIC) to IDT vector 43 (pin 11)
     ioapic_set_routing(11, 43, get_lapic_id());
 
+    // Route IRQ 12 (PS/2 Mouse) to IDT vector 44 (pin 12)
+    ioapic_set_routing(12, 44, get_lapic_id());
+
     kprintln!("[apic] Redirection routing established via I/O APIC.");
 }
 

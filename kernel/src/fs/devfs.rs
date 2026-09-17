@@ -279,6 +279,7 @@ pub struct FbFixScreeninfo {
     pub xpanstep: u16,
     pub ypanstep: u16,
     pub ywrapstep: u16,
+    pub _pad: u16,
     pub line_length: u32,
     pub mmio_start: u64,
     pub mmio_len: u32,
@@ -286,6 +287,11 @@ pub struct FbFixScreeninfo {
     pub capabilities: u16,
     pub reserved: [u16; 2],
 }
+
+const _: () = assert!(
+    core::mem::size_of::<FbFixScreeninfo>() == 80,
+    "FbFixScreeninfo must be 80 bytes to match Linux uapi on x86-64"
+);
 
 /// Linux colormap structure (`struct fb_cmap`).
 #[repr(C)]
@@ -345,7 +351,10 @@ impl InodeOps for DevFb0 {
         const FBIOGET_FSCREENINFO: u64 = 0x4602;
         const FBIOGETCMAP: u64 = 0x4604;
         const FBIOPUTCMAP: u64 = 0x4605;
+        const FBIOPAN_DISPLAY: u64 = 0x4606;
+        const FBIOGET_CON2FBMAP: u64 = 0x460F;
         const FBIOBLANK: u64 = 0x4611;
+        const FBIO_WAITFORVSYNC: u64 = 0x4620;
 
         match request {
             FBIOGET_FSCREENINFO => {
@@ -381,6 +390,7 @@ impl InodeOps for DevFb0 {
                     xpanstep: 0,
                     ypanstep: 0,
                     ywrapstep: 0,
+                    _pad: 0,
                     line_length,
                     mmio_start: 0,
                     mmio_len: 0,
@@ -541,6 +551,16 @@ impl InodeOps for DevFb0 {
                 }
                 Ok(0)
             }
+            FBIOPAN_DISPLAY => {
+                crate::syscall::validation::validate_user_ptr_write(
+                    arg as *mut u8,
+                    core::mem::size_of::<FbVarScreeninfo>(),
+                )
+                .map_err(|_| -14)?;
+                Ok(0)
+            }
+            FBIO_WAITFORVSYNC => Ok(0),
+            FBIOGET_CON2FBMAP => Ok(0),
             FBIOGETCMAP | FBIOPUTCMAP => {
                 if arg != 0 {
                     if !crate::syscall::validation::validate_user_ptr(
@@ -559,6 +579,124 @@ impl InodeOps for DevFb0 {
 
     fn poll(&self, _events: u32) -> u32 {
         super::inode::POLLIN | super::inode::POLLOUT
+    }
+}
+
+/// Linux input_event structure, exactly 24 bytes on x86-64.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InputEvent {
+    pub tv_sec: u64,  // seconds
+    pub tv_usec: u64, // microseconds
+    pub type_: u16,   // EV_SYN=0, EV_KEY=1, EV_REL=2
+    pub code: u16,    // key code or axis code
+    pub value: i32,   // 1=down, 0=up, signed delta for EV_REL
+}
+
+const _: () = assert!(
+    core::mem::size_of::<InputEvent>() == 24,
+    "InputEvent must be 24 bytes to match Linux uapi on x86-64"
+);
+
+/// Minimal ASCII to Linux keycode mapping (PS/2 Set 1 subset).
+fn ascii_to_keycode(ascii: u8) -> u16 {
+    match ascii {
+        b'a'..=b'z' => 30 + (ascii - b'a') as u16,
+        b'A'..=b'Z' => 30 + (ascii - b'A') as u16,
+        b'1'..=b'9' => 2 + (ascii - b'1') as u16,
+        b'0' => 11,
+        b'\n' => 28,   // KEY_ENTER
+        b'\x1b' => 1,  // KEY_ESC
+        b'\x08' => 14, // KEY_BACKSPACE
+        b'\t' => 15,   // KEY_TAB
+        b' ' => 57,    // KEY_SPACE
+        b'-' => 12,    // KEY_MINUS
+        b'=' => 13,    // KEY_EQUAL
+        _ => 0,
+    }
+}
+
+/// `/dev/input/event0` — evdev keyboard node (Major 13, Minor 64).
+pub struct DevInputKeyboard {
+    pub inode: Inode,
+}
+
+impl InodeOps for DevInputKeyboard {
+    fn inode(&self) -> &Inode {
+        &self.inode
+    }
+
+    fn wait_queue(&self) -> Option<Arc<crate::sync::wait_queue::WaitQueue>> {
+        Some(crate::drivers::keyboard::stdin_wait_queue())
+    }
+
+    fn read(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
+        const SZ: usize = core::mem::size_of::<InputEvent>();
+        if buf.len() < SZ {
+            return Err(-22); // EINVAL: buffer too small
+        }
+        match crate::drivers::keyboard::try_read_char() {
+            Some(ascii) => {
+                let ev = InputEvent {
+                    tv_sec: 0,
+                    tv_usec: 0,
+                    type_: 1, // EV_KEY
+                    code: ascii_to_keycode(ascii),
+                    value: 1, // key-down
+                };
+                // SAFETY: InputEvent is repr(C) and validated to fit in buf (buf.len() >= SZ).
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        &ev as *const InputEvent as *const u8,
+                        buf.as_mut_ptr(),
+                        SZ,
+                    );
+                }
+                Ok(SZ)
+            }
+            None => Err(-11), // EAGAIN
+        }
+    }
+
+    fn poll(&self, _events: u32) -> u32 {
+        if crate::drivers::keyboard::has_input() {
+            super::inode::POLLIN
+        } else {
+            0
+        }
+    }
+}
+
+/// `/dev/input/mice` — PS/2 mouse aggregator node (Major 13, Minor 63).
+pub struct DevInputMice {
+    pub inode: Inode,
+}
+
+impl InodeOps for DevInputMice {
+    fn inode(&self) -> &Inode {
+        &self.inode
+    }
+
+    fn wait_queue(&self) -> Option<Arc<crate::sync::wait_queue::WaitQueue>> {
+        Some(crate::drivers::ps2_mouse::mouse_wait_queue())
+    }
+
+    fn read(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
+        if buf.len() < 3 {
+            return Err(-22); // EINVAL: buffer too small
+        }
+        match crate::drivers::ps2_mouse::read_mice_packet(buf) {
+            Some(n) => Ok(n),
+            None => Err(-11), // EAGAIN
+        }
+    }
+
+    fn poll(&self, _events: u32) -> u32 {
+        if crate::drivers::ps2_mouse::has_data() {
+            super::inode::POLLIN
+        } else {
+            0
+        }
     }
 }
 
@@ -642,6 +780,26 @@ pub fn create_devfs() -> Arc<DevFs> {
             inode: make_chardev_inode(18, 29, 0),
         }) as Arc<dyn InodeOps>,
     );
+
+    // Create /dev/input directory with event0 and mice
+    let mut input_entries = BTreeMap::new();
+    input_entries.insert(
+        String::from("event0"),
+        Arc::new(DevInputKeyboard {
+            inode: make_chardev_inode(50, 13, 64),
+        }) as Arc<dyn InodeOps>,
+    );
+    input_entries.insert(
+        String::from("mice"),
+        Arc::new(DevInputMice {
+            inode: make_chardev_inode(51, 13, 63),
+        }) as Arc<dyn InodeOps>,
+    );
+    let input_dir = Arc::new(DevFsDir {
+        inode: Inode::new(30, FileType::Directory).with_dev(DEVFS_DEV_ID),
+        entries: RwLock::new(input_entries),
+    });
+    entries.insert(String::from("input"), input_dir as Arc<dyn InodeOps>);
 
     let root = Arc::new(DevFsDir {
         inode: Inode::new(1, FileType::Directory).with_dev(DEVFS_DEV_ID),

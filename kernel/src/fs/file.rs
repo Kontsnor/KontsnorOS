@@ -108,7 +108,14 @@ impl FileDescription {
         }
 
         let file_type = self.inode.inode().file_type;
-        let is_seekable = file_type == crate::fs::inode::FileType::Regular;
+        // CharDevice and BlockDevice are seekable in addition to Regular files.
+        // Pipe/Socket/FIFO types are explicitly excluded (they remain non-seekable).
+        let is_seekable = matches!(
+            file_type,
+            crate::fs::inode::FileType::Regular
+                | crate::fs::inode::FileType::BlockDevice
+                | crate::fs::inode::FileType::CharDevice
+        );
 
         if is_seekable {
             let mut offset_guard = self.offset.lock();
@@ -133,7 +140,14 @@ impl FileDescription {
         }
 
         let file_type = self.inode.inode().file_type;
-        let is_seekable = file_type == crate::fs::inode::FileType::Regular;
+        // CharDevice and BlockDevice are seekable in addition to Regular files.
+        // Pipe/Socket/FIFO types are explicitly excluded (they remain non-seekable).
+        let is_seekable = matches!(
+            file_type,
+            crate::fs::inode::FileType::Regular
+                | crate::fs::inode::FileType::BlockDevice
+                | crate::fs::inode::FileType::CharDevice
+        );
 
         if is_seekable {
             let mut offset_guard = self.offset.lock();

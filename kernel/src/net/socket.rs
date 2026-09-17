@@ -251,7 +251,8 @@ impl InodeOps for SocketInode {
             // SOCK_STREAM (TCP)
             let (local_ip, remote_ip, local_port, remote_port, tcp_snd_nxt, tcp_rcv_nxt) = {
                 let sock = self.socket.lock();
-                if sock.tcp_state != TcpState::Established && sock.tcp_state != TcpState::CloseWait {
+                if sock.tcp_state != TcpState::Established && sock.tcp_state != TcpState::CloseWait
+                {
                     return Err(-32); // EPIPE / ENOTCONN
                 }
                 (

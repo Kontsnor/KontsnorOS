@@ -320,13 +320,12 @@ pub fn sys_mmap(
             let page_table_root = addr_space.page_table_root;
             let vram_phys_base = crate::drivers::gpu::bochs::get_lfb_phys() + (offset as u64);
             let num_pages = aligned_len / 4096;
-            // VRAM MMIO must not be write-through coalesced into the cache hierarchy.
-            // NO_CACHE is safe and correct. Future work: upgrade to PAT Write-Combining
-            // for ~3× throughput improvement (requires PAT MSR setup at BSP boot).
+            // PAT1 = WC: PWT=1, PCD=0, PAT=0 selects PAT entry 1 = Write-Combining,
+            // configured via IA32_PAT MSR during boot for high-throughput framebuffer writes.
             let page_flags = PageTableFlags::PRESENT
                 | PageTableFlags::USER_ACCESSIBLE
                 | PageTableFlags::WRITABLE
-                | PageTableFlags::NO_CACHE;
+                | PageTableFlags::WRITE_THROUGH;
 
             for i in 0..num_pages {
                 let page = Page::<Size4KiB>::containing_address(VirtAddr::new(

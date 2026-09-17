@@ -162,6 +162,50 @@ pub fn push_byte(byte: u8) {
     }
 }
 
+static MOUSE_BUTTONS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Set or clear mouse button state (0 = Left, 1 = Right, 2 = Middle).
+pub fn set_button_state(btn: usize, pressed: bool) {
+    if btn < 3 {
+        let mask = 1u8 << btn;
+        if pressed {
+            MOUSE_BUTTONS.fetch_or(mask, core::sync::atomic::Ordering::Relaxed);
+        } else {
+            MOUSE_BUTTONS.fetch_and(!mask, core::sync::atomic::Ordering::Relaxed);
+        }
+        push_synthesised_packet(0, 0);
+    }
+}
+
+/// Push a synthesised mouse relative movement packet.
+///
+/// Standard PS/2 packet byte 0 layout:
+/// - bit 0: Left button
+/// - bit 1: Right button
+/// - bit 2: Middle button
+/// - bit 3: Always 1
+/// - bit 4: X sign bit (1 if dx < 0)
+/// - bit 5: Y sign bit (1 if dy < 0)
+/// - bit 6: X overflow (0)
+/// - bit 7: Y overflow (0)
+pub fn push_synthesised_packet(dx: i8, dy: i8) {
+    let mut flags = 0x08u8 | (MOUSE_BUTTONS.load(core::sync::atomic::Ordering::Relaxed) & 0x07);
+    if dx < 0 {
+        flags |= 0x10;
+    }
+    if dy < 0 {
+        flags |= 0x20;
+    }
+    let pkt = MousePacket {
+        flags,
+        dx: dx as u8,
+        dy: dy as u8,
+    };
+    MOUSE_BUFFER.lock().push(pkt);
+    MOUSE_WAIT_QUEUE.wake_all();
+    MOUSE_WAIT_QUEUE_ARC.wake_all();
+}
+
 /// Read a packet from the mouse buffer.
 /// Emits standard 5-byte ImPS/2 format if buffer is >= 5 bytes, or 3-byte format if >= 3 bytes.
 pub fn read_mice_packet(buf: &mut [u8]) -> Option<usize> {

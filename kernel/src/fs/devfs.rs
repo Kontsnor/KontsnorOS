@@ -598,6 +598,40 @@ const _: () = assert!(
     "InputEvent must be 24 bytes to match Linux uapi on x86-64"
 );
 
+/// Linux input_id structure (8 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InputId {
+    pub bustype: u16,
+    pub vendor: u16,
+    pub product: u16,
+    pub version: u16,
+}
+
+const _: () = assert!(
+    core::mem::size_of::<InputId>() == 8,
+    "InputId must be 8 bytes to match Linux uapi"
+);
+
+pub const EV_SYN: u16 = 0;
+pub const EV_KEY: u16 = 1;
+pub const EV_REL: u16 = 2;
+pub const SYN_REPORT: u16 = 0;
+
+pub const REL_X: usize = 0;
+pub const REL_Y: usize = 1;
+
+pub const BTN_LEFT: usize = 0x110;
+pub const BTN_RIGHT: usize = 0x111;
+pub const BTN_MIDDLE: usize = 0x112;
+
+/// Set bit `bit` in a byte slice bitmask (Linux evdev bit-field format).
+fn set_bit(mask: &mut [u8], bit: usize) {
+    if bit / 8 < mask.len() {
+        mask[bit / 8] |= 1 << (bit % 8);
+    }
+}
+
 /// Minimal ASCII to Linux keycode mapping (PS/2 Set 1 subset).
 fn ascii_to_keycode(ascii: u8) -> u16 {
     match ascii {
@@ -616,9 +650,197 @@ fn ascii_to_keycode(ascii: u8) -> u16 {
     }
 }
 
+/// Reverse mapping from keycode to ASCII byte (if applicable).
+fn keycode_to_ascii(code: u16) -> Option<u8> {
+    match code {
+        30..=55 => Some(b'a' + (code - 30) as u8),
+        2..=10 => Some(b'1' + (code - 2) as u8),
+        11 => Some(b'0'),
+        28 => Some(b'\n'),
+        1 => Some(b'\x1b'),
+        14 => Some(b'\x08'),
+        15 => Some(b'\t'),
+        57 => Some(b' '),
+        12 => Some(b'-'),
+        13 => Some(b'='),
+        _ => None,
+    }
+}
+
+/// Generic handler for evdev capability ioctls on keyboard and mouse devices.
+fn handle_evdev_ioctl(
+    request: u64,
+    arg: u64,
+    name: &str,
+    phys: &str,
+    is_mouse: bool,
+) -> Result<u64, i32> {
+    let req32 = request as u32;
+    let base_with_dir = req32 & !0x3FFF_0000;
+    let base_raw = req32 & 0xFFFF;
+    let len = ((req32 >> 16) & 0x3FFF) as usize;
+
+    if req32 == 0x4501 || req32 == 0x8004_4501 {
+        // EVIOCGVERSION
+        crate::syscall::validation::validate_user_ptr_write(
+            arg as *mut u8,
+            core::mem::size_of::<i32>(),
+        )
+        .map_err(|_| -14i32)?;
+        // SAFETY: arg is validated to be writable for 4 bytes.
+        unsafe {
+            *(arg as *mut i32) = 0x0001_0001i32;
+        }
+        return Ok(0);
+    }
+
+    if req32 == 0x4502 || req32 == 0x8008_4502 {
+        // EVIOCGID
+        crate::syscall::validation::validate_user_ptr_write(
+            arg as *mut u8,
+            core::mem::size_of::<InputId>(),
+        )
+        .map_err(|_| -14i32)?;
+        // SAFETY: arg is validated to be writable for 8 bytes.
+        unsafe {
+            *(arg as *mut InputId) = InputId {
+                bustype: 0x11, // BUS_I8042
+                vendor: 0,
+                product: 0,
+                version: 1,
+            };
+        }
+        return Ok(0);
+    }
+
+    if base_with_dir == 0x8000_4506 || base_raw == 0x4506 {
+        // EVIOCGNAME(len)
+        let max_len = if len > 0 { len } else { 256 };
+        let bytes = name.as_bytes();
+        let copy_len = core::cmp::min(bytes.len(), max_len.saturating_sub(1));
+        crate::syscall::validation::validate_user_ptr_write(arg as *mut u8, copy_len + 1)
+            .map_err(|_| -14i32)?;
+        // SAFETY: Destination pointer is validated for copy_len + 1 bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg as *mut u8, copy_len);
+            *(arg.wrapping_add(copy_len as u64) as *mut u8) = 0;
+        }
+        return Ok(copy_len as u64);
+    }
+
+    if base_with_dir == 0x8000_4508 || base_raw == 0x4508 {
+        // EVIOCGPHYS(len)
+        let max_len = if len > 0 { len } else { 256 };
+        let bytes = phys.as_bytes();
+        let copy_len = core::cmp::min(bytes.len(), max_len.saturating_sub(1));
+        crate::syscall::validation::validate_user_ptr_write(arg as *mut u8, copy_len + 1)
+            .map_err(|_| -14i32)?;
+        // SAFETY: Destination pointer is validated for copy_len + 1 bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg as *mut u8, copy_len);
+            *(arg.wrapping_add(copy_len as u64) as *mut u8) = 0;
+        }
+        return Ok(copy_len as u64);
+    }
+
+    if base_with_dir == 0x8000_4509 || base_raw == 0x4509 {
+        // EVIOCGUNIQ(len)
+        let max_len = if len > 0 { len } else { 256 };
+        if max_len > 0 {
+            crate::syscall::validation::validate_user_ptr_write(arg as *mut u8, 1)
+                .map_err(|_| -14i32)?;
+            // SAFETY: Destination pointer is validated for 1 byte.
+            unsafe {
+                *(arg as *mut u8) = 0;
+            }
+        }
+        return Ok(0);
+    }
+
+    // EVIOCGBIT queries: 0x8000_4520 + ev_type
+    if (base_with_dir >= 0x8000_4520 && base_with_dir <= 0x8000_453F)
+        || (base_raw >= 0x4520 && base_raw <= 0x453F)
+    {
+        let ev_type = if base_with_dir >= 0x8000_4520 && base_with_dir <= 0x8000_453F {
+            base_with_dir - 0x8000_4520
+        } else {
+            base_raw - 0x4520
+        };
+
+        if len == 0 {
+            return Ok(0);
+        }
+
+        crate::syscall::validation::validate_user_ptr_write(arg as *mut u8, len)
+            .map_err(|_| -14i32)?;
+
+        let mut mask = [0u8; 128];
+        let slice = if len <= mask.len() {
+            &mut mask[..len]
+        } else {
+            // SAFETY: arg is validated for len bytes.
+            unsafe {
+                core::ptr::write_bytes(arg as *mut u8, 0, len);
+            }
+            &mut mask[..]
+        };
+
+        match ev_type {
+            0 => {
+                // EV_SYN (0), EV_KEY (1)
+                set_bit(slice, EV_SYN as usize);
+                set_bit(slice, EV_KEY as usize);
+                if is_mouse {
+                    set_bit(slice, EV_REL as usize);
+                }
+            }
+            1 => {
+                // EV_KEY
+                if is_mouse {
+                    set_bit(slice, BTN_LEFT);
+                    set_bit(slice, BTN_RIGHT);
+                    set_bit(slice, BTN_MIDDLE);
+                } else {
+                    for k in 30..=55 {
+                        set_bit(slice, k); // KEY_A..KEY_Z
+                    }
+                    for k in 2..=11 {
+                        set_bit(slice, k); // KEY_1..KEY_0
+                    }
+                    set_bit(slice, 28); // KEY_ENTER
+                    set_bit(slice, 1); // KEY_ESC
+                    set_bit(slice, 14); // KEY_BACKSPACE
+                    set_bit(slice, 15); // KEY_TAB
+                    set_bit(slice, 57); // KEY_SPACE
+                    set_bit(slice, 12); // KEY_MINUS
+                    set_bit(slice, 13); // KEY_EQUAL
+                }
+            }
+            2 => {
+                // EV_REL
+                if is_mouse {
+                    set_bit(slice, REL_X);
+                    set_bit(slice, REL_Y);
+                }
+            }
+            _ => {}
+        }
+
+        let to_copy = core::cmp::min(len, slice.len());
+        // SAFETY: Destination pointer is validated for len bytes, slice contains to_copy bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(slice.as_ptr(), arg as *mut u8, to_copy);
+        }
+        return Ok(len as u64);
+    }
+
+    Err(-25) // ENOTTY
+}
+
 /// `/dev/input/event0` — evdev keyboard node (Major 13, Minor 64).
 pub struct DevInputKeyboard {
     pub inode: Inode,
+    pub pending: crate::sync::spinlock::TicketLock<Option<([InputEvent; 4], usize)>>,
 }
 
 impl InodeOps for DevInputKeyboard {
@@ -635,31 +857,107 @@ impl InodeOps for DevInputKeyboard {
         if buf.len() < SZ {
             return Err(-22); // EINVAL: buffer too small
         }
+
+        let mut pending_lock = self.pending.lock();
+        if let Some((events, mut idx)) = *pending_lock {
+            let count_available = 4 - idx;
+            let count_can_fit = buf.len() / SZ;
+            let count_to_copy = core::cmp::min(count_available, count_can_fit);
+            let bytes_to_copy = count_to_copy * SZ;
+
+            // SAFETY: `events[idx..]` contains valid InputEvent structs and `buf` has space for `bytes_to_copy`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    &events[idx] as *const InputEvent as *const u8,
+                    buf.as_mut_ptr(),
+                    bytes_to_copy,
+                );
+            }
+
+            idx += count_to_copy;
+            if idx >= 4 {
+                *pending_lock = None;
+            } else {
+                *pending_lock = Some((events, idx));
+            }
+            return Ok(bytes_to_copy);
+        }
+
         match crate::drivers::keyboard::try_read_char() {
             Some(ascii) => {
-                let ev = InputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: 1, // EV_KEY
-                    code: ascii_to_keycode(ascii),
-                    value: 1, // key-down
-                };
-                // SAFETY: InputEvent is repr(C) and validated to fit in buf (buf.len() >= SZ).
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        &ev as *const InputEvent as *const u8,
-                        buf.as_mut_ptr(),
-                        SZ,
-                    );
+                let keycode = ascii_to_keycode(ascii);
+                let events = [
+                    InputEvent {
+                        tv_sec: 0,
+                        tv_usec: 0,
+                        type_: EV_KEY,
+                        code: keycode,
+                        value: 1, // key-down
+                    },
+                    InputEvent {
+                        tv_sec: 0,
+                        tv_usec: 0,
+                        type_: EV_SYN,
+                        code: SYN_REPORT,
+                        value: 0,
+                    },
+                    InputEvent {
+                        tv_sec: 0,
+                        tv_usec: 0,
+                        type_: EV_KEY,
+                        code: keycode,
+                        value: 0, // key-up
+                    },
+                    InputEvent {
+                        tv_sec: 0,
+                        tv_usec: 0,
+                        type_: EV_SYN,
+                        code: SYN_REPORT,
+                        value: 0,
+                    },
+                ];
+
+                if buf.len() >= 4 * SZ {
+                    // SAFETY: `events` has 4 InputEvent structs and buf.len() >= 4 * SZ.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            events.as_ptr() as *const u8,
+                            buf.as_mut_ptr(),
+                            4 * SZ,
+                        );
+                    }
+                    Ok(4 * SZ)
+                } else {
+                    let count_can_fit = buf.len() / SZ;
+                    let bytes_to_copy = count_can_fit * SZ;
+                    // SAFETY: `events` has 4 elements, count_can_fit >= 1, buf has capacity.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            events.as_ptr() as *const u8,
+                            buf.as_mut_ptr(),
+                            bytes_to_copy,
+                        );
+                    }
+                    *pending_lock = Some((events, count_can_fit));
+                    Ok(bytes_to_copy)
                 }
-                Ok(SZ)
             }
             None => Err(-11), // EAGAIN
         }
     }
 
+    fn ioctl(&self, request: u64, arg: u64) -> Result<u64, i32> {
+        handle_evdev_ioctl(
+            request,
+            arg,
+            "KontsnorOS PS/2 Keyboard",
+            "isa0060/serio0",
+            false,
+        )
+    }
+
     fn poll(&self, _events: u32) -> u32 {
-        if crate::drivers::keyboard::has_input() {
+        if self.pending.lock().is_some() || crate::drivers::keyboard::has_input() {
             super::inode::POLLIN
         } else {
             0
@@ -691,12 +989,126 @@ impl InodeOps for DevInputMice {
         }
     }
 
+    fn ioctl(&self, request: u64, arg: u64) -> Result<u64, i32> {
+        handle_evdev_ioctl(
+            request,
+            arg,
+            "KontsnorOS PS/2 Mouse",
+            "isa0060/serio1",
+            true,
+        )
+    }
+
     fn poll(&self, _events: u32) -> u32 {
         if crate::drivers::ps2_mouse::has_data() {
             super::inode::POLLIN
         } else {
             0
         }
+    }
+}
+
+/// `/dev/input/uinput` — virtual evdev injector node (Major 10, Minor 223).
+pub struct DevUinput {
+    pub inode: Inode,
+}
+
+impl InodeOps for DevUinput {
+    fn inode(&self) -> &Inode {
+        &self.inode
+    }
+
+    fn ioctl(&self, request: u64, _arg: u64) -> Result<u64, i32> {
+        let req32 = request as u32;
+        match req32 {
+            // UI_DEV_CREATE (0x5501)
+            0x5501 => Ok(0),
+            // UI_DEV_DESTROY (0x5502)
+            0x5502 => Ok(0),
+            // UI_SET_EVBIT (0x4004_5564 or 0x5564)
+            0x4004_5564 | 0x5564 => Ok(0),
+            // UI_SET_KEYBIT (0x4004_5565 or 0x5565)
+            0x4004_5565 | 0x5565 => Ok(0),
+            // UI_SET_RELBIT (0x4004_5566 or 0x5566)
+            0x4004_5566 | 0x5566 => Ok(0),
+            _ => {
+                let base = req32 & 0xFFFF;
+                if base == 0x5501 || base == 0x5502 || (base >= 0x5564 && base <= 0x5566) {
+                    Ok(0)
+                } else {
+                    Err(-25) // ENOTTY
+                }
+            }
+        }
+    }
+
+    fn write(&self, _offset: u64, buf: &[u8]) -> Result<usize, i32> {
+        const SZ: usize = core::mem::size_of::<InputEvent>();
+        if buf.len() < SZ {
+            return Ok(0);
+        }
+
+        let mut dx = 0i8;
+        let mut dy = 0i8;
+        let mut has_rel = false;
+        let num_events = buf.len() / SZ;
+
+        for i in 0..num_events {
+            let offset = i * SZ;
+            let mut ev = InputEvent::default();
+            // SAFETY: `buf` has at least `offset + SZ` bytes, and `InputEvent` is repr(C).
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    buf.as_ptr().add(offset),
+                    &mut ev as *mut InputEvent as *mut u8,
+                    SZ,
+                );
+            }
+
+            match ev.type_ {
+                EV_KEY => {
+                    if ev.code == 0x110 {
+                        crate::drivers::ps2_mouse::set_button_state(0, ev.value != 0);
+                    } else if ev.code == 0x111 {
+                        crate::drivers::ps2_mouse::set_button_state(1, ev.value != 0);
+                    } else if ev.code == 0x112 {
+                        crate::drivers::ps2_mouse::set_button_state(2, ev.value != 0);
+                    } else if ev.value == 1 {
+                        if let Some(ascii) = keycode_to_ascii(ev.code) {
+                            crate::drivers::keyboard::push_char(ascii);
+                        }
+                    }
+                }
+                EV_REL => {
+                    if ev.code == 0 {
+                        dx = dx.saturating_add(ev.value as i8);
+                        has_rel = true;
+                    } else if ev.code == 1 {
+                        dy = dy.saturating_add(ev.value as i8);
+                        has_rel = true;
+                    }
+                }
+                EV_SYN => {
+                    if has_rel {
+                        crate::drivers::ps2_mouse::push_synthesised_packet(dx, dy);
+                        dx = 0;
+                        dy = 0;
+                        has_rel = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if has_rel {
+            crate::drivers::ps2_mouse::push_synthesised_packet(dx, dy);
+        }
+
+        Ok(num_events * SZ)
+    }
+
+    fn poll(&self, _events: u32) -> u32 {
+        super::inode::POLLOUT
     }
 }
 
@@ -781,18 +1193,25 @@ pub fn create_devfs() -> Arc<DevFs> {
         }) as Arc<dyn InodeOps>,
     );
 
-    // Create /dev/input directory with event0 and mice
+    // Create /dev/input directory with event0, mice, and uinput
     let mut input_entries = BTreeMap::new();
     input_entries.insert(
         String::from("event0"),
         Arc::new(DevInputKeyboard {
             inode: make_chardev_inode(50, 13, 64),
+            pending: crate::sync::spinlock::TicketLock::new(None),
         }) as Arc<dyn InodeOps>,
     );
     input_entries.insert(
         String::from("mice"),
         Arc::new(DevInputMice {
             inode: make_chardev_inode(51, 13, 63),
+        }) as Arc<dyn InodeOps>,
+    );
+    input_entries.insert(
+        String::from("uinput"),
+        Arc::new(DevUinput {
+            inode: make_chardev_inode(52, 10, 223),
         }) as Arc<dyn InodeOps>,
     );
     let input_dir = Arc::new(DevFsDir {

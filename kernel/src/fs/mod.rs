@@ -41,6 +41,7 @@ pub mod epoll;
 pub mod eventfd;
 pub mod ext;
 pub mod file;
+pub mod flusher;
 pub mod inode;
 pub mod inotify;
 pub mod kstats;
@@ -167,6 +168,9 @@ pub fn init() {
     for (idx, drive) in nvme_drives.into_iter().enumerate() {
         crate::fs::vfs::register_block_device(alloc::format!("nvme{}", idx), drive);
     }
+
+    // Initialize background dirty writeback flusher daemon
+    flusher::init();
 
     kprintln!("[fs] VFS initialized with devfs, tmpfs, procfs, ext.");
 }

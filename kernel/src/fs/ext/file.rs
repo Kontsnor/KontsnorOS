@@ -1029,15 +1029,17 @@ impl ExtInode {
             let mut block_buf = [0u8; 4096];
             let block_size = self.fs.block_size as usize;
             assert!(block_size <= 4096);
-            if read_blocks(
-                &*self.fs.device,
-                phys_block as u64,
-                &mut block_buf[..block_size],
-                self.fs.block_size,
-            )
-            .is_err()
-            {
-                return Err(-5); // EIO
+            if block_offset != 0 || bytes_to_write < block_size {
+                if read_blocks(
+                    &*self.fs.device,
+                    phys_block as u64,
+                    &mut block_buf[..block_size],
+                    self.fs.block_size,
+                )
+                .is_err()
+                {
+                    return Err(-5); // EIO
+                }
             }
 
             block_buf[block_offset..block_offset + bytes_to_write]

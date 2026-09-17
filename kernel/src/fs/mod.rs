@@ -231,5 +231,8 @@ pub fn init() {
         crate::fs::vfs::register_block_device(alloc::format!("sata{}", idx), drive);
     }
 
+    // Initialize background dirty writeback flusher daemon
+    flusher::init();
+
     kprintln!("[fs] VFS initialized with devfs, tmpfs, procfs, ext.");
 }

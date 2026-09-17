@@ -72,7 +72,7 @@ impl ExtFileSystem {
                 blocks_per_group
             };
 
-            let block_bitmap_num = gds[g].bg_block_bitmap as u64;
+            let block_bitmap_num = gds[g].block_bitmap(self.is_64bit);
             let mut bitmap = alloc::vec![0u8; self.block_size as usize];
             if read_blocks(
                 &*self.device,
@@ -172,10 +172,11 @@ impl ExtFileSystem {
             return Err("Block number out of filesystem bounds");
         }
         let gd = &mut gds[g];
+        let block_bitmap_num = gd.block_bitmap(self.is_64bit);
         let mut bitmap = alloc::vec![0u8; self.block_size as usize];
         read_blocks(
             &*self.device,
-            gd.bg_block_bitmap as u64,
+            block_bitmap_num,
             &mut bitmap,
             self.block_size,
         )?;
@@ -184,12 +185,7 @@ impl ExtFileSystem {
         let bit = i % 8;
         if (bitmap[byte] & (1 << bit)) != 0 {
             bitmap[byte] &= !(1 << bit);
-            write_blocks(
-                &*self.device,
-                gd.bg_block_bitmap as u64,
-                &bitmap,
-                self.block_size,
-            )?;
+            write_blocks(&*self.device, block_bitmap_num, &bitmap, self.block_size)?;
 
             sb.s_free_blocks_count += 1;
             gd.bg_free_blocks_count += 1;
@@ -224,7 +220,7 @@ impl ExtFileSystem {
                 inodes_per_group
             };
 
-            let inode_bitmap_num = gds[g].bg_inode_bitmap as u64;
+            let inode_bitmap_num = gds[g].inode_bitmap(self.is_64bit);
             let mut bitmap = alloc::vec![0u8; self.block_size as usize];
             if read_blocks(
                 &*self.device,
@@ -282,10 +278,11 @@ impl ExtFileSystem {
             return Err("Inode number out of filesystem bounds");
         }
         let gd = &mut gds[g];
+        let inode_bitmap_num = gd.inode_bitmap(self.is_64bit);
         let mut bitmap = alloc::vec![0u8; self.block_size as usize];
         read_blocks(
             &*self.device,
-            gd.bg_inode_bitmap as u64,
+            inode_bitmap_num,
             &mut bitmap,
             self.block_size,
         )?;
@@ -294,12 +291,7 @@ impl ExtFileSystem {
         let bit = i % 8;
         if (bitmap[byte] & (1 << bit)) != 0 {
             bitmap[byte] &= !(1 << bit);
-            write_blocks(
-                &*self.device,
-                gd.bg_inode_bitmap as u64,
-                &bitmap,
-                self.block_size,
-            )?;
+            write_blocks(&*self.device, inode_bitmap_num, &bitmap, self.block_size)?;
 
             sb.s_free_inodes_count += 1;
             gd.bg_free_inodes_count += 1;
@@ -327,7 +319,7 @@ impl ExtFileSystem {
                 .ok_or("Group descriptor index out of bounds")?
         };
 
-        let table_block = gd.bg_inode_table as u64;
+        let table_block = gd.inode_table(self.is_64bit);
         let inode_offset_in_table = (index * self.inode_size as u32) as u64;
 
         let logical_block = table_block + (inode_offset_in_table / self.block_size as u64);
@@ -454,7 +446,7 @@ impl ExtFileSystem {
                 .copied()
                 .ok_or("Group descriptor index out of bounds")?
         };
-        let table_block = gd.bg_inode_table as u64;
+        let table_block = gd.inode_table(self.is_64bit);
         let inode_offset_in_table = (index * self.inode_size as u32) as u64;
         let logical_block = table_block + (inode_offset_in_table / self.block_size as u64);
         let offset_in_block = (inode_offset_in_table % self.block_size as u64) as usize;

@@ -217,6 +217,13 @@ pub fn dirty_inodes_for_dev(dev: u64) -> alloc::vec::Vec<u64> {
     inodes
 }
 
+/// Check if a specific inode on a device has any dirty pages currently buffered in cache.
+pub fn inode_has_dirty_pages(dev: u64, ino: u64) -> bool {
+    let shard = shard_index(dev, ino);
+    let guard = PAGE_CACHE_SHARDS[shard].lock();
+    guard.dirty_inodes.contains(&(dev, ino))
+}
+
 /// Walk the page table of a task to get a mutable reference to the target page table entry.
 ///
 /// # Safety

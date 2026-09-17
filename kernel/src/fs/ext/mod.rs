@@ -1367,6 +1367,13 @@ impl Drop for ExtInode {
                 .fs
                 .deallocate_inode_and_blocks(self.ino, &raw_copy, is_dir);
         } else {
+            // If dirty pages exist in the page cache for this inode, flush them out to disk
+            // before the in-memory ExtInode is dropped and evicted from cache.
+            if crate::memory::page_cache::inode_has_dirty_pages(EXT_DEV_ID, self.ino as u64) {
+                let _ = crate::memory::page_cache::flush_all_for_inode_inner(self);
+                let raw = self.raw.lock();
+                let _ = self.fs.write_inode(self.ino, &raw);
+            }
             let mut cache = self.fs.inode_cache.lock();
             if let Some(weak) = cache.get(&self.ino) {
                 if weak.upgrade().is_none() {

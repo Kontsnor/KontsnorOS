@@ -18,3 +18,18 @@ pub mod ahci;
 pub mod ata;
 pub mod cache;
 pub mod nvme;
+
+use crate::drivers::traits::BlockDevice;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+/// Probe and initialize all discovered block storage controllers.
+pub fn init() -> Vec<Arc<dyn BlockDevice>> {
+    let mut drives = Vec::new();
+    drives.extend(nvme::init());
+    drives.extend(ahci::init());
+    if let Some(ata) = ata::init_ata_drive() {
+        drives.push(ata);
+    }
+    drives
+}

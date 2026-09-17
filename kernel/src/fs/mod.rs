@@ -86,19 +86,24 @@ pub fn init() {
     let ramdisk = crate::drivers::ramdisk::create_ext2_ramdisk();
     crate::fs::vfs::register_block_device(alloc::string::String::from("ramdisk"), ramdisk.clone());
 
-    let mut mounted_ata = false;
+    // Probe and initialize NVMe drives
+    let nvme_drives = crate::drivers::block::nvme::init();
+    for (idx, drive) in nvme_drives.iter().enumerate() {
+        crate::fs::vfs::register_block_device(alloc::format!("nvme{}", idx), drive.clone());
+    }
 
-    // Probe the physical ATA Primary Slave drive
-    if let Some(ata_drive) = crate::drivers::block::ata::init_ata_drive() {
-        crate::fs::vfs::register_block_device(
-            alloc::string::String::from("ata0"),
-            ata_drive.clone(),
-        );
+    let mut mounted_persistent = false;
+
+    // Check if an NVMe drive is available to mount as primary disk
+    if let Some(nvme_drive) = nvme_drives.first() {
         let mut buf = [0u8; 512];
-        if ata_drive.read_block(2, &mut buf).is_ok() {
+        if nvme_drive.read_block(2, &mut buf).is_ok() {
             let magic = u16::from_le_bytes([buf[56], buf[57]]);
             if magic != 0xEF53 {
-                kprintln!("[fs] ATA drive is unformatted (magic: {:#X}). Formatting with live ext4 image...", magic);
+                kprintln!(
+                    "[fs] NVMe drive is unformatted (magic: {:#X}). Formatting with live ext4 image...",
+                    magic
+                );
                 let mut success = true;
                 for block_idx in 0..256 {
                     let mut block_data = [0u8; 512];
@@ -106,11 +111,11 @@ pub fn init() {
                         .read_block(block_idx as u64, &mut block_data)
                         .is_ok()
                     {
-                        if ata_drive
+                        if nvme_drive
                             .write_block(block_idx as u64, &block_data)
                             .is_err()
                         {
-                            kprintln!("[fs] Failed to write block {} to ATA drive.", block_idx);
+                            kprintln!("[fs] Failed to write block {} to NVMe drive.", block_idx);
                             success = false;
                             break;
                         }
@@ -121,32 +126,95 @@ pub fn init() {
                     }
                 }
                 if success {
-                    if let Err(e) = ata_drive.flush() {
-                        kprintln!("[fs] Failed to flush ATA drive: {:?}", e);
+                    if let Err(e) = nvme_drive.flush() {
+                        kprintln!("[fs] Failed to flush NVMe drive: {:?}", e);
                     } else {
-                        kprintln!("[fs] ATA drive formatted and flushed successfully.");
+                        kprintln!("[fs] NVMe drive formatted and flushed successfully.");
                     }
                 }
             } else {
-                kprintln!("[fs] ATA drive is already formatted (magic: 0xEF53).");
+                kprintln!("[fs] NVMe drive is already formatted (magic: 0xEF53).");
             }
         }
 
-        // Try mounting the physical ATA drive
         let cached_drive = alloc::sync::Arc::new(crate::drivers::block::cache::BlockCache::new(
-            ata_drive, 2048,
+            nvme_drive.clone(),
+            2048,
         ));
         if let Ok(ext_fs) = ext::ExtFileSystem::mount(cached_drive) {
             vfs::mount(alloc::string::String::from("/disk"), ext_fs.clone());
             vfs::mount(alloc::string::String::from("/"), ext_fs);
-            kprintln!("[fs] Persistent ext ATA drive mounted at /disk and /.");
-            mounted_ata = true;
+            kprintln!("[fs] Persistent ext NVMe drive mounted at /disk and /.");
+            mounted_persistent = true;
         } else {
-            kprintln!("[fs] Failed to mount ext ATA drive. Falling back to RAM disk.");
+            kprintln!("[fs] Failed to mount ext NVMe drive. Trying other drives.");
         }
     }
 
-    if !mounted_ata {
+    if !mounted_persistent {
+        // Probe the physical ATA Primary Slave drive
+        if let Some(ata_drive) = crate::drivers::block::ata::init_ata_drive() {
+            crate::fs::vfs::register_block_device(
+                alloc::string::String::from("ata0"),
+                ata_drive.clone(),
+            );
+            let mut buf = [0u8; 512];
+            if ata_drive.read_block(2, &mut buf).is_ok() {
+                let magic = u16::from_le_bytes([buf[56], buf[57]]);
+                if magic != 0xEF53 {
+                    kprintln!(
+                        "[fs] ATA drive is unformatted (magic: {:#X}). Formatting with live ext4 image...",
+                        magic
+                    );
+                    let mut success = true;
+                    for block_idx in 0..256 {
+                        let mut block_data = [0u8; 512];
+                        if ramdisk
+                            .read_block(block_idx as u64, &mut block_data)
+                            .is_ok()
+                        {
+                            if ata_drive
+                                .write_block(block_idx as u64, &block_data)
+                                .is_err()
+                            {
+                                kprintln!("[fs] Failed to write block {} to ATA drive.", block_idx);
+                                success = false;
+                                break;
+                            }
+                        } else {
+                            kprintln!("[fs] Failed to read block {} from RAM disk.", block_idx);
+                            success = false;
+                            break;
+                        }
+                    }
+                    if success {
+                        if let Err(e) = ata_drive.flush() {
+                            kprintln!("[fs] Failed to flush ATA drive: {:?}", e);
+                        } else {
+                            kprintln!("[fs] ATA drive formatted and flushed successfully.");
+                        }
+                    }
+                } else {
+                    kprintln!("[fs] ATA drive is already formatted (magic: 0xEF53).");
+                }
+            }
+
+            // Try mounting the physical ATA drive
+            let cached_drive = alloc::sync::Arc::new(
+                crate::drivers::block::cache::BlockCache::new(ata_drive, 2048),
+            );
+            if let Ok(ext_fs) = ext::ExtFileSystem::mount(cached_drive) {
+                vfs::mount(alloc::string::String::from("/disk"), ext_fs.clone());
+                vfs::mount(alloc::string::String::from("/"), ext_fs);
+                kprintln!("[fs] Persistent ext ATA drive mounted at /disk and /.");
+                mounted_persistent = true;
+            } else {
+                kprintln!("[fs] Failed to mount ext ATA drive. Falling back to RAM disk.");
+            }
+        }
+    }
+
+    if !mounted_persistent {
         // Mount it using the ext driver
         if let Ok(ext_fs) = ext::ExtFileSystem::mount(ramdisk) {
             vfs::mount(alloc::string::String::from("/disk"), ext_fs.clone());
@@ -162,15 +230,6 @@ pub fn init() {
     for (idx, drive) in sata_drives.into_iter().enumerate() {
         crate::fs::vfs::register_block_device(alloc::format!("sata{}", idx), drive);
     }
-
-    // Probe and initialize NVMe drives
-    let nvme_drives = crate::drivers::block::nvme::init();
-    for (idx, drive) in nvme_drives.into_iter().enumerate() {
-        crate::fs::vfs::register_block_device(alloc::format!("nvme{}", idx), drive);
-    }
-
-    // Initialize background dirty writeback flusher daemon
-    flusher::init();
 
     kprintln!("[fs] VFS initialized with devfs, tmpfs, procfs, ext.");
 }

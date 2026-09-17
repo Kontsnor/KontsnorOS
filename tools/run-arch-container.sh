@@ -11,6 +11,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 REBUILD_DISK=false
 INTERACTIVE=false
+USE_NVME=false
 
 for arg in "$@"; do
     case "$arg" in
@@ -19,6 +20,9 @@ for arg in "$@"; do
             ;;
         --interactive|-i|--shell)
             INTERACTIVE=true
+            ;;
+        --nvme)
+            USE_NVME=true
             ;;
     esac
 done
@@ -383,6 +387,12 @@ fi
 TEST_BIOS="/tmp/bios-arch.img"
 cp "$BIOS_IMG" "$TEST_BIOS"
 
+STORAGE_OPTS="-drive file=$DISK_IMG,format=raw,index=1,media=disk,cache=unsafe,aio=threads,discard=unmap,detect-zeroes=unmap"
+if [ "$USE_NVME" = true ]; then
+    echo "Configuring Arch container storage via NVMe PCIe Controller..."
+    STORAGE_OPTS="-drive file=$DISK_IMG,if=none,id=nvm,format=raw,cache=unsafe,aio=threads,discard=unmap,detect-zeroes=unmap -device nvme,serial=kontsnor-nvme0,drive=nvm"
+fi
+
 if [ "$INTERACTIVE" = true ]; then
     echo "[5/5] Launching QEMU in interactive shell mode..."
     echo "      Type your commands directly inside the Arch Linux container."
@@ -391,7 +401,7 @@ if [ "$INTERACTIVE" = true ]; then
     trap 'stty sane 2>/dev/null || true' EXIT INT TERM
     qemu-system-x86_64 \
         -drive format=raw,file="$TEST_BIOS",snapshot=on \
-        -drive file="$DISK_IMG",format=raw,index=1,media=disk,cache=unsafe,aio=threads,discard=unmap,detect-zeroes=unmap \
+        $STORAGE_OPTS \
         -rtc base=utc,clock=host \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
         -netdev user,id=net0 \
@@ -413,7 +423,7 @@ rm -f "$QEMU_LOG"
 set +e
 qemu-system-x86_64 \
     -drive format=raw,file="$TEST_BIOS",snapshot=on \
-    -drive file="$DISK_IMG",format=raw,index=1,media=disk,cache=unsafe,aio=threads,discard=unmap,detect-zeroes=unmap \
+    $STORAGE_OPTS \
     -rtc base=utc,clock=host \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -netdev user,id=net0 \

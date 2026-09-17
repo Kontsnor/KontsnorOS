@@ -85,19 +85,23 @@ impl<T> TicketLock<T> {
         // Get the active Local APIC ID
         let apic_id = crate::arch::x86_64::smp::current_lapic_id() as u32;
 
-        // Assert that the current CPU core doesn't already hold the lock (prevent recursive deadlocks)
+        // Assert that the current CPU core doesn't already hold the lock (prevent recursive deadlocks).
+        // Relaxed load is sufficient as holding_cpu is written by this CPU on prior acquisition.
         assert!(
-            self.holding_cpu.load(Ordering::SeqCst) != apic_id,
+            self.holding_cpu.load(Ordering::Relaxed) != apic_id,
             "Deadlock: TicketLock at {:p} recursive re-entrancy detected on CPU {}!",
             self,
             apic_id
         );
 
-        // Take a ticket
-        let ticket = self.next_ticket.fetch_add(1, Ordering::SeqCst);
+        // Take a ticket using Relaxed ordering.
+        // fetch_add is an atomic RMW operation guaranteeing a total modification order on next_ticket.
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
 
-        // Wait until our ticket is served
-        while self.now_serving.load(Ordering::SeqCst) != ticket {
+        // Wait until our ticket is served using Acquire ordering.
+        // Acquire creates a synchronizes-with relationship with the Release store in drop(),
+        // ensuring all preceding critical-section memory modifications are visible before entering.
+        while self.now_serving.load(Ordering::Acquire) != ticket {
             if crate::arch::x86_64::smp::has_pending_tlb_shootdown() {
                 x86_64::instructions::tlb::flush_all();
                 crate::arch::x86_64::smp::tlb_shootdown_ack();
@@ -105,8 +109,9 @@ impl<T> TicketLock<T> {
             core::hint::spin_loop();
         }
 
-        // Mark the lock as held by this CPU core
-        self.holding_cpu.store(apic_id, Ordering::SeqCst);
+        // Mark the lock as held by this CPU core.
+        // Relaxed ordering compiles to a plain MOV instruction on x86_64 (avoiding MFENCE/XCHG).
+        self.holding_cpu.store(apic_id, Ordering::Relaxed);
 
         TicketLockGuard {
             lock: self,
@@ -124,24 +129,24 @@ impl<T> TicketLock<T> {
         let apic_id = crate::arch::x86_64::smp::current_lapic_id() as u32;
 
         // If the lock is currently held, fail try_lock immediately
-        if self.holding_cpu.load(Ordering::SeqCst) != 0xFFFFFFFF {
+        if self.holding_cpu.load(Ordering::Relaxed) != 0xFFFFFFFF {
             if interrupts_enabled {
                 x86_64::instructions::interrupts::enable();
             }
             return None;
         }
 
-        let current = self.now_serving.load(Ordering::SeqCst);
+        let current = self.now_serving.load(Ordering::Acquire);
         let result = self.next_ticket.compare_exchange(
             current,
             current + 1,
-            Ordering::SeqCst,
+            Ordering::Acquire,
             Ordering::Relaxed,
         );
 
         match result {
             Ok(_) => {
-                self.holding_cpu.store(apic_id, Ordering::SeqCst);
+                self.holding_cpu.store(apic_id, Ordering::Relaxed);
                 Some(TicketLockGuard {
                     lock: self,
                     interrupts_enabled,
@@ -161,9 +166,9 @@ impl<T> TicketLock<T> {
     /// # Safety
     /// This is unsafe because it bypasses normal RAII lock guard guarantees.
     pub unsafe fn force_unlock(&self) {
-        let prev = self.holding_cpu.swap(0xFFFFFFFF, Ordering::SeqCst);
+        let prev = self.holding_cpu.swap(0xFFFFFFFF, Ordering::Relaxed);
         if prev != 0xFFFFFFFF {
-            self.now_serving.fetch_add(1, Ordering::SeqCst);
+            self.now_serving.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -201,11 +206,12 @@ impl<T> DerefMut for TicketLockGuard<'_, T> {
 
 impl<T> Drop for TicketLockGuard<'_, T> {
     fn drop(&mut self) {
-        // Reset holding CPU and only advance now_serving if the lock was actively held
-        let prev = self.lock.holding_cpu.swap(0xFFFFFFFF, Ordering::SeqCst);
-        if prev != 0xFFFFFFFF {
-            self.lock.now_serving.fetch_add(1, Ordering::SeqCst);
-        }
+        // Clear holding CPU state using a fast Relaxed store (compiles to plain MOV on x86_64)
+        self.lock.holding_cpu.store(0xFFFFFFFF, Ordering::Relaxed);
+
+        // Advance now_serving with Release ordering to publish all critical-section writes
+        // and notify the next waiting ticket holder.
+        self.lock.now_serving.fetch_add(1, Ordering::Release);
 
         // Restore the original interrupt state
         if self.interrupts_enabled {

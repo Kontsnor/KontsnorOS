@@ -221,6 +221,10 @@ impl BlockDevice for NvmeNamespace {
         let start_virt = buf.as_ptr() as u64;
         let len = buf.len();
 
+        if len == 0 || (len as u64 % self.block_size) != 0 {
+            return Err(DriverError::InvalidParam);
+        }
+
         // Translate the buffer virtual address to physical pages
         let mut pages = Vec::new();
         let mut offset = 0;
@@ -279,6 +283,12 @@ impl BlockDevice for NvmeNamespace {
         cmd.cdw11 = (block >> 32) as u32;
 
         let sectors_count = (len as u64 / self.block_size) as u32;
+        if sectors_count == 0 || sectors_count > 0x10000 {
+            if let Some(phys_to_free) = prp_list_phys_to_free {
+                crate::memory::physical::deallocate_frame(phys_to_free);
+            }
+            return Err(DriverError::InvalidParam);
+        }
         cmd.cdw12 = (sectors_count - 1) & 0xFFFF; // 0-based number of blocks
 
         let result = io_queue.submit_and_wait(cmd);
@@ -296,6 +306,10 @@ impl BlockDevice for NvmeNamespace {
 
         let start_virt = data.as_ptr() as u64;
         let len = data.len();
+
+        if len == 0 || (len as u64 % self.block_size) != 0 {
+            return Err(DriverError::InvalidParam);
+        }
 
         // Translate the buffer virtual address to physical pages
         let mut pages = Vec::new();
@@ -355,6 +369,12 @@ impl BlockDevice for NvmeNamespace {
         cmd.cdw11 = (block >> 32) as u32;
 
         let sectors_count = (len as u64 / self.block_size) as u32;
+        if sectors_count == 0 || sectors_count > 0x10000 {
+            if let Some(phys_to_free) = prp_list_phys_to_free {
+                crate::memory::physical::deallocate_frame(phys_to_free);
+            }
+            return Err(DriverError::InvalidParam);
+        }
         cmd.cdw12 = (sectors_count - 1) & 0xFFFF; // 0-based number of blocks
 
         let result = io_queue.submit_and_wait(cmd);
@@ -425,7 +445,10 @@ pub mod test_helpers {
 
 /// Detects NVMe controller on the PCI bus, maps registers, configures the controller, and initializes active namespaces.
 pub fn init() -> Vec<Arc<dyn BlockDevice>> {
-    let devices = crate::drivers::bus::pci::find_by_class(0x01, 0x08);
+    let mut devices = crate::drivers::bus::pci::find_by_class_progif(0x01, 0x08, 0x02);
+    if devices.is_empty() {
+        devices = crate::drivers::bus::pci::find_by_class(0x01, 0x08);
+    }
     if devices.is_empty() {
         kprintln!("[nvme] No NVMe Controller found on PCI bus.");
         return Vec::new();
@@ -433,7 +456,7 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
 
     let mut drives = Vec::new();
 
-    for dev in &devices {
+    for (dev_idx, dev) in devices.iter().enumerate() {
         kprintln!(
             "[nvme] Found NVMe Controller at [{:02x}:{:02x}.{:01x}]",
             dev.bus,
@@ -465,7 +488,7 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
 
         // Map registers to a dedicated MMIO virtual address range
         // Non-overlapping with AHCI address range (starts at 0xffff_d000_1000_0000)
-        let virt_base = 0xffff_d000_1000_0000u64;
+        let virt_base = 0xffff_d000_1000_0000u64 + (dev_idx as u64 * 0x10_0000);
         let page_flags = PageTableFlags::PRESENT
             | PageTableFlags::WRITABLE
             | PageTableFlags::NO_CACHE
@@ -482,6 +505,23 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
             }
         }
 
+        // Read Capabilities register (CAP) to find MQES, TO, and Doorbell Stride (DSTRD)
+        // SAFETY: CAP is a valid mapped MMIO register.
+        let cap = unsafe { test_helpers::read_reg64(virt_base, CAP) };
+        let mqes = ((cap & 0xFFFF) as u16).saturating_add(1); // 0-based value, so + 1
+        let to_units = ((cap >> 24) & 0xFF) as u8; // Timeout in 500 ms units
+        let dstrd = ((cap >> 32) & 0xF) as u32; // Doorbell stride
+        let doorbell_stride = 4 << dstrd;
+        let timeout_limit = (to_units as u32).max(1) * 500_000;
+
+        kprintln!(
+            "[nvme] Capabilities: MQES={}, TO={} ms, DSTRD={} (stride={} bytes)",
+            mqes,
+            (to_units as u32) * 500,
+            dstrd,
+            doorbell_stride
+        );
+
         // Disable controller first to allow setting configurations (CC.EN = 0)
         // SAFETY: MMIO register access is volatile and synchronized since this is early initialization.
         unsafe {
@@ -494,7 +534,7 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
         let mut timeout = 0;
         // SAFETY: CSTS is a valid mapped MMIO register.
         while (unsafe { test_helpers::read_reg32(virt_base, CSTS) } & 1) != 0 {
-            if timeout > 1_000_000 {
+            if timeout > timeout_limit {
                 kprintln!("[nvme] Controller disable timed out!");
                 break;
             }
@@ -502,11 +542,7 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
             timeout += 1;
         }
 
-        // Read Capabilities register (CAP) to find the Doorbell Stride (DSTRD)
-        // SAFETY: CAP is a valid mapped MMIO register.
-        let cap = unsafe { test_helpers::read_reg64(virt_base, CAP) };
-        let dstrd = ((cap >> 32) & 0xF) as u32;
-        let doorbell_stride = 4 << dstrd;
+        let admin_queue_size = 64u16.min(mqes);
 
         // Allocate physical memory pages for Admin Submission Queue (ASQ) and Admin Completion Queue (ACQ)
         let asq_phys = crate::memory::physical::allocate_frame()
@@ -526,8 +562,8 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
         }
 
         // Set Admin Queue attributes (AQA)
-        // AQS (bits 0-11) and ACQS (bits 16-27). Value is 0-based size (e.g. 63 for 64 entries)
-        let aqa = (63 << 16) | 63;
+        // AQS (bits 0-11) and ACQS (bits 16-27). Value is 0-based size
+        let aqa = (((admin_queue_size - 1) as u32) << 16) | ((admin_queue_size - 1) as u32);
         // SAFETY: AQA, ASQ, and ACQ are mapped MMIO registers.
         unsafe {
             test_helpers::write_reg32(virt_base, AQA, aqa);
@@ -546,7 +582,7 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
         let mut timeout = 0;
         // SAFETY: CSTS is a mapped MMIO register.
         while (unsafe { test_helpers::read_reg32(virt_base, CSTS) } & 1) == 0 {
-            if timeout > 1_000_000 {
+            if timeout > timeout_limit {
                 kprintln!("[nvme] Controller enable timed out!");
                 break;
             }
@@ -562,12 +598,57 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
             acq_phys,
             asq_virt,
             acq_virt,
-            64,
+            admin_queue_size,
             db_sq_admin,
             db_cq_admin,
         );
 
+        // Issue Identify Controller Admin command (opcode 0x06, CNS = 0x01, NSID = 0)
+        let id_ctrl_phys = crate::memory::physical::allocate_frame()
+            .expect("NVMe: out of physical frames for Identify Controller");
+        let id_ctrl_virt = (id_ctrl_phys + crate::memory::r#virtual::phys_mem_offset()) as *mut u8;
+        // SAFETY: id_ctrl_virt points to a valid physical frame allocated specifically for Identify Controller.
+        unsafe {
+            core::ptr::write_bytes(id_ctrl_virt, 0, 4096);
+        }
+
+        let mut cmd_id_ctrl = NvmeCmd::default();
+        cmd_id_ctrl.opcode = 0x06;
+        cmd_id_ctrl.nsid = 0;
+        cmd_id_ctrl.prp1 = id_ctrl_phys;
+        cmd_id_ctrl.cdw10 = 0x01; // CNS = 0x01 (Identify Controller)
+
+        if let Err(e) = admin_queue.submit_and_wait(cmd_id_ctrl) {
+            kprintln!("[nvme] Identify Controller command failed: {:?}", e);
+            crate::memory::physical::deallocate_frame(id_ctrl_phys);
+            continue;
+        }
+
+        let mut sn_bytes = [0u8; 20];
+        let mut mn_bytes = [0u8; 40];
+        let mut fr_bytes = [0u8; 8];
+        // SAFETY: id_ctrl_virt has been populated by the controller DMA transfer.
+        unsafe {
+            core::ptr::copy_nonoverlapping(id_ctrl_virt.add(4), sn_bytes.as_mut_ptr(), 20);
+            core::ptr::copy_nonoverlapping(id_ctrl_virt.add(24), mn_bytes.as_mut_ptr(), 40);
+            core::ptr::copy_nonoverlapping(id_ctrl_virt.add(64), fr_bytes.as_mut_ptr(), 8);
+        }
+        let sn = core::str::from_utf8(&sn_bytes).unwrap_or("").trim();
+        let mn = core::str::from_utf8(&mn_bytes).unwrap_or("").trim();
+        let fr = core::str::from_utf8(&fr_bytes).unwrap_or("").trim();
+        let nn = unsafe { (id_ctrl_virt.add(516) as *const u32).read_volatile() };
+
+        kprintln!(
+            "[nvme] Controller Model: '{}', Serial: '{}', FW: '{}', Namespaces: {}",
+            mn,
+            sn,
+            fr,
+            nn
+        );
+        crate::memory::physical::deallocate_frame(id_ctrl_phys);
+
         // Allocate physical memory pages for I/O queues (SQ and CQ)
+        let io_queue_size = 64u16.min(mqes);
         let io_sq_phys = crate::memory::physical::allocate_frame()
             .expect("NVMe: out of physical frames for I/O SQ");
         let io_sq_virt = (io_sq_phys + crate::memory::r#virtual::phys_mem_offset()) as *mut NvmeCmd;
@@ -588,7 +669,7 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
         let mut cmd_ccq = NvmeCmd::default();
         cmd_ccq.opcode = 0x05;
         cmd_ccq.prp1 = io_cq_phys;
-        cmd_ccq.cdw10 = (63 << 16) | 1; // Size 64, QID 1
+        cmd_ccq.cdw10 = (((io_queue_size - 1) as u32) << 16) | 1; // Size, QID 1
         cmd_ccq.cdw11 = 1; // Physically Contiguous = 1
         if let Err(e) = admin_queue.submit_and_wait(cmd_ccq) {
             kprintln!("[nvme] Failed to create I/O Completion Queue: {:?}", e);
@@ -599,7 +680,7 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
         let mut cmd_csq = NvmeCmd::default();
         cmd_csq.opcode = 0x01;
         cmd_csq.prp1 = io_sq_phys;
-        cmd_csq.cdw10 = (63 << 16) | 1; // Size 64, QID 1
+        cmd_csq.cdw10 = (((io_queue_size - 1) as u32) << 16) | 1; // Size, QID 1
         cmd_csq.cdw11 = (1 << 16) | 1; // CQID = 1, Physically Contiguous = 1
         if let Err(e) = admin_queue.submit_and_wait(cmd_csq) {
             kprintln!("[nvme] Failed to create I/O Submission Queue: {:?}", e);
@@ -607,10 +688,17 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
         }
 
         // Set up the I/O Queue doorbells (Queue 1)
+        // Doorbell Offset = 0x1000 + (2 * QID + is_cq) * (4 << CAP.DSTRD)
         let db_sq_io = (virt_base + DOORBELL_BASE as u64 + 2 * doorbell_stride as u64) as *mut u32;
         let db_cq_io = (virt_base + DOORBELL_BASE as u64 + 3 * doorbell_stride as u64) as *mut u32;
         let io_queue = NvmeQueue::new(
-            io_sq_phys, io_cq_phys, io_sq_virt, io_cq_virt, 64, db_sq_io, db_cq_io,
+            io_sq_phys,
+            io_cq_phys,
+            io_sq_virt,
+            io_cq_virt,
+            io_queue_size,
+            db_sq_io,
+            db_cq_io,
         );
 
         let controller = Arc::new(Mutex::new(NvmeController {
@@ -620,9 +708,9 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
             doorbell_stride,
         }));
 
-        // Send Identify Namespace Admin command (opcode 0x06, CNS = 1, NSID = 1)
+        // Send Identify Namespace Admin command (opcode 0x06, CNS = 0x00, NSID = 1)
         let identify_phys = crate::memory::physical::allocate_frame()
-            .expect("NVMe: out of physical frames for Identify");
+            .expect("NVMe: out of physical frames for Identify Namespace");
         let identify_virt =
             (identify_phys + crate::memory::r#virtual::phys_mem_offset()) as *mut u8;
         // SAFETY: identify_virt points to a valid physical frame allocated specifically for Identify data.
@@ -634,7 +722,7 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
         cmd_ident.opcode = 0x06;
         cmd_ident.nsid = 1;
         cmd_ident.prp1 = identify_phys;
-        cmd_ident.cdw10 = 1; // CNS = 1
+        cmd_ident.cdw10 = 0x00; // CNS = 0x00 (Identify Namespace)
 
         let ident_res = controller.lock().admin_queue.submit_and_wait(cmd_ident);
         if let Err(e) = ident_res {
@@ -671,7 +759,7 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
         crate::memory::physical::deallocate_frame(identify_phys);
 
         let info = DriverInfo {
-            name: String::from("nvme0"),
+            name: alloc::format!("nvme{}", dev_idx),
             version: String::from("0.1.0"),
             author: String::from("Antigravity Systems"),
             license: String::from("GPL-3.0-only"),
@@ -687,6 +775,20 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
             block_size,
             info,
         });
+
+        // Diagnostic self-test: read block 0 to verify end-to-end I/O
+        let mut test_buf = [0u8; 512];
+        match namespace.read_block(0, &mut test_buf) {
+            Ok(_) => {
+                kprintln!("[nvme] Self-test: sector read verified successfully!");
+            }
+            Err(e) => {
+                kprintln!(
+                    "[nvme] Self-test warning: initial sector read returned {:?}",
+                    e
+                );
+            }
+        }
 
         drives.push(namespace as Arc<dyn BlockDevice>);
     }

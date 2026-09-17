@@ -177,6 +177,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     arch::x86_64::smp::init();
     kprintln!("[boot] SMP CPU Manager initialized.");
 
+    kprintln!("[boot] Initializing PCI bus...");
+    drivers::bus::pci::init();
+    kprintln!("[boot] PCI bus initialized.");
+
     // ── Phase 5: Subsystem initialization ──────────────────────────────
     kprintln!("[boot] Initializing VFS...");
     fs::init();

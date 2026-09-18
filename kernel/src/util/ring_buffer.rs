@@ -18,14 +18,19 @@
 //! A fixed-size circular buffer for single-producer, single-consumer
 //! scenarios (e.g., interrupt handler → kernel thread communication).
 
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// A lock-free single-producer single-consumer ring buffer.
 pub struct RingBuffer<T, const N: usize> {
-    buffer: [core::mem::MaybeUninit<T>; N],
+    buffer: UnsafeCell<[core::mem::MaybeUninit<T>; N]>,
     head: AtomicUsize, // Write position (producer)
     tail: AtomicUsize, // Read position (consumer)
 }
+
+// SAFETY: Synchronization of element access is guaranteed by atomic head/tail orderings for SPSC operations.
+unsafe impl<T: Send, const N: usize> Sync for RingBuffer<T, N> {}
+unsafe impl<T: Send, const N: usize> Send for RingBuffer<T, N> {}
 
 impl<T: Copy, const N: usize> RingBuffer<T, N> {
     /// Create a new, empty ring buffer.
@@ -36,8 +41,7 @@ impl<T: Copy, const N: usize> RingBuffer<T, N> {
     pub const fn new() -> Self {
         assert!(N.is_power_of_two(), "Ring buffer size must be a power of 2");
         Self {
-            // SAFETY: MaybeUninit doesn't require initialization
-            buffer: unsafe { core::mem::MaybeUninit::uninit().assume_init() },
+            buffer: UnsafeCell::new([const { core::mem::MaybeUninit::uninit() }; N]),
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
         }
@@ -55,10 +59,12 @@ impl<T: Copy, const N: usize> RingBuffer<T, N> {
         }
 
         let index = head & (N - 1);
-        // SAFETY: We have exclusive producer access and the index is in bounds.
+        // SAFETY: The index is bounded in [0..N) by head & (N - 1) where N is power-of-two.
+        // Exclusive producer write access is guaranteed by single-producer contract.
         unsafe {
-            let ptr = self.buffer.as_ptr().add(index) as *mut T;
-            ptr.write(item);
+            let buf_ptr = self.buffer.get();
+            let elem_ptr = (*buf_ptr).as_mut_ptr().add(index);
+            (*elem_ptr).write(item);
         }
 
         self.head.store(head + 1, Ordering::Release);
@@ -77,10 +83,12 @@ impl<T: Copy, const N: usize> RingBuffer<T, N> {
         }
 
         let index = tail & (N - 1);
-        // SAFETY: We have exclusive consumer access and the index is in bounds.
+        // SAFETY: The index is bounded in [0..N) by tail & (N - 1) where N is power-of-two.
+        // Exclusive consumer read access is guaranteed by single-consumer contract.
         let item = unsafe {
-            let ptr = self.buffer.as_ptr().add(index) as *const T;
-            ptr.read()
+            let buf_ptr = self.buffer.get();
+            let elem_ptr = (*buf_ptr).as_ptr().add(index);
+            (*elem_ptr).assume_init()
         };
 
         self.tail.store(tail + 1, Ordering::Release);
@@ -99,5 +107,37 @@ impl<T: Copy, const N: usize> RingBuffer<T, N> {
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
         head - tail
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ring_buffer_operations() {
+        let rb: RingBuffer<u8, 4> = RingBuffer::new();
+        assert!(rb.is_empty());
+        assert_eq!(rb.len(), 0);
+
+        assert_eq!(rb.push(10), Ok(()));
+        assert_eq!(rb.push(20), Ok(()));
+        assert_eq!(rb.push(30), Ok(()));
+        assert_eq!(rb.push(40), Ok(()));
+        assert_eq!(rb.push(50), Err(50)); // Full
+
+        assert!(!rb.is_empty());
+        assert_eq!(rb.len(), 4);
+
+        assert_eq!(rb.pop(), Some(10));
+        assert_eq!(rb.pop(), Some(20));
+        assert_eq!(rb.len(), 2);
+
+        assert_eq!(rb.push(50), Ok(()));
+        assert_eq!(rb.pop(), Some(30));
+        assert_eq!(rb.pop(), Some(40));
+        assert_eq!(rb.pop(), Some(50));
+        assert_eq!(rb.pop(), None);
+        assert!(rb.is_empty());
     }
 }

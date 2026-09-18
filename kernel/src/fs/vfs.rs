@@ -550,10 +550,18 @@ pub fn resolve_relative_path(path: &str) -> String {
 }
 
 /// Helper to resolve paths relative to a directory file descriptor.
+///
+/// POSIX.1-2017 `openat` & Linux `openat(2)`:
+/// If `path` is relative and `dfd` is neither `AT_FDCWD` (-100) nor a valid
+/// file descriptor (e.g. `dfd < 0`), the call shall fail with `EBADF`.
 pub fn resolve_relative_path_at(dfd: i32, path: &str) -> Result<String, Errno> {
     if path.starts_with('/') || dfd == -100 {
         // AT_FDCWD or absolute path: resolve relative to current task's cwd and jail root.
         return Ok(resolve_relative_path(path));
+    }
+
+    if dfd < 0 {
+        return Err(Errno::EBADF);
     }
 
     let desc = crate::process::fd::current_task_get_file_desc(dfd).ok_or(Errno::EBADF)?;

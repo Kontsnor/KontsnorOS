@@ -427,7 +427,7 @@ pub unsafe fn copy_argv_from_user(
         if str_ptr.is_null() {
             break;
         }
-        let s = unsafe { crate::syscall::fs::copy_string_from_user_pub(str_ptr) }?;
+        let s = unsafe { crate::syscall::fs::copy_string_from_user(str_ptr) }?;
         args.push(s);
         argv_ptr = unsafe { argv_ptr.add(1) };
         if args.len() > 4096 {

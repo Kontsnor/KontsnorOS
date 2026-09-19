@@ -534,7 +534,7 @@ pub fn sys_pipe2(pipefds: *mut i32, flags: i32) -> SyscallResult {
 /// `memfd_create(name, flags)` — Create an anonymous RAM-backed file descriptor.
 pub fn sys_memfd_create(name_ptr: *const u8, flags: u32) -> SyscallResult {
     let name = unsafe {
-        match crate::syscall::validation::copy_string_from_user_pub(name_ptr) {
+        match crate::syscall::validation::copy_string_from_user(name_ptr) {
             Some(s) => s,
             None => return Errno::EFAULT.into(),
         }

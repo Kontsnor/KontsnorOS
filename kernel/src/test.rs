@@ -3356,3 +3356,67 @@ fn test_devfs_special_nodes() {
 
     kprintln!("[test] devfs special character device nodes test PASSED!");
 }
+
+#[test_case]
+fn test_fd_table_next_free_fd_optimization() {
+    kprintln!("[test] Starting FdTable O(1) allocation & next_free_fd recycling test...");
+
+    let current_pid = crate::process::scheduler::current_pid().expect("No current PID");
+    let task_arc = crate::process::scheduler::get_task_arc(current_pid).expect("No task ARC");
+    let task = task_arc.lock();
+
+    // Verify initial next_free_fd state
+    {
+        let fd_table = task.fd_table.lock();
+        assert!(
+            fd_table.next_free_fd >= 3,
+            "Standard FDs 0, 1, 2 must be allocated"
+        );
+    }
+
+    let dev_null = crate::fs::vfs::lookup("/dev/null").expect("/dev/null missing");
+
+    // Allocate 3 sequential file descriptors
+    let fd_a =
+        crate::process::fd::current_task_alloc_fd(dev_null.clone()).expect("alloc fd_a failed");
+    let fd_b =
+        crate::process::fd::current_task_alloc_fd(dev_null.clone()).expect("alloc fd_b failed");
+    let fd_c =
+        crate::process::fd::current_task_alloc_fd(dev_null.clone()).expect("alloc fd_c failed");
+
+    assert_eq!(fd_b, fd_a + 1);
+    assert_eq!(fd_c, fd_b + 1);
+
+    // Verify next_free_fd advanced past fd_c
+    {
+        let fd_table = task.fd_table.lock();
+        assert_eq!(fd_table.next_free_fd, (fd_c + 1) as usize);
+    }
+
+    // Close middle descriptor fd_b
+    assert!(crate::process::fd::current_task_close_fd(fd_b));
+
+    // Verify next_free_fd was updated to fd_b
+    {
+        let fd_table = task.fd_table.lock();
+        assert_eq!(fd_table.next_free_fd, fd_b as usize);
+    }
+
+    // Allocate a new descriptor — must reuse fd_b in O(1) fast-path!
+    let fd_reused = crate::process::fd::current_task_alloc_fd(dev_null.clone())
+        .expect("alloc fd_reused failed");
+    assert_eq!(fd_reused, fd_b);
+
+    // Verify next_free_fd advanced back past fd_c
+    {
+        let fd_table = task.fd_table.lock();
+        assert_eq!(fd_table.next_free_fd, (fd_c + 1) as usize);
+    }
+
+    // Clean up allocated descriptors
+    crate::process::fd::current_task_close_fd(fd_a);
+    crate::process::fd::current_task_close_fd(fd_reused);
+    crate::process::fd::current_task_close_fd(fd_c);
+
+    kprintln!("[test] FdTable O(1) allocation & next_free_fd recycling test PASSED!");
+}

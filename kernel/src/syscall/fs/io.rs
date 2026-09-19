@@ -600,7 +600,16 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
 
             *file_desc.ref_count.lock() += 1;
 
-            let mut new_fd = start_fd;
+            let mut new_fd = core::cmp::max(start_fd as usize, fd_table.next_free_fd) as i32;
+            if start_fd < (fd_table.next_free_fd as i32) {
+                for candidate in (start_fd as usize)..(fd_table.next_free_fd) {
+                    if candidate >= fd_table.entries.len() || fd_table.entries[candidate].is_none()
+                    {
+                        new_fd = candidate as i32;
+                        break;
+                    }
+                }
+            }
             while (new_fd as usize) < fd_table.entries.len()
                 && fd_table.entries[new_fd as usize].is_some()
             {
@@ -618,6 +627,14 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                 fd_table.cloexec[new_fd as usize] = true;
             } else {
                 fd_table.cloexec[new_fd as usize] = false;
+            }
+
+            if (new_fd as usize) == fd_table.next_free_fd {
+                let mut next = (new_fd as usize) + 1;
+                while next < fd_table.entries.len() && fd_table.entries[next].is_some() {
+                    next += 1;
+                }
+                fd_table.next_free_fd = next;
             }
 
             if crate::syscall::DEBUG_SYSCALLS {

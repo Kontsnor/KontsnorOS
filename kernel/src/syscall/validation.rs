@@ -265,9 +265,3 @@ pub unsafe fn copy_string_from_user(ptr: *const u8) -> Option<String> {
     }
     Some(result)
 }
-
-/// Public wrapper used by other modules for path resolution.
-pub unsafe fn copy_string_from_user_pub(ptr: *const u8) -> Option<String> {
-    // SAFETY: Delegate to copy_string_from_user with same safety contract.
-    unsafe { copy_string_from_user(ptr) }
-}

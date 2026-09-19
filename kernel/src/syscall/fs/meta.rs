@@ -1603,7 +1603,7 @@ pub fn sys_statfs(path_ptr: *const u8, buf: *mut LinuxStatfs) -> SyscallResult {
     }
 
     let path_str = unsafe {
-        match crate::syscall::validation::copy_string_from_user_pub(path_ptr) {
+        match crate::syscall::validation::copy_string_from_user(path_ptr) {
             Some(s) => s,
             None => return Errno::EFAULT.into(),
         }

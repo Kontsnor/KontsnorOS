@@ -45,7 +45,7 @@ pub use open::{
 
 // Re-export the validation functions for backward compatibility so other modules can import them from `fs`
 pub use crate::syscall::validation::{
-    copy_string_from_user_pub, validate_user_ptr, validate_user_ptr_write,
+    copy_string_from_user, validate_user_ptr, validate_user_ptr_write,
 };
 
 pub use crate::fs::epoll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait};

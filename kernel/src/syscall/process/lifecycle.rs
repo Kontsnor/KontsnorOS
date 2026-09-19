@@ -21,8 +21,9 @@ use super::super::{Errno, SyscallResult};
 use super::creds::calculate_exec_creds;
 use crate::kprintln;
 use crate::process::scheduler;
-use crate::syscall::fs::copy_string_from_user_pub;
-use crate::syscall::validation::{validate_user_ptr, validate_user_ptr_write};
+use crate::syscall::validation::{
+    copy_string_from_user, validate_user_ptr, validate_user_ptr_write,
+};
 
 /// `fork()` — Create a child process.
 ///
@@ -333,7 +334,7 @@ pub fn sys_execve(
     _envp: *const *const u8,
 ) -> SyscallResult {
     // Copy the path string from user-space memory
-    let path = unsafe { copy_string_from_user_pub(pathname) };
+    let path = unsafe { copy_string_from_user(pathname) };
     let path = match path {
         Some(p) => p,
         None => return Errno::EFAULT.into(),

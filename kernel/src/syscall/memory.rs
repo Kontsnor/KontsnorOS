@@ -51,11 +51,27 @@ pub fn sys_mmap(
         return Errno::EINVAL.into();
     }
 
-    // We support anonymous private mappings and private/shared file mappings
-    let is_anon = (flags & 0x20) != 0 || fd == -1;
-    let is_shared = (flags & 0x01) != 0;
+    // POSIX.1-2017 / Linux mmap(2):
+    // 1. Exactly one of MAP_SHARED (0x01), MAP_PRIVATE (0x02), or MAP_SHARED_VALIDATE (0x03)
+    //    must be specified in flags.
+    let map_type = flags & 0x0f;
+    if map_type != 0x01 && map_type != 0x02 && map_type != 0x03 {
+        return Errno::EINVAL.into();
+    }
+
+    // 2. offset must be non-negative and page-aligned (multiple of 4096).
+    if offset < 0 || (offset as u64 & 4095) != 0 {
+        return Errno::EINVAL.into();
+    }
+
+    // 3. For file-backed mappings (MAP_ANONYMOUS 0x20 not set), fd must be a valid file descriptor.
+    let is_anon = (flags & 0x20) != 0;
+    let is_shared = (flags & 0x0f) == 0x01 || (flags & 0x0f) == 0x03;
 
     let file_desc = if !is_anon {
+        if fd < 0 {
+            return Errno::EBADF.into();
+        }
         match proc_fd::current_task_get_file_desc(fd) {
             Some(d) => Some(d),
             None => return Errno::EBADF.into(),

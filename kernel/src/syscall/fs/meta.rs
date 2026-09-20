@@ -455,6 +455,13 @@ pub fn sys_unlink(pathname: *const u8) -> SyscallResult {
 pub fn sys_unlink_with_resolved_path(resolved_path: String) -> SyscallResult {
     // kprintln!("[syscall] unlink(\"{}\")", resolved_path);
 
+    // POSIX.1-2017 & Linux unlink(2): If path refers to a directory, unlink shall fail and set errno to EISDIR.
+    if let Some(target_inode) = crate::fs::vfs::lookup_follow(&resolved_path, false) {
+        if target_inode.inode().is_dir() {
+            return Errno::EISDIR.into();
+        }
+    }
+
     // Split resolved_path into parent directory and base name
     let (parent_path, name) = crate::fs::path::split_path(&resolved_path);
 

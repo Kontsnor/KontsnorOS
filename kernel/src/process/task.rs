@@ -161,6 +161,8 @@ impl Drop for AddressSpace {
 pub struct FdTable {
     pub entries: Vec<Option<Arc<FileDescription>>>,
     pub cloexec: Vec<bool>,
+    /// Optimization hint: index of the lowest unallocated descriptor slot.
+    pub next_free_fd: usize,
 }
 
 /// A Task Control Block (TCB).
@@ -350,6 +352,7 @@ impl Task {
             fd_table: Arc::new(spin::Mutex::new(FdTable {
                 entries,
                 cloexec: alloc::vec![false, false, false],
+                next_free_fd: 3,
             })),
             cwd: String::from("/"),
             pending_signals: 0,

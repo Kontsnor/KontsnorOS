@@ -76,6 +76,7 @@ pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
             let mut child_fds = child_task.fd_table.lock();
             child_fds.entries = parent_fds.entries.clone();
             child_fds.cloexec = parent_fds.cloexec.clone();
+            child_fds.next_free_fd = parent_fds.next_free_fd;
             for slot in &child_fds.entries {
                 if let Some(ref file_desc) = slot {
                     *file_desc.ref_count.lock() += 1;
@@ -754,6 +755,7 @@ pub fn sys_execve(
                 let current_table = task.fd_table.lock();
                 let new_entries = current_table.entries.clone();
                 let new_cloexec = current_table.cloexec.clone();
+                let next_free_fd = current_table.next_free_fd;
                 for slot in &new_entries {
                     if let Some(ref file_desc) = slot {
                         *file_desc.ref_count.lock() += 1;
@@ -763,6 +765,7 @@ pub fn sys_execve(
                 task.fd_table = Arc::new(spin::Mutex::new(crate::process::task::FdTable {
                     entries: new_entries,
                     cloexec: new_cloexec,
+                    next_free_fd,
                 }));
             }
 
@@ -775,6 +778,7 @@ pub fn sys_execve(
                         if *rc > 0 {
                             *rc -= 1;
                         }
+                        fd_table.next_free_fd = fd_table.next_free_fd.min(i);
                     }
                     fd_table.cloexec[i] = false;
                 }
@@ -1430,6 +1434,7 @@ pub fn sys_clone(
                 let mut child_fds = child_task.fd_table.lock();
                 child_fds.entries = parent_fds.entries.clone();
                 child_fds.cloexec = parent_fds.cloexec.clone();
+                child_fds.next_free_fd = parent_fds.next_free_fd;
                 for slot in &child_fds.entries {
                     if let Some(ref file_desc) = slot {
                         *file_desc.ref_count.lock() += 1;

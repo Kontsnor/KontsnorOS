@@ -607,17 +607,21 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                 new_fd += 1;
             }
 
-            if (new_fd as usize) >= fd_table.entries.len() {
-                fd_table.entries.resize(new_fd as usize + 1, None);
+            let new_fd_idx = new_fd as usize;
+            if new_fd_idx >= fd_table.entries.len() {
+                fd_table.entries.resize(new_fd_idx + 1, None);
             }
-            if (new_fd as usize) >= fd_table.cloexec.len() {
-                fd_table.cloexec.resize(new_fd as usize + 1, false);
+            if new_fd_idx >= fd_table.cloexec.len() {
+                fd_table.cloexec.resize(new_fd_idx + 1, false);
             }
-            fd_table.entries[new_fd as usize] = Some(file_desc);
+            fd_table.entries[new_fd_idx] = Some(file_desc);
+            if new_fd_idx == fd_table.next_free_fd {
+                fd_table.next_free_fd += 1;
+            }
             if cmd == 1030 {
-                fd_table.cloexec[new_fd as usize] = true;
+                fd_table.cloexec[new_fd_idx] = true;
             } else {
-                fd_table.cloexec[new_fd as usize] = false;
+                fd_table.cloexec[new_fd_idx] = false;
             }
 
             if crate::syscall::DEBUG_SYSCALLS {

@@ -349,6 +349,7 @@ impl Scheduler {
                 task.fd_table = Arc::new(spin::Mutex::new(crate::process::task::FdTable {
                     entries: Vec::new(),
                     cloexec: Vec::new(),
+                    next_free_fd: 0,
                 }));
                 // Only clear fd_table entries if this task was the sole owner of the fd_table
                 // (strong_count == 1 because only old_fd_table holds the last reference after detaching).

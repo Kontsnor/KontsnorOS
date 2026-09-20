@@ -16,6 +16,8 @@
 //! Freestanding memory and unwind stubs for self-hosting compilation
 //! under `x86_64-unknown-linux-musl` with `-C link-self-contained=no`.
 
+#![allow(suspicious_runtime_symbol_definitions)]
+
 #[cfg(not(target_os = "none"))]
 #[no_mangle]
 pub extern "C" fn rust_eh_personality() {}

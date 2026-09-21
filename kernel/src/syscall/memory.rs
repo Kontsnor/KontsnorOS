@@ -47,13 +47,30 @@ pub fn sys_mmap(
     use crate::process::fd as proc_fd;
     use crate::process::scheduler;
 
+    // POSIX.1-2017 / Linux mmap(2): length cannot be 0.
     if length == 0 {
         return Errno::EINVAL.into();
     }
 
-    // We support anonymous private mappings and private/shared file mappings
-    let is_anon = (flags & 0x20) != 0 || fd == -1;
-    let is_shared = (flags & 0x01) != 0;
+    // POSIX.1-2017 / Linux mmap(2): offset must be non-negative and page-aligned.
+    if offset < 0 || (offset as u64 & 4095) != 0 {
+        return Errno::EINVAL.into();
+    }
+
+    // POSIX.1-2017 / Linux mmap(2): flags must specify exactly one mapping type:
+    // MAP_SHARED (0x01), MAP_PRIVATE (0x02), or MAP_SHARED_VALIDATE (0x03).
+    let map_type = flags & 0x0f;
+    if map_type != 0x01 && map_type != 0x02 && map_type != 0x03 {
+        return Errno::EINVAL.into();
+    }
+
+    let is_anon = (flags & 0x20) != 0;
+    // POSIX.1-2017: Non-anonymous mappings without MAP_ANONYMOUS (0x20) require a valid file descriptor.
+    if !is_anon && fd < 0 {
+        return Errno::EBADF.into();
+    }
+
+    let is_shared = (map_type & 0x01) != 0;
 
     let file_desc = if !is_anon {
         match proc_fd::current_task_get_file_desc(fd) {

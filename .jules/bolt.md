@@ -19,3 +19,7 @@
 ## 2026-03-30 - TicketLock Atomic Memory Ordering Optimization
 **Learning:** In `kernel/src/sync/spinlock.rs`, `TicketLock` was using `Ordering::SeqCst` for all atomic operations (`fetch_add`, `store`, `load`, `swap`). On x86_64, `SeqCst` stores emit bus-locking `XCHG` or `MFENCE` instructions (~20-30 cycles), whereas `Relaxed` stores compile to plain `MOV` instructions (0 cycles). Replacing `SeqCst` with `Relaxed` (for ticket allocation and holder CPU tracking), `Acquire` (for now_serving spin-waits), and `Release` (for now_serving increment on release) reduces atomic synchronization overhead by >50% per spinlock acquire/release cycle.
 **Action:** Avoid default `SeqCst` orderings on hot synchronization primitives. Use `Acquire`/`Release` for lock barriers and `Relaxed` for independent atomic counter operations or holder tracking.
+
+## 2026-03-30 - O(1) File Descriptor Allocation Hint Optimization
+**Learning:** In `kernel/src/process/fd.rs` and `kernel/src/syscall/fs/io.rs`, `alloc_fd`, `dup`, and `fcntl(F_DUPFD)` performed linear O(N) searches starting at index 0 through `fd_table.entries` on every descriptor allocation. Adding a `next_free_fd: usize` lower-bound hint to `FdTable` allows descriptor allocations to immediately jump to the first unallocated slot in O(1) fast-path time, bypassing comparisons over already-occupied slots (0..`next_free_fd`).
+**Action:** When managing dynamic index tables or slot vectors in process/resource management, track a lower-bound hint index to convert linear search allocations to O(1) fast-path lookups.

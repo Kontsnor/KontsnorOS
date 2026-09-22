@@ -105,18 +105,38 @@ pub fn current_task_alloc_fd_with_flags_and_path(
     let mut fd_table = task.fd_table.lock();
     let file_desc = Arc::new(FileDescription::new(inode, flags, path));
 
-    // Find first free slot (first None entry)
-    for (i, slot) in fd_table.entries.iter_mut().enumerate() {
+    // Fast-path: start searching for free slots from next_free_fd hint
+    let start_idx = fd_table.next_free_fd;
+    for i in start_idx..fd_table.entries.len() {
         if i >= task.rlimit_nofile_cur as usize {
             return None;
         }
-        if slot.is_none() {
-            *slot = Some(file_desc);
+        if fd_table.entries[i].is_none() {
+            fd_table.entries[i] = Some(file_desc);
             if i >= fd_table.cloexec.len() {
                 fd_table.cloexec.resize(i + 1, false);
             }
             fd_table.cloexec[i] = (flags.0 & OpenFlags::O_CLOEXEC) != 0;
+            fd_table.next_free_fd = i + 1;
             return Some(i as i32);
+        }
+    }
+
+    // Fallback if hint was past 0 and missed an earlier freed slot
+    if start_idx > 0 {
+        for i in 0..start_idx {
+            if i >= task.rlimit_nofile_cur as usize {
+                return None;
+            }
+            if fd_table.entries[i].is_none() {
+                fd_table.entries[i] = Some(file_desc);
+                if i >= fd_table.cloexec.len() {
+                    fd_table.cloexec.resize(i + 1, false);
+                }
+                fd_table.cloexec[i] = (flags.0 & OpenFlags::O_CLOEXEC) != 0;
+                fd_table.next_free_fd = i + 1;
+                return Some(i as i32);
+            }
         }
     }
 
@@ -126,8 +146,10 @@ pub fn current_task_alloc_fd_with_flags_and_path(
         fd_table.entries.push(Some(file_desc));
         fd_table.cloexec.resize(next_idx + 1, false);
         fd_table.cloexec[next_idx] = (flags.0 & OpenFlags::O_CLOEXEC) != 0;
+        fd_table.next_free_fd = next_idx + 1;
         Some(next_idx as i32)
     } else {
+        fd_table.next_free_fd = task.rlimit_nofile_cur as usize;
         None // EMFILE
     }
 }
@@ -153,7 +175,11 @@ pub fn current_task_close_fd(fd: i32) -> bool {
         if fd_idx < fd_table.cloexec.len() {
             fd_table.cloexec[fd_idx] = false;
         }
-        fd_table.entries[fd_idx].take()
+        let item = fd_table.entries[fd_idx].take();
+        if fd_idx < fd_table.next_free_fd {
+            fd_table.next_free_fd = fd_idx;
+        }
+        item
     } else {
         None
     };
@@ -186,18 +212,38 @@ pub fn current_task_dup_fd(fd: i32) -> Option<i32> {
     let file_desc = fd_table.entries.get(fd_idx)?.as_ref().cloned()?;
     *file_desc.ref_count.lock() += 1;
 
-    // Find first free slot (first None entry)
-    for (i, slot) in fd_table.entries.iter_mut().enumerate() {
+    // Fast-path: start searching for free slots from next_free_fd hint
+    let start_idx = fd_table.next_free_fd;
+    for i in start_idx..fd_table.entries.len() {
         if i >= task.rlimit_nofile_cur as usize {
             return None;
         }
-        if slot.is_none() {
-            *slot = Some(file_desc);
+        if fd_table.entries[i].is_none() {
+            fd_table.entries[i] = Some(file_desc);
             if i >= fd_table.cloexec.len() {
                 fd_table.cloexec.resize(i + 1, false);
             }
             fd_table.cloexec[i] = false; // dup clears close-on-exec
+            fd_table.next_free_fd = i + 1;
             return Some(i as i32);
+        }
+    }
+
+    // Fallback if hint was past 0 and missed an earlier freed slot
+    if start_idx > 0 {
+        for i in 0..start_idx {
+            if i >= task.rlimit_nofile_cur as usize {
+                return None;
+            }
+            if fd_table.entries[i].is_none() {
+                fd_table.entries[i] = Some(file_desc);
+                if i >= fd_table.cloexec.len() {
+                    fd_table.cloexec.resize(i + 1, false);
+                }
+                fd_table.cloexec[i] = false; // dup clears close-on-exec
+                fd_table.next_free_fd = i + 1;
+                return Some(i as i32);
+            }
         }
     }
 
@@ -207,8 +253,10 @@ pub fn current_task_dup_fd(fd: i32) -> Option<i32> {
         fd_table.entries.push(Some(file_desc));
         fd_table.cloexec.resize(next_idx + 1, false);
         fd_table.cloexec[next_idx] = false; // dup clears close-on-exec
+        fd_table.next_free_fd = next_idx + 1;
         Some(next_idx as i32)
     } else {
+        fd_table.next_free_fd = task.rlimit_nofile_cur as usize;
         None
     }
 }
@@ -259,6 +307,9 @@ pub fn current_task_dup2_fd(oldfd: i32, newfd: i32) -> Option<i32> {
 
     fd_table.entries[newfd_idx] = Some(file_desc);
     fd_table.cloexec[newfd_idx] = false; // dup2 clears close-on-exec
+    if newfd_idx == fd_table.next_free_fd {
+        fd_table.next_free_fd = newfd_idx + 1;
+    }
 
     drop(fd_table);
     drop(task);
@@ -305,6 +356,9 @@ pub fn current_task_dup3_fd(oldfd: i32, newfd: i32, cloexec: bool) -> Option<i32
 
     fd_table.entries[newfd_idx] = Some(file_desc);
     fd_table.cloexec[newfd_idx] = cloexec;
+    if newfd_idx == fd_table.next_free_fd {
+        fd_table.next_free_fd = newfd_idx + 1;
+    }
 
     drop(fd_table);
     drop(task);

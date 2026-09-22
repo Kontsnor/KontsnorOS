@@ -929,11 +929,25 @@ pub fn sys_sched_yield() -> SyscallResult {
 /// `wait4(pid, wstatus, options, rusage)` — Wait for a child process.
 ///
 /// Cooperatively yields until a zombie child is found, then reaps it.
-pub fn sys_wait4(pid: i32, wstatus: *mut i32, options: i32, _rusage: *mut u8) -> SyscallResult {
+pub fn sys_wait4(pid: i32, wstatus: *mut i32, options: i32, rusage: *mut u8) -> SyscallResult {
     use crate::process::task::TaskState;
+
+    // POSIX.1-2017 & Linux wait4(2) / waitpid(2): Validate options flags.
+    // Allowed options flags: WNOHANG (1), WUNTRACED (2), WCONTINUED (8),
+    // __WCLONE (0x80000000), __WALL (0x40000000), __WNOTHREAD (0x20000000).
+    const WAIT4_ALLOWED_OPTIONS: i32 = 1 | 2 | 8 | (0x80000000u32 as i32) | 0x40000000 | 0x20000000;
+    if (options & !WAIT4_ALLOWED_OPTIONS) != 0 {
+        return Errno::EINVAL.into();
+    }
 
     if !wstatus.is_null()
         && validate_user_ptr_write(wstatus as *mut u8, core::mem::size_of::<i32>()).is_err()
+    {
+        return Errno::EFAULT.into();
+    }
+
+    if !rusage.is_null()
+        && validate_user_ptr_write(rusage, core::mem::size_of::<super::info::RUsage>()).is_err()
     {
         return Errno::EFAULT.into();
     }
@@ -1034,9 +1048,18 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, options: i32, _rusage: *mut u8) ->
                 x86_64::instructions::interrupts::enable();
 
                 // Write exit status to user-space if wstatus is non-null and not WNOHANG 0
-                if child_pid.as_u64() != 0 && !wstatus.is_null() {
-                    unsafe {
-                        wstatus.write_volatile((exit_code & 0xFF) << 8);
+                if child_pid.as_u64() != 0 {
+                    if !wstatus.is_null() {
+                        unsafe {
+                            wstatus.write_volatile((exit_code & 0xFF) << 8);
+                        }
+                    }
+                    if !rusage.is_null() {
+                        let ru = super::info::RUsage::default();
+                        // SAFETY: rusage was validated with validate_user_ptr_write above.
+                        unsafe {
+                            core::ptr::write(rusage as *mut super::info::RUsage, ru);
+                        }
                     }
                 }
                 return child_pid.as_u64() as SyscallResult;
@@ -1113,6 +1136,25 @@ pub fn sys_waitid(
     options: i32,
     _ru: *mut u8,
 ) -> SyscallResult {
+    // POSIX.1-2017 & Linux waitid(2):
+    // 1. Allowed options: WNOHANG (1), WSTOPPED/WUNTRACED (2), WEXITED (4), WCONTINUED (8),
+    //    WNOWAIT (0x01000000), __WCLONE (0x80000000), __WALL (0x40000000), __WNOTHREAD (0x20000000).
+    // 2. options MUST contain at least one of WEXITED (4), WSTOPPED (2), or WCONTINUED (8).
+    const WAITID_ALLOWED_OPTIONS: i32 =
+        1 | 2 | 4 | 8 | 0x01000000 | (0x80000000u32 as i32) | 0x40000000 | 0x20000000;
+    if (options & !WAITID_ALLOWED_OPTIONS) != 0 {
+        return Errno::EINVAL.into();
+    }
+    if (options & (4 | 2 | 8)) == 0 {
+        return Errno::EINVAL.into();
+    }
+
+    if !infop.is_null()
+        && validate_user_ptr_write(infop as *mut u8, core::mem::size_of::<SigInfo>()).is_err()
+    {
+        return Errno::EFAULT.into();
+    }
+
     let pid = match which {
         0 => -1,  // P_ALL
         1 => id,  // P_PID
@@ -1121,10 +1163,12 @@ pub fn sys_waitid(
     };
 
     let mut wstatus = 0i32;
+    // Strip WEXITED (4) and WNOWAIT (0x01000000) before forwarding to sys_wait4
+    let wait4_options = options & !4 & !0x01000000;
     let ret = sys_wait4(
         pid,
         &mut wstatus as *mut i32,
-        options,
+        wait4_options,
         core::ptr::null_mut(),
     );
     if ret < 0 {

@@ -78,8 +78,8 @@ pub struct CpuContext {
     pub gs_base: u64,
     /// IA32_KERNEL_GS_BASE MSR — offset 0x60.
     pub kernel_gs_base: u64,
-    /// Reserved alignment padding for 16-byte aligned FXSAVE area.
-    pub _reserved: u64,
+    /// Has the task used FPU/SSE? If non-zero, fxsave/fxrstor are active.
+    pub fpu_used: u64,
     /// 512-byte x87 FPU and SSE/AVX register state.
     pub fxsave: [u8; 512],
 }
@@ -107,7 +107,7 @@ impl Default for CpuContext {
             fs_base: 0,
             gs_base: 0,
             kernel_gs_base: 0,
-            _reserved: 0,
+            fpu_used: 0,
             fxsave,
         }
     }
@@ -188,12 +188,13 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut CpuContext, _new_ctx: *co
         "shl rdx, 32",
         "or rax, rdx",
         "mov [rdi + 0x60], rax",
-        // Save FPU/SSE state (XMM0-XMM15, MXCSR, FPU control words)
+        // Save FPU/SSE state unconditionally
         "fxsave64 [rdi + 0x70]",
         // ── Restore new context ────────────────────────────────────
         // rsi = new_ctx pointer
 
-        // Restore FPU/SSE state before register clobbers
+        // Restore FPU/SSE state unconditionally
+        "clts",
         "fxrstor64 [rsi + 0x70]",
         // 1. Read all values from [rsi] while still in the current address space
         // where [rsi] is guaranteed to be mapped.
@@ -221,11 +222,14 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut CpuContext, _new_ctx: *co
         "popfq",
         // 5. Restore FS_BASE (TLS)
         "wrfsbase rax",
-        // 6. Restore KERNEL_GS_BASE MSR unconditionally
+        // 6. Restore KERNEL_GS_BASE MSR only if changed
+        "cmp [rdi + 0x60], rdx",
+        "je 6f",
         "mov rax, rdx",
         "shr rdx, 32",
         "mov ecx, 0xC0000102",
         "wrmsr",
+        "6:",
         // 7. Jump to the new task's entry point
         "jmp r9",
     );

@@ -485,7 +485,7 @@ pub extern "C" fn ap_entry() -> ! {
     super::interrupts::init_idt();
 
     // 3. Enable SSE and FSGSBASE
-    // SAFETY: Enabling SSE and FSGSBASE is safe on x86_64 CPUs.
+    // SAFETY: SSE is safe on x86_64 CPUs; FSGSBASE validates CPUID.(7,0):EBX[0] before setting CR4.
     unsafe {
         super::boot::enable_sse();
         super::boot::enable_fsgsbase();

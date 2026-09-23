@@ -113,6 +113,10 @@ impl InodeOps for SocketInode {
         &self.inode
     }
 
+    fn wait_queue(&self) -> Option<Arc<crate::sync::wait_queue::WaitQueue>> {
+        Some(self.socket.lock().wait_queue.clone())
+    }
+
     fn as_socket(&self) -> Option<Arc<Mutex<Socket>>> {
         Some(self.socket.clone())
     }
@@ -159,54 +163,57 @@ impl InodeOps for SocketInode {
                 sock.tcp_recv_buf.drain(..n);
 
                 // Check if user-space drain reopened the receive window significantly
-                // or if buffer was full/nearly full previously.
+                // or if buffer was drained completely to prevent zero-window deadlocks.
                 let new_buf_len = sock.tcp_recv_buf.len();
-                let prev_wnd = super::tcp::TCP_MAX_RECV_BUF.saturating_sub(prev_buf_len);
                 let new_wnd = super::tcp::TCP_MAX_RECV_BUF.saturating_sub(new_buf_len);
+                let new_wnd_u16 = (new_wnd as u32).min(65535) as u16;
 
-                // If window opened by at least 16 KB or opened from 0, send window update ACK
-                if (prev_wnd == 0 && new_wnd > 0) || (new_wnd.saturating_sub(prev_wnd) >= 16384) {
-                    if sock.tcp_state == TcpState::Established {
-                        if let (
-                            Some(local_ip),
-                            Some(remote_ip),
-                            Some(local_port),
-                            Some(remote_port),
-                        ) = (
-                            sock.local_addr,
-                            sock.remote_addr,
-                            sock.local_port,
-                            sock.remote_port,
+                // Send window update ACK if:
+                // 1. Buffer was drained to empty (prevent zero-window stall)
+                // 2. Previously advertised window was restricted (< 32768) and current window opened significantly (>= 32768)
+                // 3. Previously advertised window was 0 and has now reopened
+                // 4. Or window opened by at least 16 KB since last advertised
+                let should_send_wnd_update = new_buf_len == 0
+                    || (sock.tcp_rcv_wnd < 32768 && new_wnd_u16 >= 32768)
+                    || (sock.tcp_rcv_wnd == 0 && new_wnd_u16 > 0)
+                    || (new_wnd_u16.saturating_sub(sock.tcp_rcv_wnd) >= 16384);
+
+                if should_send_wnd_update && sock.tcp_state == TcpState::Established {
+                    sock.tcp_rcv_wnd = new_wnd_u16;
+                    if let (Some(local_ip), Some(remote_ip), Some(local_port), Some(remote_port)) = (
+                        sock.local_addr,
+                        sock.remote_addr,
+                        sock.local_port,
+                        sock.remote_port,
+                    ) {
+                        let seq = sock.tcp_snd_nxt;
+                        let ack = sock.tcp_rcv_nxt;
+                        let wnd = new_wnd_u16;
+
+                        drop(sock);
+
+                        let mut tcp_buf = [0u8; 128];
+                        if let Some(tcp_len) = super::tcp::build_tcp_packet(
+                            &mut tcp_buf,
+                            local_ip,
+                            remote_ip,
+                            local_port,
+                            remote_port,
+                            seq,
+                            ack,
+                            super::tcp::TCP_ACK,
+                            wnd,
+                            &[],
                         ) {
-                            let seq = sock.tcp_snd_nxt;
-                            let ack = sock.tcp_rcv_nxt;
-                            let wnd = (new_wnd as u32).min(65535) as u16;
-
-                            drop(sock);
-
-                            let mut tcp_buf = [0u8; 128];
-                            if let Some(tcp_len) = super::tcp::build_tcp_packet(
-                                &mut tcp_buf,
+                            let _ = super::ipv4::send_packet(
                                 local_ip,
                                 remote_ip,
-                                local_port,
-                                remote_port,
-                                seq,
-                                ack,
-                                super::tcp::TCP_ACK,
-                                wnd,
-                                &[],
-                            ) {
-                                let _ = super::ipv4::send_packet(
-                                    local_ip,
-                                    remote_ip,
-                                    super::ipv4::PROTO_TCP,
-                                    &tcp_buf[..tcp_len],
-                                );
-                            }
-
-                            return Ok(n);
+                                super::ipv4::PROTO_TCP,
+                                &tcp_buf[..tcp_len],
+                            );
                         }
+
+                        return Ok(n);
                     }
                 }
             }
@@ -244,7 +251,8 @@ impl InodeOps for SocketInode {
             // SOCK_STREAM (TCP)
             let (local_ip, remote_ip, local_port, remote_port, tcp_snd_nxt, tcp_rcv_nxt) = {
                 let sock = self.socket.lock();
-                if sock.tcp_state != TcpState::Established {
+                if sock.tcp_state != TcpState::Established && sock.tcp_state != TcpState::CloseWait
+                {
                     return Err(-32); // EPIPE / ENOTCONN
                 }
                 (
@@ -376,14 +384,23 @@ impl InodeOps for SocketInode {
                     if (events & crate::fs::inode::POLLIN) != 0 {
                         revents |= crate::fs::inode::POLLIN;
                     }
+                    if (events & crate::fs::inode::POLLOUT) != 0 {
+                        revents |= crate::fs::inode::POLLOUT;
+                    }
                 }
                 crate::net::tcp::TcpState::Closed => {
                     // If we previously attempted a connect (had_remote_addr),
                     // a Closed state here means the connection failed or was
-                    // reset. Signal POLLERR and POLLHUP so libcurl's
-                    // non-blocking connect error path fires correctly.
+                    // reset. Signal POLLERR and POLLHUP (as well as POLLOUT/POLLIN)
+                    // so libcurl's non-blocking connect error path fires correctly.
                     if sock.had_remote_addr {
                         revents |= crate::fs::inode::POLLERR | crate::fs::inode::POLLHUP;
+                        if (events & crate::fs::inode::POLLOUT) != 0 {
+                            revents |= crate::fs::inode::POLLOUT;
+                        }
+                        if (events & crate::fs::inode::POLLIN) != 0 {
+                            revents |= crate::fs::inode::POLLIN;
+                        }
                     }
                 }
                 _ => {}

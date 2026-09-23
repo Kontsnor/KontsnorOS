@@ -24,6 +24,7 @@
 //! - `/dev/random` — reads return random bytes
 //! - `/dev/console` — kernel console
 
+use crate::drivers::traits::BlockDevice;
 use crate::kprintln;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -552,7 +553,7 @@ impl InodeOps for DevFb0 {
                 Ok(0)
             }
             FBIOBLANK => Ok(0),
-            _ => Err(-22), // EINVAL
+            _ => Err(-25), // ENOTTY
         }
     }
 
@@ -685,4 +686,150 @@ pub fn register_pts_device(name: String, device: Arc<dyn InodeOps>) {
         pts.entries.write().insert(name.clone(), device);
         kprintln!("[devfs] Registered pts device: /dev/pts/{}", name);
     }
+}
+
+static NEXT_DEVFS_INO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(100);
+
+/// A block device node in devfs, translating byte-stream file operations
+/// to block-aligned reads/writes on an underlying `BlockDevice`.
+pub struct BlockDevNode {
+    inode: Inode,
+    device: Arc<dyn BlockDevice>,
+}
+
+impl BlockDevNode {
+    pub fn new(device: Arc<dyn BlockDevice>, major: u64, minor: u64) -> Self {
+        let ino = NEXT_DEVFS_INO.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let mut inode = Inode::new(ino, FileType::BlockDevice).with_dev(DEVFS_DEV_ID);
+        inode.rdev = (major << 8) | (minor & 0xff);
+        inode.permissions = super::inode::FilePermissions::new(0o660);
+        inode.size = device.block_count().saturating_mul(device.block_size());
+        inode.blocks = device.block_count();
+        Self { inode, device }
+    }
+}
+
+impl InodeOps for BlockDevNode {
+    fn inode(&self) -> &Inode {
+        &self.inode
+    }
+
+    fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
+        let block_size = self.device.block_size();
+        if block_size == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+
+        let total_size = self.device.block_count().saturating_mul(block_size);
+        if offset >= total_size {
+            return Ok(0);
+        }
+
+        let to_read = (buf.len() as u64).min(total_size - offset) as usize;
+        let mut bytes_read = 0;
+        let mut temp_block = alloc::vec![0u8; block_size as usize];
+
+        while bytes_read < to_read {
+            let curr_offset = offset + bytes_read as u64;
+            let block_idx = curr_offset / block_size;
+            let block_offset = (curr_offset % block_size) as usize;
+            let chunk = (to_read - bytes_read).min(block_size as usize - block_offset);
+
+            if block_offset == 0 && chunk == block_size as usize {
+                if self
+                    .device
+                    .read_block(block_idx, &mut buf[bytes_read..bytes_read + chunk])
+                    .is_err()
+                {
+                    return if bytes_read > 0 {
+                        Ok(bytes_read)
+                    } else {
+                        Err(-5)
+                    };
+                }
+            } else {
+                if self.device.read_block(block_idx, &mut temp_block).is_err() {
+                    return if bytes_read > 0 {
+                        Ok(bytes_read)
+                    } else {
+                        Err(-5)
+                    };
+                }
+                buf[bytes_read..bytes_read + chunk]
+                    .copy_from_slice(&temp_block[block_offset..block_offset + chunk]);
+            }
+
+            bytes_read += chunk;
+        }
+
+        Ok(bytes_read)
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> Result<usize, i32> {
+        let block_size = self.device.block_size();
+        if block_size == 0 || data.is_empty() {
+            return Ok(0);
+        }
+
+        let total_size = self.device.block_count().saturating_mul(block_size);
+        if offset >= total_size {
+            return Err(-28); // ENOSPC
+        }
+
+        let to_write = (data.len() as u64).min(total_size - offset) as usize;
+        let mut bytes_written = 0;
+        let mut temp_block = alloc::vec![0u8; block_size as usize];
+
+        while bytes_written < to_write {
+            let curr_offset = offset + bytes_written as u64;
+            let block_idx = curr_offset / block_size;
+            let block_offset = (curr_offset % block_size) as usize;
+            let chunk = (to_write - bytes_written).min(block_size as usize - block_offset);
+
+            if block_offset == 0 && chunk == block_size as usize {
+                if self
+                    .device
+                    .write_block(block_idx, &data[bytes_written..bytes_written + chunk])
+                    .is_err()
+                {
+                    return if bytes_written > 0 {
+                        Ok(bytes_written)
+                    } else {
+                        Err(-5)
+                    };
+                }
+            } else {
+                if self.device.read_block(block_idx, &mut temp_block).is_err() {
+                    return if bytes_written > 0 {
+                        Ok(bytes_written)
+                    } else {
+                        Err(-5)
+                    };
+                }
+                temp_block[block_offset..block_offset + chunk]
+                    .copy_from_slice(&data[bytes_written..bytes_written + chunk]);
+                if self.device.write_block(block_idx, &temp_block).is_err() {
+                    return if bytes_written > 0 {
+                        Ok(bytes_written)
+                    } else {
+                        Err(-5)
+                    };
+                }
+            }
+
+            bytes_written += chunk;
+        }
+
+        Ok(bytes_written)
+    }
+
+    fn ioctl(&self, _request: u64, _arg: u64) -> Result<u64, i32> {
+        Ok(0)
+    }
+}
+
+/// Register a block device in devfs.
+pub fn register_block_device_node(name: &str, device: Arc<dyn BlockDevice>) {
+    let node = Arc::new(BlockDevNode::new(device, 259, 0));
+    register_device(name, node);
 }

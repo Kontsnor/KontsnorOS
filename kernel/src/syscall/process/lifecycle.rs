@@ -763,6 +763,7 @@ pub fn sys_execve(
                 task.fd_table = Arc::new(spin::Mutex::new(crate::process::task::FdTable {
                     entries: new_entries,
                     cloexec: new_cloexec,
+                    next_free_fd: 0,
                 }));
             }
 
@@ -916,7 +917,7 @@ pub fn sys_exit_group(status: i32) -> SyscallResult {
     scheduler::schedule();
 
     loop {
-        x86_64::instructions::hlt();
+        x86_64::instructions::interrupts::enable_and_hlt();
     }
 }
 
@@ -929,7 +930,7 @@ pub fn sys_sched_yield() -> SyscallResult {
 /// `wait4(pid, wstatus, options, rusage)` — Wait for a child process.
 ///
 /// Cooperatively yields until a zombie child is found, then reaps it.
-pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -> SyscallResult {
+pub fn sys_wait4(pid: i32, wstatus: *mut i32, options: i32, _rusage: *mut u8) -> SyscallResult {
     use crate::process::task::TaskState;
 
     if !wstatus.is_null()
@@ -943,9 +944,20 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
         None => return Errno::ESRCH.into(),
     };
 
-    // kprintln!("[syscall] wait4(pid={})", pid);
+    let current_task_pgid = scheduler::get_task_arc(current_pid)
+        .map(|t| t.lock().pgid)
+        .unwrap_or(0);
 
     loop {
+        // Handle pending unblocked signals (excluding SIGCHLD which we are waiting on/handling)
+        if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+            let task = task_arc.lock();
+            let unblocked = task.pending_signals & !task.blocked_signals;
+            if (unblocked & !(1 << 16)) != 0 {
+                return Errno::EINTR.into();
+            }
+        }
+
         // Disable interrupts and lock SCHEDULER
         x86_64::instructions::interrupts::disable();
         let mut sched_lock = crate::process::scheduler::SCHEDULER.lock();
@@ -955,36 +967,40 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
             let tasks = scheduler::TASKS.read();
             let mut found = None;
             let mut has_children = false;
-            for slot in tasks.iter() {
-                if let Some(task_arc) = slot {
-                    if let Some(task) = task_arc.try_lock() {
+
+            if pid > 0 {
+                let idx = pid as usize;
+                if let Some(Some(task_arc)) = tasks.get(idx) {
+                    let task = task_arc.lock();
+                    let is_child = task.parent_pid == current_pid;
+                    let is_process_leader = task.tgid == task.pid;
+                    if is_child && is_process_leader {
+                        has_children = true;
+                        if task.state == TaskState::Zombie {
+                            found = Some((task.pid, task.exit_code.unwrap_or(0)));
+                        }
+                    }
+                }
+            } else {
+                for slot in tasks.iter() {
+                    if let Some(task_arc) = slot {
+                        let task = task_arc.lock();
                         let is_child = task.parent_pid == current_pid;
-                        let matches_pid = pid == -1 || task.pid.as_u64() as i32 == pid;
-                        // CLONE_THREAD tasks (threads, not process leaders) are never
-                        // wait4-able from an external process.  They are reaped by
-                        // the thread-group leader via pthread_join / futex, not wait4.
+                        let matches_pid = if pid == -1 {
+                            true
+                        } else if pid == 0 {
+                            task.pgid == current_task_pgid
+                        } else {
+                            task.pgid == (-pid) as u64
+                        };
                         let is_process_leader = task.tgid == task.pid;
                         if is_child && matches_pid && is_process_leader {
                             has_children = true;
                             if task.state == TaskState::Zombie {
-                                if crate::syscall::DEBUG_SYSCALLS {
-                                    let (total_f, alloc_f, free_f) =
-                                        crate::memory::physical::stats();
-                                    crate::kprintln!(
-                                        "[syscall] wait4: found zombie child PID {}, free_mem={}MB/{}MB (alloc_frames={})",
-                                        task.pid,
-                                        (free_f * 4096) / (1024 * 1024),
-                                        (total_f * 4096) / (1024 * 1024),
-                                        alloc_f
-                                    );
-                                }
                                 found = Some((task.pid, task.exit_code.unwrap_or(0)));
                                 break;
                             }
                         }
-                    } else {
-                        // Task is active on another core; assume runnable child
-                        has_children = true;
                     }
                 }
             }
@@ -1005,6 +1021,9 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
                 Some(Ok((child_pid, exit_code)))
             } else if !has_children {
                 Some(Err(Errno::ECHILD))
+            } else if (options & 1) != 0 {
+                // WNOHANG: Return 0 immediately if children exist but none are zombies yet
+                Some(Ok((crate::process::pid::Pid::from_raw(0), 0)))
             } else {
                 None
             }
@@ -1015,8 +1034,8 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
                 drop(sched_lock);
                 x86_64::instructions::interrupts::enable();
 
-                // Write exit status to user-space if wstatus is non-null with interrupts enabled
-                if !wstatus.is_null() {
+                // Write exit status to user-space if wstatus is non-null and not WNOHANG 0
+                if child_pid.as_u64() != 0 && !wstatus.is_null() {
                     unsafe {
                         wstatus.write_volatile((exit_code & 0xFF) << 8);
                     }
@@ -1030,7 +1049,6 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
             }
             None => {
                 // Sleep on our child_wait_queue until a child exits.
-                // Since we hold the SCHEDULER lock, no child can exit or wake us up before we block!
                 let task_arc = match scheduler::get_task_arc(current_pid) {
                     Some(t) => t,
                     None => {
@@ -1047,13 +1065,16 @@ pub fn sys_wait4(pid: i32, wstatus: *mut i32, _options: i32, _rusage: *mut u8) -
                 wait_queue.register(current_pid);
                 drop(sched_lock);
 
-                // Note: schedule() will yield CPU and re-enable interrupts inside the new task's context switch
-                scheduler::schedule();
-
-                // When we wake up, interrupts are enabled. We must disable them again to clean up and re-loop
-                x86_64::instructions::interrupts::disable();
-                wait_queue.remove(current_pid);
+                // Enable interrupts before yielding so IPIs and timer events are delivered
                 x86_64::instructions::interrupts::enable();
+
+                // If a child exited concurrently and transitioned us to Ready, do not deschedule
+                let already_ready = task_arc.lock().state != TaskState::Blocked;
+                if !already_ready {
+                    scheduler::schedule();
+                }
+
+                wait_queue.remove(current_pid);
             }
         }
     }

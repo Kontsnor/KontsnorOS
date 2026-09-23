@@ -21,6 +21,7 @@
 
 use crate::kprintln;
 use crate::sync::spinlock::TicketLock;
+use alloc::sync::Arc;
 
 /// Size of the keyboard input ring buffer (4 KiB, power-of-2 for fast masking).
 const BUFFER_CAPACITY: usize = 4096;
@@ -86,6 +87,15 @@ static KEYBOARD_BUFFER: TicketLock<RingBuffer> = TicketLock::new(RingBuffer::new
 /// Global stdin wait queue.
 pub static STDIN_WAIT_QUEUE: crate::sync::wait_queue::WaitQueue =
     crate::sync::wait_queue::WaitQueue::new();
+
+lazy_static::lazy_static! {
+    pub static ref STDIN_WAIT_QUEUE_ARC: Arc<crate::sync::wait_queue::WaitQueue> =
+        Arc::new(crate::sync::wait_queue::WaitQueue::new());
+}
+
+pub fn stdin_wait_queue() -> Arc<crate::sync::wait_queue::WaitQueue> {
+    STDIN_WAIT_QUEUE_ARC.clone()
+}
 
 /// Whether the Shift key is currently pressed.
 static SHIFT_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -182,6 +192,7 @@ pub fn push_scancode(scancode: u8) {
     if let Some(ascii) = scan_to_ascii(scancode) {
         KEYBOARD_BUFFER.lock().push(ascii);
         STDIN_WAIT_QUEUE.wake_all();
+        STDIN_WAIT_QUEUE_ARC.wake_all();
     }
 }
 
@@ -190,6 +201,7 @@ pub fn push_scancode(scancode: u8) {
 pub fn push_char(byte: u8) {
     KEYBOARD_BUFFER.lock().push(byte);
     STDIN_WAIT_QUEUE.wake_all();
+    STDIN_WAIT_QUEUE_ARC.wake_all();
 }
 
 /// Non-blocking read of one ASCII character from the keyboard buffer.

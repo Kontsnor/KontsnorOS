@@ -327,7 +327,7 @@ pub trait InodeOps: Send + Sync {
 
     /// Device-specific I/O control.
     fn ioctl(&self, _request: u64, _arg: u64) -> Result<u64, i32> {
-        Err(-22) // EINVAL
+        Err(-25) // ENOTTY
     }
 
     /// Set non-blocking state of the inode.
@@ -336,6 +336,26 @@ pub trait InodeOps: Send + Sync {
     /// Poll for I/O readiness.
     fn poll(&self, events: u32) -> u32 {
         events
+    }
+
+    /// Return the wait queue associated with this inode for event monitoring (poll / epoll).
+    fn wait_queue(&self) -> Option<alloc::sync::Arc<crate::sync::wait_queue::WaitQueue>> {
+        if let Some(s) = self.as_socket() {
+            return Some(s.lock().wait_queue.clone());
+        }
+        if let Some(t) = self.as_timerfd() {
+            return Some(t.wait_queue.clone());
+        }
+        if let Some(e) = self.as_eventfd() {
+            return Some(e.wait_queue.clone());
+        }
+        if let Some(s) = self.as_signalfd() {
+            return Some(s.wait_queue.clone());
+        }
+        if let Some(ep) = self.as_epoll() {
+            return Some(ep.wait_queue.clone());
+        }
+        None
     }
 
     /// Downcast helpers

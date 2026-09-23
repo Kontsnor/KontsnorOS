@@ -383,58 +383,86 @@ pub fn flush_all_for_inode(inode: &Arc<dyn InodeOps>) -> Result<(), Errno> {
     flush_all_for_inode_inner(&**inode)
 }
 
+/// Record of a shared memory mapping for scalable reverse-lookup during page cache sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedMmapRecord {
+    pub page_table_root: u64,
+    pub dev: u64,
+    pub ino: u64,
+    pub start: u64,
+    pub len: usize,
+    pub offset: u64,
+}
+
+pub static SHARED_MMAP_RECORDS: spin::Mutex<alloc::vec::Vec<SharedMmapRecord>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
+
+/// Register a shared file mapping for reverse-mapping tracking.
+pub fn register_shared_mmap(record: SharedMmapRecord) {
+    let mut list = SHARED_MMAP_RECORDS.lock();
+    if !list
+        .iter()
+        .any(|r| r.page_table_root == record.page_table_root && r.start == record.start)
+    {
+        list.push(record);
+    }
+}
+
+/// Unregister any shared mappings overlapping [start, end) for a given page table.
+pub fn unregister_shared_mmap_range(page_table_root: u64, start: u64, end: u64) {
+    let mut list = SHARED_MMAP_RECORDS.lock();
+    list.retain(|r| {
+        if r.page_table_root != page_table_root {
+            return true;
+        }
+        let r_end = r.start + r.len as u64;
+        r_end <= start || r.start >= end
+    });
+}
+
+/// Unregister all shared mappings for an address space being freed.
+pub fn unregister_shared_mmaps_for_page_table(page_table_root: u64) {
+    let mut list = SHARED_MMAP_RECORDS.lock();
+    list.retain(|r| r.page_table_root != page_table_root);
+}
+
 /// Helper function implementing dirty page cache flushing for all pages of an inode using raw `&dyn InodeOps`.
 pub fn flush_all_for_inode_inner(inode: &dyn InodeOps) -> Result<(), Errno> {
     let dev = inode.inode().dev;
     let ino = inode.inode().ino;
 
-    // Collect Arc references to all active tasks under the read lock, then drop it immediately
-    // to prevent cross-thread read-write lock deadlocks if a task exits/forks concurrently.
-    let task_arcs: alloc::vec::Vec<(usize, Arc<spin::Mutex<crate::process::task::Task>>)> = {
-        let tasks = crate::process::scheduler::TASKS.read();
-        tasks
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, opt)| opt.as_ref().map(|arc| (idx, arc.clone())))
+    // Use reverse mapping registry to query only shared mappings for this inode,
+    // completely eliminating lock contention on TASKS and O(N) full task scans.
+    let matching_records: alloc::vec::Vec<SharedMmapRecord> = {
+        let list = SHARED_MMAP_RECORDS.lock();
+        list.iter()
+            .filter(|r| r.dev == dev && r.ino == ino)
+            .copied()
             .collect()
     };
 
-    for (_idx, task_arc) in task_arcs {
+    for record in matching_records {
         x86_64::instructions::interrupts::without_interrupts(|| {
-            if let Some(task) = task_arc.try_lock() {
-                if let Some(addr_space) = task.address_space.try_lock() {
-                    for region in &addr_space.mmap_regions {
-                        if region.is_shared
-                            && region
-                                .inode
-                                .as_ref()
-                                .map(|i| (i.inode().dev, i.inode().ino))
-                                == Some((dev, ino))
-                        {
-                            let start_page = region.start & !4095;
-                            let end_page = (region.start + region.len as u64 - 1) & !4095;
-                            for vaddr in (start_page..=end_page).step_by(4096) {
-                                let page_offset_in_mapping = vaddr - region.start;
-                                let file_offset = region.offset + page_offset_in_mapping;
+            let start_page = record.start & !4095;
+            let end_page = (record.start + record.len as u64 - 1) & !4095;
+            for vaddr in (start_page..=end_page).step_by(4096) {
+                let page_offset_in_mapping = vaddr - record.start;
+                let file_offset = record.offset + page_offset_in_mapping;
 
-                                unsafe {
-                                    if let Some(pte) = get_page_table_entry(
-                                        addr_space.page_table_root,
-                                        VirtAddr::new(vaddr),
-                                    ) {
-                                        let mut flags = pte.flags();
-                                        if flags.contains(PageTableFlags::DIRTY) {
-                                            flags.remove(PageTableFlags::DIRTY);
-                                            pte.set_addr(pte.addr(), flags);
-                                            x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
+                // SAFETY: get_page_table_entry safely traverses the page table root.
+                unsafe {
+                    if let Some(pte) =
+                        get_page_table_entry(record.page_table_root, VirtAddr::new(vaddr))
+                    {
+                        let mut flags = pte.flags();
+                        if flags.contains(PageTableFlags::DIRTY) {
+                            flags.remove(PageTableFlags::DIRTY);
+                            pte.set_addr(pte.addr(), flags);
+                            x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
 
-                                            // Mark dirty in cache
-                                            let aligned_file_offset = file_offset & !4095;
-                                            page_cache_mark_dirty(dev, ino, aligned_file_offset);
-                                        }
-                                    }
-                                }
-                            }
+                            // Mark dirty in cache
+                            let aligned_file_offset = file_offset & !4095;
+                            page_cache_mark_dirty(dev, ino, aligned_file_offset);
                         }
                     }
                 }

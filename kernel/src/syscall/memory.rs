@@ -292,6 +292,21 @@ pub fn sys_mmap(
                 is_stack: false,
             });
 
+        if is_shared {
+            if let Some(ref desc) = file_desc {
+                crate::memory::page_cache::register_shared_mmap(
+                    crate::memory::page_cache::SharedMmapRecord {
+                        page_table_root: addr_space.page_table_root,
+                        dev: desc.inode.inode().dev,
+                        ino: desc.inode.inode().ino,
+                        start: resolved,
+                        len: aligned_len,
+                        offset: offset as u64,
+                    },
+                );
+            }
+        }
+
         if is_dev_fb0 {
             use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
             use x86_64::{PhysAddr, VirtAddr};
@@ -447,6 +462,11 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
             }
         }
         addr_space.mmap_regions = new_regions;
+        crate::memory::page_cache::unregister_shared_mmap_range(
+            page_table_root,
+            unmap_start,
+            unmap_end,
+        );
         if unmap_end >= addr_space.mmap_bump && addr < 0x0000_7000_0000_0000 {
             let highest_remaining = addr_space
                 .mmap_regions

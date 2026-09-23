@@ -464,7 +464,7 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
 
     // If there is absolutely no other task left (should not happen due to idle task)
     loop {
-        x86_64::instructions::hlt();
+        x86_64::instructions::interrupts::enable_and_hlt();
     }
 }
 

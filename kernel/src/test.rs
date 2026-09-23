@@ -104,6 +104,42 @@ fn test_memory_allocator() {
 }
 
 #[test_case]
+fn test_path_normalization() {
+    kprintln!("[test] Starting path normalization test...");
+
+    use crate::fs::path::{is_normalized, join, normalize, normalize_jailed};
+
+    // 1. Test is_normalized
+    assert!(is_normalized("/"));
+    assert!(is_normalized("/usr/bin"));
+    assert!(is_normalized("/a/b/c"));
+    assert!(is_normalized("foo/bar"));
+    assert!(!is_normalized(""));
+    assert!(!is_normalized("//usr/bin"));
+    assert!(!is_normalized("/usr/bin/"));
+    assert!(!is_normalized("/usr/./bin"));
+    assert!(!is_normalized("/usr/../bin"));
+
+    // 2. Test normalize fast-path and component resolution
+    assert_eq!(normalize("/usr/bin"), "/usr/bin");
+    assert_eq!(normalize("/usr/./local/../bin"), "/usr/bin");
+    assert_eq!(normalize("///foo//bar"), "/foo/bar");
+    assert_eq!(normalize("a/b/../c"), "a/c");
+    assert_eq!(normalize(""), "/");
+
+    // 3. Test join with pre-allocated capacity
+    assert_eq!(join("/usr", "bin"), "/usr/bin");
+    assert_eq!(join("/usr/", "bin"), "/usr/bin");
+    assert_eq!(join("/usr", "/bin"), "/bin");
+
+    // 4. Test normalize_jailed
+    assert_eq!(normalize_jailed("/jail/a/b/../../c", "/jail"), "/jail/c");
+    assert_eq!(normalize_jailed("/jail/../../..", "/jail"), "/jail");
+
+    kprintln!("[test] Path normalization test PASSED!");
+}
+
+#[test_case]
 fn test_vfs_path_resolution() {
     kprintln!("[test] Starting VFS path resolution test...");
     // Lookup non-existent path
@@ -1480,6 +1516,57 @@ fn test_nvme_identify_parsing() {
     assert_eq!(block_size_12, 4096);
 
     kprintln!("[test] NVMe Identify Parsing test PASSED!");
+}
+
+#[test_case]
+fn test_nvme_identify_controller_parsing() {
+    kprintln!("[test] Starting NVMe Identify Controller Parsing test...");
+
+    let mut id_ctrl_buf = alloc::vec![0u8; 4096];
+
+    // Serial number at offset 4..24 (20 ASCII bytes)
+    let sn = b"TEST-NVME-SN-1234   ";
+    id_ctrl_buf[4..24].copy_from_slice(sn);
+
+    // Model number at offset 24..64 (40 ASCII bytes)
+    let mn = b"KONTSNOR-NVME-DRIVE                     ";
+    id_ctrl_buf[24..64].copy_from_slice(mn);
+
+    // Firmware revision at offset 64..72 (8 ASCII bytes)
+    let fr = b"1.0.0   ";
+    id_ctrl_buf[64..72].copy_from_slice(fr);
+
+    // Number of Namespaces at offset 516..520 (u32)
+    let nn: u32 = 1;
+    id_ctrl_buf[516..520].copy_from_slice(&nn.to_ne_bytes());
+
+    let mut sn_bytes = [0u8; 20];
+    let mut mn_bytes = [0u8; 40];
+    let mut fr_bytes = [0u8; 8];
+    sn_bytes.copy_from_slice(&id_ctrl_buf[4..24]);
+    mn_bytes.copy_from_slice(&id_ctrl_buf[24..64]);
+    fr_bytes.copy_from_slice(&id_ctrl_buf[64..72]);
+
+    let parsed_sn = core::str::from_utf8(&sn_bytes).unwrap().trim();
+    let parsed_mn = core::str::from_utf8(&mn_bytes).unwrap().trim();
+    let parsed_fr = core::str::from_utf8(&fr_bytes).unwrap().trim();
+    let parsed_nn = u32::from_ne_bytes(id_ctrl_buf[516..520].try_into().unwrap());
+
+    assert_eq!(parsed_sn, "TEST-NVME-SN-1234");
+    assert_eq!(parsed_mn, "KONTSNOR-NVME-DRIVE");
+    assert_eq!(parsed_fr, "1.0.0");
+    assert_eq!(parsed_nn, 1);
+
+    // Also verify doorbell offset calculation:
+    // Doorbell Offset = 0x1000 + (2 * QID + is_cq) * (4 << DSTRD)
+    let dstrd = 0u32; // stride = 4
+    let stride = 4 << dstrd;
+    assert_eq!(0x1000 + (2 * 0 + 0) * stride, 0x1000); // Admin SQ
+    assert_eq!(0x1000 + (2 * 0 + 1) * stride, 0x1004); // Admin CQ
+    assert_eq!(0x1000 + (2 * 1 + 0) * stride, 0x1008); // IO SQ
+    assert_eq!(0x1000 + (2 * 1 + 1) * stride, 0x100C); // IO CQ
+
+    kprintln!("[test] NVMe Identify Controller Parsing test PASSED!");
 }
 
 static FUTEX_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -3268,4 +3355,33 @@ fn test_devfs_special_nodes() {
     assert_eq!(write_urandom, 32);
 
     kprintln!("[test] devfs special character device nodes test PASSED!");
+}
+
+#[test_case]
+fn test_lseek_espipe_on_pipe() {
+    kprintln!("[test] Starting lseek ESPIPE on pipe test...");
+    let mut pipefds = [0i32; 2];
+    let res = crate::syscall::fs::sys_pipe(pipefds.as_mut_ptr());
+    assert_eq!(res, 0);
+
+    let read_fd = pipefds[0];
+    let write_fd = pipefds[1];
+
+    let lseek_read_res = crate::syscall::fs::sys_lseek(read_fd, 0, 0);
+    assert_eq!(
+        lseek_read_res,
+        crate::syscall::Errno::ESPIPE as i64,
+        "lseek on pipe read end must return -ESPIPE (-29)"
+    );
+
+    let lseek_write_res = crate::syscall::fs::sys_lseek(write_fd, 0, 0);
+    assert_eq!(
+        lseek_write_res,
+        crate::syscall::Errno::ESPIPE as i64,
+        "lseek on pipe write end must return -ESPIPE (-29)"
+    );
+
+    crate::syscall::fs::sys_close(read_fd);
+    crate::syscall::fs::sys_close(write_fd);
+    kprintln!("[test] lseek ESPIPE on pipe test PASSED!");
 }

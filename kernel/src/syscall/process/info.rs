@@ -140,7 +140,7 @@ pub fn boot_realtime_sec() -> u64 {
     BOOT_REALTIME_SEC.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-fn get_monotonic_ns() -> u64 {
+pub fn get_monotonic_ns() -> u64 {
     let ticks = crate::arch::x86_64::interrupts::timer_ticks();
     let current_count = crate::arch::x86_64::apic::get_lapic_timer_current() as u64;
     let init_count = 10_000_000;
@@ -150,6 +150,19 @@ fn get_monotonic_ns() -> u64 {
         0
     };
     ticks * 10_000_000 + sub_tick
+}
+
+pub fn get_realtime_ns() -> u64 {
+    let boot_sec = BOOT_REALTIME_SEC.load(core::sync::atomic::Ordering::Relaxed);
+    boot_sec * 1_000_000_000 + get_monotonic_ns()
+}
+
+/// `timespec` struct used by `clock_gettime` and `nanosleep`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimeSpec {
+    pub tv_sec: i64,
+    pub tv_nsec: i64,
 }
 
 /// `gettimeofday(tv, tz)` — Return current time-of-day.
@@ -183,13 +196,6 @@ pub fn sys_gettimeofday(tv: *mut u8, tz: *mut u8) -> SyscallResult {
         }
     }
     0
-}
-
-/// `timespec` struct used by `clock_gettime` and `nanosleep`.
-#[repr(C)]
-struct TimeSpec {
-    tv_sec: i64,
-    tv_nsec: i64,
 }
 
 /// `clock_gettime(clockid, tp)` — Return current clock value.
@@ -265,34 +271,70 @@ pub fn sys_nanosleep(req: *const u8, rem: *mut u8) -> SyscallResult {
     let start_ns = get_monotonic_ns();
     let end_ns = start_ns.saturating_add(sleep_ns);
 
+    sleep_until(end_ns, rem)
+}
+
+/// Helper to put the current task to sleep until an absolute monotonic deadline in nanoseconds.
+pub fn sleep_until(end_ns: u64, rem: *mut u8) -> SyscallResult {
     let current_pid = match crate::process::scheduler::current_pid() {
         Some(p) => p,
         None => return Errno::ESRCH.into(),
     };
 
-    while get_monotonic_ns() < end_ns {
-        // Check for unblocked pending signals
-        if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
-            let task = task_arc.lock();
-            let unblocked = task.pending_signals & !task.blocked_signals;
-            if unblocked != 0 {
-                let now = get_monotonic_ns();
-                let remaining_ns = end_ns.saturating_sub(now);
-                if !rem.is_null() {
-                    if validate_user_ptr_write(rem, core::mem::size_of::<TimeSpec>()).is_ok() {
-                        let remaining_ts = TimeSpec {
-                            tv_sec: (remaining_ns / 1_000_000_000) as i64,
-                            tv_nsec: (remaining_ns % 1_000_000_000) as i64,
-                        };
-                        unsafe {
-                            core::ptr::write(rem as *mut TimeSpec, remaining_ts);
-                        }
-                    }
-                }
-                return Errno::EINTR.into();
+    let mut now = get_monotonic_ns();
+    if now >= end_ns {
+        if !rem.is_null() {
+            if validate_user_ptr_write(rem, core::mem::size_of::<TimeSpec>()).is_err() {
+                return Errno::EFAULT.into();
+            }
+            let zero_ts = TimeSpec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            unsafe {
+                core::ptr::write(rem as *mut TimeSpec, zero_ts);
             }
         }
-        crate::process::scheduler::yield_now();
+        return 0;
+    }
+
+    // Register sleep timer and block task
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        crate::process::scheduler::register_sleep_timer(current_pid, end_ns);
+        let sched_lock = crate::process::scheduler::SCHEDULER.lock();
+        if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+            task_arc.lock().state = crate::process::task::TaskState::Blocked;
+        }
+        drop(sched_lock);
+    });
+
+    // Schedule other tasks (or idle task which executes HLT!)
+    crate::process::scheduler::schedule();
+
+    // Woken up: remove timer in case it was woken early by signal
+    crate::process::scheduler::remove_sleep_timer(current_pid);
+
+    now = get_monotonic_ns();
+
+    // Check if an unblocked signal woke us early
+    if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
+        let task = task_arc.lock();
+        let unblocked = task.pending_signals & !task.blocked_signals;
+        if unblocked != 0 && now < end_ns {
+            let remaining_ns = end_ns.saturating_sub(now);
+            if !rem.is_null() {
+                if validate_user_ptr_write(rem, core::mem::size_of::<TimeSpec>()).is_ok() {
+                    let remaining_ts = TimeSpec {
+                        tv_sec: (remaining_ns / 1_000_000_000) as i64,
+                        tv_nsec: (remaining_ns % 1_000_000_000) as i64,
+                    };
+                    unsafe {
+                        core::ptr::write(rem as *mut TimeSpec, remaining_ts);
+                    }
+                }
+            }
+            return Errno::EINTR.into();
+        }
     }
 
     if !rem.is_null() {
@@ -307,6 +349,7 @@ pub fn sys_nanosleep(req: *const u8, rem: *mut u8) -> SyscallResult {
             core::ptr::write(rem as *mut TimeSpec, zero_ts);
         }
     }
+
     0
 }
 
@@ -1100,17 +1143,54 @@ pub fn sys_clock_getres(clock_id: i32, res: *mut u8) -> SyscallResult {
     0
 }
 
+pub const TIMER_ABSTIME: i32 = 1;
+
 /// `clock_nanosleep(clock_id, flags, req, rem)` — High-resolution sleep with a specified clock.
 pub fn sys_clock_nanosleep(
     clock_id: i32,
-    _flags: i32,
+    flags: i32,
     req: *const u8,
     rem: *mut u8,
 ) -> SyscallResult {
     if clock_id < 0 || clock_id > 11 {
         return Errno::EINVAL.into();
     }
-    sys_nanosleep(req, rem)
+    if req.is_null() {
+        return Errno::EFAULT.into();
+    }
+    if !validate_user_ptr(req, core::mem::size_of::<TimeSpec>()) {
+        return Errno::EFAULT.into();
+    }
+
+    let ts = unsafe { *(req as *const TimeSpec) };
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return Errno::EINVAL.into();
+    }
+
+    let req_ns = (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64);
+
+    let end_ns = if flags & TIMER_ABSTIME != 0 {
+        if clock_id == 0 {
+            // CLOCK_REALTIME: req is absolute Unix epoch timestamp
+            let boot_sec = BOOT_REALTIME_SEC.load(core::sync::atomic::Ordering::Relaxed);
+            let boot_ns = boot_sec.saturating_mul(1_000_000_000);
+            if req_ns <= boot_ns {
+                0
+            } else {
+                req_ns - boot_ns
+            }
+        } else {
+            // CLOCK_MONOTONIC or other clock: req is absolute monotonic timestamp
+            req_ns
+        }
+    } else {
+        // Relative sleep
+        get_monotonic_ns().saturating_add(req_ns)
+    };
+
+    sleep_until(end_ns, rem)
 }
 
 /// `clock_settime(clock_id, tp)` — Set the specified clock.

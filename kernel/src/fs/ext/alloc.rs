@@ -18,21 +18,6 @@
 use super::{read_blocks, write_blocks};
 use super::{ExtFileSystem, ExtRawInode};
 
-/// Helper to count free bits (zeros) in a bitmap buffer.
-pub fn count_free_bits(bitmap: &[u8], total_count: u32) -> u32 {
-    let mut count = 0;
-    for i in 0..total_count {
-        let byte_idx = (i / 8) as usize;
-        let bit_idx = i % 8;
-        if byte_idx < bitmap.len() {
-            if (bitmap[byte_idx] & (1 << bit_idx)) == 0 {
-                count += 1;
-            }
-        }
-    }
-    count
-}
-
 impl ExtFileSystem {
     /// Allocate up to `count` contiguous blocks from the filesystem block bitmap.
     /// Returns `(start_block_num, allocated_count)`.

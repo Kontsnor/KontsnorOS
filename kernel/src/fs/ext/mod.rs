@@ -40,17 +40,23 @@ pub const EXT_DEV_ID: u64 = 1;
 
 /// Helper to count free bits (zeros) in a bitmap buffer.
 pub(crate) fn count_free_bits(bitmap: &[u8], total_count: u32) -> u32 {
-    let mut count = 0;
-    for i in 0..total_count {
-        let byte_idx = (i / 8) as usize;
-        let bit_idx = i % 8;
-        if byte_idx < bitmap.len() {
-            if (bitmap[byte_idx] & (1 << bit_idx)) == 0 {
-                count += 1;
-            }
-        }
+    let full_bytes = (total_count / 8) as usize;
+    let tail_bits = total_count % 8;
+
+    let full_bytes_count = bitmap
+        .iter()
+        .take(full_bytes)
+        .map(|&b| b.count_zeros())
+        .sum::<u32>();
+
+    if tail_bits > 0 && full_bytes < bitmap.len() {
+        let mask = (1u8 << tail_bits) - 1;
+        let tail_byte = bitmap[full_bytes] & mask;
+        let zeros = (tail_byte | !mask).count_zeros();
+        full_bytes_count + zeros
+    } else {
+        full_bytes_count
     }
-    count
 }
 
 /// Safely deserialize `ExtRawInode` respecting `inode_size` and buffer bounds.

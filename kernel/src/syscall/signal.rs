@@ -212,6 +212,10 @@ pub fn sys_kill(pid: i32, sig: i32) -> SyscallResult {
 }
 
 /// `rt_sigaction(signum, act, oldact, sigsetsize)` — Set signal handler.
+///
+/// Ref: POSIX.1-2017 / Linux sigaction(2): Attempting to set a new handler (!act.is_null())
+/// for SIGKILL (9) or SIGSTOP (19) returns -EINVAL. However, querying current handler
+/// (act.is_null() && !oldact.is_null()) for SIGKILL/SIGSTOP is permitted and returns 0.
 pub fn sys_rt_sigaction(
     signum: i32,
     act: *const crate::process::task::SigAction,
@@ -221,8 +225,8 @@ pub fn sys_rt_sigaction(
     if signum < 1 || signum > 64 || sigsetsize != 8 {
         return Errno::EINVAL.into();
     }
-    if signum == 9 || signum == 19 {
-        // SIGKILL, SIGSTOP cannot be caught
+    if !act.is_null() && (signum == 9 || signum == 19) {
+        // SIGKILL, SIGSTOP cannot be caught or ignored when setting new action
         return Errno::EINVAL.into();
     }
 

@@ -18,8 +18,9 @@
 use crate::fs::inode::InodeOps;
 use crate::sync::spinlock::TicketLock;
 use crate::syscall::Errno;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use x86_64::structures::paging::{PageTable, PageTableFlags};
 use x86_64::VirtAddr;
 
@@ -32,6 +33,9 @@ pub struct PageCacheEntry {
     pub dirty: bool,
 }
 
+/// Global atomic count of currently dirty pages across all shards.
+pub static DIRTY_PAGE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 /// Number of independent page cache shards.
 /// Must be a power of two so shard selection is a cheap bitwise AND.
 const PAGE_CACHE_SHARD_COUNT: usize = 64;
@@ -39,12 +43,14 @@ const PAGE_CACHE_SHARD_COUNT: usize = 64;
 /// A single page cache shard.
 struct PageCacheShard {
     map: BTreeMap<(u64, u64, u64), PageCacheEntry>,
+    dirty_inodes: BTreeSet<(u64, u64)>,
 }
 
 impl PageCacheShard {
     const fn new() -> Self {
         Self {
             map: BTreeMap::new(),
+            dirty_inodes: BTreeSet::new(),
         }
     }
 }
@@ -56,20 +62,20 @@ static PAGE_CACHE_SHARDS: [TicketLock<PageCacheShard>; PAGE_CACHE_SHARD_COUNT] =
     [SHARD; PAGE_CACHE_SHARD_COUNT]
 };
 
-/// Select the shard index for a given `(dev, ino, aligned_offset)` key.
+/// Select the shard index for a given `(dev, ino)` key.
+/// Partitioning by (dev, ino) ensures that all pages of a file live within a single shard,
+/// allowing fast O(K) range lookups and flushes rather than scanning all 64 shards.
 #[inline(always)]
-fn shard_index(dev: u64, ino: u64, aligned_offset: u64) -> usize {
-    // Mix dev, ino, and offset so adjacent pages and different files land in distinct shards.
+pub fn shard_index(dev: u64, ino: u64) -> usize {
     let mixed = dev
         .wrapping_mul(1_140_071_481_932_319_8485)
-        .wrapping_add(ino.wrapping_mul(2_654_435_761))
-        .wrapping_add(aligned_offset >> 12);
+        .wrapping_add(ino.wrapping_mul(2_654_435_761));
     (mixed as usize) & (PAGE_CACHE_SHARD_COUNT - 1)
 }
 
 /// Look up an entry in the sharded page cache.
 pub fn page_cache_get(dev: u64, ino: u64, aligned_offset: u64) -> Option<PageCacheEntry> {
-    let shard = shard_index(dev, ino, aligned_offset);
+    let shard = shard_index(dev, ino);
     PAGE_CACHE_SHARDS[shard]
         .lock()
         .map
@@ -79,59 +85,105 @@ pub fn page_cache_get(dev: u64, ino: u64, aligned_offset: u64) -> Option<PageCac
 
 /// Insert an entry into the sharded page cache.
 pub fn page_cache_insert(dev: u64, ino: u64, aligned_offset: u64, entry: PageCacheEntry) {
-    let shard = shard_index(dev, ino, aligned_offset);
-    PAGE_CACHE_SHARDS[shard]
-        .lock()
-        .map
-        .insert((dev, ino, aligned_offset), entry);
+    let shard = shard_index(dev, ino);
+    let mut guard = PAGE_CACHE_SHARDS[shard].lock();
+    if entry.dirty {
+        guard.dirty_inodes.insert((dev, ino));
+        let new_count = DIRTY_PAGE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if new_count >= crate::fs::flusher::DIRTY_WATERMARK_PAGES {
+            crate::fs::flusher::wake_flusher();
+        }
+    }
+    if let Some(old) = guard.map.insert((dev, ino, aligned_offset), entry) {
+        if old.dirty && !entry.dirty {
+            DIRTY_PAGE_COUNT.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Remove an entry from the sharded page cache.
 pub fn page_cache_remove(dev: u64, ino: u64, aligned_offset: u64) {
-    let shard = shard_index(dev, ino, aligned_offset);
-    PAGE_CACHE_SHARDS[shard]
-        .lock()
-        .map
-        .remove(&(dev, ino, aligned_offset));
+    let shard = shard_index(dev, ino);
+    let mut guard = PAGE_CACHE_SHARDS[shard].lock();
+    if let Some(entry) = guard.map.remove(&(dev, ino, aligned_offset)) {
+        if entry.dirty {
+            DIRTY_PAGE_COUNT.fetch_sub(1, Ordering::Relaxed);
+            let has_dirty = guard
+                .map
+                .range((dev, ino, 0)..=(dev, ino, u64::MAX))
+                .any(|(_, e)| e.dirty);
+            if !has_dirty {
+                guard.dirty_inodes.remove(&(dev, ino));
+            }
+        }
+    }
 }
 
 /// Invalidate and remove all cached pages for the given inode on a filesystem device.
 pub fn page_cache_invalidate_inode(dev: u64, ino: u64) {
-    for shard in &PAGE_CACHE_SHARDS {
-        let mut guard = shard.lock();
-        guard.map.retain(|key, entry| {
-            if key.0 == dev && key.1 == ino {
-                crate::memory::physical::deallocate_frame(entry.phys_addr);
-                false
-            } else {
-                true
+    let shard = shard_index(dev, ino);
+    let mut guard = PAGE_CACHE_SHARDS[shard].lock();
+    guard.dirty_inodes.remove(&(dev, ino));
+
+    let keys: alloc::vec::Vec<(u64, u64, u64)> = guard
+        .map
+        .range((dev, ino, 0)..=(dev, ino, u64::MAX))
+        .map(|(&k, _)| k)
+        .collect();
+
+    for k in keys {
+        if let Some(entry) = guard.map.remove(&k) {
+            if entry.dirty {
+                DIRTY_PAGE_COUNT.fetch_sub(1, Ordering::Relaxed);
             }
-        });
+            crate::memory::physical::deallocate_frame(entry.phys_addr);
+        }
     }
 }
 
 /// Invalidate and remove cached pages for the given inode beyond `size` on a filesystem device.
 pub fn page_cache_truncate_inode(dev: u64, ino: u64, size: u64) {
     let aligned_size = (size + 4095) & !4095;
-    for shard in &PAGE_CACHE_SHARDS {
-        let mut guard = shard.lock();
-        guard.map.retain(|key, entry| {
-            if key.0 == dev && key.1 == ino && key.2 >= aligned_size {
-                crate::memory::physical::deallocate_frame(entry.phys_addr);
-                false
-            } else {
-                true
+    let shard = shard_index(dev, ino);
+    let mut guard = PAGE_CACHE_SHARDS[shard].lock();
+
+    let keys: alloc::vec::Vec<(u64, u64, u64)> = guard
+        .map
+        .range((dev, ino, aligned_size)..=(dev, ino, u64::MAX))
+        .map(|(&k, _)| k)
+        .collect();
+
+    for k in keys {
+        if let Some(entry) = guard.map.remove(&k) {
+            if entry.dirty {
+                DIRTY_PAGE_COUNT.fetch_sub(1, Ordering::Relaxed);
             }
-        });
+            crate::memory::physical::deallocate_frame(entry.phys_addr);
+        }
+    }
+
+    let has_dirty = guard
+        .map
+        .range((dev, ino, 0)..=(dev, ino, u64::MAX))
+        .any(|(_, e)| e.dirty);
+    if !has_dirty {
+        guard.dirty_inodes.remove(&(dev, ino));
     }
 }
 
 /// Mark a cached page as dirty (needs write-back).
 pub fn page_cache_mark_dirty(dev: u64, ino: u64, aligned_offset: u64) {
-    let shard = shard_index(dev, ino, aligned_offset);
+    let shard = shard_index(dev, ino);
     let mut guard = PAGE_CACHE_SHARDS[shard].lock();
     if let Some(entry) = guard.map.get_mut(&(dev, ino, aligned_offset)) {
-        entry.dirty = true;
+        if !entry.dirty {
+            entry.dirty = true;
+            guard.dirty_inodes.insert((dev, ino));
+            let new_count = DIRTY_PAGE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if new_count >= crate::fs::flusher::DIRTY_WATERMARK_PAGES {
+                crate::fs::flusher::wake_flusher();
+            }
+        }
     }
 }
 
@@ -140,10 +192,8 @@ pub fn dirty_inodes() -> alloc::vec::Vec<(u64, u64)> {
     let mut inodes = alloc::vec::Vec::new();
     for shard in &PAGE_CACHE_SHARDS {
         let guard = shard.lock();
-        for (key, entry) in guard.map.iter() {
-            if entry.dirty {
-                inodes.push((key.0, key.1));
-            }
+        for &item in &guard.dirty_inodes {
+            inodes.push(item);
         }
     }
     inodes.sort_unstable();
@@ -156,15 +206,22 @@ pub fn dirty_inodes_for_dev(dev: u64) -> alloc::vec::Vec<u64> {
     let mut inodes = alloc::vec::Vec::new();
     for shard in &PAGE_CACHE_SHARDS {
         let guard = shard.lock();
-        for (key, entry) in guard.map.iter() {
-            if key.0 == dev && entry.dirty {
-                inodes.push(key.1);
+        for &(d, ino) in &guard.dirty_inodes {
+            if d == dev {
+                inodes.push(ino);
             }
         }
     }
     inodes.sort_unstable();
     inodes.dedup();
     inodes
+}
+
+/// Check if a specific inode on a device has any dirty pages currently buffered in cache.
+pub fn inode_has_dirty_pages(dev: u64, ino: u64) -> bool {
+    let shard = shard_index(dev, ino);
+    let guard = PAGE_CACHE_SHARDS[shard].lock();
+    guard.dirty_inodes.contains(&(dev, ino))
 }
 
 /// Walk the page table of a task to get a mutable reference to the target page table entry.
@@ -294,7 +351,7 @@ pub fn get_or_create_page_inner(inode: &dyn InodeOps, offset: u64) -> Result<u64
     }
 
     // 3. Re-acquire shard lock and insert/check atomically (double-checked locking pattern)
-    let shard = shard_index(dev, ino, aligned_offset);
+    let shard = shard_index(dev, ino);
     let mut guard = PAGE_CACHE_SHARDS[shard].lock();
     if let Some(entry) = guard.map.get(&(dev, ino, aligned_offset)) {
         // Someone else allocated and read it in the meantime!
@@ -339,7 +396,7 @@ pub fn flush_page_inner(inode: &dyn InodeOps, offset: u64) -> Result<(), Errno> 
 
     // 1. Check if dirty and copy page info under shard lock
     let phys_to_write = {
-        let shard = shard_index(dev, ino, aligned_offset);
+        let shard = shard_index(dev, ino);
         let guard = PAGE_CACHE_SHARDS[shard].lock();
         if let Some(entry) = guard.map.get(&(dev, ino, aligned_offset)) {
             if entry.dirty {
@@ -366,13 +423,21 @@ pub fn flush_page_inner(inode: &dyn InodeOps, offset: u64) -> Result<(), Errno> 
         }
 
         // 3. Clear dirty flag under shard lock
-        let shard = shard_index(dev, ino, aligned_offset);
+        let shard = shard_index(dev, ino);
         let mut guard = PAGE_CACHE_SHARDS[shard].lock();
         if let Some(entry) = guard.map.get_mut(&(dev, ino, aligned_offset)) {
             // Only clear dirty if the physical page hasn't changed (it shouldn't have)
-            if entry.phys_addr == phys {
+            if entry.phys_addr == phys && entry.dirty {
                 entry.dirty = false;
+                DIRTY_PAGE_COUNT.fetch_sub(1, Ordering::Relaxed);
             }
+        }
+        let has_dirty = guard
+            .map
+            .range((dev, ino, 0)..=(dev, ino, u64::MAX))
+            .any(|(_, e)| e.dirty);
+        if !has_dirty {
+            guard.dirty_inodes.remove(&(dev, ino));
         }
     }
     Ok(())
@@ -470,17 +535,15 @@ pub fn flush_all_for_inode_inner(inode: &dyn InodeOps) -> Result<(), Errno> {
         });
     }
 
-    let mut offsets = alloc::vec::Vec::new();
-    for shard in &PAGE_CACHE_SHARDS {
-        let guard = shard.lock();
-        for (key, entry) in guard.map.iter() {
-            if key.0 == dev && key.1 == ino && entry.dirty {
-                offsets.push(key.2);
-            }
-        }
-    }
-    offsets.sort_unstable();
-    offsets.dedup();
+    let shard = shard_index(dev, ino);
+    let offsets: alloc::vec::Vec<u64> = {
+        let guard = PAGE_CACHE_SHARDS[shard].lock();
+        guard
+            .map
+            .range((dev, ino, 0)..=(dev, ino, u64::MAX))
+            .filter_map(|(key, entry)| if entry.dirty { Some(key.2) } else { None })
+            .collect()
+    };
 
     for offset in offsets {
         flush_page_inner(inode, offset)?;
@@ -568,12 +631,20 @@ pub fn sync_mapped_region(
                     let _ = inode.write_direct(aligned_file_offset, &src_slice[..write_len]);
                 }
 
-                let shard = shard_index(dev, ino, aligned_file_offset);
+                let shard = shard_index(dev, ino);
                 let mut guard = PAGE_CACHE_SHARDS[shard].lock();
                 if let Some(entry) = guard.map.get_mut(&(dev, ino, aligned_file_offset)) {
-                    if entry.phys_addr == phys {
+                    if entry.phys_addr == phys && entry.dirty {
                         entry.dirty = false;
+                        DIRTY_PAGE_COUNT.fetch_sub(1, Ordering::Relaxed);
                     }
+                }
+                let has_dirty = guard
+                    .map
+                    .range((dev, ino, 0)..=(dev, ino, u64::MAX))
+                    .any(|(_, e)| e.dirty);
+                if !has_dirty {
+                    guard.dirty_inodes.remove(&(dev, ino));
                 }
             }
         }

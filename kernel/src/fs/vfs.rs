@@ -34,12 +34,21 @@ use crate::syscall::Errno;
 /// The global VFS instance.
 static VFS: RwLock<Option<Vfs>> = RwLock::new(None);
 
-/// Sync all mounted filesystems.
+/// Sync all mounted filesystems and commit underlying hardware block device caches.
 pub fn sync_all() {
     if let Some(ref vfs) = *VFS.read() {
         for entry in vfs.mounts.values() {
             entry.filesystem.sync();
         }
+    }
+    flush_all_devices();
+}
+
+/// Flush write cache barriers across all registered block devices.
+pub fn flush_all_devices() {
+    let devices = BLOCK_DEVICES.read().clone();
+    for (_name, dev) in devices {
+        let _ = dev.flush();
     }
 }
 

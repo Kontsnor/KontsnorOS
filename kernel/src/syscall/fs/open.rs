@@ -497,7 +497,17 @@ pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: *const u8) -> Syscal
         LINUX_REBOOT_CMD_CAD_ON | LINUX_REBOOT_CMD_CAD_OFF => 0,
         LINUX_REBOOT_CMD_RESTART | LINUX_REBOOT_CMD_RESTART2 => {
             crate::kprintln!("[kernel] System restart requested via reboot()");
-            crate::fs::vfs::sync_all();
+            for _ in 0..100 {
+                crate::fs::vfs::sync_all();
+                if crate::memory::page_cache::DIRTY_PAGE_COUNT
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    == 0
+                {
+                    break;
+                }
+                crate::process::scheduler::yield_now();
+            }
+            crate::fs::vfs::flush_all_devices();
             // Triple fault / 8042 keyboard controller reset
             // SAFETY: Standard x86 8042 reset port access
             unsafe {
@@ -516,7 +526,20 @@ pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: *const u8) -> Syscal
                 current_pid,
                 caller_name
             );
-            crate::fs::vfs::sync_all();
+            // Blocking sync barrier: guarantee all dirty page cache frames and filesystem metadata
+            // are written to disk before triggering ACPI hardware poweroff.
+            for _ in 0..100 {
+                crate::fs::vfs::sync_all();
+                if crate::memory::page_cache::DIRTY_PAGE_COUNT
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    == 0
+                {
+                    break;
+                }
+                crate::process::scheduler::yield_now();
+            }
+            crate::fs::vfs::flush_all_devices();
+
             // Allow pending PTY router and serial queues to drain to console
             for _ in 0..100 {
                 crate::process::scheduler::yield_now();

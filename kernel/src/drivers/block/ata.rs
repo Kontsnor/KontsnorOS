@@ -442,12 +442,19 @@ impl BlockDevice for AtaDrive {
 
     fn flush(&self) -> Result<(), DriverError> {
         let _inner = self.inner.lock();
+        self.select_drive(0).map_err(|_| DriverError::IoError)?;
         let mut command_port = Port::<u8>::new(0x1F7);
         self.wait_ready().map_err(|_| DriverError::Timeout)?;
+        // SAFETY: 0xE7 is standard ATA FLUSH CACHE command dispatched to the command port.
         unsafe {
             command_port.write(0xE7);
-        } // 0xE7 = Cache Flush
+        }
         self.wait_ready().map_err(|_| DriverError::Timeout)?;
+        let mut status_port = Port::<u8>::new(0x1F7);
+        let status = unsafe { status_port.read() };
+        if (status & 0x01) != 0 {
+            return Err(DriverError::IoError);
+        }
         Ok(())
     }
 

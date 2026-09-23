@@ -325,6 +325,11 @@ pub trait InodeOps: Send + Sync {
         Err(-1) // EPERM
     }
 
+    /// Flush cached file data and metadata to persistent storage.
+    fn fsync(&self) -> Result<(), Errno> {
+        Ok(())
+    }
+
     /// Device-specific I/O control.
     fn ioctl(&self, _request: u64, _arg: u64) -> Result<u64, i32> {
         Err(-25) // ENOTTY

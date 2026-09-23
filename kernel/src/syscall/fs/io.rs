@@ -350,7 +350,7 @@ pub fn sys_fsync(fd: i32) -> SyscallResult {
         None => return Errno::EBADF.into(),
     };
 
-    match crate::memory::page_cache::flush_all_for_inode(&file_desc.inode) {
+    match file_desc.inode.fsync() {
         Ok(_) => 0,
         Err(e) => e as SyscallResult,
     }

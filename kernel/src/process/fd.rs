@@ -94,6 +94,11 @@ pub fn current_task_alloc_fd_with_flags(inode: Arc<dyn InodeOps>, flags: OpenFla
 }
 
 /// Allocate the next free file descriptor slot with specified flags and open path.
+///
+/// Performance Rationale:
+/// Uses `fd_table.next_free_fd` as a hint for the first available slot to avoid O(N)
+/// linear scans across occupied file descriptors during frequent open/pipe/socket
+/// syscalls. Reduces FD allocation latency to O(1) on hot syscall paths.
 pub fn current_task_alloc_fd_with_flags_and_path(
     inode: Arc<dyn InodeOps>,
     flags: OpenFlags,
@@ -105,27 +110,51 @@ pub fn current_task_alloc_fd_with_flags_and_path(
     let mut fd_table = task.fd_table.lock();
     let file_desc = Arc::new(FileDescription::new(inode, flags, path));
 
-    // Find first free slot (first None entry)
-    for (i, slot) in fd_table.entries.iter_mut().enumerate() {
-        if i >= task.rlimit_nofile_cur as usize {
+    // Fast-path: start searching from `next_free_fd` to achieve O(1) FD allocation
+    let start_idx = fd_table.next_free_fd;
+    let rlimit = task.rlimit_nofile_cur as usize;
+
+    for i in start_idx..fd_table.entries.len() {
+        if i >= rlimit {
             return None;
         }
-        if slot.is_none() {
-            *slot = Some(file_desc);
+        if fd_table.entries[i].is_none() {
+            fd_table.entries[i] = Some(file_desc);
             if i >= fd_table.cloexec.len() {
                 fd_table.cloexec.resize(i + 1, false);
             }
             fd_table.cloexec[i] = (flags.0 & OpenFlags::O_CLOEXEC) != 0;
+            fd_table.next_free_fd = i + 1;
             return Some(i as i32);
         }
     }
 
-    // No free slot found — extend the table up to rlimit_nofile_cur
+    // Fallback scan if next_free_fd hint was stale (slots before start_idx were freed)
+    if start_idx > 0 {
+        let max_search = core::cmp::min(start_idx, fd_table.entries.len());
+        for i in 0..max_search {
+            if i >= rlimit {
+                return None;
+            }
+            if fd_table.entries[i].is_none() {
+                fd_table.entries[i] = Some(file_desc);
+                if i >= fd_table.cloexec.len() {
+                    fd_table.cloexec.resize(i + 1, false);
+                }
+                fd_table.cloexec[i] = (flags.0 & OpenFlags::O_CLOEXEC) != 0;
+                fd_table.next_free_fd = i + 1;
+                return Some(i as i32);
+            }
+        }
+    }
+
+    // No free slot found in existing entries — extend table up to rlimit
     let next_idx = fd_table.entries.len();
-    if next_idx < task.rlimit_nofile_cur as usize {
+    if next_idx < rlimit {
         fd_table.entries.push(Some(file_desc));
         fd_table.cloexec.resize(next_idx + 1, false);
         fd_table.cloexec[next_idx] = (flags.0 & OpenFlags::O_CLOEXEC) != 0;
+        fd_table.next_free_fd = next_idx + 1;
         Some(next_idx as i32)
     } else {
         None // EMFILE
@@ -152,6 +181,9 @@ pub fn current_task_close_fd(fd: i32) -> bool {
     let desc = if fd_idx < fd_table.entries.len() && fd_table.entries[fd_idx].is_some() {
         if fd_idx < fd_table.cloexec.len() {
             fd_table.cloexec[fd_idx] = false;
+        }
+        if fd_idx < fd_table.next_free_fd {
+            fd_table.next_free_fd = fd_idx;
         }
         fd_table.entries[fd_idx].take()
     } else {
@@ -186,27 +218,50 @@ pub fn current_task_dup_fd(fd: i32) -> Option<i32> {
     let file_desc = fd_table.entries.get(fd_idx)?.as_ref().cloned()?;
     *file_desc.ref_count.lock() += 1;
 
-    // Find first free slot (first None entry)
-    for (i, slot) in fd_table.entries.iter_mut().enumerate() {
-        if i >= task.rlimit_nofile_cur as usize {
+    let start_idx = fd_table.next_free_fd;
+    let rlimit = task.rlimit_nofile_cur as usize;
+
+    for i in start_idx..fd_table.entries.len() {
+        if i >= rlimit {
             return None;
         }
-        if slot.is_none() {
-            *slot = Some(file_desc);
+        if fd_table.entries[i].is_none() {
+            fd_table.entries[i] = Some(file_desc);
             if i >= fd_table.cloexec.len() {
                 fd_table.cloexec.resize(i + 1, false);
             }
             fd_table.cloexec[i] = false; // dup clears close-on-exec
+            fd_table.next_free_fd = i + 1;
             return Some(i as i32);
         }
     }
 
-    // No free slot found — extend the table up to rlimit_nofile_cur
+    // Fallback scan if next_free_fd hint was stale
+    if start_idx > 0 {
+        let max_search = core::cmp::min(start_idx, fd_table.entries.len());
+        for i in 0..max_search {
+            if i >= rlimit {
+                return None;
+            }
+            if fd_table.entries[i].is_none() {
+                fd_table.entries[i] = Some(file_desc);
+                if i >= fd_table.cloexec.len() {
+                    fd_table.cloexec.resize(i + 1, false);
+                }
+                fd_table.cloexec[i] = false; // dup clears close-on-exec
+                fd_table.next_free_fd = i + 1;
+                return Some(i as i32);
+            }
+        }
+    }
+
+    // Extend table up to rlimit_nofile_cur
     let next_idx = fd_table.entries.len();
-    if next_idx < task.rlimit_nofile_cur as usize {
+    if next_idx < rlimit {
         fd_table.entries.push(Some(file_desc));
         fd_table.cloexec.resize(next_idx + 1, false);
         fd_table.cloexec[next_idx] = false; // dup clears close-on-exec
+        fd_table.next_free_fd = next_idx + 1;
         Some(next_idx as i32)
     } else {
         None

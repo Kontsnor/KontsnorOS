@@ -763,6 +763,7 @@ pub fn sys_execve(
                 task.fd_table = Arc::new(spin::Mutex::new(crate::process::task::FdTable {
                     entries: new_entries,
                     cloexec: new_cloexec,
+                    next_free_fd: 0,
                 }));
             }
 

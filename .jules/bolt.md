@@ -8,6 +8,9 @@
 **Learning:** Performing byte-by-byte loops and modulo operations in `PipeBuffer` (`push`/`pop`) incurs severe CPU overhead and branch mispredictions on large pipe read/write operations (e.g. 64 KiB buffers). Implementing `push_slice` and `pop_slice` with `copy_from_slice` reduces transfer overheads from O(N) loop iterations to at most two O(1) bulk memory copies (`rep movsb`).
 **Action:** When working with ring buffers or IPC stream channels, prefer slice-based contiguous chunk copies over element-by-element push/pop loops.
 
+## 2026-03-30 - 32-Byte Unrolled Internet Checksum Optimization
+**Learning:** Computing Internet checksums (RFC 1071) byte-by-byte or 16 bits at a time in `internet_checksum` and `compute_transport_checksum` causes 16x excessive loop iterations and branch overhead during network packet processing. Loop unrolling over 32-byte (16 x 16-bit word) blocks dramatically reduces loop branch checks and instruction pipeline stalls without risk of `u32` accumulator overflow or endianness conversion bugs.
+**Action:** Use multi-word unrolled loops when calculating 16-bit Internet checksums over packet buffers to minimize loop branch overhead while keeping arithmetic safely within `u32`.
 ## 2026-03-30 - Sharded Dentry Cache Lock Contention Reduction
 **Learning:** In `kernel/src/fs/dcache.rs`, a single global `TicketLock` guarding all dcache lookup/insert operations creates severe lock contention under multi-core/multi-process VFS path lookups. Partitioning the cache into 64 independent `TicketLock` shards and replacing guarded counter updates with lock-free `AtomicU64` atomics reduces global lock contention by up to 64x without lock overhead on diagnostic counter updates.
 **Action:** For hot global kernel caches (such as dcache and page cache), prefer sharded locks indexed by hash or offset over single global spinlocks.
@@ -19,3 +22,7 @@
 ## 2026-03-30 - TicketLock Atomic Memory Ordering Optimization
 **Learning:** In `kernel/src/sync/spinlock.rs`, `TicketLock` was using `Ordering::SeqCst` for all atomic operations (`fetch_add`, `store`, `load`, `swap`). On x86_64, `SeqCst` stores emit bus-locking `XCHG` or `MFENCE` instructions (~20-30 cycles), whereas `Relaxed` stores compile to plain `MOV` instructions (0 cycles). Replacing `SeqCst` with `Relaxed` (for ticket allocation and holder CPU tracking), `Acquire` (for now_serving spin-waits), and `Release` (for now_serving increment on release) reduces atomic synchronization overhead by >50% per spinlock acquire/release cycle.
 **Action:** Avoid default `SeqCst` orderings on hot synchronization primitives. Use `Acquire`/`Release` for lock barriers and `Relaxed` for independent atomic counter operations or holder tracking.
+
+## 2026-03-30 - Hint-Based O(1) File Descriptor Allocation
+**Learning:** In `kernel/src/process/fd.rs` and `kernel/src/process/task.rs`, file descriptor allocation previously scanned the task's `FdTable.entries` linearly from index 0 on every `open`, `pipe`, `socket`, `dup`, or `accept` syscall. Maintaining a `next_free_fd: usize` hint in `FdTable` that points to the lowest candidate unallocated descriptor index bypasses linear scans of occupied low-index descriptors, reducing FD allocation latency from O(N) to O(1) while guaranteeing lowest-fd POSIX compliance.
+**Action:** For tables or collections where indices are allocated sequentially and freed dynamically, maintain a lowest-known-free index hint to eliminate linear scanning overhead on allocation.

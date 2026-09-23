@@ -152,6 +152,14 @@ impl FileDescription {
 
     /// Seek to a new offset.
     pub fn seek(&self, offset: i64, whence: i32) -> Result<u64, i32> {
+        let file_type = self.inode.inode().file_type;
+        // POSIX.1-2017 & Linux lseek(2): lseek on a pipe, socket, or FIFO shall fail with ESPIPE (-29).
+        if file_type == crate::fs::inode::FileType::Pipe
+            || file_type == crate::fs::inode::FileType::Socket
+        {
+            return Err(-29); // ESPIPE
+        }
+
         let mut current = self.offset.lock();
         let new_offset = match whence {
             0 => {

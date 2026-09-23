@@ -3356,3 +3356,32 @@ fn test_devfs_special_nodes() {
 
     kprintln!("[test] devfs special character device nodes test PASSED!");
 }
+
+#[test_case]
+fn test_lseek_espipe_on_pipe() {
+    kprintln!("[test] Starting lseek ESPIPE on pipe test...");
+    let mut pipefds = [0i32; 2];
+    let res = crate::syscall::fs::sys_pipe(pipefds.as_mut_ptr());
+    assert_eq!(res, 0);
+
+    let read_fd = pipefds[0];
+    let write_fd = pipefds[1];
+
+    let lseek_read_res = crate::syscall::fs::sys_lseek(read_fd, 0, 0);
+    assert_eq!(
+        lseek_read_res,
+        crate::syscall::Errno::ESPIPE as i64,
+        "lseek on pipe read end must return -ESPIPE (-29)"
+    );
+
+    let lseek_write_res = crate::syscall::fs::sys_lseek(write_fd, 0, 0);
+    assert_eq!(
+        lseek_write_res,
+        crate::syscall::Errno::ESPIPE as i64,
+        "lseek on pipe write end must return -ESPIPE (-29)"
+    );
+
+    crate::syscall::fs::sys_close(read_fd);
+    crate::syscall::fs::sys_close(write_fd);
+    kprintln!("[test] lseek ESPIPE on pipe test PASSED!");
+}

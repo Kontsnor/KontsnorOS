@@ -271,3 +271,104 @@ fn test_dirty_page_flush() {
     crate::process::fd::current_task_close_fd(fd);
     let _ = disk_dir.unlink("flush_test.txt");
 }
+
+#[test_case]
+fn test_unmap_range_geometric_cases_and_benchmark() {
+    kprintln!("[test] Starting AddressSpace::unmap_range geometric cases & benchmark test...");
+    use crate::process::task::{AddressSpace, MappedRegion};
+
+    let make_region = |start: u64, len: usize| MappedRegion {
+        start,
+        len,
+        inode: None,
+        offset: 0,
+        is_shared: false,
+        prot: 3,
+        pathname: None,
+        is_stack: false,
+    };
+
+    let mut addr_space = AddressSpace {
+        page_table_root: 0,
+        start_brk: 0,
+        brk: 0,
+        mmap_bump: 0x500000000000,
+        mmap_regions: alloc::vec::Vec::new(),
+    };
+
+    // Case 1: No-op unmap (unmapping range where no regions exist)
+    addr_space.mmap_regions =
+        alloc::vec![make_region(0x1000, 0x1000), make_region(0x3000, 0x1000),];
+    addr_space.unmap_range(0x2000, 0x3000);
+    assert_eq!(addr_space.mmap_regions.len(), 2);
+    assert_eq!(addr_space.mmap_regions[0].start, 0x1000);
+    assert_eq!(addr_space.mmap_regions[1].start, 0x3000);
+
+    // Case 2: Full unmap
+    addr_space.unmap_range(0x1000, 0x2000);
+    assert_eq!(addr_space.mmap_regions.len(), 1);
+    assert_eq!(addr_space.mmap_regions[0].start, 0x3000);
+
+    // Case 3: Left-edge trim
+    addr_space.mmap_regions = alloc::vec![make_region(0x1000, 0x2000)]; // [0x1000, 0x3000)
+    addr_space.unmap_range(0x1000, 0x1800);
+    assert_eq!(addr_space.mmap_regions.len(), 1);
+    assert_eq!(addr_space.mmap_regions[0].start, 0x1800);
+    assert_eq!(addr_space.mmap_regions[0].len, 0x1800); // 0x3000 - 0x1800 = 0x1800
+
+    // Case 4: Right-edge trim
+    addr_space.mmap_regions = alloc::vec![make_region(0x1000, 0x2000)]; // [0x1000, 0x3000)
+    addr_space.unmap_range(0x2800, 0x3800);
+    assert_eq!(addr_space.mmap_regions.len(), 1);
+    assert_eq!(addr_space.mmap_regions[0].start, 0x1000);
+    assert_eq!(addr_space.mmap_regions[0].len, 0x1800); // 0x2800 - 0x1000 = 0x1800
+
+    // Case 5: Middle split (punching a hole)
+    addr_space.mmap_regions = alloc::vec![make_region(0x1000, 0x3000)]; // [0x1000, 0x4000)
+    addr_space.unmap_range(0x2000, 0x3000);
+    assert_eq!(addr_space.mmap_regions.len(), 2);
+    assert_eq!(addr_space.mmap_regions[0].start, 0x1000);
+    assert_eq!(addr_space.mmap_regions[0].len, 0x1000);
+    assert_eq!(addr_space.mmap_regions[1].start, 0x3000);
+    assert_eq!(addr_space.mmap_regions[1].len, 0x1000);
+
+    // Case 6: Multi-region straddle (trims right of R1, deletes R2 entirely, trims left of R3)
+    addr_space.mmap_regions = alloc::vec![
+        make_region(0x1000, 0x1000), // R1: [0x1000, 0x2000)
+        make_region(0x2000, 0x1000), // R2: [0x2000, 0x3000)
+        make_region(0x3000, 0x1000), // R3: [0x3000, 0x4000)
+    ];
+    addr_space.unmap_range(0x1800, 0x3800);
+    assert_eq!(addr_space.mmap_regions.len(), 2);
+    assert_eq!(addr_space.mmap_regions[0].start, 0x1000);
+    assert_eq!(addr_space.mmap_regions[0].len, 0x800);
+    assert_eq!(addr_space.mmap_regions[1].start, 0x3800);
+    assert_eq!(addr_space.mmap_regions[1].len, 0x800);
+
+    // Benchmark measuring rdtsc cycle counts for 1,000 unmap_range operations
+    let mut bench_regions = alloc::vec::Vec::with_capacity(100);
+    for i in 0..100 {
+        bench_regions.push(make_region(0x10000 + (i as u64) * 0x2000, 0x1000));
+    }
+    let mut bench_space = AddressSpace {
+        page_table_root: 0,
+        start_brk: 0,
+        brk: 0,
+        mmap_bump: 0x500000000000,
+        mmap_regions: bench_regions.clone(),
+    };
+
+    let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    for _ in 0..1000 {
+        bench_space.mmap_regions = bench_regions.clone();
+        bench_space.unmap_range(0x11000, 0x18000);
+    }
+    let end_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let elapsed_cycles = end_tsc.saturating_sub(start_tsc);
+    kprintln!(
+        "[bench] 1,000 in-place unmap operations completed in {} TSC cycles",
+        elapsed_cycles
+    );
+
+    kprintln!("[test] AddressSpace::unmap_range geometric cases & benchmark test PASSED!");
+}

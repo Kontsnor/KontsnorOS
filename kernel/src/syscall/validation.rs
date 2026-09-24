@@ -20,6 +20,9 @@
 
 use alloc::string::String;
 use x86_64::VirtAddr;
+use crate::syscall::Errno;
+
+pub const USER_SPACE_END: u64 = 0x0000_7FFF_FFFF_FFFF;
 
 /// Eagerly map a page if it is valid under the current task's mapped regions but not yet present.
 fn ensure_page_mapped(vaddr: u64) -> bool {
@@ -213,7 +216,7 @@ pub fn validate_user_ptr_write(ptr: *mut u8, size: usize) -> Result<(), ()> {
         Some(e) => e,
         None => return Err(()),
     };
-    if end > 0x0000_7FFF_FFFF_FFFF {
+    if end > USER_SPACE_END {
         return Err(());
     }
     if size == 0 {
@@ -222,12 +225,111 @@ pub fn validate_user_ptr_write(ptr: *mut u8, size: usize) -> Result<(), ()> {
     let page_size: u64 = 4096;
     let start_page = start & !(page_size - 1);
     let end_page = (end + page_size - 1) & !(page_size - 1);
+
+    if let Some(pid) = crate::process::scheduler::current_pid() {
+        if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+            let task = task_arc.lock();
+            let addr_space = task.address_space.lock();
+            let mut curr = start_page;
+            while curr < end_page {
+                let region = addr_space
+                    .mmap_regions
+                    .iter()
+                    .find(|r| curr >= r.start && curr < r.start + r.len as u64);
+                if let Some(r) = region {
+                    if (r.prot & 2) == 0 {
+                        // Region is read-only (not PROT_WRITE)
+                        return Err(());
+                    }
+                }
+                curr += page_size;
+            }
+        }
+    }
+
     let mut curr = start_page;
     while curr < end_page {
         if !ensure_page_mapped(curr) {
             return Err(());
         }
         curr += page_size;
+    }
+    Ok(())
+}
+
+/// Safely copy a value of type `T` from user space pointer `src`.
+///
+/// Validates non-nullness, user address bounds, page mapping, and reads unaligned.
+pub fn copy_from_user<T: Copy>(src: *const T) -> Result<T, Errno> {
+    if src.is_null() {
+        return Err(Errno::EFAULT);
+    }
+    let size = core::mem::size_of::<T>();
+    if !validate_user_ptr(src as *const u8, size) {
+        return Err(Errno::EFAULT);
+    }
+    // SAFETY: validate_user_ptr confirmed that all pages for `[src, src + size)` reside in
+    // canonical user memory and are mapped in the active page directory.
+    // read_unaligned handles unaligned pointers safely.
+    unsafe { Ok(core::ptr::read_unaligned(src)) }
+}
+
+/// Safely copy a slice of `T` elements from user space pointer `src` into kernel buffer `dst`.
+pub fn copy_from_user_slice<T: Copy>(src: *const T, dst: &mut [T]) -> Result<(), Errno> {
+    if src.is_null() && !dst.is_empty() {
+        return Err(Errno::EFAULT);
+    }
+    let size = core::mem::size_of_val(dst);
+    if size == 0 {
+        return Ok(());
+    }
+    if !validate_user_ptr(src as *const u8, size) {
+        return Err(Errno::EFAULT);
+    }
+    // SAFETY: validate_user_ptr confirmed that all pages for `[src, src + size)` reside in
+    // canonical user memory and are mapped in the active page directory.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src as *const u8, dst.as_mut_ptr() as *mut u8, size);
+    }
+    Ok(())
+}
+
+/// Safely copy a value `val` of type `T` to user space pointer `dst`.
+///
+/// Validates non-nullness, user address bounds, page mapping, writability, and writes unaligned.
+pub fn copy_to_user<T: Copy>(dst: *mut T, val: &T) -> Result<(), Errno> {
+    if dst.is_null() {
+        return Err(Errno::EFAULT);
+    }
+    let size = core::mem::size_of::<T>();
+    if validate_user_ptr_write(dst as *mut u8, size).is_err() {
+        return Err(Errno::EFAULT);
+    }
+    // SAFETY: validate_user_ptr_write confirmed that all pages for `[dst, dst + size)` reside in
+    // canonical user memory, are mapped and writable.
+    // write_unaligned handles unaligned pointers safely.
+    unsafe {
+        core::ptr::write_unaligned(dst, *val);
+    }
+    Ok(())
+}
+
+/// Safely copy a slice of `T` elements from kernel buffer `src` to user space pointer `dst`.
+pub fn copy_to_user_slice<T: Copy>(dst: *mut T, src: &[T]) -> Result<(), Errno> {
+    if dst.is_null() && !src.is_empty() {
+        return Err(Errno::EFAULT);
+    }
+    let size = core::mem::size_of_val(src);
+    if size == 0 {
+        return Ok(());
+    }
+    if validate_user_ptr_write(dst as *mut u8, size).is_err() {
+        return Err(Errno::EFAULT);
+    }
+    // SAFETY: validate_user_ptr_write confirmed that all pages for `[dst, dst + size)` reside in
+    // canonical user memory, are mapped and writable.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, dst as *mut u8, size);
     }
     Ok(())
 }

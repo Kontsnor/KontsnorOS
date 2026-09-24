@@ -3385,3 +3385,164 @@ fn test_lseek_espipe_on_pipe() {
     crate::syscall::fs::sys_close(write_fd);
     kprintln!("[test] lseek ESPIPE on pipe test PASSED!");
 }
+
+#[test_case]
+fn test_user_copy_safety_and_cap_syscalls() {
+    use crate::syscall::validation::{
+        copy_from_user, copy_from_user_slice, copy_to_user, copy_to_user_slice, USER_SPACE_END,
+    };
+    use crate::syscall::process::creds::{
+        sys_capget, sys_capset, CapUserHeader, CapUserData, LINUX_CAPABILITY_VERSION_1, LINUX_CAPABILITY_VERSION_3,
+    };
+    use crate::syscall::Errno;
+
+    kprintln!("[test] Starting user copy safety and cap syscalls test...");
+
+    // Setup test task for validation context
+    let task = alloc::sync::Arc::new(spinning_top::Spinlock::new(
+        crate::process::task::Task::new(
+            crate::process::pid::Pid::from_raw(9999),
+            crate::process::pid::Pid::from_raw(9999),
+        ),
+    ));
+    crate::process::scheduler::insert_task_for_test(
+        crate::process::pid::Pid::from_raw(9999),
+        task,
+    );
+    crate::process::scheduler::set_current_pid_for_test(
+        crate::process::pid::Pid::from_raw(9999),
+    );
+
+    // Create a 2-page user mmap region (8192 bytes): first page RW (prot 3), second page RO (prot 1)
+    let page1_frame = crate::memory::physical::allocate_frame().expect("allocate frame page 1");
+    let page2_frame = crate::memory::physical::allocate_frame().expect("allocate frame page 2");
+    let user_vaddr: u64 = 0x0000_1000_0000_0000;
+
+    {
+        let task_arc = crate::process::scheduler::get_task_arc(
+            crate::process::pid::Pid::from_raw(9999),
+        )
+        .unwrap();
+        let task_lock = task_arc.lock();
+        let mut addr_space = task_lock.address_space.lock();
+
+        addr_space.mmap_regions.push(crate::memory::address_space::MmapRegion {
+            start: user_vaddr,
+            len: 4096,
+            prot: 3, // PROT_READ | PROT_WRITE
+            flags: 0x22,
+            inode: None,
+            offset: 0,
+            is_shared: false,
+            is_stack: false,
+        });
+        addr_space.mmap_regions.push(crate::memory::address_space::MmapRegion {
+            start: user_vaddr + 4096,
+            len: 4096,
+            prot: 1, // PROT_READ only
+            flags: 0x22,
+            inode: None,
+            offset: 0,
+            is_shared: false,
+            is_stack: false,
+        });
+
+        use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
+        use x86_64::{PhysAddr, VirtAddr};
+
+        let page1 = Page::<Size4KiB>::containing_address(VirtAddr::new(user_vaddr));
+        let frame1 = PhysFrame::containing_address(PhysAddr::new(page1_frame));
+        unsafe {
+            crate::memory::r#virtual::ensure_directory_permissions(
+                addr_space.page_table_root,
+                VirtAddr::new(user_vaddr),
+            );
+            let _ = crate::memory::r#virtual::map_user_page_no_shootdown(
+                addr_space.page_table_root,
+                page1,
+                frame1,
+                PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE,
+            );
+        }
+
+        let page2 = Page::<Size4KiB>::containing_address(VirtAddr::new(user_vaddr + 4096));
+        let frame2 = PhysFrame::containing_address(PhysAddr::new(page2_frame));
+        unsafe {
+            crate::memory::r#virtual::ensure_directory_permissions(
+                addr_space.page_table_root,
+                VirtAddr::new(user_vaddr + 4096),
+            );
+            let _ = crate::memory::r#virtual::map_user_page_no_shootdown(
+                addr_space.page_table_root,
+                page2,
+                frame2,
+                PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE,
+            );
+        }
+    }
+
+    // 1. Null pointer safety
+    let null_hdr: *const CapUserHeader = core::ptr::null();
+    assert_eq!(copy_from_user(null_hdr), Err(Errno::EFAULT));
+    let null_hdr_mut: *mut CapUserHeader = core::ptr::null_mut();
+    assert_eq!(copy_to_user(null_hdr_mut, &CapUserHeader { version: 1, pid: 0 }), Err(Errno::EFAULT));
+
+    // 2. Unmapped pointer safety
+    let unmapped_ptr = 0x0000_2000_0000_0000 as *const u32;
+    assert_eq!(copy_from_user(unmapped_ptr), Err(Errno::EFAULT));
+
+    // 3. Higher-half kernel address / overflow safety
+    let kernel_ptr = 0xFFFF_8000_0000_0000 as *const u32;
+    assert_eq!(copy_from_user(kernel_ptr), Err(Errno::EFAULT));
+
+    let overflow_ptr = (USER_SPACE_END - 2) as *const u64;
+    assert_eq!(copy_from_user(overflow_ptr), Err(Errno::EFAULT));
+
+    // 4. Misaligned pointer handling in mapped user space
+    let aligned_ptr = user_vaddr as *mut u32;
+    let misaligned_ptr = (user_vaddr + 1) as *mut u32;
+
+    let write_val: u32 = 0xDEADBEEF;
+    assert_eq!(copy_to_user(aligned_ptr, &write_val), Ok(()));
+    assert_eq!(copy_to_user(misaligned_ptr, &write_val), Ok(()));
+
+    let read_val = copy_from_user(misaligned_ptr as *const u32);
+    assert_eq!(read_val, Ok(write_val));
+
+    // 5. Read-only region write rejection
+    let ro_ptr = (user_vaddr + 4096) as *mut u32;
+    let ro_read = copy_from_user(ro_ptr as *const u32);
+    assert!(ro_read.is_ok(), "Reading from read-only page must succeed");
+    let ro_write = copy_to_user(ro_ptr, &write_val);
+    assert_eq!(ro_write, Err(Errno::EFAULT), "Writing to read-only page must return EFAULT");
+
+    // 6. Capability syscalls capget / capset with valid and misaligned pointers
+    let hdr_ptr = user_vaddr as *mut CapUserHeader;
+    let data_ptr = (user_vaddr + 64) as *mut CapUserData;
+
+    // Write valid CapUserHeader
+    let valid_hdr = CapUserHeader {
+        version: LINUX_CAPABILITY_VERSION_1,
+        pid: 0,
+    };
+    assert_eq!(copy_to_user(hdr_ptr, &valid_hdr), Ok(()));
+
+    let capget_res = sys_capget(hdr_ptr, data_ptr);
+    assert_eq!(capget_res, 0, "capget with valid user pointer must return 0");
+
+    let capset_res = sys_capset(hdr_ptr as *const CapUserHeader, data_ptr as *const CapUserData);
+    assert_eq!(capset_res, 0, "capset with valid user pointer must return 0");
+
+    // Invalid cap version test
+    let invalid_hdr = CapUserHeader {
+        version: 0x12345678,
+        pid: 0,
+    };
+    assert_eq!(copy_to_user(hdr_ptr, &invalid_hdr), Ok(()));
+    let capget_invalid_res = sys_capget(hdr_ptr, data_ptr);
+    assert_eq!(capget_invalid_res, Errno::EINVAL as i64, "capget with invalid version must return -EINVAL");
+    let updated_hdr = copy_from_user(hdr_ptr as *const CapUserHeader).unwrap();
+    assert_eq!(updated_hdr.version, LINUX_CAPABILITY_VERSION_3, "capget with invalid version must write preferred version 3 back to header");
+
+    kprintln!("[test] user copy safety and cap syscalls test PASSED!");
+}

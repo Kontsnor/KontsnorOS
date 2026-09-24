@@ -328,6 +328,7 @@ pub fn sys_connect(fd: i32, addr_ptr: *const SockAddrIn, addrlen: u32) -> Syscal
     crate::kprintln!("[sys_connect] Blocking wait for connection establishment...");
     // Wait until state changes to Established or Closed (error) with timeout
     let start_ticks = crate::arch::x86_64::interrupts::timer_ticks();
+    let wq = socket.lock().wait_queue.clone();
     loop {
         {
             let sock = socket.lock();
@@ -344,10 +345,6 @@ pub fn sys_connect(fd: i32, addr_ptr: *const SockAddrIn, addrlen: u32) -> Syscal
             sock.tcp_state = crate::net::tcp::TcpState::Closed;
             return -110; // ETIMEDOUT
         }
-        let wq = {
-            let sock = socket.lock();
-            sock.wait_queue.clone()
-        };
         wq.wait();
     }
 

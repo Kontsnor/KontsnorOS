@@ -1043,6 +1043,40 @@ fn test_pseudo_filesystems() {
 }
 
 #[test_case]
+fn test_cgroup_procs_benchmark() {
+    kprintln!("[test] Starting cgroupfs procs benchmark test...");
+
+    // Warmup
+    let initial_output = crate::fs::cgroupfs::gen_cgroup_procs();
+    assert!(!initial_output.is_empty());
+
+    let start_ticks = crate::arch::x86_64::interrupts::timer_ticks();
+    let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+
+    let iterations = 10_000;
+    for _ in 0..iterations {
+        let res = crate::fs::cgroupfs::gen_cgroup_procs();
+        core::hint::black_box(res);
+    }
+
+    let end_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let end_ticks = crate::arch::x86_64::interrupts::timer_ticks();
+
+    let total_tsc = end_tsc.saturating_sub(start_tsc);
+    let elapsed_ms = (end_ticks.saturating_sub(start_ticks)) * 10;
+
+    kprintln!(
+        "[test] cgroup procs baseline/benchmark for {} iterations: {} cycles ({} cycles/op), {} ms",
+        iterations,
+        total_tsc,
+        total_tsc / iterations as u64,
+        elapsed_ms
+    );
+
+    kprintln!("[test] cgroupfs procs benchmark test PASSED!");
+}
+
+#[test_case]
 fn test_ext4_extent_mapping() {
     kprintln!("[test] Starting Ext4 extent mapping test...");
 

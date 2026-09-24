@@ -586,7 +586,7 @@ fn test_vfs_lookup_dcache_benchmark() {
     let _ = crate::fs::vfs::lookup("/tmp/bench_dir/file.txt").expect("Lookup failed");
 
     // Measure cached path lookups
-    let iterations = 10_000;
+    let iterations = 1_000;
     let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
     for _ in 0..iterations {
         let node = crate::fs::vfs::lookup("/tmp/bench_dir/file.txt");

@@ -263,17 +263,18 @@ impl Vfs {
                     resolved_till_now.push_str(component);
                 }
 
-                let next = {
-                    let cache = self.dentry_cache.read();
-                    cache.get(&resolved_till_now).cloned()
-                };
-
-                let next = if let Some(n) = next {
+                let next = if let Some(n) = self
+                    .dentry_cache
+                    .read()
+                    .get(resolved_till_now.as_str())
+                    .cloned()
+                {
                     n
                 } else {
                     let n = current.lookup(component)?;
-                    let mut cache = self.dentry_cache.write();
-                    cache.insert(resolved_till_now.clone(), n.clone());
+                    self.dentry_cache
+                        .write()
+                        .insert(resolved_till_now.clone(), n.clone());
                     n
                 };
 

@@ -15,6 +15,8 @@
 
 //! Filesystem and VFS unit & regression tests.
 
+use crate::kprintln;
+
 #[test_case]
 fn test_vfs_path_resolution() {
     // Lookup non-existent path
@@ -605,6 +607,60 @@ fn test_vfs_lookup_dcache_benchmark() {
 
     let _ = test_dir.unlink("file.txt");
     let _ = tmp_dir.rmdir("bench_dir");
+}
+
+#[test_case]
+fn test_vfs_symlink_resolution_benchmark() {
+    let tmp_dir = crate::fs::vfs::lookup("/tmp").expect("Failed to lookup /tmp");
+    let test_dir = tmp_dir
+        .mkdir("symlink_bench_dir")
+        .expect("Failed to create /tmp/symlink_bench_dir");
+
+    let target_file = test_dir
+        .create("target.txt", crate::fs::inode::FileType::Regular)
+        .expect("Failed to create /tmp/symlink_bench_dir/target.txt");
+    let test_data = b"Symlink Benchmark Data";
+    let _ = target_file.write(0, test_data);
+
+    // Create symlink: /tmp/symlink_bench_dir/link.txt -> target.txt
+    let link_inode = test_dir
+        .create("link.txt", crate::fs::inode::FileType::Symlink)
+        .expect("Failed to create symlink");
+    let _ = link_inode.write(0, b"target.txt");
+
+    // Warm up / verify symlink resolution
+    crate::fs::vfs::invalidate_dentry("/tmp/symlink_bench_dir/link.txt");
+    let resolved = crate::fs::vfs::lookup_follow("/tmp/symlink_bench_dir/link.txt", true)
+        .expect("Symlink resolution failed");
+    let mut read_buf = [0u8; 32];
+    let n = resolved.read(0, &mut read_buf).expect("Read failed");
+    assert_eq!(&read_buf[..n], test_data);
+
+    // Benchmark symlink lookup resolution with dcache invalidation
+    let iterations = 100;
+    let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    for _ in 0..iterations {
+        crate::fs::vfs::invalidate_dentry("/tmp/symlink_bench_dir/link.txt");
+        let node = crate::fs::vfs::lookup_follow("/tmp/symlink_bench_dir/link.txt", true);
+        core::hint::black_box(node);
+    }
+    let end_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let elapsed_tsc = end_tsc - start_tsc;
+    let cycles_per_lookup = elapsed_tsc / iterations;
+
+    crate::kprintln!(
+        "[bench] VFS symlink resolution (uncached): {} total cycles for {} iterations (avg {} cycles/lookup)",
+        elapsed_tsc,
+        iterations,
+        cycles_per_lookup
+    );
+
+    let _ = test_dir.unlink("link.txt");
+    let _ = test_dir.unlink("target.txt");
+    let _ = tmp_dir.rmdir("symlink_bench_dir");
+}
+
+#[test_case]
 fn test_ext_readdir_streaming_benchmark() {
     kprintln!("[test] Starting Ext4 zero-allocation streaming readdir benchmark test...");
 
@@ -666,11 +722,8 @@ fn test_ext_readdir_streaming_benchmark() {
     let mut total_dents_read = 0;
 
     loop {
-        let nread = crate::syscall::fs::sys_getdents64(
-            dir_fd as i32,
-            dents_buf_addr as *mut u8,
-            4096,
-        );
+        let nread =
+            crate::syscall::fs::sys_getdents64(dir_fd as i32, dents_buf_addr as *mut u8, 4096);
         if nread <= 0 {
             break;
         }

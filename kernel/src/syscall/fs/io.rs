@@ -994,30 +994,98 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: i32) -> SyscallResult {
     if iov.is_null() || iovcnt <= 0 || iovcnt > 1024 {
         return Errno::EINVAL.into();
     }
+    let iovcnt_usize = iovcnt as usize;
     if !validate_user_ptr(
         iov as *const u8,
-        iovcnt as usize * core::mem::size_of::<IoVec>(),
+        iovcnt_usize * core::mem::size_of::<IoVec>(),
     ) {
         return Errno::EFAULT.into();
     }
-    let mut local_iov =
-        alloc::vec![IoVec { iov_base: core::ptr::null(), iov_len: 0 }; iovcnt as usize];
-    unsafe {
-        core::ptr::copy_nonoverlapping(iov, local_iov.as_mut_ptr(), iovcnt as usize);
-    }
-    let mut total_written = 0;
-    for io in local_iov {
-        if io.iov_len == 0 {
-            continue;
+
+    const CHUNK_SIZE: usize = 16;
+
+    // Fast path for small iovcnt (most common case <= 16)
+    if iovcnt_usize <= CHUNK_SIZE {
+        let mut local_iov = [IoVec {
+            iov_base: core::ptr::null(),
+            iov_len: 0,
+        }; CHUNK_SIZE];
+        // SAFETY: The source pointer iov has been checked for nullity and validated using validate_user_ptr.
+        unsafe {
+            core::ptr::copy_nonoverlapping(iov, local_iov.as_mut_ptr(), iovcnt_usize);
         }
-        let ret = sys_write(fd, io.iov_base, io.iov_len);
-        if ret < 0 {
-            if total_written > 0 {
-                break;
+
+        let mut total_len: usize = 0;
+        for io in &local_iov[..iovcnt_usize] {
+            match total_len.checked_add(io.iov_len) {
+                Some(sum) if sum <= isize::MAX as usize => total_len = sum,
+                _ => return Errno::EINVAL.into(),
             }
-            return ret;
         }
-        total_written += ret;
+
+        let mut total_written = 0;
+        for io in &local_iov[..iovcnt_usize] {
+            if io.iov_len == 0 {
+                continue;
+            }
+            let ret = sys_write(fd, io.iov_base, io.iov_len);
+            if ret < 0 {
+                if total_written > 0 {
+                    break;
+                }
+                return ret;
+            }
+            total_written += ret;
+        }
+        return total_written;
+    }
+
+    // Slow path for iovcnt > 16: process in stack chunks without heap allocation
+    let mut total_len: usize = 0;
+    let mut offset = 0;
+    while offset < iovcnt_usize {
+        let chunk_len = core::cmp::min(CHUNK_SIZE, iovcnt_usize - offset);
+        let mut chunk = [IoVec {
+            iov_base: core::ptr::null(),
+            iov_len: 0,
+        }; CHUNK_SIZE];
+        unsafe {
+            core::ptr::copy_nonoverlapping(iov.add(offset), chunk.as_mut_ptr(), chunk_len);
+        }
+        for io in &chunk[..chunk_len] {
+            match total_len.checked_add(io.iov_len) {
+                Some(sum) if sum <= isize::MAX as usize => total_len = sum,
+                _ => return Errno::EINVAL.into(),
+            }
+        }
+        offset += chunk_len;
+    }
+
+    let mut total_written = 0;
+    offset = 0;
+    while offset < iovcnt_usize {
+        let chunk_len = core::cmp::min(CHUNK_SIZE, iovcnt_usize - offset);
+        let mut chunk = [IoVec {
+            iov_base: core::ptr::null(),
+            iov_len: 0,
+        }; CHUNK_SIZE];
+        unsafe {
+            core::ptr::copy_nonoverlapping(iov.add(offset), chunk.as_mut_ptr(), chunk_len);
+        }
+        for io in &chunk[..chunk_len] {
+            if io.iov_len == 0 {
+                continue;
+            }
+            let ret = sys_write(fd, io.iov_base, io.iov_len);
+            if ret < 0 {
+                if total_written > 0 {
+                    return total_written;
+                }
+                return ret;
+            }
+            total_written += ret;
+        }
+        offset += chunk_len;
     }
     total_written
 }
@@ -1100,34 +1168,104 @@ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: i32) -> SyscallResult {
     if iov.is_null() || iovcnt <= 0 || iovcnt > 1024 {
         return Errno::EINVAL.into();
     }
+    let iovcnt_usize = iovcnt as usize;
     if !validate_user_ptr(
         iov as *const u8,
-        iovcnt as usize * core::mem::size_of::<IoVec>(),
+        iovcnt_usize * core::mem::size_of::<IoVec>(),
     ) {
         return Errno::EFAULT.into();
     }
-    let mut local_iov =
-        alloc::vec![IoVec { iov_base: core::ptr::null(), iov_len: 0 }; iovcnt as usize];
-    // SAFETY: The source pointer iov has been checked for nullity and validated using validate_user_ptr.
-    unsafe {
-        core::ptr::copy_nonoverlapping(iov, local_iov.as_mut_ptr(), iovcnt as usize);
-    }
-    let mut total_read = 0;
-    for io in local_iov {
-        if io.iov_len == 0 {
-            continue;
+
+    const CHUNK_SIZE: usize = 16;
+
+    // Fast path for small iovcnt (most common case <= 16)
+    if iovcnt_usize <= CHUNK_SIZE {
+        let mut local_iov = [IoVec {
+            iov_base: core::ptr::null(),
+            iov_len: 0,
+        }; CHUNK_SIZE];
+        // SAFETY: The source pointer iov has been checked for nullity and validated using validate_user_ptr.
+        unsafe {
+            core::ptr::copy_nonoverlapping(iov, local_iov.as_mut_ptr(), iovcnt_usize);
         }
-        let ret = sys_read(fd, io.iov_base as *mut u8, io.iov_len);
-        if ret < 0 {
-            if total_read > 0 {
+
+        let mut total_len: usize = 0;
+        for io in &local_iov[..iovcnt_usize] {
+            match total_len.checked_add(io.iov_len) {
+                Some(sum) if sum <= isize::MAX as usize => total_len = sum,
+                _ => return Errno::EINVAL.into(),
+            }
+        }
+
+        let mut total_read = 0;
+        for io in &local_iov[..iovcnt_usize] {
+            if io.iov_len == 0 {
+                continue;
+            }
+            let ret = sys_read(fd, io.iov_base as *mut u8, io.iov_len);
+            if ret < 0 {
+                if total_read > 0 {
+                    break;
+                }
+                return ret;
+            }
+            total_read += ret;
+            if ret < io.iov_len as i64 {
                 break;
             }
-            return ret;
         }
-        total_read += ret;
-        if ret < io.iov_len as i64 {
-            break;
+        return total_read;
+    }
+
+    // Slow path for iovcnt > 16: process in stack chunks without heap allocation
+    let mut total_len: usize = 0;
+    let mut offset = 0;
+    while offset < iovcnt_usize {
+        let chunk_len = core::cmp::min(CHUNK_SIZE, iovcnt_usize - offset);
+        let mut chunk = [IoVec {
+            iov_base: core::ptr::null(),
+            iov_len: 0,
+        }; CHUNK_SIZE];
+        unsafe {
+            core::ptr::copy_nonoverlapping(iov.add(offset), chunk.as_mut_ptr(), chunk_len);
         }
+        for io in &chunk[..chunk_len] {
+            match total_len.checked_add(io.iov_len) {
+                Some(sum) if sum <= isize::MAX as usize => total_len = sum,
+                _ => return Errno::EINVAL.into(),
+            }
+        }
+        offset += chunk_len;
+    }
+
+    let mut total_read = 0;
+    offset = 0;
+    'read_loop: while offset < iovcnt_usize {
+        let chunk_len = core::cmp::min(CHUNK_SIZE, iovcnt_usize - offset);
+        let mut chunk = [IoVec {
+            iov_base: core::ptr::null(),
+            iov_len: 0,
+        }; CHUNK_SIZE];
+        unsafe {
+            core::ptr::copy_nonoverlapping(iov.add(offset), chunk.as_mut_ptr(), chunk_len);
+        }
+        for io in &chunk[..chunk_len] {
+            if io.iov_len == 0 {
+                continue;
+            }
+            let ret = sys_read(fd, io.iov_base as *mut u8, io.iov_len);
+            if ret < 0 {
+                if total_read > 0 {
+                    return total_read;
+                }
+                return ret;
+            }
+            total_read += ret;
+            if ret < io.iov_len as i64 {
+                break 'read_loop;
+            }
+        }
+        offset += chunk_len;
     }
     total_read
 }

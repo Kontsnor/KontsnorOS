@@ -605,8 +605,110 @@ fn test_vfs_lookup_dcache_benchmark() {
 
     let _ = test_dir.unlink("file.txt");
     let _ = tmp_dir.rmdir("bench_dir");
+}
+
+#[test_case]
+fn test_readv_writev_benchmark() {
+    use crate::syscall::fs::{sys_readv, sys_writev, IoVec};
+
+    let path_str = b"/tmp/readv_writev_bench.txt\0";
+    let path_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    assert!(path_addr > 0);
+    unsafe {
+        core::ptr::copy_nonoverlapping(path_str.as_ptr(), path_addr as *mut u8, path_str.len());
+    }
+
+    let fd = crate::syscall::fs::sys_open(path_addr as *const u8, 0o102, 0o644); // O_CREAT | O_RDWR
+    assert!(fd >= 0);
+    let fd = fd as i32;
+
+    let buf1 = [1u8; 128];
+    let buf2 = [2u8; 256];
+    let buf3 = [3u8; 512];
+    let buf4 = [4u8; 1024];
+
+    let iov_write = [
+        IoVec {
+            iov_base: buf1.as_ptr(),
+            iov_len: buf1.len(),
+        },
+        IoVec {
+            iov_base: buf2.as_ptr(),
+            iov_len: buf2.len(),
+        },
+        IoVec {
+            iov_base: buf3.as_ptr(),
+            iov_len: buf3.len(),
+        },
+        IoVec {
+            iov_base: buf4.as_ptr(),
+            iov_len: buf4.len(),
+        },
+    ];
+
+    let mut rbuf1 = [0u8; 128];
+    let mut rbuf2 = [0u8; 256];
+    let mut rbuf3 = [0u8; 512];
+    let mut rbuf4 = [0u8; 1024];
+
+    let iov_read = [
+        IoVec {
+            iov_base: rbuf1.as_mut_ptr(),
+            iov_len: rbuf1.len(),
+        },
+        IoVec {
+            iov_base: rbuf2.as_mut_ptr(),
+            iov_len: rbuf2.len(),
+        },
+        IoVec {
+            iov_base: rbuf3.as_mut_ptr(),
+            iov_len: rbuf3.len(),
+        },
+        IoVec {
+            iov_base: rbuf4.as_mut_ptr(),
+            iov_len: rbuf4.len(),
+        },
+    ];
+
+    let iterations = 1_000;
+
+    let start_write_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    for _ in 0..iterations {
+        let _ = crate::syscall::fs::sys_lseek(fd, 0, 0);
+        let ret = sys_writev(fd, iov_write.as_ptr(), iov_write.len() as i32);
+        assert_eq!(ret, (128 + 256 + 512 + 1024));
+    }
+    let end_write_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let elapsed_write = end_write_tsc - start_write_tsc;
+
+    let start_read_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    for _ in 0..iterations {
+        let _ = crate::syscall::fs::sys_lseek(fd, 0, 0);
+        let ret = sys_readv(fd, iov_read.as_ptr(), iov_read.len() as i32);
+        assert_eq!(ret, (128 + 256 + 512 + 1024));
+    }
+    let end_read_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let elapsed_read = end_read_tsc - start_read_tsc;
+
+    crate::kprintln!(
+        "[bench] sys_writev (4 iovecs, 1000 iter): {} total cycles (avg {} cycles/op)",
+        elapsed_write,
+        elapsed_write / iterations
+    );
+    crate::kprintln!(
+        "[bench] sys_readv (4 iovecs, 1000 iter): {} total cycles (avg {} cycles/op)",
+        elapsed_read,
+        elapsed_read / iterations
+    );
+
+    let _ = crate::syscall::fs::sys_close(fd);
+    let _ = crate::syscall::fs::sys_unlink(path_addr as *const u8);
+    crate::syscall::memory::sys_munmap(path_addr, 4096);
+}
+
+#[test_case]
 fn test_ext_readdir_streaming_benchmark() {
-    kprintln!("[test] Starting Ext4 zero-allocation streaming readdir benchmark test...");
+    crate::kprintln!("[test] Starting Ext4 zero-allocation streaming readdir benchmark test...");
 
     let dir_path = b"/disk/stream_bench_dir\0";
     let dir_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
@@ -666,11 +768,8 @@ fn test_ext_readdir_streaming_benchmark() {
     let mut total_dents_read = 0;
 
     loop {
-        let nread = crate::syscall::fs::sys_getdents64(
-            dir_fd as i32,
-            dents_buf_addr as *mut u8,
-            4096,
-        );
+        let nread =
+            crate::syscall::fs::sys_getdents64(dir_fd as i32, dents_buf_addr as *mut u8, 4096);
         if nread <= 0 {
             break;
         }
@@ -693,7 +792,7 @@ fn test_ext_readdir_streaming_benchmark() {
     let _ = crate::syscall::fs::sys_close(dir_fd as i32);
 
     let stream_ms = (end_ticks_stream.saturating_sub(start_ticks_stream)) * 10;
-    kprintln!(
+    crate::kprintln!(
         "[test] Ext4 zero-allocation streaming readdir benchmark (100 iterations on {} entries): {} ms",
         entry_count,
         stream_ms
@@ -718,5 +817,5 @@ fn test_ext_readdir_streaming_benchmark() {
     crate::syscall::memory::sys_munmap(path_buf_addr, 4096);
     crate::syscall::memory::sys_munmap(dents_buf_addr, 4096);
 
-    kprintln!("[test] Ext4 zero-allocation streaming readdir benchmark test PASSED!");
+    crate::kprintln!("[test] Ext4 zero-allocation streaming readdir benchmark test PASSED!");
 }

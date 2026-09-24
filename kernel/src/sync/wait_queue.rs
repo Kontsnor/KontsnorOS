@@ -99,6 +99,68 @@ impl WaitQueue {
         pids.retain(|&x| x != current_pid);
     }
 
+    /// Wake up a single task currently sleeping on this wait queue.
+    ///
+    /// Returns `true` if a task was woken, or `false` if the queue was empty.
+    pub fn wake_one(&self) -> bool {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            if let Some(mut sched_lock) = scheduler::SCHEDULER.try_lock() {
+                if let Some(ref mut sched) = *sched_lock {
+                    self.wake_one_locked(sched)
+                } else {
+                    false
+                }
+            } else {
+                let apic_id = crate::arch::x86_64::smp::current_lapic_id() as u32;
+                if scheduler::SCHEDULER.holding_cpu_id() == apic_id {
+                    // SAFETY: The current CPU already holds SCHEDULER exclusively
+                    unsafe {
+                        if let Some(ref mut sched) = *scheduler::SCHEDULER.get_mut_unchecked() {
+                            self.wake_one_locked(sched)
+                        } else {
+                            false
+                        }
+                    }
+                } else {
+                    let mut sched_lock = scheduler::SCHEDULER.lock();
+                    if let Some(ref mut sched) = *sched_lock {
+                        self.wake_one_locked(sched)
+                    } else {
+                        false
+                    }
+                }
+            }
+        })
+    }
+
+    /// Wake up a single task currently sleeping on this wait queue and propagate to attached listeners.
+    /// The caller must already hold the scheduler lock.
+    ///
+    /// Returns `true` if a task was woken, or `false` if the queue was empty.
+    pub fn wake_one_locked(&self, sched: &mut scheduler::Scheduler) -> bool {
+        let mut pids = self.pids.lock();
+        let woken = if let Some(pid) = pids.pop_front() {
+            sched.wake_task(pid);
+            true
+        } else {
+            false
+        };
+        drop(pids);
+
+        // Propagate wakeup to any attached listener queues (e.g. epoll, poll)
+        let mut listeners = self.listeners.lock();
+        listeners.retain(|weak_wq| {
+            if let Some(child_wq) = weak_wq.upgrade() {
+                child_wq.wake_all_locked(sched);
+                true
+            } else {
+                false
+            }
+        });
+
+        woken
+    }
+
     /// Wake up all tasks currently sleeping on this wait queue.
     pub fn wake_all(&self) {
         x86_64::instructions::interrupts::without_interrupts(|| {

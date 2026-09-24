@@ -19,22 +19,20 @@
 //! rather than busy-waiting. This is more efficient for longer critical
 //! sections or when the lock is expected to be held for a while.
 //!
-//! Note: In the current implementation, this falls back to spinning
-//! since we don't yet have a full thread scheduler with wait queues.
-//! It will be upgraded to a proper sleeping mutex when the scheduler
-//! supports blocking.
-
+use crate::sync::wait_queue::WaitQueue;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// A sleeping mutex.
 ///
-/// Currently implemented as a spinning mutex (TODO: convert to sleeping
-/// once the scheduler supports wait queues).
+/// Uses an atomic flag for fast-path uncontended access, a short bounded spin
+/// loop for brief lock hold times, and sleeps on a `WaitQueue` when contended.
 pub struct KMutex<T> {
     /// Lock state: true = locked, false = unlocked.
     locked: AtomicBool,
+    /// Wait queue for tasks waiting to acquire the mutex.
+    wait_queue: WaitQueue,
     /// The protected data.
     data: UnsafeCell<T>,
 }
@@ -48,22 +46,46 @@ impl<T> KMutex<T> {
     pub const fn new(data: T) -> Self {
         Self {
             locked: AtomicBool::new(false),
+            wait_queue: WaitQueue::new(),
             data: UnsafeCell::new(data),
         }
     }
 
     /// Acquire the mutex.
     ///
-    /// Currently spins; will block the thread once the scheduler
-    /// supports wait queues.
+    /// Fast path: Attempts an immediate atomic acquire.
+    /// Spin path: Spins briefly (16 iterations) using `spin_loop` in case the holder
+    /// releases quickly.
+    /// Slow path: Enqueues on `wait_queue` and blocks until woken up by `KMutexGuard::drop`.
     pub fn lock(&self) -> KMutexGuard<'_, T> {
+        // Fast path
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return KMutexGuard { mutex: self };
+        }
+
+        // Bounded short spin loop
+        for _ in 0..16 {
+            if self
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return KMutexGuard { mutex: self };
+            }
+            core::hint::spin_loop();
+        }
+
+        // Slow path: sleep on wait queue until acquired
         while self
             .locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            // TODO: Add to wait queue and yield to scheduler
-            core::hint::spin_loop();
+            self.wait_queue.wait();
         }
 
         KMutexGuard { mutex: self }
@@ -105,6 +127,6 @@ impl<T> DerefMut for KMutexGuard<'_, T> {
 impl<T> Drop for KMutexGuard<'_, T> {
     fn drop(&mut self) {
         self.mutex.locked.store(false, Ordering::Release);
-        // TODO: Wake up one thread from the wait queue
+        self.mutex.wait_queue.wake_one();
     }
 }

@@ -15,10 +15,51 @@
 
 //! Miscellaneous / Trivial test cases.
 
+use crate::kprintln;
+
 #[test_case]
 fn test_trivial() {
     let two = 2;
     assert_eq!(1 + 1, two);
+}
+
+#[test_case]
+fn test_kmutex_basic() {
+    use crate::sync::mutex::KMutex;
+
+    static MUTEX: KMutex<u32> = KMutex::new(0);
+
+    // 1. Uncontended lock acquire and release
+    {
+        let mut guard = MUTEX.lock();
+        assert_eq!(*guard, 0);
+        *guard = 42;
+    }
+
+    // 2. Verify state after release
+    {
+        let guard = MUTEX.lock();
+        assert_eq!(*guard, 42);
+    }
+
+    // 3. try_lock when unlocked vs locked
+    {
+        let mut guard1 = MUTEX.try_lock();
+        assert!(guard1.is_some());
+        let guard1_ref = guard1.as_mut().unwrap();
+        **guard1_ref = 100;
+
+        // While locked, try_lock should fail (return None)
+        let guard2 = MUTEX.try_lock();
+        assert!(guard2.is_none());
+    }
+
+    // After guard1 is dropped, try_lock should succeed again
+    {
+        let guard = MUTEX.try_lock();
+        assert!(guard.is_some());
+        assert_eq!(*guard.unwrap(), 100);
+    }
 }
 
 #[test_case]
@@ -27,10 +68,12 @@ fn test_pty_active_master_optimization() {
 
     // 1. Verify initial active master setting
     let pty1 = crate::fs::pty::allocate_new_pty().expect("Failed to allocate PTY 1");
-    let version_before = crate::fs::pty::ACTIVE_PTY_VERSION.load(core::sync::atomic::Ordering::Acquire);
+    let version_before =
+        crate::fs::pty::ACTIVE_PTY_VERSION.load(core::sync::atomic::Ordering::Acquire);
 
     crate::fs::pty::set_active_pty_master(Some(pty1.clone()));
-    let version_after_pty1 = crate::fs::pty::ACTIVE_PTY_VERSION.load(core::sync::atomic::Ordering::Acquire);
+    let version_after_pty1 =
+        crate::fs::pty::ACTIVE_PTY_VERSION.load(core::sync::atomic::Ordering::Acquire);
     assert_eq!(version_after_pty1, version_before + 1);
 
     // Verify ACTIVE_PTY_MASTER is pty1
@@ -40,12 +83,14 @@ fn test_pty_active_master_optimization() {
     // 2. Test dynamic switching to a new PTY master
     let pty2 = crate::fs::pty::allocate_new_pty().expect("Failed to allocate PTY 2");
     crate::fs::pty::set_active_pty_master(Some(pty2.clone()));
-    let version_after_pty2 = crate::fs::pty::ACTIVE_PTY_VERSION.load(core::sync::atomic::Ordering::Acquire);
+    let version_after_pty2 =
+        crate::fs::pty::ACTIVE_PTY_VERSION.load(core::sync::atomic::Ordering::Acquire);
     assert_eq!(version_after_pty2, version_after_pty1 + 1);
 
     // 3. Test clearing active master
     crate::fs::pty::set_active_pty_master(None);
-    let version_after_none = crate::fs::pty::ACTIVE_PTY_VERSION.load(core::sync::atomic::Ordering::Acquire);
+    let version_after_none =
+        crate::fs::pty::ACTIVE_PTY_VERSION.load(core::sync::atomic::Ordering::Acquire);
     assert_eq!(version_after_none, version_after_pty2 + 1);
     assert!(crate::fs::pty::ACTIVE_PTY_MASTER.lock().is_none());
 
@@ -69,7 +114,8 @@ fn test_pty_active_master_optimization() {
     let mut cached_master: Option<alloc::sync::Arc<dyn crate::fs::inode::InodeOps>> = None;
     let mut cached_version: u64 = 0;
     for _ in 0..ITERATIONS {
-        let current_version = crate::fs::pty::ACTIVE_PTY_VERSION.load(core::sync::atomic::Ordering::Acquire);
+        let current_version =
+            crate::fs::pty::ACTIVE_PTY_VERSION.load(core::sync::atomic::Ordering::Acquire);
         if current_version != cached_version || (cached_master.is_none() && current_version == 0) {
             cached_master = crate::fs::pty::ACTIVE_PTY_MASTER.lock().clone();
             cached_version = current_version;

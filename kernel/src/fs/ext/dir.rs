@@ -384,7 +384,9 @@ impl ExtInode {
             return Vec::new();
         }
 
-        let mut entries = Vec::new();
+        // Estimate number of entries based on directory size (avg 32 bytes per entry)
+        let estimated_entries = (file_size as usize / 32).max(8);
+        let mut entries = Vec::with_capacity(estimated_entries);
         let mut offset = 0u64;
 
         while offset < file_size {
@@ -452,6 +454,91 @@ impl ExtInode {
         }
 
         entries
+    }
+
+    /// Implement VFS zero-allocation directory streaming iteration.
+    pub fn iterate_dir_entries_impl(
+        &self,
+        start_offset: u64,
+        f: &mut dyn FnMut(u64, u64, FileType, &str) -> bool,
+    ) -> Result<u64, i32> {
+        let (is_dir, file_size) = {
+            let vfs = self.vfs_inode.read();
+            (vfs.is_dir(), vfs.size)
+        };
+        if !is_dir {
+            return Ok(start_offset);
+        }
+
+        let block_size = self.fs.block_size as u64;
+        let mut offset = start_offset;
+
+        while offset < file_size {
+            let file_block = (offset / block_size) as u32;
+            let block_offset = (offset % block_size) as usize;
+
+            let phys_block = match self.resolve_block(file_block) {
+                Ok(b) if b != 0 => b,
+                _ => break,
+            };
+
+            let mut block_buf = alloc::vec![0u8; self.fs.block_size as usize];
+            if read_blocks(
+                &*self.fs.device,
+                phys_block as u64,
+                &mut block_buf,
+                self.fs.block_size,
+            )
+            .is_err()
+            {
+                break;
+            }
+
+            let mut ptr = block_offset;
+            while ptr + 8 <= self.fs.block_size as usize {
+                let entry_offset = (file_block as u64) * block_size + ptr as u64;
+                let inode = u32::from_le_bytes([
+                    block_buf[ptr],
+                    block_buf[ptr + 1],
+                    block_buf[ptr + 2],
+                    block_buf[ptr + 3],
+                ]);
+                let rec_len = u16::from_le_bytes([block_buf[ptr + 4], block_buf[ptr + 5]]) as usize;
+                let name_len = block_buf[ptr + 6] as usize;
+                let file_type_byte = block_buf[ptr + 7];
+
+                if rec_len == 0 || ptr + rec_len > self.fs.block_size as usize {
+                    break;
+                }
+
+                let next_entry_offset = entry_offset + rec_len as u64;
+
+                if inode != 0 && ptr + 8 + name_len <= self.fs.block_size as usize {
+                    let name_bytes = &block_buf[ptr + 8..ptr + 8 + name_len];
+                    if let Ok(name_str) = core::str::from_utf8(name_bytes) {
+                        let file_type = match file_type_byte {
+                            1 => FileType::Regular,
+                            2 => FileType::Directory,
+                            7 => FileType::Symlink,
+                            _ => FileType::Regular,
+                        };
+                        if !f(next_entry_offset, inode as u64, file_type, name_str) {
+                            return Ok(entry_offset);
+                        }
+                    }
+                }
+
+                ptr += rec_len;
+                offset = next_entry_offset;
+            }
+
+            let next_block_offset = ((file_block as u64) + 1) * block_size;
+            if offset < next_block_offset {
+                offset = next_block_offset;
+            }
+        }
+
+        Ok(offset)
     }
 
     /// Implement VFS lookup.

@@ -110,11 +110,11 @@ impl<T: Copy, const N: usize> RingBuffer<T, N> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test"))]
 mod tests {
     use super::*;
 
-    #[test]
+    #[test_case]
     fn test_ring_buffer_operations() {
         let rb: RingBuffer<u8, 4> = RingBuffer::new();
         assert!(rb.is_empty());

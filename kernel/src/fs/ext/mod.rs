@@ -1312,6 +1312,14 @@ impl InodeOps for ExtInode {
         self.readdir_dir_entry()
     }
 
+    fn iterate_dir_entries(
+        &self,
+        offset: u64,
+        f: &mut dyn FnMut(u64, u64, FileType, &str) -> bool,
+    ) -> Result<u64, i32> {
+        self.iterate_dir_entries_impl(offset, f)
+    }
+
     fn lookup(&self, name: &str) -> Option<Arc<dyn InodeOps>> {
         self.lookup_dir_entry(name)
     }

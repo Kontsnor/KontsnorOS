@@ -140,43 +140,113 @@ fn conflicts(
     false
 }
 
-fn subtract_range(
-    lock: &FileRangeLock,
+fn subtract_range_in_place(
+    locks: &mut alloc::vec::Vec<FileRangeLock>,
+    owner: LockOwner,
     u_start: u64,
     u_len: u64,
-) -> alloc::vec::Vec<FileRangeLock> {
-    if !ranges_overlap(lock.start, lock.len, u_start, u_len) {
-        return alloc::vec![lock.clone()];
-    }
-    let l_end = if lock.len == 0 {
-        u64::MAX
-    } else {
-        lock.start + lock.len
-    };
+) {
     let u_end = if u_len == 0 {
         u64::MAX
     } else {
-        u_start + u_len
+        u_start.saturating_add(u_len)
     };
 
-    let mut res = alloc::vec::Vec::new();
-    if lock.start < u_start {
-        res.push(FileRangeLock {
-            owner: lock.owner,
-            typ: lock.typ,
-            start: lock.start,
-            len: u_start - lock.start,
-        });
+    let mut i = 0;
+    while i < locks.len() {
+        if locks[i].owner != owner || !ranges_overlap(locks[i].start, locks[i].len, u_start, u_len)
+        {
+            i += 1;
+            continue;
+        }
+
+        let l_start = locks[i].start;
+        let l_len = locks[i].len;
+        let l_end = if l_len == 0 {
+            u64::MAX
+        } else {
+            l_start.saturating_add(l_len)
+        };
+
+        let left_overlap = l_start < u_start;
+        let right_overlap = l_end > u_end;
+
+        if left_overlap && right_overlap {
+            locks[i].len = u_start - l_start;
+            let right_len = if l_len == 0 { 0 } else { l_end - u_end };
+            let right_lock = FileRangeLock {
+                owner,
+                typ: locks[i].typ,
+                start: u_end,
+                len: right_len,
+            };
+            locks.insert(i + 1, right_lock);
+            i += 2;
+        } else if left_overlap {
+            locks[i].len = u_start - l_start;
+            i += 1;
+        } else if right_overlap {
+            locks[i].start = u_end;
+            locks[i].len = if l_len == 0 { 0 } else { l_end - u_end };
+            i += 1;
+        } else {
+            locks.remove(i);
+        }
     }
-    if l_end > u_end {
-        res.push(FileRangeLock {
-            owner: lock.owner,
-            typ: lock.typ,
-            start: u_end,
-            len: if lock.len == 0 { 0 } else { l_end - u_end },
-        });
+}
+
+fn add_range_lock_in_place(
+    locks: &mut alloc::vec::Vec<FileRangeLock>,
+    owner: LockOwner,
+    req_typ: LockType,
+    start: u64,
+    len: u64,
+) {
+    // 1. Subtract range from owner's locks first to overwrite/update subranges
+    subtract_range_in_place(locks, owner, start, len);
+
+    // 2. Coalesce/merge contiguous or overlapping ranges for the same owner and type
+    let mut new_start = start;
+    let mut new_len = len;
+    let mut new_end = if new_len == 0 {
+        u64::MAX
+    } else {
+        new_start.saturating_add(new_len)
+    };
+
+    let mut i = 0;
+    while i < locks.len() {
+        if locks[i].owner == owner && locks[i].typ == req_typ {
+            let l_start = locks[i].start;
+            let l_end = if locks[i].len == 0 {
+                u64::MAX
+            } else {
+                l_start.saturating_add(locks[i].len)
+            };
+
+            // Touch or overlap check
+            if l_start <= new_end && new_start <= l_end {
+                new_start = core::cmp::min(l_start, new_start);
+                new_end = core::cmp::max(l_end, new_end);
+                new_len = if new_end == u64::MAX {
+                    0
+                } else {
+                    new_end - new_start
+                };
+                locks.remove(i);
+                i = 0;
+                continue;
+            }
+        }
+        i += 1;
     }
-    res
+
+    locks.push(FileRangeLock {
+        owner,
+        typ: req_typ,
+        start: new_start,
+        len: new_len,
+    });
 }
 
 pub fn release_flock_locks(fd_desc_ptr: usize, ino: u64) {
@@ -800,15 +870,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                     // F_UNLCK
                     let mut locks = FILE_LOCKS.lock();
                     if let Some(state) = locks.get_mut(&(dev, ino)) {
-                        let mut new_locks = alloc::vec::Vec::new();
-                        for lock in &state.range_locks {
-                            if lock.owner == owner {
-                                new_locks.extend(subtract_range(lock, start, len));
-                            } else {
-                                new_locks.push(lock.clone());
-                            }
-                        }
-                        state.range_locks = new_locks;
+                        subtract_range_in_place(&mut state.range_locks, owner, start, len);
                     }
                     0
                 } else {
@@ -837,23 +899,13 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                             drop(locks);
                             crate::process::scheduler::yield_now();
                         } else {
-                            // Subtract range from our own locks first to update/overwrite
-                            let mut new_locks = alloc::vec::Vec::new();
-                            for lock in &state.range_locks {
-                                if lock.owner == owner {
-                                    new_locks.extend(subtract_range(lock, start, len));
-                                } else {
-                                    new_locks.push(lock.clone());
-                                }
-                            }
-                            // Add the new lock
-                            new_locks.push(FileRangeLock {
+                            add_range_lock_in_place(
+                                &mut state.range_locks,
                                 owner,
-                                typ: req_typ,
+                                req_typ,
                                 start,
                                 len,
-                            });
-                            state.range_locks = new_locks;
+                            );
                             return 0;
                         }
                     }

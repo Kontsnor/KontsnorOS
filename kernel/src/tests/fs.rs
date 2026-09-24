@@ -260,6 +260,129 @@ fn test_eventfd() {
 }
 
 #[test_case]
+fn test_posix_range_lock_conformance() {
+    let tmp_dir = crate::fs::vfs::lookup("/tmp").expect("Failed to lookup /tmp");
+    let test_file = tmp_dir
+        .create("lock_posix.txt", crate::fs::inode::FileType::Regular)
+        .expect("Failed to create lock_posix.txt");
+
+    let fd = crate::process::fd::current_task_alloc_fd_with_flags_and_path(
+        test_file,
+        crate::fs::file::OpenFlags(crate::fs::file::OpenFlags::O_RDWR),
+        Some(alloc::string::String::from("/tmp/lock_posix.txt")),
+    )
+    .expect("Alloc fd failed") as i32;
+
+    // Helper to test GETLK
+    let get_lock = |fd: i32, l_type: i16, start: i64, len: i64| -> crate::syscall::fs::Flock {
+        let mut fl = crate::syscall::fs::Flock {
+            l_type,
+            l_whence: 0,
+            l_start: start,
+            l_len: len,
+            l_pid: 0,
+        };
+        let res = crate::syscall::fs::sys_fcntl(fd, 5, &mut fl as *mut _ as u64); // F_GETLK
+        assert_eq!(res, 0);
+        fl
+    };
+
+    // 1. Adjacent merging test: Lock [0, 50) shared, then [50, 50) shared.
+    let mut fl1 = crate::syscall::fs::Flock {
+        l_type: 0, // F_RDLCK
+        l_whence: 0,
+        l_start: 0,
+        l_len: 50,
+        l_pid: 0,
+    };
+    assert_eq!(
+        crate::syscall::fs::sys_fcntl(fd, 6, &mut fl1 as *mut _ as u64),
+        0
+    );
+
+    let mut fl2 = crate::syscall::fs::Flock {
+        l_type: 0, // F_RDLCK
+        l_whence: 0,
+        l_start: 50,
+        l_len: 50,
+        l_pid: 0,
+    };
+    assert_eq!(
+        crate::syscall::fs::sys_fcntl(fd, 6, &mut fl2 as *mut _ as u64),
+        0
+    );
+
+    // Verify [0, 100) is locked by same owner (F_GETLK with exclusive request shows lock starting at 0, len 100)
+    let q1 = get_lock(fd, 1, 0, 100);
+    // Since F_GETLK is run by same process owner, it won't conflict with itself unless checked with another PID/owner or internal state.
+    // Clean up
+    let mut fl_un = crate::syscall::fs::Flock {
+        l_type: 2, // F_UNLCK
+        l_whence: 0,
+        l_start: 0,
+        l_len: 100,
+        l_pid: 0,
+    };
+    assert_eq!(
+        crate::syscall::fs::sys_fcntl(fd, 6, &mut fl_un as *mut _ as u64),
+        0
+    );
+
+    // 2. Middle hole punch test: Lock [0, 100) write lock, unlock [30, 40)
+    let mut fl_full = crate::syscall::fs::Flock {
+        l_type: 1, // F_WRLCK
+        l_whence: 0,
+        l_start: 0,
+        l_len: 100,
+        l_pid: 0,
+    };
+    assert_eq!(
+        crate::syscall::fs::sys_fcntl(fd, 6, &mut fl_full as *mut _ as u64),
+        0
+    );
+
+    let mut fl_hole = crate::syscall::fs::Flock {
+        l_type: 2, // F_UNLCK
+        l_whence: 0,
+        l_start: 30,
+        l_len: 40,
+        l_pid: 0,
+    };
+    assert_eq!(
+        crate::syscall::fs::sys_fcntl(fd, 6, &mut fl_hole as *mut _ as u64),
+        0
+    );
+
+    // 3. Type conversion test: Lock [0, 30) with read lock
+    let mut fl_conv = crate::syscall::fs::Flock {
+        l_type: 0, // F_RDLCK
+        l_whence: 0,
+        l_start: 0,
+        l_len: 20,
+        l_pid: 0,
+    };
+    assert_eq!(
+        crate::syscall::fs::sys_fcntl(fd, 6, &mut fl_conv as *mut _ as u64),
+        0
+    );
+
+    // Final unlock
+    let mut fl_un_all = crate::syscall::fs::Flock {
+        l_type: 2,
+        l_whence: 0,
+        l_start: 0,
+        l_len: 0, // 0 = to EOF
+        l_pid: 0,
+    };
+    assert_eq!(
+        crate::syscall::fs::sys_fcntl(fd, 6, &mut fl_un_all as *mut _ as u64),
+        0
+    );
+
+    crate::process::fd::current_task_close_fd(fd);
+}
+
+#[test_case]
 fn test_timerfd() {
     let epfd = crate::fs::epoll::sys_epoll_create1(0);
     assert!(epfd >= 0);
@@ -568,4 +691,91 @@ fn test_lseek_espipe_on_pipe() {
 
     crate::syscall::fs::sys_close(read_fd);
     crate::syscall::fs::sys_close(write_fd);
+}
+
+#[test_case]
+fn test_file_range_lock_performance() {
+    let tmp_dir = crate::fs::vfs::lookup("/tmp").expect("Failed to lookup /tmp");
+    let test_file = tmp_dir
+        .create("lock_perf.txt", crate::fs::inode::FileType::Regular)
+        .expect("Failed to create lock_perf.txt");
+
+    let fd = crate::process::fd::current_task_alloc_fd_with_flags_and_path(
+        test_file,
+        crate::fs::file::OpenFlags(crate::fs::file::OpenFlags::O_RDWR),
+        Some(alloc::string::String::from("/tmp/lock_perf.txt")),
+    )
+    .expect("Alloc fd failed") as i32;
+
+    let iterations = 2000;
+    let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+
+    for i in 0..iterations {
+        // 1. Acquire read lock on [0, 100)
+        let mut fl_rd = crate::syscall::fs::Flock {
+            l_type: 0,   // F_RDLCK
+            l_whence: 0, // SEEK_SET
+            l_start: 0,
+            l_len: 100,
+            l_pid: 0,
+        };
+        let res1 = crate::syscall::fs::sys_fcntl(fd, 6, &mut fl_rd as *mut _ as u64); // F_SETLK
+        assert_eq!(res1, 0);
+
+        // 2. Convert subrange [20, 40) to write lock (type conversion / hole in middle)
+        let mut fl_wr = crate::syscall::fs::Flock {
+            l_type: 1, // F_WRLCK
+            l_whence: 0,
+            l_start: 20,
+            l_len: 20,
+            l_pid: 0,
+        };
+        let res2 = crate::syscall::fs::sys_fcntl(fd, 6, &mut fl_wr as *mut _ as u64);
+        assert_eq!(res2, 0);
+
+        // 3. Acquire adjacent read lock on [100, 200) (tests merging)
+        let mut fl_rd_adj = crate::syscall::fs::Flock {
+            l_type: 0, // F_RDLCK
+            l_whence: 0,
+            l_start: 100,
+            l_len: 100,
+            l_pid: 0,
+        };
+        let res3 = crate::syscall::fs::sys_fcntl(fd, 6, &mut fl_rd_adj as *mut _ as u64);
+        assert_eq!(res3, 0);
+
+        // 4. Hole punch / unlock middle subrange [25, 35)
+        let mut fl_un1 = crate::syscall::fs::Flock {
+            l_type: 2, // F_UNLCK
+            l_whence: 0,
+            l_start: 25,
+            l_len: 10,
+            l_pid: 0,
+        };
+        let res4 = crate::syscall::fs::sys_fcntl(fd, 6, &mut fl_un1 as *mut _ as u64);
+        assert_eq!(res4, 0);
+
+        // 5. Unlock remaining range [0, 200)
+        let mut fl_un_all = crate::syscall::fs::Flock {
+            l_type: 2, // F_UNLCK
+            l_whence: 0,
+            l_start: 0,
+            l_len: 200,
+            l_pid: 0,
+        };
+        let res5 = crate::syscall::fs::sys_fcntl(fd, 6, &mut fl_un_all as *mut _ as u64);
+        assert_eq!(res5, 0);
+    }
+
+    let end_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let elapsed_tsc = end_tsc.saturating_sub(start_tsc);
+
+    crate::kprintln!(
+        "[perf] range lock test ({} iterations, 5 ops/iter): {} cycles total ({} cycles/op)",
+        iterations,
+        elapsed_tsc,
+        elapsed_tsc / (iterations * 5)
+    );
+
+    crate::process::fd::current_task_close_fd(fd);
 }

@@ -55,9 +55,8 @@ pub fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
     let mut bytes_written = 0;
     let mut einval = false;
 
-    let next_offset = match inode.iterate_dir_entries(
-        current_offset,
-        &mut |next_off, ino, file_type, name| {
+    let next_offset =
+        match inode.iterate_dir_entries(current_offset, &mut |next_off, ino, file_type, name| {
             let name_bytes = name.as_bytes();
             let name_len = name_bytes.len();
 
@@ -99,11 +98,10 @@ pub fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
 
             bytes_written += reclen;
             true
-        },
-    ) {
-        Ok(off) => off,
-        Err(e) => return e as SyscallResult,
-    };
+        }) {
+            Ok(off) => off,
+            Err(e) => return e as SyscallResult,
+        };
 
     if einval {
         return Errno::EINVAL.into();
@@ -133,6 +131,11 @@ pub fn sys_chdir(pathname: *const u8) -> SyscallResult {
         return Errno::ENOTDIR.into();
     }
 
+    // Verify execute permission on directory
+    if let Err(e) = check_permission(inode.inode(), MAY_EXEC) {
+        return e as SyscallResult;
+    }
+
     // Update current task's cwd
     let current_pid = match crate::process::scheduler::current_pid() {
         Some(p) => p,
@@ -143,7 +146,9 @@ pub fn sys_chdir(pathname: *const u8) -> SyscallResult {
         Some(t) => t,
         None => return Errno::ESRCH.into(),
     };
-    task_arc.lock().cwd = resolved_path;
+    let mut task = task_arc.lock();
+    task.fs_ctx.write().cwd = resolved_path.clone();
+    task.cwd = resolved_path;
     0 // Success
 }
 
@@ -156,19 +161,14 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> SyscallResult {
         return Errno::EFAULT.into();
     }
 
-    let current_pid = match crate::process::scheduler::current_pid() {
-        Some(p) => p,
-        None => return 0, // returns NULL on error
-    };
-
-    let task_arc = match crate::process::scheduler::get_task_arc(current_pid) {
-        Some(t) => t,
-        None => return 0,
-    };
-    let (cwd, jail_root) = {
-        let task = task_arc.lock();
-        let jail = task.fs_ctx.read().root.clone();
-        (task.cwd.clone(), jail)
+    let (cwd, jail_root) = if let Some(fs_ctx_arc) = crate::process::scheduler::current_fs_ctx() {
+        let guard = fs_ctx_arc.read();
+        (guard.cwd.clone(), guard.root.clone())
+    } else {
+        (
+            alloc::string::String::from("/"),
+            alloc::string::String::from("/"),
+        )
     };
 
     let jail_str = jail_root.as_str();

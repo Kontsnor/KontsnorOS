@@ -1484,17 +1484,20 @@ pub fn sys_clone(
 
             // ── Namespace propagation for clone() ─────────────────────────────
 
-            // CLONE_NEWNS: child gets a private copy of the mount namespace.
-            if flags & CLONE_NEWNS != 0 {
+            // CLONE_FS (0x00000200): share the exact same FsContext Arc as the parent
+            if (flags & 0x0000_0200) != 0 {
+                child_task.fs_ctx = parent_task.fs_ctx.clone();
+            } else if flags & CLONE_NEWNS != 0 {
+                // CLONE_NEWNS: child gets a private copy of the mount namespace.
                 let new_ns = parent_task.fs_ctx.read().mount_ns.read().fork();
-                child_task.fs_ctx = Arc::new(spin::RwLock::new(
-                    crate::fs::namespace::FsContext::new_initial(alloc::sync::Arc::new(
-                        spin::RwLock::new(new_ns),
-                    )),
-                ));
-                child_task.fs_ctx.write().root = parent_task.fs_ctx.read().root.clone();
+                child_task.fs_ctx =
+                    Arc::new(spin::RwLock::new(crate::fs::namespace::FsContext::new(
+                        parent_task.fs_ctx.read().cwd.clone(),
+                        parent_task.fs_ctx.read().root.clone(),
+                        alloc::sync::Arc::new(spin::RwLock::new(new_ns)),
+                    )));
             } else {
-                // Shared mount namespace (Arc clone).
+                // Shared mount namespace (Arc clone), but deep-copied FsContext root and cwd.
                 child_task.fs_ctx = Arc::new(spin::RwLock::new(parent_task.fs_ctx.read().fork()));
             }
 

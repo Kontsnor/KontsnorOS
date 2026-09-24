@@ -179,16 +179,12 @@ impl Vfs {
     ///
     /// Returns the filesystem and the remaining path within it.
     pub fn resolve_mount(&self, path: &str) -> Option<(Arc<dyn FileSystem>, String)> {
-        // First check current task's private mount namespace if available
-        if let Some(pid) = crate::process::scheduler::current_pid() {
-            if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
-                if let Some(task) = task_arc.try_lock() {
-                    let mount_ns = task.fs_ctx.read().mount_ns.clone();
-                    let guard = mount_ns.read();
-                    if let Some(res) = guard.resolve_mount(path) {
-                        return Some(res);
-                    }
-                }
+        // First check current task's private mount namespace directly via CPU-local FsContext
+        if let Some(fs_ctx_arc) = crate::process::scheduler::current_fs_ctx() {
+            let mount_ns = fs_ctx_arc.read().mount_ns.clone();
+            let guard = mount_ns.read();
+            if let Some(res) = guard.resolve_mount(path) {
+                return Some(res);
             }
         }
 
@@ -510,33 +506,10 @@ pub fn invalidate_dentry(path: &str) {
 /// If the task has a non-"/" `fs_ctx.root`, path resolution is clamped so
 /// that `..` traversal cannot escape the jail boundary.
 pub fn resolve_relative_path(path: &str) -> String {
-    // Retrieve current task's cwd and jail root
-    let (cwd, jail_root) = if let Some(pid) = crate::process::scheduler::current_pid() {
-        // Skip fs_ctx access for kernel bootstrap threads (PID 0–2) which may
-        // not yet have a fully-initialized or stable fs_ctx Arc during early boot.
-        // Also use try_lock() to avoid blocking on a lock already held by an
-        // interrupted context.
-        if pid.as_u64() <= 2 {
-            (
-                alloc::string::String::from("/"),
-                alloc::string::String::from("/"),
-            )
-        } else if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
-            if let Some(task) = task_arc.try_lock() {
-                let root = task.fs_ctx.read().root.clone();
-                (task.cwd.clone(), root)
-            } else {
-                (
-                    alloc::string::String::from("/"),
-                    alloc::string::String::from("/"),
-                )
-            }
-        } else {
-            (
-                alloc::string::String::from("/"),
-                alloc::string::String::from("/"),
-            )
-        }
+    // Retrieve current task's cwd and jail root directly from CPU-local FsContext
+    let (cwd, jail_root) = if let Some(fs_ctx_arc) = crate::process::scheduler::current_fs_ctx() {
+        let guard = fs_ctx_arc.read();
+        (guard.cwd.clone(), guard.root.clone())
     } else {
         (
             alloc::string::String::from("/"),

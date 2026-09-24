@@ -181,41 +181,7 @@ pub fn sys_mmap(
             }
 
             // Truncate or remove overlapping regions in mmap_regions
-            let mut new_regions = alloc::vec::Vec::new();
-            for r in addr_space.mmap_regions.iter() {
-                let r_start = r.start;
-                let r_end = r.start + r.len as u64;
-                if r_end <= addr || r_start >= end_addr {
-                    new_regions.push(r.clone());
-                } else {
-                    if r_start < addr {
-                        new_regions.push(crate::process::task::MappedRegion {
-                            start: r_start,
-                            len: (addr - r_start) as usize,
-                            inode: r.inode.clone(),
-                            offset: r.offset,
-                            is_shared: r.is_shared,
-                            prot: r.prot,
-                            pathname: r.pathname.clone(),
-                            is_stack: r.is_stack,
-                        });
-                    }
-                    if r_end > end_addr {
-                        let diff = end_addr - r_start;
-                        new_regions.push(crate::process::task::MappedRegion {
-                            start: end_addr,
-                            len: (r_end - end_addr) as usize,
-                            inode: r.inode.clone(),
-                            offset: r.offset + diff,
-                            is_shared: r.is_shared,
-                            prot: r.prot,
-                            pathname: r.pathname.clone(),
-                            is_stack: r.is_stack,
-                        });
-                    }
-                }
-            }
-            addr_space.mmap_regions = new_regions;
+            addr_space.unmap_range(addr, end_addr);
 
             addr
         } else {
@@ -425,43 +391,7 @@ pub fn sys_munmap(addr: u64, length: usize) -> SyscallResult {
             }
         }
 
-        let mut new_regions = alloc::vec::Vec::new();
-
-        for r in addr_space.mmap_regions.iter() {
-            let r_start = r.start;
-            let r_end = r.start + r.len as u64;
-
-            if r_end <= unmap_start || r_start >= unmap_end {
-                new_regions.push(r.clone());
-            } else {
-                if r_start < unmap_start {
-                    new_regions.push(crate::process::task::MappedRegion {
-                        start: r_start,
-                        len: (unmap_start - r_start) as usize,
-                        inode: r.inode.clone(),
-                        offset: r.offset,
-                        is_shared: r.is_shared,
-                        prot: r.prot,
-                        pathname: r.pathname.clone(),
-                        is_stack: r.is_stack,
-                    });
-                }
-                if r_end > unmap_end {
-                    let diff = unmap_end - r_start;
-                    new_regions.push(crate::process::task::MappedRegion {
-                        start: unmap_end,
-                        len: (r_end - unmap_end) as usize,
-                        inode: r.inode.clone(),
-                        offset: r.offset + diff,
-                        is_shared: r.is_shared,
-                        prot: r.prot,
-                        pathname: r.pathname.clone(),
-                        is_stack: r.is_stack,
-                    });
-                }
-            }
-        }
-        addr_space.mmap_regions = new_regions;
+        addr_space.unmap_range(unmap_start, unmap_end);
         crate::memory::page_cache::unregister_shared_mmap_range(
             page_table_root,
             unmap_start,

@@ -137,6 +137,49 @@ pub struct AddressSpace {
     pub mmap_regions: Vec<MappedRegion>,
 }
 
+impl AddressSpace {
+    /// Unmaps virtual memory regions overlapping `[unmap_start, unmap_end)` in place.
+    pub fn unmap_range(&mut self, unmap_start: u64, unmap_end: u64) {
+        if unmap_start >= unmap_end {
+            return;
+        }
+        let mut i = 0;
+        while i < self.mmap_regions.len() {
+            let r_start = self.mmap_regions[i].start;
+            let r_end = r_start + self.mmap_regions[i].len as u64;
+
+            if r_end <= unmap_start || r_start >= unmap_end {
+                i += 1;
+            } else if r_start >= unmap_start && r_end <= unmap_end {
+                self.mmap_regions.remove(i);
+            } else if r_start < unmap_start && r_end > unmap_end {
+                let right_region = MappedRegion {
+                    start: unmap_end,
+                    len: (r_end - unmap_end) as usize,
+                    inode: self.mmap_regions[i].inode.clone(),
+                    offset: self.mmap_regions[i].offset + (unmap_end - r_start),
+                    is_shared: self.mmap_regions[i].is_shared,
+                    prot: self.mmap_regions[i].prot,
+                    pathname: self.mmap_regions[i].pathname.clone(),
+                    is_stack: self.mmap_regions[i].is_stack,
+                };
+                self.mmap_regions[i].len = (unmap_start - r_start) as usize;
+                self.mmap_regions.insert(i + 1, right_region);
+                break;
+            } else if r_start < unmap_start {
+                self.mmap_regions[i].len = (unmap_start - r_start) as usize;
+                i += 1;
+            } else {
+                let diff = unmap_end - r_start;
+                self.mmap_regions[i].start = unmap_end;
+                self.mmap_regions[i].len = (r_end - unmap_end) as usize;
+                self.mmap_regions[i].offset += diff;
+                i += 1;
+            }
+        }
+    }
+}
+
 impl Drop for AddressSpace {
     fn drop(&mut self) {
         if self.page_table_root != 0

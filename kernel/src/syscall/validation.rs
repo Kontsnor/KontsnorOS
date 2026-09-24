@@ -234,22 +234,28 @@ pub fn validate_user_ptr_write(ptr: *mut u8, size: usize) -> Result<(), ()> {
 
 /// Copy a null-terminated string from user-space virtual address `ptr`.
 ///
-/// Validates that each byte's page pointer resides in user memory and is mapped
-/// in the active page table before dereferencing it, preventing unmapped page faults.
+/// Validates that each page containing bytes of the string resides in user memory
+/// and is mapped in the active page table before dereferencing bytes.
+/// Caches the page base address to avoid redundant 4-level page table walks
+/// on every byte iteration when consecutive bytes reside on the same 4 KiB page.
 pub unsafe fn copy_string_from_user(ptr: *const u8) -> Option<String> {
     if ptr.is_null() || (ptr as u64) > 0x0000_7FFF_FFFF_FFFF {
         return None;
     }
-    let mut result = String::new();
+    let mut result = String::with_capacity(64);
     let mut p = ptr;
+    let mut last_page_base: Option<u64> = None;
     loop {
         let addr = p as u64;
         if addr > 0x0000_7FFF_FFFF_FFFF {
             return None;
         }
         let page_base = addr & !4095;
-        if !ensure_page_mapped(page_base) {
-            return None;
+        if last_page_base != Some(page_base) {
+            if !ensure_page_mapped(page_base) {
+                return None;
+            }
+            last_page_base = Some(page_base);
         }
         // SAFETY: We validated that the page is mapped.
         let byte = unsafe { p.read_volatile() };

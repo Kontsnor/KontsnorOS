@@ -298,8 +298,11 @@ pub fn sys_epoll_wait(
         None
     };
 
+    let initial_cap = (maxevents as usize).min(1024);
+    let mut ready_list = Vec::with_capacity(initial_cap);
+
     loop {
-        let mut ready_list = Vec::new();
+        ready_list.clear();
         {
             let monitored = epoll.monitored.lock();
             let mut last_ready = epoll.last_ready.lock();

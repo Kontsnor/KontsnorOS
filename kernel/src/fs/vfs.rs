@@ -219,6 +219,17 @@ impl Vfs {
     /// Lookup an inode by path, optionally following symlinks.
     pub fn lookup_follow(&self, path: &str, follow_last: bool) -> Option<Arc<dyn InodeOps>> {
         let mut resolved_path = resolve_relative_path(path);
+
+        // Fast path: check if the full resolved path is already in the dentry cache
+        {
+            let cache = self.dentry_cache.read();
+            if let Some(inode) = cache.get(resolved_path.as_str()) {
+                if inode.inode().file_type != FileType::Symlink || !follow_last {
+                    return Some(inode.clone());
+                }
+            }
+        }
+
         let mut symlink_count = 0;
 
         loop {
@@ -263,17 +274,19 @@ impl Vfs {
                     resolved_till_now.push_str(component);
                 }
 
-                let next = {
-                    let cache = self.dentry_cache.read();
-                    cache.get(&resolved_till_now).cloned()
-                };
+                let cached = self
+                    .dentry_cache
+                    .read()
+                    .get(resolved_till_now.as_str())
+                    .cloned();
 
-                let next = if let Some(n) = next {
+                let next = if let Some(n) = cached {
                     n
                 } else {
                     let n = current.lookup(component)?;
-                    let mut cache = self.dentry_cache.write();
-                    cache.insert(resolved_till_now.clone(), n.clone());
+                    self.dentry_cache
+                        .write()
+                        .insert(resolved_till_now.clone(), n.clone());
                     n
                 };
 

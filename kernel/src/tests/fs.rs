@@ -571,6 +571,40 @@ fn test_lseek_espipe_on_pipe() {
 }
 
 #[test_case]
+fn test_vfs_lookup_dcache_benchmark() {
+    let tmp_dir = crate::fs::vfs::lookup("/tmp").expect("Failed to lookup /tmp");
+    let test_dir = tmp_dir
+        .mkdir("bench_dir")
+        .expect("Failed to create /tmp/bench_dir");
+
+    let test_file = test_dir
+        .create("file.txt", crate::fs::inode::FileType::Regular)
+        .expect("Failed to create /tmp/bench_dir/file.txt");
+    let _ = test_file.write(0, b"data");
+
+    // Populate dcache on first lookup
+    let _ = crate::fs::vfs::lookup("/tmp/bench_dir/file.txt").expect("Lookup failed");
+
+    // Measure cached path lookups
+    let iterations = 1_000;
+    let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    for _ in 0..iterations {
+        let node = crate::fs::vfs::lookup("/tmp/bench_dir/file.txt");
+        core::hint::black_box(node);
+    }
+    let end_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let elapsed_tsc = end_tsc - start_tsc;
+    let cycles_per_lookup = elapsed_tsc / iterations;
+
+    crate::kprintln!(
+        "[bench] VFS cached path lookup: {} total cycles for {} iterations (avg {} cycles/lookup)",
+        elapsed_tsc,
+        iterations,
+        cycles_per_lookup
+    );
+
+    let _ = test_dir.unlink("file.txt");
+    let _ = tmp_dir.rmdir("bench_dir");
 fn test_ext_readdir_streaming_benchmark() {
     kprintln!("[test] Starting Ext4 zero-allocation streaming readdir benchmark test...");
 

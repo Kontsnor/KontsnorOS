@@ -32,6 +32,10 @@ use crate::syscall::validation::{validate_user_ptr, validate_user_ptr_write};
 /// - In the child: 0
 /// - On error: negative errno
 pub fn sys_fork(regs: *mut crate::syscall::SavedRegisters) -> SyscallResult {
+    if regs.is_null() {
+        return Errno::EFAULT.into();
+    }
+
     use crate::process::{pid, scheduler, task::Task};
 
     // kprintln!("[syscall] fork()");
@@ -1368,6 +1372,10 @@ pub fn sys_clone(
     newtls: u64,
     regs: *mut crate::syscall::SavedRegisters,
 ) -> SyscallResult {
+    if regs.is_null() {
+        return Errno::EFAULT.into();
+    }
+
     use crate::process::{context::CpuContext, pid, scheduler, task::Task};
 
     // kprintln!("[syscall] clone(flags={:#x}, child_stack={:#x}, parent_tid={:?}, child_tid={:?}, newtls={:#x})",
@@ -1661,6 +1669,10 @@ pub fn sys_clone3(
     size: usize,
     regs: *mut crate::syscall::SavedRegisters,
 ) -> SyscallResult {
+    if regs.is_null() {
+        return Errno::EFAULT.into();
+    }
+
     if size < 64 || size > 4096 {
         return Errno::EINVAL.into();
     }

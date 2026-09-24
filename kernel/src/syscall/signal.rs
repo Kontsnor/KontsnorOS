@@ -454,6 +454,10 @@ fn terminate_group_and_exit(current_pid: crate::process::pid::Pid, exit_code: i3
 
 /// Delivers pending unblocked signals to the current process.
 pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
+    if regs.is_null() {
+        return;
+    }
+
     use crate::process::scheduler;
 
     let current_pid = match scheduler::current_pid() {
@@ -668,6 +672,10 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
 
 /// `sys_rt_sigreturn` — Return from signal handler.
 pub fn sys_rt_sigreturn(regs: *mut super::SavedRegisters) -> SyscallResult {
+    if regs.is_null() {
+        return Errno::EFAULT.into();
+    }
+
     let user_sp = unsafe { (*regs).rsp };
     let frame_ptr = (user_sp - 8) as *const RtSigFrame;
 

@@ -304,6 +304,10 @@ pub fn set_kernel_stack(stack: u64) {
 /// Dispatcher assembly calling wrapper.
 #[no_mangle]
 pub extern "C" fn syscall_dispatch_rust(regs: *mut SavedRegisters, syscall_num: u64) -> i64 {
+    if regs.is_null() {
+        return -(Errno::EFAULT as i64);
+    }
+
     if syscall_num == 15 {
         return crate::syscall::signal::sys_rt_sigreturn(regs);
     }

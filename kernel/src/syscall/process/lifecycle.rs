@@ -455,11 +455,11 @@ pub fn sys_execve(
         }
 
         // Add the script path as the next argument
-        new_argv.push(path.clone());
+        new_argv.push(path);
 
         // Add the original script arguments (excluding argv[0])
-        for arg in argv.iter().skip(1) {
-            new_argv.push(arg.clone());
+        for arg in argv.into_iter().skip(1) {
+            new_argv.push(arg);
         }
 
         path = alloc::string::String::from(interp_str);

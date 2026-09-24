@@ -356,7 +356,7 @@ pub fn sys_epoll_wait(
 
         // Check if timeout has expired
         let current_ticks = crate::arch::x86_64::interrupts::timer_ticks();
-        if timeout == 0 || (expire_ticks.is_some() && current_ticks >= expire_ticks.unwrap()) {
+        if timeout == 0 || expire_ticks.map_or(false, |exp| current_ticks >= exp) {
             return 0;
         }
 

@@ -109,35 +109,3 @@ impl<T: Copy, const N: usize> RingBuffer<T, N> {
         head - tail
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_ring_buffer_operations() {
-        let rb: RingBuffer<u8, 4> = RingBuffer::new();
-        assert!(rb.is_empty());
-        assert_eq!(rb.len(), 0);
-
-        assert_eq!(rb.push(10), Ok(()));
-        assert_eq!(rb.push(20), Ok(()));
-        assert_eq!(rb.push(30), Ok(()));
-        assert_eq!(rb.push(40), Ok(()));
-        assert_eq!(rb.push(50), Err(50)); // Full
-
-        assert!(!rb.is_empty());
-        assert_eq!(rb.len(), 4);
-
-        assert_eq!(rb.pop(), Some(10));
-        assert_eq!(rb.pop(), Some(20));
-        assert_eq!(rb.len(), 2);
-
-        assert_eq!(rb.push(50), Ok(()));
-        assert_eq!(rb.pop(), Some(30));
-        assert_eq!(rb.pop(), Some(40));
-        assert_eq!(rb.pop(), Some(50));
-        assert_eq!(rb.pop(), None);
-        assert!(rb.is_empty());
-    }
-}

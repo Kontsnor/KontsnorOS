@@ -110,7 +110,7 @@ impl<T: Copy, const N: usize> RingBuffer<T, N> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use super::*;
 

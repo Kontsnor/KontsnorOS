@@ -236,7 +236,8 @@ impl Vfs {
             } else {
                 &resolved_path[..resolved_path.len() - remaining_path.len()]
             };
-            let mut resolved_till_now = String::from(mount_path);
+            let mut resolved_till_now = String::with_capacity(resolved_path.len());
+            resolved_till_now.push_str(mount_path);
 
             let n_comp = components.len();
             let mut i = 0;
@@ -251,15 +252,19 @@ impl Vfs {
                 }
 
                 i += 1;
-                let path_key = if resolved_till_now.is_empty() || resolved_till_now == "/" {
-                    format!("/{}", component)
+                if resolved_till_now.is_empty() {
+                    resolved_till_now.push('/');
+                    resolved_till_now.push_str(component);
+                } else if resolved_till_now == "/" {
+                    resolved_till_now.push_str(component);
                 } else {
-                    format!("{}/{}", resolved_till_now, component)
-                };
+                    resolved_till_now.push('/');
+                    resolved_till_now.push_str(component);
+                }
 
                 let next = {
                     let cache = self.dentry_cache.read();
-                    cache.get(&path_key).cloned()
+                    cache.get(&resolved_till_now).cloned()
                 };
 
                 let next = if let Some(n) = next {
@@ -267,7 +272,7 @@ impl Vfs {
                 } else {
                     let n = current.lookup(component)?;
                     let mut cache = self.dentry_cache.write();
-                    cache.insert(path_key.clone(), n.clone());
+                    cache.insert(resolved_till_now.clone(), n.clone());
                     n
                 };
 
@@ -293,7 +298,6 @@ impl Vfs {
                 }
 
                 current = next;
-                resolved_till_now = path_key;
             }
 
             if let Some((dir_path, target, remainder)) = symlink_target {
@@ -395,7 +399,8 @@ pub fn resolve_canonical(path: &str) -> Option<String> {
         } else {
             &resolved_path[..resolved_path.len() - remaining_path.len()]
         };
-        let mut resolved_till_now = String::from(mount_path);
+        let mut resolved_till_now = String::with_capacity(resolved_path.len());
+        resolved_till_now.push_str(mount_path);
 
         let n_comp = components.len();
         let mut i = 0;
@@ -409,11 +414,15 @@ pub fn resolve_canonical(path: &str) -> Option<String> {
             }
 
             i += 1;
-            let path_key = if resolved_till_now.is_empty() || resolved_till_now == "/" {
-                format!("/{}", component)
+            if resolved_till_now.is_empty() {
+                resolved_till_now.push('/');
+                resolved_till_now.push_str(component);
+            } else if resolved_till_now == "/" {
+                resolved_till_now.push_str(component);
             } else {
-                format!("{}/{}", resolved_till_now, component)
-            };
+                resolved_till_now.push('/');
+                resolved_till_now.push_str(component);
+            }
 
             let next = current.lookup(component)?;
 
@@ -434,7 +443,6 @@ pub fn resolve_canonical(path: &str) -> Option<String> {
             }
 
             current = next;
-            resolved_till_now = path_key;
         }
 
         if let Some((dir_path, target, remainder)) = symlink_target {

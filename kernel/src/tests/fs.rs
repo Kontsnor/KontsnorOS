@@ -605,4 +605,118 @@ fn test_vfs_lookup_dcache_benchmark() {
 
     let _ = test_dir.unlink("file.txt");
     let _ = tmp_dir.rmdir("bench_dir");
+fn test_ext_readdir_streaming_benchmark() {
+    kprintln!("[test] Starting Ext4 zero-allocation streaming readdir benchmark test...");
+
+    let dir_path = b"/disk/stream_bench_dir\0";
+    let dir_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    assert!(dir_addr > 0);
+    unsafe {
+        core::ptr::copy_nonoverlapping(dir_path.as_ptr(), dir_addr as *mut u8, dir_path.len());
+    }
+
+    let mkdir_res = crate::syscall::fs::sys_mkdir(dir_addr as *const u8, 0o755);
+    assert_eq!(mkdir_res, 0, "mkdir /disk/stream_bench_dir failed");
+
+    let path_buf_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    let entry_count = 100;
+
+    // 1. Create 100 files in the directory
+    for i in 0..entry_count {
+        let filename = alloc::format!("/disk/stream_bench_dir/entry_{:03}.txt\0", i);
+        let name_bytes = filename.as_bytes();
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                name_bytes.as_ptr(),
+                path_buf_addr as *mut u8,
+                name_bytes.len(),
+            );
+        }
+
+        let fd = crate::syscall::fs::sys_open(path_buf_addr as *const u8, 0o102, 0o644); // O_CREAT | O_RDWR
+        assert!(fd >= 0, "create file failed");
+        let _ = crate::syscall::fs::sys_close(fd as i32);
+    }
+
+    let dir_inode = crate::fs::vfs::lookup("/disk/stream_bench_dir")
+        .expect("Failed to lookup stream_bench_dir");
+
+    // 2. Measure iterate_dir_entries performance
+    let start_ticks_stream = crate::arch::x86_64::interrupts::timer_ticks();
+    let mut stream_count = 0;
+
+    for _ in 0..100 {
+        stream_count = 0;
+        let _ = dir_inode.iterate_dir_entries(0, &mut |_next_off, _ino, _type, name| {
+            if name != "." && name != ".." {
+                stream_count += 1;
+            }
+            true
+        });
+    }
+
+    let end_ticks_stream = crate::arch::x86_64::interrupts::timer_ticks();
+    assert_eq!(stream_count, entry_count);
+
+    // 3. Test sys_getdents64 integration
+    let dir_fd = crate::syscall::fs::sys_open(dir_addr as *const u8, 0o20000, 0); // O_DIRECTORY
+    assert!(dir_fd >= 0, "Failed to open directory for getdents64");
+
+    let dents_buf_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    let mut total_dents_read = 0;
+
+    loop {
+        let nread = crate::syscall::fs::sys_getdents64(
+            dir_fd as i32,
+            dents_buf_addr as *mut u8,
+            4096,
+        );
+        if nread <= 0 {
+            break;
+        }
+
+        let mut offset = 0;
+        while offset < nread as usize {
+            let reclen = unsafe {
+                let ptr = (dents_buf_addr as *const u8).add(offset + 16) as *const u16;
+                ptr.read_unaligned() as usize
+            };
+            if reclen == 0 {
+                break;
+            }
+            total_dents_read += 1;
+            offset += reclen;
+        }
+    }
+
+    assert_eq!(total_dents_read, entry_count + 2); // Includes . and ..
+    let _ = crate::syscall::fs::sys_close(dir_fd as i32);
+
+    let stream_ms = (end_ticks_stream.saturating_sub(start_ticks_stream)) * 10;
+    kprintln!(
+        "[test] Ext4 zero-allocation streaming readdir benchmark (100 iterations on {} entries): {} ms",
+        entry_count,
+        stream_ms
+    );
+
+    // Clean up created files and directory
+    for i in 0..entry_count {
+        let filename = alloc::format!("/disk/stream_bench_dir/entry_{:03}.txt\0", i);
+        let name_bytes = filename.as_bytes();
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                name_bytes.as_ptr(),
+                path_buf_addr as *mut u8,
+                name_bytes.len(),
+            );
+        }
+        let _ = crate::syscall::fs::sys_unlink(path_buf_addr as *const u8);
+    }
+    let _ = crate::syscall::fs::sys_rmdir(dir_addr as *const u8);
+
+    crate::syscall::memory::sys_munmap(dir_addr, 4096);
+    crate::syscall::memory::sys_munmap(path_buf_addr, 4096);
+    crate::syscall::memory::sys_munmap(dents_buf_addr, 4096);
+
+    kprintln!("[test] Ext4 zero-allocation streaming readdir benchmark test PASSED!");
 }

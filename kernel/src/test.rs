@@ -1786,11 +1786,12 @@ fn test_multicore_deadlock_stress() {
 
     // 4. Wait for all threads to finish while yielding and printing
     let mut main_step = 0;
+    let mut stress_states = alloc::vec::Vec::with_capacity(thread_count);
     while STRESS_THREADS_ACTIVE.load(core::sync::atomic::Ordering::SeqCst) > 0 {
         main_step += 1;
         if main_step % 20 == 0 {
+            stress_states.clear();
             let tasks = crate::process::scheduler::TASKS.read();
-            let mut stress_states = alloc::vec::Vec::new();
             for (idx, task_opt) in tasks.iter().enumerate() {
                 if let Some(task_arc) = task_opt {
                     let t = task_arc.lock();

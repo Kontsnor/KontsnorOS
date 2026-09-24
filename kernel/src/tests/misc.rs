@@ -13,15 +13,10 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Central test suite module routing and declarations.
+//! Miscellaneous / Trivial test cases.
 
-pub mod acpi;
-pub mod crypto;
-pub mod drivers;
-pub mod fs;
-pub mod fs_path;
-pub mod memory;
-pub mod misc;
-pub mod net;
-pub mod process;
-pub mod ring_buffer;
+#[test_case]
+fn test_trivial() {
+    let two = 2;
+    assert_eq!(1 + 1, two);
+}

@@ -180,6 +180,42 @@ fn test_vfs_path_resolution() {
 }
 
 #[test_case]
+fn test_vfs_path_resolution_benchmark() {
+    kprintln!("[test] Starting VFS path resolution benchmark...");
+    let tmp_dir = crate::fs::vfs::lookup("/tmp").expect("Failed to lookup /tmp");
+    let mut curr = tmp_dir;
+    let parts = ["bench_a", "bench_b", "bench_c", "bench_d", "bench_e", "bench_f", "bench_g", "bench_h"];
+    for part in &parts {
+        curr = curr.mkdir(part).unwrap_or_else(|| curr.lookup(part).unwrap());
+    }
+    let _file = curr.create("file.txt", crate::fs::inode::FileType::Regular).unwrap_or_else(|| curr.lookup("file.txt").unwrap());
+
+    let path = "/tmp/bench_a/bench_b/bench_c/bench_d/bench_e/bench_f/bench_g/bench_h/file.txt";
+
+    // Warmup
+    let _ = crate::fs::vfs::lookup(path);
+    let _ = crate::fs::vfs::resolve_canonical(path);
+
+    const ITERATIONS: u64 = 10_000;
+
+    let start_cycles = unsafe { core::arch::x86_64::_rdtsc() };
+    for _ in 0..ITERATIONS {
+        crate::fs::vfs::invalidate_dentry(path);
+        let node = crate::fs::vfs::lookup(path);
+        core::hint::black_box(node);
+        let resolved = crate::fs::vfs::resolve_canonical(path);
+        core::hint::black_box(resolved);
+    }
+    let end_cycles = unsafe { core::arch::x86_64::_rdtsc() };
+
+    let total_cycles = end_cycles.saturating_sub(start_cycles);
+    let cycles_per_iter = total_cycles / ITERATIONS;
+    kprintln!("[benchmark] VFS path resolution 10,000 iterations: total cycles = {}, cycles/iter = {}", total_cycles, cycles_per_iter);
+
+    kprintln!("[test] VFS path resolution benchmark test PASSED!");
+}
+
+#[test_case]
 fn test_scheduler_priority_queues() {
     kprintln!("[test] Starting scheduler priority queues test...");
     let mut sched = crate::process::scheduler::Scheduler::new();

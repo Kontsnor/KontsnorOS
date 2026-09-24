@@ -18,6 +18,7 @@
 //! Provides utilities to verify that pointers passed from user space are safe
 //! to read or write, avoiding page faults in kernel context.
 
+use super::Errno;
 use alloc::string::String;
 use x86_64::VirtAddr;
 
@@ -270,4 +271,45 @@ pub unsafe fn copy_string_from_user(ptr: *const u8) -> Option<String> {
 pub unsafe fn copy_string_from_user_pub(ptr: *const u8) -> Option<String> {
     // SAFETY: Delegate to copy_string_from_user with same safety contract.
     unsafe { copy_string_from_user(ptr) }
+}
+
+/// Safely copy a value of type `T` from kernel space to user space (`dst`).
+///
+/// Validates that `dst` resides in user space, is non-null, and that all backing pages are mapped and writable.
+/// Uses `core::ptr::write_unaligned` under the hood to safely handle unaligned user pointers.
+pub fn copy_to_user<T: Copy>(dst: *mut T, src: &T) -> Result<(), Errno> {
+    if dst.is_null() {
+        return Err(Errno::EFAULT);
+    }
+    let size = core::mem::size_of::<T>();
+    if validate_user_ptr_write(dst as *mut u8, size).is_err() {
+        return Err(Errno::EFAULT);
+    }
+
+    // SAFETY: `dst` has been validated for user-space range and writable page mappings.
+    // `write_unaligned` prevents hardware faults or UB if user space supplied an unaligned address.
+    unsafe {
+        core::ptr::write_unaligned(dst, *src);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_copy_to_user_null() {
+        let val: u32 = 42;
+        let res = copy_to_user(core::ptr::null_mut::<u32>(), &val);
+        assert_eq!(res, Err(Errno::EFAULT));
+    }
+
+    #[test]
+    fn test_copy_to_user_kernel_addr() {
+        let val: u64 = 0x1234;
+        let kernel_ptr = 0xFFFF_8000_0000_0000 as *mut u64;
+        let res = copy_to_user(kernel_ptr, &val);
+        assert_eq!(res, Err(Errno::EFAULT));
+    }
 }

@@ -3385,3 +3385,75 @@ fn test_lseek_espipe_on_pipe() {
     crate::syscall::fs::sys_close(write_fd);
     kprintln!("[test] lseek ESPIPE on pipe test PASSED!");
 }
+
+#[test_case]
+fn test_null_saved_registers_validation() {
+    kprintln!("[test] Starting null SavedRegisters pointer validation test...");
+
+    let null_regs = core::ptr::null_mut();
+
+    // 1. syscall_dispatch_rust with null regs
+    let ret_dispatch = crate::syscall::syscall_dispatch_rust(null_regs, 39); // sys_getpid
+    assert_eq!(
+        ret_dispatch,
+        -(crate::syscall::Errno::EFAULT as i64),
+        "syscall_dispatch_rust with null regs must return -EFAULT"
+    );
+
+    // 2. sys_rt_sigreturn with null regs
+    let ret_sigreturn = crate::syscall::signal::sys_rt_sigreturn(null_regs);
+    assert_eq!(
+        ret_sigreturn,
+        -(crate::syscall::Errno::EFAULT as i64),
+        "sys_rt_sigreturn with null regs must return -EFAULT"
+    );
+
+    // 3. handle_pending_signals with null regs
+    crate::syscall::signal::handle_pending_signals(null_regs);
+
+    // 4. sys_fork with null regs
+    let ret_fork = crate::syscall::process::sys_fork(null_regs);
+    assert_eq!(
+        ret_fork,
+        -(crate::syscall::Errno::EFAULT as i64),
+        "sys_fork with null regs must return -EFAULT"
+    );
+
+    // 5. sys_vfork with null regs
+    let ret_vfork = crate::syscall::process::sys_vfork(null_regs);
+    assert_eq!(
+        ret_vfork,
+        -(crate::syscall::Errno::EFAULT as i64),
+        "sys_vfork with null regs must return -EFAULT"
+    );
+
+    // 6. sys_clone with null regs
+    let ret_clone = crate::syscall::process::sys_clone(
+        0,
+        0,
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+        0,
+        null_regs,
+    );
+    assert_eq!(
+        ret_clone,
+        -(crate::syscall::Errno::EFAULT as i64),
+        "sys_clone with null regs must return -EFAULT"
+    );
+
+    // 7. sys_clone3 with null regs
+    let clone_args = crate::syscall::process::lifecycle::CloneArgs::default();
+    let ret_clone3 = crate::syscall::process::sys_clone3(
+        &clone_args,
+        core::mem::size_of::<crate::syscall::process::lifecycle::CloneArgs>(),
+        null_regs,
+    );
+    assert_eq!(
+        ret_clone3,
+        -(crate::syscall::Errno::EFAULT as i64),
+        "sys_clone3 with null regs must return -EFAULT"
+    );
+
+    kprintln!("[test] null SavedRegisters pointer validation test PASSED!");
+}

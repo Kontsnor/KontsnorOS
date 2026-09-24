@@ -313,3 +313,80 @@ fn test_nvme_identify_controller_parsing() {
     assert_eq!(0x1000 + (2 * 1 + 0) * stride, 0x1008); // IO SQ
     assert_eq!(0x1000 + (2 * 1 + 1) * stride, 0x100C); // IO CQ
 }
+
+#[test_case]
+fn test_serial_console_buffering() {
+    use crate::drivers::console::serial::SerialConsole;
+    use crate::drivers::traits::{CharDevice, DriverError};
+
+    let console = SerialConsole::new();
+
+    // 1. Zero-length buffer read returns Ok(0)
+    let mut empty_buf = [0u8; 0];
+    assert_eq!(console.read(&mut empty_buf), Ok(0));
+
+    // 2. Reading from empty buffer returns DriverError::NotReady (when hardware UART is empty)
+    let mut read_buf = [0u8; 16];
+    if !crate::arch::x86_64::serial::has_data() {
+        assert_eq!(console.read(&mut read_buf), Err(DriverError::NotReady));
+        let poll_res = console.poll();
+        assert_eq!(poll_res.readable, false);
+    }
+
+    // 3. Enqueue bytes and verify read & FIFO ordering
+    assert!(console.enqueue_byte(b'A').is_ok());
+    assert!(console.enqueue_byte(b'B').is_ok());
+    assert!(console.enqueue_byte(b'C').is_ok());
+
+    let poll_res = console.poll();
+    assert_eq!(poll_res.readable, true);
+
+    let mut buf = [0u8; 2];
+    assert_eq!(console.read(&mut buf), Ok(2));
+    assert_eq!(&buf, b"AB");
+
+    // Read remaining byte
+    let mut buf_rem = [0u8; 4];
+    assert_eq!(console.read(&mut buf_rem), Ok(1));
+    assert_eq!(buf_rem[0], b'C');
+
+    // Buffer is empty again
+    if !crate::arch::x86_64::serial::has_data() {
+        assert_eq!(console.read(&mut buf_rem), Err(DriverError::NotReady));
+    }
+}
+
+#[test_case]
+fn test_serial_console_buffer_overflow_and_wraparound() {
+    use crate::drivers::console::serial::SerialConsole;
+    use crate::drivers::traits::CharDevice;
+
+    let console = SerialConsole::new();
+
+    // Fill buffer to capacity (256 bytes)
+    for i in 0..256 {
+        assert!(console.enqueue_byte(i as u8).is_ok());
+    }
+
+    // Next push should fail (buffer full)
+    assert_eq!(console.enqueue_byte(0xFF), Err(0xFF));
+
+    // Read half (128 bytes)
+    let mut half_buf = [0u8; 128];
+    assert_eq!(console.read(&mut half_buf), Ok(128));
+    for i in 0..128 {
+        assert_eq!(half_buf[i], i as u8);
+    }
+
+    // Enqueue 128 more bytes to test wrap-around
+    for i in 0..128 {
+        assert!(console.enqueue_byte((128 + i) as u8).is_ok());
+    }
+
+    // Read remaining 256 bytes
+    let mut full_buf = [0u8; 256];
+    assert_eq!(console.read(&mut full_buf), Ok(256));
+    for i in 0..256 {
+        assert_eq!(full_buf[i], (128 + i) as u8);
+    }
+}

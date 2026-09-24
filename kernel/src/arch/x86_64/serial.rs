@@ -114,6 +114,14 @@ pub fn init() {
     SERIAL1.with_lock(|_| {});
 }
 
+/// Check if a byte is available to read from the serial receive buffer without consuming it.
+pub fn has_data() -> bool {
+    use x86_64::instructions::port::Port;
+    let mut lsr: Port<u8> = Port::new(COM1_PORT + 5);
+    let status = unsafe { lsr.read() };
+    status & 0x01 != 0
+}
+
 /// Try to read one byte from the serial receive buffer (non-blocking).
 pub fn try_read_byte() -> Option<u8> {
     use x86_64::instructions::port::Port;

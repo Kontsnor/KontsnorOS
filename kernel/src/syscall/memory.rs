@@ -51,6 +51,18 @@ pub fn sys_mmap(
         return Errno::EINVAL.into();
     }
 
+    // POSIX.1-2017 & Linux mmap(2): flags must specify exactly one mapping type
+    // (MAP_SHARED = 0x01, MAP_PRIVATE = 0x02, or MAP_SHARED_VALIDATE = 0x03).
+    let map_type = flags & 0x0F;
+    if map_type != 0x01 && map_type != 0x02 && map_type != 0x03 {
+        return Errno::EINVAL.into();
+    }
+
+    // POSIX.1-2017 & Linux mmap(2): offset must be non-negative and page-aligned.
+    if offset < 0 || (offset & 4095) != 0 {
+        return Errno::EINVAL.into();
+    }
+
     // We support anonymous private mappings and private/shared file mappings
     let is_anon = (flags & 0x20) != 0 || fd == -1;
     let is_shared = (flags & 0x01) != 0;

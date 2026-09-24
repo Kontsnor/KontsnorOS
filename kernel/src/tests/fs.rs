@@ -15,6 +15,8 @@
 
 //! Filesystem and VFS unit & regression tests.
 
+use crate::kprintln;
+
 #[test_case]
 fn test_vfs_path_resolution() {
     // Lookup non-existent path
@@ -632,11 +634,8 @@ fn test_ext_readdir_streaming_benchmark() {
     let mut total_dents_read = 0;
 
     loop {
-        let nread = crate::syscall::fs::sys_getdents64(
-            dir_fd as i32,
-            dents_buf_addr as *mut u8,
-            4096,
-        );
+        let nread =
+            crate::syscall::fs::sys_getdents64(dir_fd as i32, dents_buf_addr as *mut u8, 4096);
         if nread <= 0 {
             break;
         }

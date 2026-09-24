@@ -3385,3 +3385,113 @@ fn test_lseek_espipe_on_pipe() {
     crate::syscall::fs::sys_close(write_fd);
     kprintln!("[test] lseek ESPIPE on pipe test PASSED!");
 }
+
+#[test_case]
+fn test_posix_mq_pointer_validation() {
+    kprintln!("[test] Starting POSIX message queue pointer validation test...");
+
+    // 1. Open a test message queue
+    let name_buf = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    assert!(name_buf > 0);
+    let name_bytes = b"/test_posix_mq_validation\0";
+    // SAFETY: name_buf is mapped user memory with write permissions.
+    unsafe {
+        core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_buf as *mut u8, name_bytes.len());
+    }
+
+    let mqdes = crate::syscall::ipc::sys_mq_open(
+        name_buf as *const u8,
+        0o102, // O_CREAT | O_RDWR
+        0o666,
+        core::ptr::null(),
+    );
+    assert!(mqdes >= 0, "sys_mq_open failed");
+    let mqdes = mqdes as i32;
+
+    // 2. Normal message send and receive with valid user memory
+    let msg_buf = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    assert!(msg_buf > 0);
+    let msg_content = b"hello_posix_mq";
+    // SAFETY: msg_buf is mapped user memory.
+    unsafe {
+        core::ptr::copy_nonoverlapping(msg_content.as_ptr(), msg_buf as *mut u8, msg_content.len());
+    }
+
+    let send_res = crate::syscall::ipc::sys_mq_timedsend(
+        mqdes,
+        msg_buf as *const u8,
+        msg_content.len(),
+        10,
+        core::ptr::null(),
+    );
+    assert_eq!(send_res, 0, "Valid sys_mq_timedsend failed");
+
+    let recv_buf = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    assert!(recv_buf > 0);
+    let mut prio_out: u32 = 0;
+
+    let recv_res = crate::syscall::ipc::sys_mq_timedreceive(
+        mqdes,
+        recv_buf as *mut u8,
+        4096,
+        &mut prio_out as *mut u32,
+        core::ptr::null(),
+    );
+    assert_eq!(recv_res, msg_content.len() as i64);
+    assert_eq!(prio_out, 10);
+
+    // SAFETY: recv_buf contains msg_content.len() bytes written by sys_mq_timedreceive.
+    let recv_slice = unsafe { core::slice::from_raw_parts(recv_buf as *const u8, recv_res as usize) };
+    assert_eq!(recv_slice, msg_content);
+
+    // 3. NULL pointer for sys_mq_timedsend -> must return -EFAULT (-14)
+    let null_send_res = crate::syscall::ipc::sys_mq_timedsend(
+        mqdes,
+        core::ptr::null(),
+        16,
+        1,
+        core::ptr::null(),
+    );
+    assert_eq!(
+        null_send_res,
+        crate::syscall::Errno::EFAULT as i64,
+        "NULL msg_ptr must return -EFAULT"
+    );
+
+    // 4. Pointer + length crossing canonical address boundary into kernel space -> must return -EFAULT (-14)
+    let bad_ptr = (0x0000_7FFF_FFFF_FFF0u64) as *const u8;
+    let overflow_send_res = crate::syscall::ipc::sys_mq_timedsend(
+        mqdes,
+        bad_ptr,
+        64, // Extends past 0x0000_7FFF_FFFF_FFFF limit
+        1,
+        core::ptr::null(),
+    );
+    assert_eq!(
+        overflow_send_res,
+        crate::syscall::Errno::EFAULT as i64,
+        "Out-of-bounds user pointer must return -EFAULT"
+    );
+
+    // 5. Message length exceeding mq_msgsize (default 8192) -> must return -EMSGSIZE (-90)
+    let oversize_send_res = crate::syscall::ipc::sys_mq_timedsend(
+        mqdes,
+        msg_buf as *const u8,
+        10000, // 10000 > 8192
+        1,
+        core::ptr::null(),
+    );
+    assert_eq!(
+        oversize_send_res,
+        crate::syscall::Errno::EMSGSIZE as i64,
+        "Message size exceeding mq_msgsize must return -EMSGSIZE"
+    );
+
+    // Clean up
+    crate::syscall::ipc::sys_mq_unlink(name_buf as *const u8);
+    crate::syscall::memory::sys_munmap(name_buf, 4096);
+    crate::syscall::memory::sys_munmap(msg_buf, 4096);
+    crate::syscall::memory::sys_munmap(recv_buf, 4096);
+
+    kprintln!("[test] POSIX message queue pointer validation test PASSED!");
+}

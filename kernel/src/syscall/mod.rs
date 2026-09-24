@@ -121,6 +121,7 @@ pub enum Errno {
     ETIMEDOUT = -110,
     EBUSY = -16,
     ENODEV = -19,
+    EMSGSIZE = -90,
     ENOMSG = -42,
     EOPNOTSUPP = -95,
     EAFNOSUPPORT = -97,

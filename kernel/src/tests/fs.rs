@@ -15,6 +15,8 @@
 
 //! Filesystem and VFS unit & regression tests.
 
+use crate::kprintln;
+
 #[test_case]
 fn test_vfs_path_resolution() {
     // Lookup non-existent path
@@ -605,6 +607,65 @@ fn test_vfs_lookup_dcache_benchmark() {
 
     let _ = test_dir.unlink("file.txt");
     let _ = tmp_dir.rmdir("bench_dir");
+}
+
+#[test_case]
+fn test_vfs_fs_ctx_lock_free_resolution() {
+    kprintln!("[test] Starting FsContext lock-free resolution unit test...");
+
+    let pid = crate::process::scheduler::current_pid().expect("No current task");
+    let task_arc = crate::process::scheduler::get_task_arc(pid).expect("No task arc");
+
+    // 1. Initial resolution (default cwd is /)
+    assert_eq!(crate::fs::vfs::resolve_relative_path("usr/bin"), "/usr/bin");
+
+    // 2. Change directory and verify updated cwd in FsContext
+    let orig_cwd = { task_arc.lock().cwd.clone() };
+    let tmp_dir_path = b"/tmp\0";
+    let chdir_res = crate::syscall::fs::sys_chdir(tmp_dir_path.as_ptr());
+    assert_eq!(chdir_res, 0, "sys_chdir /tmp failed");
+
+    assert_eq!(
+        crate::fs::vfs::resolve_relative_path("foo/bar"),
+        "/tmp/foo/bar"
+    );
+
+    // Verify FsContext.cwd matches task.cwd
+    {
+        let task = task_arc.lock();
+        let fs_ctx = task.fs_ctx.read();
+        assert_eq!(fs_ctx.cwd, "/tmp");
+        assert_eq!(task.cwd, "/tmp");
+    }
+
+    // Restore original cwd
+    let orig_cwd_bytes = alloc::format!("{}\0", orig_cwd);
+    let _ = crate::syscall::fs::sys_chdir(orig_cwd_bytes.as_ptr());
+
+    kprintln!("[test] FsContext lock-free resolution unit test PASSED!");
+}
+
+#[test_case]
+fn test_vfs_resolve_relative_path_benchmark() {
+    let iterations = 10_000;
+    let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    for _ in 0..iterations {
+        let res = crate::fs::vfs::resolve_relative_path("usr/bin/cat");
+        core::hint::black_box(res);
+    }
+    let end_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let elapsed_tsc = end_tsc - start_tsc;
+    let cycles_per_resolve = elapsed_tsc / iterations;
+
+    crate::kprintln!(
+        "[bench] VFS resolve_relative_path: {} total cycles for {} iterations (avg {} cycles/resolve)",
+        elapsed_tsc,
+        iterations,
+        cycles_per_resolve
+    );
+}
+
+#[test_case]
 fn test_ext_readdir_streaming_benchmark() {
     kprintln!("[test] Starting Ext4 zero-allocation streaming readdir benchmark test...");
 
@@ -666,11 +727,8 @@ fn test_ext_readdir_streaming_benchmark() {
     let mut total_dents_read = 0;
 
     loop {
-        let nread = crate::syscall::fs::sys_getdents64(
-            dir_fd as i32,
-            dents_buf_addr as *mut u8,
-            4096,
-        );
+        let nread =
+            crate::syscall::fs::sys_getdents64(dir_fd as i32, dents_buf_addr as *mut u8, 4096);
         if nread <= 0 {
             break;
         }

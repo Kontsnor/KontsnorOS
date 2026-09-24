@@ -981,7 +981,7 @@ pub fn sys_pwrite64(fd: i32, buf: *const u8, count: usize, offset: i64) -> Sysca
     total_written as SyscallResult
 }
 
-/// `IoVec` structure for `writev`.
+/// `IoVec` structure for `writev` / `readv`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IoVec {
@@ -989,24 +989,78 @@ pub struct IoVec {
     pub iov_len: usize,
 }
 
+pub const UIO_FASTIOV: usize = 8;
+pub const UIO_MAXIOV: i32 = 1024;
+
+enum IoVecStorage {
+    Stack(usize),
+    Heap(alloc::vec::Vec<IoVec>),
+}
+
+fn copy_iovecs(
+    iov: *const IoVec,
+    iovcnt: i32,
+    fast_buf: &mut [IoVec; UIO_FASTIOV],
+) -> Result<IoVecStorage, Errno> {
+    if iov.is_null() || iovcnt <= 0 || iovcnt > UIO_MAXIOV {
+        return Err(Errno::EINVAL);
+    }
+    let count = iovcnt as usize;
+    if !validate_user_ptr(iov as *const u8, count * core::mem::size_of::<IoVec>()) {
+        return Err(Errno::EFAULT);
+    }
+
+    let storage = if count <= UIO_FASTIOV {
+        // SAFETY: `iov` was validated with `validate_user_ptr` for `count * size_of::<IoVec>()` bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(iov, fast_buf.as_mut_ptr(), count);
+        }
+        IoVecStorage::Stack(count)
+    } else {
+        let mut heap_vec = alloc::vec![IoVec { iov_base: core::ptr::null(), iov_len: 0 }; count];
+        // SAFETY: `iov` was validated with `validate_user_ptr` for `count * size_of::<IoVec>()` bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(iov, heap_vec.as_mut_ptr(), count);
+        }
+        IoVecStorage::Heap(heap_vec)
+    };
+
+    let slice = match &storage {
+        IoVecStorage::Stack(len) => &fast_buf[..*len],
+        IoVecStorage::Heap(vec) => vec.as_slice(),
+    };
+
+    let mut total_len: usize = 0;
+    for io in slice {
+        let (new_total, overflow) = total_len.overflowing_add(io.iov_len);
+        if overflow || new_total > isize::MAX as usize {
+            return Err(Errno::EINVAL);
+        }
+        total_len = new_total;
+    }
+
+    Ok(storage)
+}
+
 /// `writev(fd, iov, iovcnt)` — Write vector.
 pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: i32) -> SyscallResult {
-    if iov.is_null() || iovcnt <= 0 || iovcnt > 1024 {
-        return Errno::EINVAL.into();
-    }
-    if !validate_user_ptr(
-        iov as *const u8,
-        iovcnt as usize * core::mem::size_of::<IoVec>(),
-    ) {
-        return Errno::EFAULT.into();
-    }
-    let mut local_iov =
-        alloc::vec![IoVec { iov_base: core::ptr::null(), iov_len: 0 }; iovcnt as usize];
-    unsafe {
-        core::ptr::copy_nonoverlapping(iov, local_iov.as_mut_ptr(), iovcnt as usize);
-    }
+    let mut fast_buf = [IoVec {
+        iov_base: core::ptr::null(),
+        iov_len: 0,
+    }; UIO_FASTIOV];
+
+    let storage = match copy_iovecs(iov, iovcnt, &mut fast_buf) {
+        Ok(s) => s,
+        Err(e) => return e.into(),
+    };
+
+    let iov_slice = match &storage {
+        IoVecStorage::Stack(len) => &fast_buf[..*len],
+        IoVecStorage::Heap(vec) => vec.as_slice(),
+    };
+
     let mut total_written = 0;
-    for io in local_iov {
+    for io in iov_slice {
         if io.iov_len == 0 {
             continue;
         }
@@ -1097,23 +1151,23 @@ pub fn sys_flock(fd: i32, operation: i32) -> SyscallResult {
 
 /// `readv(fd, iov, iovcnt)` — Read vector.
 pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: i32) -> SyscallResult {
-    if iov.is_null() || iovcnt <= 0 || iovcnt > 1024 {
-        return Errno::EINVAL.into();
-    }
-    if !validate_user_ptr(
-        iov as *const u8,
-        iovcnt as usize * core::mem::size_of::<IoVec>(),
-    ) {
-        return Errno::EFAULT.into();
-    }
-    let mut local_iov =
-        alloc::vec![IoVec { iov_base: core::ptr::null(), iov_len: 0 }; iovcnt as usize];
-    // SAFETY: The source pointer iov has been checked for nullity and validated using validate_user_ptr.
-    unsafe {
-        core::ptr::copy_nonoverlapping(iov, local_iov.as_mut_ptr(), iovcnt as usize);
-    }
+    let mut fast_buf = [IoVec {
+        iov_base: core::ptr::null(),
+        iov_len: 0,
+    }; UIO_FASTIOV];
+
+    let storage = match copy_iovecs(iov, iovcnt, &mut fast_buf) {
+        Ok(s) => s,
+        Err(e) => return e.into(),
+    };
+
+    let iov_slice = match &storage {
+        IoVecStorage::Stack(len) => &fast_buf[..*len],
+        IoVecStorage::Heap(vec) => vec.as_slice(),
+    };
+
     let mut total_read = 0;
-    for io in local_iov {
+    for io in iov_slice {
         if io.iov_len == 0 {
             continue;
         }

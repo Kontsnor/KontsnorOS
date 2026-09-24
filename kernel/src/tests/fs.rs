@@ -605,6 +605,9 @@ fn test_vfs_lookup_dcache_benchmark() {
 
     let _ = test_dir.unlink("file.txt");
     let _ = tmp_dir.rmdir("bench_dir");
+}
+
+#[test_case]
 fn test_ext_readdir_streaming_benchmark() {
     kprintln!("[test] Starting Ext4 zero-allocation streaming readdir benchmark test...");
 
@@ -666,11 +669,8 @@ fn test_ext_readdir_streaming_benchmark() {
     let mut total_dents_read = 0;
 
     loop {
-        let nread = crate::syscall::fs::sys_getdents64(
-            dir_fd as i32,
-            dents_buf_addr as *mut u8,
-            4096,
-        );
+        let nread =
+            crate::syscall::fs::sys_getdents64(dir_fd as i32, dents_buf_addr as *mut u8, 4096);
         if nread <= 0 {
             break;
         }
@@ -719,4 +719,133 @@ fn test_ext_readdir_streaming_benchmark() {
     crate::syscall::memory::sys_munmap(dents_buf_addr, 4096);
 
     kprintln!("[test] Ext4 zero-allocation streaming readdir benchmark test PASSED!");
+}
+
+#[test_case]
+fn test_readv_writev_optimization_and_benchmark() {
+    use crate::syscall::fs::{sys_close, sys_open, sys_readv, sys_writev, IoVec};
+    use crate::syscall::Errno;
+
+    crate::kprintln!(
+        "[test] Starting readv/writev stack allocation optimization & benchmark test..."
+    );
+
+    // Create a temporary file
+    let path = b"/tmp/test_iovec_opt.txt\0";
+    let fd = sys_open(path.as_ptr(), 0o102, 0o644); // O_CREAT | O_RDWR
+    assert!(fd >= 0, "Failed to open temporary file for writev test");
+    let fd = fd as i32;
+
+    // 1. Edge Case: Invalid iovcnt (<0, 0, >1024)
+    let dummy_iov = IoVec {
+        iov_base: core::ptr::null(),
+        iov_len: 0,
+    };
+    assert_eq!(sys_writev(fd, &dummy_iov, 0), Errno::EINVAL as i64);
+    assert_eq!(sys_writev(fd, &dummy_iov, -1), Errno::EINVAL as i64);
+    assert_eq!(sys_writev(fd, &dummy_iov, 1025), Errno::EINVAL as i64);
+
+    // 2. Edge Case: Null or invalid user pointer
+    assert_eq!(sys_writev(fd, core::ptr::null(), 2), Errno::EINVAL as i64);
+
+    // 3. Edge Case: Integer overflow of total iov_len (> isize::MAX)
+    let overflow_iovs = [
+        IoVec {
+            iov_base: 0x1000 as *const u8,
+            iov_len: isize::MAX as usize,
+        },
+        IoVec {
+            iov_base: 0x2000 as *const u8,
+            iov_len: 100,
+        },
+    ];
+    assert_eq!(
+        sys_writev(fd, overflow_iovs.as_ptr(), 2),
+        Errno::EINVAL as i64
+    );
+
+    // 4. Functionality test: Stack fast-path writev (3 vectors <= UIO_FASTIOV)
+    let buf1 = b"Hello, ";
+    let buf2 = b"writev ";
+    let buf3 = b"fast-path!";
+    let fast_iovs = [
+        IoVec {
+            iov_base: buf1.as_ptr(),
+            iov_len: buf1.len(),
+        },
+        IoVec {
+            iov_base: buf2.as_ptr(),
+            iov_len: buf2.len(),
+        },
+        IoVec {
+            iov_base: buf3.as_ptr(),
+            iov_len: buf3.len(),
+        },
+    ];
+
+    let written = sys_writev(fd, fast_iovs.as_ptr(), 3);
+    let expected_len = (buf1.len() + buf2.len() + buf3.len()) as i64;
+    assert_eq!(written, expected_len, "sys_writev fast-path short write");
+
+    // Rewind file offset
+    assert_eq!(crate::syscall::fs::sys_lseek(fd, 0, 0), 0);
+
+    // 5. Functionality test: Stack fast-path readv (3 vectors <= UIO_FASTIOV)
+    let mut read_buf1 = [0u8; 7];
+    let mut read_buf2 = [0u8; 7];
+    let mut read_buf3 = [0u8; 10];
+    let read_iovs = [
+        IoVec {
+            iov_base: read_buf1.as_mut_ptr(),
+            iov_len: read_buf1.len(),
+        },
+        IoVec {
+            iov_base: read_buf2.as_mut_ptr(),
+            iov_len: read_buf2.len(),
+        },
+        IoVec {
+            iov_base: read_buf3.as_mut_ptr(),
+            iov_len: read_buf3.len(),
+        },
+    ];
+
+    let nread = sys_readv(fd, read_iovs.as_ptr(), 3);
+    assert_eq!(nread, expected_len, "sys_readv fast-path short read");
+    assert_eq!(&read_buf1, buf1);
+    assert_eq!(&read_buf2, buf2);
+    assert_eq!(&read_buf3, buf3);
+
+    // 6. Functionality test: Heap fallback (> UIO_FASTIOV = 8, e.g., 10 vectors)
+    assert_eq!(crate::syscall::fs::sys_lseek(fd, 0, 0), 0);
+    let chunk = b"X";
+    let heap_iovs = [IoVec {
+        iov_base: chunk.as_ptr(),
+        iov_len: chunk.len(),
+    }; 10];
+
+    let written_heap = sys_writev(fd, heap_iovs.as_ptr(), 10);
+    assert_eq!(written_heap, 10);
+
+    // 7. Micro-benchmark: Measure TSC cycles for small writev calls
+    let iterations = 10_000;
+    let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    for _ in 0..iterations {
+        let ret = sys_writev(fd, fast_iovs.as_ptr(), 3);
+        core::hint::black_box(ret);
+    }
+    let end_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let total_cycles = end_tsc - start_tsc;
+    let avg_cycles = total_cycles / iterations;
+
+    crate::kprintln!(
+        "[bench] sys_writev fast-path (3 iovecs): {} total cycles across {} calls (avg {} cycles/call)",
+        total_cycles,
+        iterations,
+        avg_cycles
+    );
+
+    let _ = sys_close(fd);
+    let _ = crate::syscall::fs::sys_unlink(path.as_ptr());
+
+    crate::kprintln!("[test] readv/writev stack allocation optimization & benchmark test PASSED!");
 }

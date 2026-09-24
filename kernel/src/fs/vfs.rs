@@ -252,6 +252,7 @@ impl Vfs {
                 }
 
                 i += 1;
+                let parent_len = resolved_till_now.len();
                 if resolved_till_now.is_empty() {
                     resolved_till_now.push('/');
                     resolved_till_now.push_str(component);
@@ -286,7 +287,7 @@ impl Vfs {
                             if let Ok(target_str) = core::str::from_utf8(&target_buf[..n]) {
                                 let remainder = components[i..].to_vec();
                                 symlink_target = Some((
-                                    resolved_till_now.clone(),
+                                    String::from(&resolved_till_now[..parent_len]),
                                     String::from(target_str),
                                     remainder,
                                 ));
@@ -414,6 +415,7 @@ pub fn resolve_canonical(path: &str) -> Option<String> {
             }
 
             i += 1;
+            let parent_len = resolved_till_now.len();
             if resolved_till_now.is_empty() {
                 resolved_till_now.push('/');
                 resolved_till_now.push_str(component);
@@ -432,7 +434,7 @@ pub fn resolve_canonical(path: &str) -> Option<String> {
                     if let Ok(target_str) = core::str::from_utf8(&target_buf[..n]) {
                         let remainder = components[i..].to_vec();
                         symlink_target = Some((
-                            resolved_till_now.clone(),
+                            String::from(&resolved_till_now[..parent_len]),
                             String::from(target_str),
                             remainder,
                         ));

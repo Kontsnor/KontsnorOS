@@ -2750,19 +2750,8 @@ fn test_ext_small_file_creation_benchmark() {
         core::ptr::copy_nonoverlapping(dir_path.as_ptr(), dir_addr as *mut u8, dir_path.len());
     }
 
-    // Ensure clean state from any previous incomplete runs
-    let _ = crate::syscall::fs::sys_rmdir(dir_addr as *const u8);
-    for i in 0..1000 {
-        let filename = alloc::format!("/disk/bench_dir/file_{}.txt\0", i);
-        let path_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
-        if path_addr > 0 {
-            unsafe { core::ptr::copy_nonoverlapping(filename.as_bytes().as_ptr(), path_addr as *mut u8, filename.len()); }
-            let _ = crate::syscall::fs::sys_unlink(path_addr as *const u8);
-            crate::syscall::memory::sys_munmap(path_addr, 4096);
-        }
-    }
-
     let mkdir_res = crate::syscall::fs::sys_mkdir(dir_addr as *const u8, 0o755);
+    assert_eq!(mkdir_res, 0, "mkdir /disk/bench_dir failed");
 
     let start_ticks = crate::arch::x86_64::interrupts::timer_ticks();
 

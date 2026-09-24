@@ -309,24 +309,65 @@ pub fn sys_newfstatat(
     0
 }
 
-/// `faccessat(dfd, pathname, mode, flags)` — Check user's permissions for a file relative to directory fd.
-pub fn sys_faccessat(dfd: i32, pathname: *const u8, mode: i32, _flags: i32) -> SyscallResult {
+/// `faccessat2(dfd, pathname, mode, flags)` — Check user's permissions for a file relative to directory fd.
+pub fn sys_faccessat2(dfd: i32, pathname: *const u8, mode: i32, flags: i32) -> SyscallResult {
+    const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+    const AT_EACCESS: i32 = 0x200;
+    const AT_EMPTY_PATH: i32 = 0x1000;
+
+    // Validate flag bitmask per Linux man faccessat2(2)
+    if (flags & !(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH)) != 0 {
+        return Errno::EINVAL.into();
+    }
+
+    // Validate mode bits (F_OK = 0, R_OK = 4, W_OK = 2, X_OK = 1)
+    if mode != 0 && (mode & !7) != 0 {
+        return Errno::EINVAL.into();
+    }
+
     if pathname.is_null() {
         return Errno::EFAULT.into();
     }
+
     let raw_path = match unsafe { copy_string_from_user(pathname) } {
         Some(p) => p,
         None => return Errno::EFAULT.into(),
     };
 
-    let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
-        Ok(path) => path,
-        Err(e) => return e.into(),
-    };
+    let inode_ops = if raw_path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+        if dfd == -100 {
+            // AT_FDCWD
+            let cwd = if let Some(pid) = crate::process::scheduler::current_pid() {
+                if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+                    task_arc.lock().cwd.clone()
+                } else {
+                    alloc::string::String::from("/")
+                }
+            } else {
+                alloc::string::String::from("/")
+            };
+            match crate::fs::vfs::lookup(&cwd) {
+                Some(i) => i,
+                None => return Errno::ENOENT.into(),
+            }
+        } else {
+            let desc = match proc_fd::current_task_get_file_desc(dfd) {
+                Some(d) => d,
+                None => return Errno::EBADF.into(),
+            };
+            desc.inode.clone()
+        }
+    } else {
+        let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
+            Ok(path) => path,
+            Err(e) => return e.into(),
+        };
 
-    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved_path, true) {
-        Some(i) => i,
-        None => return Errno::ENOENT.into(),
+        let follow_last = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+        match crate::fs::vfs::lookup_follow(&resolved_path, follow_last) {
+            Some(i) => i,
+            None => return Errno::ENOENT.into(),
+        }
     };
 
     let inode = inode_ops.inode();
@@ -347,6 +388,11 @@ pub fn sys_faccessat(dfd: i32, pathname: *const u8, mode: i32, _flags: i32) -> S
     }
 
     0
+}
+
+/// `faccessat(dfd, pathname, mode, flags)` — Check user's permissions for a file relative to directory fd.
+pub fn sys_faccessat(dfd: i32, pathname: *const u8, mode: i32, flags: i32) -> SyscallResult {
+    sys_faccessat2(dfd, pathname, mode, flags)
 }
 
 /// `mkdir(pathname, mode)` — Create a directory.

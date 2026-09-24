@@ -1,0 +1,3 @@
+## 2026-03-31 - faccessat2 Linux Syscall Conformance
+**Learning:** Modern Musl, Glibc, and Busybox runtimes issue `faccessat2` (syscall #439) instead of `faccessat` (syscall #269) when testing file accessibility. `faccessat2` accepts flags (`AT_SYMLINK_NOFOLLOW` = 0x100, `AT_EACCESS` = 0x200, `AT_EMPTY_PATH` = 0x1000) and mode bits (`F_OK` = 0, `R_OK` = 4, `W_OK` = 2, `X_OK` = 1). Unrecognized flags or modes must strictly return `-EINVAL`.
+**Action:** Always validate `flags` against supported bitmasks (`!(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH) == 0`) and `mode` against `F_OK | R_OK | W_OK | X_OK` before dereferencing or resolving paths.

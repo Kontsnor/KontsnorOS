@@ -18,6 +18,9 @@
 use super::super::{Errno, SyscallResult};
 use crate::process::pid::Pid;
 use crate::process::scheduler;
+use crate::syscall::validation::{
+    copy_from_user, copy_from_user_slice, copy_to_user, copy_to_user_slice,
+};
 
 /// `getpid()` — Get the process ID of the calling process.
 pub fn sys_getpid() -> SyscallResult {
@@ -256,28 +259,15 @@ pub fn sys_getgroups(size: i32, list: *mut u32) -> SyscallResult {
     if (size as usize) < count {
         return Errno::EINVAL.into();
     }
-    if list.is_null() {
-        return Errno::EFAULT.into();
-    }
-    if super::super::validation::validate_user_ptr_write(
-        list as *mut u8,
-        count * core::mem::size_of::<u32>(),
-    )
-    .is_err()
-    {
-        return Errno::EFAULT.into();
+
+    if task.groups.is_empty() {
+        if let Err(err) = copy_to_user(list, &task.gid) {
+            return err.into();
+        }
+    } else if let Err(err) = copy_to_user_slice(list, &task.groups) {
+        return err.into();
     }
 
-    // SAFETY: The user pointer was validated with validate_user_ptr_write for count * sizeof(u32).
-    unsafe {
-        if task.groups.is_empty() {
-            core::ptr::write(list, task.gid);
-        } else {
-            for (idx, &g) in task.groups.iter().enumerate() {
-                core::ptr::write(list.add(idx), g);
-            }
-        }
-    }
     count as SyscallResult
 }
 
@@ -303,22 +293,10 @@ pub fn sys_setgroups(size: usize, list: *const u32) -> SyscallResult {
         task.groups.clear();
         return 0;
     }
-    if list.is_null() {
-        return Errno::EFAULT.into();
-    }
-    if !super::super::validation::validate_user_ptr(
-        list as *const u8,
-        size * core::mem::size_of::<u32>(),
-    ) {
-        return Errno::EFAULT.into();
-    }
 
-    let mut new_groups = alloc::vec::Vec::with_capacity(size);
-    // SAFETY: The pointer was validated with validate_user_ptr for size * sizeof(u32).
-    unsafe {
-        for i in 0..size {
-            new_groups.push(core::ptr::read(list.add(i)));
-        }
+    let mut new_groups = alloc::vec![0u32; size];
+    if let Err(err) = copy_from_user_slice(list, &mut new_groups) {
+        return err.into();
     }
     task.groups = new_groups;
     0
@@ -337,40 +315,19 @@ pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> SyscallR
     let task = task_arc.lock();
 
     if !ruid.is_null() {
-        if super::super::validation::validate_user_ptr_write(
-            ruid as *mut u8,
-            core::mem::size_of::<u32>(),
-        )
-        .is_err()
-        {
-            return Errno::EFAULT.into();
+        if let Err(err) = copy_to_user(ruid, &task.uid) {
+            return err.into();
         }
-        // SAFETY: Pointer validated with validate_user_ptr_write.
-        unsafe { core::ptr::write(ruid, task.uid) };
     }
     if !euid.is_null() {
-        if super::super::validation::validate_user_ptr_write(
-            euid as *mut u8,
-            core::mem::size_of::<u32>(),
-        )
-        .is_err()
-        {
-            return Errno::EFAULT.into();
+        if let Err(err) = copy_to_user(euid, &task.euid) {
+            return err.into();
         }
-        // SAFETY: Pointer validated with validate_user_ptr_write.
-        unsafe { core::ptr::write(euid, task.euid) };
     }
     if !suid.is_null() {
-        if super::super::validation::validate_user_ptr_write(
-            suid as *mut u8,
-            core::mem::size_of::<u32>(),
-        )
-        .is_err()
-        {
-            return Errno::EFAULT.into();
+        if let Err(err) = copy_to_user(suid, &task.suid) {
+            return err.into();
         }
-        // SAFETY: Pointer validated with validate_user_ptr_write.
-        unsafe { core::ptr::write(suid, task.suid) };
     }
     0
 }
@@ -425,40 +382,19 @@ pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> SyscallR
     let task = task_arc.lock();
 
     if !rgid.is_null() {
-        if super::super::validation::validate_user_ptr_write(
-            rgid as *mut u8,
-            core::mem::size_of::<u32>(),
-        )
-        .is_err()
-        {
-            return Errno::EFAULT.into();
+        if let Err(err) = copy_to_user(rgid, &task.gid) {
+            return err.into();
         }
-        // SAFETY: Pointer validated with validate_user_ptr_write.
-        unsafe { core::ptr::write(rgid, task.gid) };
     }
     if !egid.is_null() {
-        if super::super::validation::validate_user_ptr_write(
-            egid as *mut u8,
-            core::mem::size_of::<u32>(),
-        )
-        .is_err()
-        {
-            return Errno::EFAULT.into();
+        if let Err(err) = copy_to_user(egid, &task.egid) {
+            return err.into();
         }
-        // SAFETY: Pointer validated with validate_user_ptr_write.
-        unsafe { core::ptr::write(egid, task.egid) };
     }
     if !sgid.is_null() {
-        if super::super::validation::validate_user_ptr_write(
-            sgid as *mut u8,
-            core::mem::size_of::<u32>(),
-        )
-        .is_err()
-        {
-            return Errno::EFAULT.into();
+        if let Err(err) = copy_to_user(sgid, &task.sgid) {
+            return err.into();
         }
-        // SAFETY: Pointer validated with validate_user_ptr_write.
-        unsafe { core::ptr::write(sgid, task.sgid) };
     }
     0
 }
@@ -601,27 +537,18 @@ pub const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 
 /// `capget(hdrp, datap)` — Get process capabilities.
 pub fn sys_capget(hdrp: *mut CapUserHeader, datap: *mut CapUserData) -> SyscallResult {
-    if hdrp.is_null() {
-        return Errno::EFAULT.into();
-    }
-    if super::super::validation::validate_user_ptr_write(
-        hdrp as *mut u8,
-        core::mem::size_of::<CapUserHeader>(),
-    )
-    .is_err()
-    {
-        return Errno::EFAULT.into();
-    }
+    let mut header = match copy_from_user(hdrp as *const CapUserHeader) {
+        Ok(hdr) => hdr,
+        Err(err) => return err.into(),
+    };
 
-    let header = unsafe { core::ptr::read(hdrp) };
     if header.version != LINUX_CAPABILITY_VERSION_1
         && header.version != LINUX_CAPABILITY_VERSION_2
         && header.version != LINUX_CAPABILITY_VERSION_3
     {
         // Indicate preferred version in header
-        unsafe {
-            (*hdrp).version = LINUX_CAPABILITY_VERSION_3;
-        }
+        header.version = LINUX_CAPABILITY_VERSION_3;
+        let _ = copy_to_user(hdrp, &header);
         return Errno::EINVAL.into();
     }
 
@@ -635,47 +562,36 @@ pub fn sys_capget(hdrp: *mut CapUserHeader, datap: *mut CapUserData) -> SyscallR
         2
     };
 
-    if super::super::validation::validate_user_ptr_write(
-        datap as *mut u8,
-        entries * core::mem::size_of::<CapUserData>(),
-    )
-    .is_err()
-    {
-        return Errno::EFAULT.into();
-    }
-
     let is_root = sys_geteuid() == 0;
     let cap_val = if is_root { 0xFFFF_FFFF } else { 0 };
 
-    // SAFETY: Pointers validated with validate_user_ptr_write for required entries.
-    unsafe {
-        for i in 0..entries {
-            core::ptr::write(
-                datap.add(i),
-                CapUserData {
-                    effective: cap_val,
-                    permitted: cap_val,
-                    inheritable: 0,
-                },
-            );
-        }
+    let cap_data = [
+        CapUserData {
+            effective: cap_val,
+            permitted: cap_val,
+            inheritable: 0,
+        },
+        CapUserData {
+            effective: cap_val,
+            permitted: cap_val,
+            inheritable: 0,
+        },
+    ];
+
+    if let Err(err) = copy_to_user_slice(datap, &cap_data[..entries]) {
+        return err.into();
     }
+
     0
 }
 
 /// `capset(hdrp, datap)` — Set process capabilities.
 pub fn sys_capset(hdrp: *const CapUserHeader, datap: *const CapUserData) -> SyscallResult {
-    if hdrp.is_null() || datap.is_null() {
-        return Errno::EFAULT.into();
-    }
-    if !super::super::validation::validate_user_ptr(
-        hdrp as *const u8,
-        core::mem::size_of::<CapUserHeader>(),
-    ) {
-        return Errno::EFAULT.into();
-    }
+    let header = match copy_from_user(hdrp) {
+        Ok(hdr) => hdr,
+        Err(err) => return err.into(),
+    };
 
-    let header = unsafe { core::ptr::read(hdrp) };
     if header.version != LINUX_CAPABILITY_VERSION_1
         && header.version != LINUX_CAPABILITY_VERSION_2
         && header.version != LINUX_CAPABILITY_VERSION_3
@@ -689,11 +605,14 @@ pub fn sys_capset(hdrp: *const CapUserHeader, datap: *const CapUserData) -> Sysc
         2
     };
 
-    if !super::super::validation::validate_user_ptr(
-        datap as *const u8,
-        entries * core::mem::size_of::<CapUserData>(),
-    ) {
-        return Errno::EFAULT.into();
+    let mut user_caps = [CapUserData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+
+    if let Err(err) = copy_from_user_slice(datap, &mut user_caps[..entries]) {
+        return err.into();
     }
 
     // Unprivileged users cannot raise capabilities

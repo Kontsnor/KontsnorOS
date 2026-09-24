@@ -18,11 +18,11 @@
 //! Provides control group nodes with default values that satisfy systemd
 //! and other service managers' startup validation checks.
 
-use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::fmt::Write;
 
 use super::inode::{DirEntry, FileType, Inode, InodeOps};
 use super::vfs::FileSystem;
@@ -127,15 +127,15 @@ fn gen_cgroup_subtree_control() -> String {
     String::from("\n")
 }
 
-fn gen_cgroup_procs() -> String {
-    let mut out = String::new();
+pub(crate) fn gen_cgroup_procs() -> String {
     let tasks = crate::process::scheduler::TASKS.read();
+    let mut out = String::with_capacity(tasks.len() * 12);
     for slot in tasks.iter() {
         if let Some(task_arc) = slot {
             let task = task_arc.lock();
             use crate::process::task::TaskState;
             if task.state != TaskState::Zombie {
-                out.push_str(&format!("{}\n", task.pid.as_u64()));
+                let _ = writeln!(out, "{}", task.pid.as_u64());
             }
         }
     }

@@ -320,6 +320,29 @@ pub trait InodeOps: Send + Sync {
         Vec::new()
     }
 
+    /// Zero-allocation directory entry iterator for streaming directory traversal.
+    ///
+    /// Accepts a starting offset and a closure `f`.
+    /// `f(next_offset, ino, file_type, name)` is called for each valid entry.
+    /// If `f` returns `false`, iteration halts and returns `Ok(current_entry_offset)`.
+    fn iterate_dir_entries(
+        &self,
+        offset: u64,
+        f: &mut dyn FnMut(u64, u64, FileType, &str) -> bool,
+    ) -> Result<u64, i32> {
+        let entries = self.readdir();
+        let mut idx = offset as usize;
+        while idx < entries.len() {
+            let entry = &entries[idx];
+            let next_off = (idx + 1) as u64;
+            if !f(next_off, entry.ino, entry.file_type, &entry.name) {
+                return Ok(idx as u64);
+            }
+            idx += 1;
+        }
+        Ok(entries.len() as u64)
+    }
+
     /// Truncate the file to the given size.
     fn truncate(&self, _size: u64) -> Result<(), i32> {
         Err(-1) // EPERM

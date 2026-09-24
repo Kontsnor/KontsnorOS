@@ -51,56 +51,65 @@ pub fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
         return Errno::ENOTDIR.into();
     }
 
-    let entries = inode.readdir();
-    let mut current_idx = proc_fd::get_fd_offset(fd).unwrap_or(0) as usize;
+    let current_offset = proc_fd::get_fd_offset(fd).unwrap_or(0);
     let mut bytes_written = 0;
+    let mut einval = false;
 
-    while current_idx < entries.len() {
-        let entry = &entries[current_idx];
-        let name_bytes = entry.name.as_bytes();
-        let name_len = name_bytes.len();
+    let next_offset = match inode.iterate_dir_entries(
+        current_offset,
+        &mut |next_off, ino, file_type, name| {
+            let name_bytes = name.as_bytes();
+            let name_len = name_bytes.len();
 
-        // 19 bytes before name (8 + 8 + 2 + 1), align up to 8
-        let reclen = (19 + name_len + 1 + 7) & !7;
+            // 19 bytes before name (8 + 8 + 2 + 1), align up to 8
+            let reclen = (19 + name_len + 1 + 7) & !7;
 
-        if bytes_written + reclen > count {
-            if bytes_written == 0 {
-                return Errno::EINVAL.into();
+            if bytes_written + reclen > count {
+                if bytes_written == 0 {
+                    einval = true;
+                }
+                return false;
             }
-            break;
-        }
 
-        let dest_ptr = unsafe { dirp.add(bytes_written) };
+            let dest_ptr = unsafe { dirp.add(bytes_written) };
 
-        let d_type = match entry.file_type {
-            FileType::Directory => 4,
-            FileType::Regular => 8,
-            FileType::CharDevice => 2,
-            FileType::BlockDevice => 6,
-            FileType::Pipe => 1,
-            FileType::Socket => 12,
-            FileType::Symlink => 10,
-        };
+            let d_type = match file_type {
+                FileType::Directory => 4,
+                FileType::Regular => 8,
+                FileType::CharDevice => 2,
+                FileType::BlockDevice => 6,
+                FileType::Pipe => 1,
+                FileType::Socket => 12,
+                FileType::Symlink => 10,
+            };
 
-        let header = LinuxDirent64 {
-            d_ino: entry.ino,
-            d_off: (current_idx + 1) as i64,
-            d_reclen: reclen as u16,
-            d_type,
-        };
+            let header = LinuxDirent64 {
+                d_ino: ino,
+                d_off: next_off as i64,
+                d_reclen: reclen as u16,
+                d_type,
+            };
 
-        unsafe {
-            core::ptr::write(dest_ptr as *mut LinuxDirent64, header);
-            let name_dest = dest_ptr.add(19);
-            core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_dest, name_len);
-            *name_dest.add(name_len) = 0;
-        }
+            unsafe {
+                core::ptr::write(dest_ptr as *mut LinuxDirent64, header);
+                let name_dest = dest_ptr.add(19);
+                core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_dest, name_len);
+                *name_dest.add(name_len) = 0;
+            }
 
-        bytes_written += reclen;
-        current_idx += 1;
+            bytes_written += reclen;
+            true
+        },
+    ) {
+        Ok(off) => off,
+        Err(e) => return e as SyscallResult,
+    };
+
+    if einval {
+        return Errno::EINVAL.into();
     }
 
-    proc_fd::set_fd_offset(fd, current_idx as u64);
+    proc_fd::set_fd_offset(fd, next_offset);
     bytes_written as SyscallResult
 }
 

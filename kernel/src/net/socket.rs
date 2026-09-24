@@ -132,6 +132,7 @@ impl InodeOps for SocketInode {
             if sock.tcp_state == TcpState::Closed {
                 return Err(-104); // ECONNRESET
             }
+            let mut wq_opt: Option<Arc<WaitQueue>> = None;
             while sock.tcp_recv_buf.is_empty() {
                 match sock.tcp_state {
                     TcpState::CloseWait | TcpState::TimeWait => {
@@ -150,8 +151,8 @@ impl InodeOps for SocketInode {
                 if sock.nonblocking {
                     return Err(-11); // -EAGAIN
                 }
-                // Block/Wait
-                let wq = sock.wait_queue.clone();
+                // Block/Wait - lazily clone wait_queue on first wait iteration only
+                let wq = wq_opt.get_or_insert_with(|| sock.wait_queue.clone());
                 drop(sock);
                 wq.wait();
                 sock = self.socket.lock();

@@ -499,7 +499,11 @@ pub fn sys_semtimedop(
         return Errno::EFAULT.into();
     }
 
-    let ops = unsafe { core::slice::from_raw_parts(sops, nsops) };
+    let mut ops = alloc::vec![SemBuf::default(); nsops];
+    // SAFETY: sops validated for total_size bytes.
+    unsafe {
+        core::ptr::copy_nonoverlapping(sops, ops.as_mut_ptr(), nsops);
+    }
 
     let sem_arc = {
         let reg = SEM_REGISTRY.lock();
@@ -510,14 +514,14 @@ pub fn sys_semtimedop(
     };
 
     let mut sem = sem_arc.lock();
-    for op in ops {
+    for op in &ops {
         if (op.sem_num as usize) >= sem.values.len() {
             return Errno::EFBIG.into();
         }
     }
 
     // Attempt all operations
-    for op in ops {
+    for op in &ops {
         let idx = op.sem_num as usize;
         let val = sem.values[idx];
         if op.sem_op < 0 {
@@ -699,8 +703,17 @@ pub fn sys_msgsnd(msqid: i32, msgp: *const u8, msgsz: usize, _msgflg: i32) -> Sy
         return Errno::EINVAL.into();
     }
 
-    let payload =
-        unsafe { core::slice::from_raw_parts(msgp.add(core::mem::size_of::<i64>()), msgsz) };
+    let mut payload = alloc::vec![0u8; msgsz];
+    if msgsz > 0 {
+        // SAFETY: msgp validated for total_size bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                msgp.add(core::mem::size_of::<i64>()),
+                payload.as_mut_ptr(),
+                msgsz,
+            );
+        }
+    }
 
     let mq_arc = {
         let reg = MSG_REGISTRY.lock();
@@ -711,7 +724,7 @@ pub fn sys_msgsnd(msqid: i32, msgp: *const u8, msgsz: usize, _msgflg: i32) -> Sy
     };
 
     let mut mq = mq_arc.lock();
-    mq.messages.push_back((mtype, payload.to_vec()));
+    mq.messages.push_back((mtype, payload));
     mq.ds.msg_qnum = mq.messages.len() as u64;
     mq.ds.msg_cbytes = mq.ds.msg_cbytes.saturating_add(msgsz as u64);
     mq.wait_queue.wake_all();
@@ -879,11 +892,6 @@ pub fn sys_mq_timedsend(
     msg_prio: u32,
     _abs_timeout: *const u8,
 ) -> SyscallResult {
-    if msg_ptr.is_null() || !validate_user_ptr(msg_ptr, msg_len) {
-        return Errno::EFAULT.into();
-    }
-    let data = unsafe { core::slice::from_raw_parts(msg_ptr, msg_len) };
-
     let mq_arc = {
         let reg = POSIX_MQ_REGISTRY.lock();
         match reg.get(&mqdes).cloned() {
@@ -893,7 +901,23 @@ pub fn sys_mq_timedsend(
     };
 
     let mut mq = mq_arc.lock();
-    mq.messages.push((msg_prio, data.to_vec()));
+    if msg_len > mq.msgsize as usize {
+        return Errno::EMSGSIZE.into();
+    }
+
+    if msg_ptr.is_null() || !validate_user_ptr(msg_ptr, msg_len) {
+        return Errno::EFAULT.into();
+    }
+
+    let mut data = alloc::vec![0u8; msg_len];
+    if msg_len > 0 {
+        // SAFETY: msg_ptr validated for msg_len bytes and data has capacity msg_len.
+        unsafe {
+            core::ptr::copy_nonoverlapping(msg_ptr, data.as_mut_ptr(), msg_len);
+        }
+    }
+
+    mq.messages.push((msg_prio, data));
     mq.wait_queue.wake_all();
     0
 }

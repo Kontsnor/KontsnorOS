@@ -21,6 +21,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 
 use crate::fs::inode::{FileType, Inode, InodeOps};
@@ -685,12 +686,28 @@ pub fn allocate_new_pty() -> Result<Arc<dyn InodeOps>, i32> {
 
 /// Global active PTY master reference.
 pub static ACTIVE_PTY_MASTER: spin::Mutex<Option<Arc<dyn InodeOps>>> = spin::Mutex::new(None);
+/// Version counter incremented whenever ACTIVE_PTY_MASTER changes.
+pub static ACTIVE_PTY_VERSION: AtomicU64 = AtomicU64::new(0);
+
+/// Updates the active PTY master and increments the version counter.
+pub fn set_active_pty_master(master: Option<Arc<dyn InodeOps>>) {
+    *ACTIVE_PTY_MASTER.lock() = master;
+    ACTIVE_PTY_VERSION.fetch_add(1, Ordering::Release);
+}
 
 fn pty_flusher_thread() {
     let mut buf = [0u8; 128];
+    let mut cached_master: Option<Arc<dyn InodeOps>> = None;
+    let mut cached_version: u64 = 0;
+
     loop {
-        let master_opt = ACTIVE_PTY_MASTER.lock().clone();
-        if let Some(master) = master_opt {
+        let current_version = ACTIVE_PTY_VERSION.load(Ordering::Acquire);
+        if current_version != cached_version || (cached_master.is_none() && current_version == 0) {
+            cached_master = ACTIVE_PTY_MASTER.lock().clone();
+            cached_version = current_version;
+        }
+
+        if let Some(ref master) = cached_master {
             match master.read(0, &mut buf) {
                 Ok(n) if n > 0 => {
                     x86_64::instructions::interrupts::without_interrupts(|| {
@@ -718,6 +735,9 @@ fn pty_flusher_thread() {
 pub const DEBUG_PTY_ROUTER: bool = false;
 
 fn pty_router_thread() {
+    let mut cached_master: Option<Arc<dyn InodeOps>> = None;
+    let mut cached_version: u64 = 0;
+
     loop {
         // Poll serial input for QEMU stdio
         if let Some(ch) = crate::arch::x86_64::serial::try_read_byte() {
@@ -743,8 +763,13 @@ fn pty_router_thread() {
             }
         }
         if count > 0 {
-            let master_opt = ACTIVE_PTY_MASTER.lock().clone();
-            if let Some(master) = master_opt {
+            let current_version = ACTIVE_PTY_VERSION.load(Ordering::Acquire);
+            if current_version != cached_version || (cached_master.is_none() && current_version == 0) {
+                cached_master = ACTIVE_PTY_MASTER.lock().clone();
+                cached_version = current_version;
+            }
+
+            if let Some(ref master) = cached_master {
                 let _ = master.write(0, &temp_buf[..count]);
             }
         }

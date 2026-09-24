@@ -179,9 +179,8 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut CpuContext, _new_ctx: *co
         // Save CR3 (current page table)
         "mov rax, cr3",
         "mov [rdi + 0x48], rax",
-        // Save FS_BASE using rdfsbase (since userspace can now modify FS_BASE directly)
-        "rdfsbase rax",
-        "mov [rdi + 0x50], rax",
+        // FS_BASE is maintained across syscall boundaries (sys_arch_prctl, sys_clone, sys_execve),
+        // so reading FS_BASE via rdfsbase on every context switch is redundant.
         // Save user GS_BASE (stored in KERNEL_GS_BASE MSR 0xC0000102 while in ring 0)
         "mov ecx, 0xC0000102",
         "rdmsr",

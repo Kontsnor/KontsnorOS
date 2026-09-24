@@ -3385,3 +3385,55 @@ fn test_lseek_espipe_on_pipe() {
     crate::syscall::fs::sys_close(write_fd);
     kprintln!("[test] lseek ESPIPE on pipe test PASSED!");
 }
+
+#[test_case]
+fn test_socket_read_wait_queue_hoist() {
+    use crate::fs::inode::InodeOps;
+    use crate::net::socket::{Socket, SocketInode};
+
+    kprintln!("[test] Starting Socket read wait_queue hoist benchmark test...");
+
+    let sock = alloc::sync::Arc::new(spin::Mutex::new(Socket::new(2, 1, 0))); // AF_INET, SOCK_STREAM
+    {
+        let mut s = sock.lock();
+        s.tcp_state = crate::net::tcp::TcpState::Established;
+        s.nonblocking = true;
+    }
+
+    let sock_inode = SocketInode::new(sock.clone());
+    let mut buf = [0u8; 64];
+
+    // Verify non-blocking read returns -EAGAIN (-11)
+    let res = sock_inode.read(0, &mut buf);
+    assert_eq!(res, Err(-11), "Non-blocking empty read must return -EAGAIN (-11)");
+
+    // Populate data into tcp_recv_buf
+    {
+        let mut s = sock.lock();
+        s.tcp_recv_buf.extend_from_slice(b"benchmark_socket_read_data");
+    }
+
+    // Measure time/cycles for repeated non-blocking reads or populated reads
+    let start_ticks = crate::arch::x86_64::time::rdtsc();
+    const ITERATIONS: usize = 10_000;
+    for _ in 0..ITERATIONS {
+        {
+            let mut s = sock.lock();
+            if s.tcp_recv_buf.is_empty() {
+                s.tcp_recv_buf.extend_from_slice(b"a");
+            }
+        }
+        let read_res = sock_inode.read(0, &mut buf);
+        assert!(read_res.is_ok());
+    }
+    let end_ticks = crate::arch::x86_64::time::rdtsc();
+    let elapsed_ticks = end_ticks.saturating_sub(start_ticks);
+
+    kprintln!(
+        "[test] Socket read (10,000 ops) completed in {} ticks ({:.2} ticks/op)",
+        elapsed_ticks,
+        elapsed_ticks as f64 / ITERATIONS as f64
+    );
+
+    kprintln!("[test] Socket read wait_queue hoist benchmark test PASSED!");
+}

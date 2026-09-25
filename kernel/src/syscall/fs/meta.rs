@@ -55,9 +55,8 @@ pub fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
     let mut bytes_written = 0;
     let mut einval = false;
 
-    let next_offset = match inode.iterate_dir_entries(
-        current_offset,
-        &mut |next_off, ino, file_type, name| {
+    let next_offset =
+        match inode.iterate_dir_entries(current_offset, &mut |next_off, ino, file_type, name| {
             let name_bytes = name.as_bytes();
             let name_len = name_bytes.len();
 
@@ -99,11 +98,10 @@ pub fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
 
             bytes_written += reclen;
             true
-        },
-    ) {
-        Ok(off) => off,
-        Err(e) => return e as SyscallResult,
-    };
+        }) {
+            Ok(off) => off,
+            Err(e) => return e as SyscallResult,
+        };
 
     if einval {
         return Errno::EINVAL.into();
@@ -148,22 +146,27 @@ pub fn sys_chdir(pathname: *const u8) -> SyscallResult {
 }
 
 /// `getcwd(buf, size)` — Get current working directory.
+///
+/// POSIX.1-2017 & Linux getcwd(2):
+/// - Returns -EINVAL if `size == 0`.
+/// - Returns -EFAULT if `buf` is NULL or points to invalid memory.
+/// - Returns -ERANGE if `size` > 0 but is smaller than path length + 1.
 pub fn sys_getcwd(buf: *mut u8, size: usize) -> SyscallResult {
-    if buf.is_null() || size == 0 {
+    if size == 0 {
         return Errno::EINVAL.into();
     }
-    if !validate_user_ptr(buf as *const u8, size) {
+    if buf.is_null() || !validate_user_ptr(buf as *const u8, size) {
         return Errno::EFAULT.into();
     }
 
     let current_pid = match crate::process::scheduler::current_pid() {
         Some(p) => p,
-        None => return 0, // returns NULL on error
+        None => return Errno::ESRCH.into(),
     };
 
     let task_arc = match crate::process::scheduler::get_task_arc(current_pid) {
         Some(t) => t,
-        None => return 0,
+        None => return Errno::ESRCH.into(),
     };
     let (cwd, jail_root) = {
         let task = task_arc.lock();
@@ -188,7 +191,7 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> SyscallResult {
 
     let cwd_bytes = display_cwd.as_bytes();
     if cwd_bytes.len() + 1 > size {
-        return Errno::EINVAL.into(); // buffer too small
+        return Errno::ERANGE.into();
     }
 
     // Write to user space

@@ -1354,9 +1354,65 @@ pub fn sys_set_tid_address(tidptr: *mut i32) -> SyscallResult {
     pid.as_u64() as i64
 }
 
-/// `prctl(option, ...)` — Process control (stub).
-pub fn sys_prctl(_option: i32, _arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> SyscallResult {
-    0
+/// Linux `prctl` option constants for thread name management.
+pub const PR_SET_NAME: i32 = 15;
+pub const PR_GET_NAME: i32 = 16;
+
+/// `prctl(option, arg2, arg3, arg4, arg5)` — Process control operations.
+///
+/// Implements `PR_SET_NAME` (15) and `PR_GET_NAME` (16) to set and retrieve thread names.
+pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> SyscallResult {
+    match option {
+        PR_SET_NAME => {
+            let ptr = arg2 as *const u8;
+            if ptr.is_null() || !validate_user_ptr(ptr, 16) {
+                return Errno::EFAULT.into();
+            }
+
+            // SAFETY: Memory pointer validated with validate_user_ptr for 16 bytes.
+            let bytes = unsafe { core::slice::from_raw_parts(ptr, 16) };
+            let len = bytes.iter().position(|&b| b == 0).unwrap_or(16);
+            let name_str = alloc::string::String::from_utf8_lossy(&bytes[..len]).into_owned();
+
+            let current_pid = match scheduler::current_pid() {
+                Some(p) => p,
+                None => return Errno::ESRCH.into(),
+            };
+
+            if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+                task_arc.lock().name = name_str;
+            }
+            0
+        }
+        PR_GET_NAME => {
+            let ptr = arg2 as *mut u8;
+            if ptr.is_null() || validate_user_ptr_write(ptr, 16).is_err() {
+                return Errno::EFAULT.into();
+            }
+
+            let current_pid = match scheduler::current_pid() {
+                Some(p) => p,
+                None => return Errno::ESRCH.into(),
+            };
+
+            let name = if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+                task_arc.lock().name.clone()
+            } else {
+                alloc::string::String::from("unknown")
+            };
+
+            let mut buf = [0u8; 16];
+            let copy_len = name.len().min(15);
+            buf[..copy_len].copy_from_slice(&name.as_bytes()[..copy_len]);
+
+            // SAFETY: Buffer pointer validated with validate_user_ptr_write for 16 bytes.
+            unsafe {
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr, 16);
+            }
+            0
+        }
+        _ => 0,
+    }
 }
 
 /// `clone(flags, child_stack, parent_tidptr, child_tidptr, newtls)`

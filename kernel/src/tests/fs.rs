@@ -605,6 +605,8 @@ fn test_vfs_lookup_dcache_benchmark() {
 
     let _ = test_dir.unlink("file.txt");
     let _ = tmp_dir.rmdir("bench_dir");
+}
+
 fn test_ext_readdir_streaming_benchmark() {
     kprintln!("[test] Starting Ext4 zero-allocation streaming readdir benchmark test...");
 
@@ -666,11 +668,8 @@ fn test_ext_readdir_streaming_benchmark() {
     let mut total_dents_read = 0;
 
     loop {
-        let nread = crate::syscall::fs::sys_getdents64(
-            dir_fd as i32,
-            dents_buf_addr as *mut u8,
-            4096,
-        );
+        let nread =
+            crate::syscall::fs::sys_getdents64(dir_fd as i32, dents_buf_addr as *mut u8, 4096);
         if nread <= 0 {
             break;
         }
@@ -719,4 +718,28 @@ fn test_ext_readdir_streaming_benchmark() {
     crate::syscall::memory::sys_munmap(dents_buf_addr, 4096);
 
     kprintln!("[test] Ext4 zero-allocation streaming readdir benchmark test PASSED!");
+}
+
+#[test_case]
+fn test_getcwd_error_semantics() {
+    let buf_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as *mut u8;
+    assert!(!buf_addr.is_null());
+
+    // 1. size == 0 should return -EINVAL
+    let res_size_zero = crate::syscall::fs::sys_getcwd(buf_addr, 0);
+    assert_eq!(res_size_zero, crate::syscall::Errno::EINVAL as i64);
+
+    // 2. null buffer should return -EFAULT when size > 0
+    let res_null_buf = crate::syscall::fs::sys_getcwd(core::ptr::null_mut(), 100);
+    assert_eq!(res_null_buf, crate::syscall::Errno::EFAULT as i64);
+
+    // 3. buffer size too small for CWD (e.g., size = 1 for "/") should return -ERANGE
+    let res_small_buf = crate::syscall::fs::sys_getcwd(buf_addr, 1);
+    assert_eq!(res_small_buf, crate::syscall::Errno::ERANGE as i64);
+
+    // 4. valid buffer size should succeed and return buffer address
+    let res_valid = crate::syscall::fs::sys_getcwd(buf_addr, 4096);
+    assert_eq!(res_valid, buf_addr as i64);
+
+    crate::syscall::memory::sys_munmap(buf_addr as u64, 4096);
 }

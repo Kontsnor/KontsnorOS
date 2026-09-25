@@ -108,6 +108,7 @@ pub enum Errno {
     ENOSPC = -28,
     ESPIPE = -29,
     EROFS = -30,
+    ERANGE = -34,
     ENOSYS = -38,
     ENOTEMPTY = -39,
     ENOEXEC = -8,

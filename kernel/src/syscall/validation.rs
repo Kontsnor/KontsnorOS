@@ -202,34 +202,13 @@ pub fn validate_user_ptr(ptr: *const u8, size: usize) -> bool {
 
 /// Validate that a user-space write target at `[ptr, ptr+size)` is safe.
 ///
-/// This is the write-variant of `validate_user_ptr`: it must also be mapped
-/// and writable (we allow any user-space address below the canonical hole).
+/// Delegates range checks and page mapping checks to `validate_user_ptr`.
 pub fn validate_user_ptr_write(ptr: *mut u8, size: usize) -> Result<(), ()> {
-    if ptr.is_null() {
-        return Err(());
+    if validate_user_ptr(ptr as *const u8, size) {
+        Ok(())
+    } else {
+        Err(())
     }
-    let start = ptr as u64;
-    let end = match start.checked_add(size as u64) {
-        Some(e) => e,
-        None => return Err(()),
-    };
-    if end > 0x0000_7FFF_FFFF_FFFF {
-        return Err(());
-    }
-    if size == 0 {
-        return Ok(());
-    }
-    let page_size: u64 = 4096;
-    let start_page = start & !(page_size - 1);
-    let end_page = (end + page_size - 1) & !(page_size - 1);
-    let mut curr = start_page;
-    while curr < end_page {
-        if !ensure_page_mapped(curr) {
-            return Err(());
-        }
-        curr += page_size;
-    }
-    Ok(())
 }
 
 /// Copy a null-terminated string from user-space virtual address `ptr`.

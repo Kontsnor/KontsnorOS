@@ -55,9 +55,8 @@ pub fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
     let mut bytes_written = 0;
     let mut einval = false;
 
-    let next_offset = match inode.iterate_dir_entries(
-        current_offset,
-        &mut |next_off, ino, file_type, name| {
+    let next_offset =
+        match inode.iterate_dir_entries(current_offset, &mut |next_off, ino, file_type, name| {
             let name_bytes = name.as_bytes();
             let name_len = name_bytes.len();
 
@@ -99,11 +98,10 @@ pub fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
 
             bytes_written += reclen;
             true
-        },
-    ) {
-        Ok(off) => off,
-        Err(e) => return e as SyscallResult,
-    };
+        }) {
+            Ok(off) => off,
+            Err(e) => return e as SyscallResult,
+        };
 
     if einval {
         return Errno::EINVAL.into();

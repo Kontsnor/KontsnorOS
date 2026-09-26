@@ -71,6 +71,7 @@ pub enum SyscallNumber {
     EpollWait = 232,
     EpollCtl = 233,
     TimerFdCreate = 283,
+    TimerFdGetTime = 284,
     TimerFdSetTime = 286,
     SignalFd4 = 289,
     EventFd2 = 290,
@@ -682,6 +683,7 @@ pub fn dispatch(
             arg3 as *const crate::fs::epoll::EpollEvent,
         ),
         283 => fs::sys_timerfd_create(arg0 as i32, arg1 as i32),
+        284 => fs::sys_timerfd_gettime(arg0 as i32, arg1 as *mut crate::fs::timerfd::Itimerspec),
         285 => fs::sys_fallocate(arg0 as i32, arg1 as i32, arg2 as i64, arg3 as i64),
         286 => fs::sys_timerfd_settime(
             arg0 as i32,

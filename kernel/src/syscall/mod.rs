@@ -376,11 +376,6 @@ pub extern "C" fn syscall_dispatch_rust(regs: *mut SavedRegisters, syscall_num: 
         );
     }
 
-    let current_pid_val = crate::process::scheduler::current_pid()
-        .map(|p| p.as_u64())
-        .unwrap_or(0);
-    let _ = current_pid_val;
-
     let res = dispatch(regs, syscall_num, arg0, arg1, arg2, arg3, arg4, arg5);
 
     if DEBUG_SYSCALLS {

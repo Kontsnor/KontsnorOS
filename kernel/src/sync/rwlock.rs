@@ -76,7 +76,9 @@ impl<T> KRwLock<T> {
 
         loop {
             // Respect writer priority: spin while a writer is pending or active.
-            if self.writer_pending.load(Ordering::Acquire) {
+            // Ordering::Relaxed is sufficient for spin-reading state on x86_64,
+            // avoiding unnecessary atomic pipeline stalls during spin loops.
+            if self.writer_pending.load(Ordering::Relaxed) {
                 if crate::arch::x86_64::smp::has_pending_tlb_shootdown() {
                     x86_64::instructions::tlb::flush_all();
                     crate::arch::x86_64::smp::tlb_shootdown_ack();

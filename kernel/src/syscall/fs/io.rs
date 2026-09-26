@@ -1148,7 +1148,8 @@ pub fn sys_ftruncate(fd: i32, length: i64) -> SyscallResult {
 
     let flags = file_desc.flags.lock();
     if !flags.is_writable() {
-        return Errno::EINVAL.into(); // In Linux, ftruncate returns EINVAL if fd is not open for writing.
+        // POSIX.1-2017 & Linux ftruncate(2): EBADF if file descriptor is not open for writing.
+        return Errno::EBADF.into();
     }
     drop(flags);
 

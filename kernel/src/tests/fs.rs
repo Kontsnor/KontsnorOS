@@ -605,6 +605,9 @@ fn test_vfs_lookup_dcache_benchmark() {
 
     let _ = test_dir.unlink("file.txt");
     let _ = tmp_dir.rmdir("bench_dir");
+}
+
+#[test_case]
 fn test_ext_readdir_streaming_benchmark() {
     kprintln!("[test] Starting Ext4 zero-allocation streaming readdir benchmark test...");
 
@@ -666,11 +669,8 @@ fn test_ext_readdir_streaming_benchmark() {
     let mut total_dents_read = 0;
 
     loop {
-        let nread = crate::syscall::fs::sys_getdents64(
-            dir_fd as i32,
-            dents_buf_addr as *mut u8,
-            4096,
-        );
+        let nread =
+            crate::syscall::fs::sys_getdents64(dir_fd as i32, dents_buf_addr as *mut u8, 4096);
         if nread <= 0 {
             break;
         }
@@ -719,4 +719,27 @@ fn test_ext_readdir_streaming_benchmark() {
     crate::syscall::memory::sys_munmap(dents_buf_addr, 4096);
 
     kprintln!("[test] Ext4 zero-allocation streaming readdir benchmark test PASSED!");
+}
+
+#[test_case]
+fn test_ftruncate_ebadf_on_read_only_fd() {
+    let path = b"/tmp/test_ftruncate_ro.txt\0";
+    // O_CREAT (0x40) | O_RDWR (0x02)
+    let create_fd = crate::syscall::fs::sys_open(path.as_ptr(), 0x40 | 0x02, 0o644);
+    assert!(create_fd >= 0, "sys_open create failed");
+
+    // Open O_RDONLY (0)
+    let ro_fd = crate::syscall::fs::sys_open(path.as_ptr(), 0, 0);
+    assert!(ro_fd >= 0, "sys_open ro failed");
+
+    let res = crate::syscall::fs::sys_ftruncate(ro_fd as i32, 0);
+    assert_eq!(
+        res,
+        crate::syscall::Errno::EBADF as i64,
+        "ftruncate on read-only fd should return -EBADF"
+    );
+
+    crate::syscall::fs::sys_close(create_fd as i32);
+    crate::syscall::fs::sys_close(ro_fd as i32);
+    crate::syscall::fs::sys_unlink(path.as_ptr());
 }

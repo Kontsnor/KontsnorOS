@@ -55,4 +55,4 @@ pub use crate::fs::inotify::{
 };
 pub use crate::fs::pidfd::{sys_pidfd_getfd, sys_pidfd_open, sys_pidfd_send_signal};
 pub use crate::fs::signalfd::sys_signalfd4;
-pub use crate::fs::timerfd::{sys_timerfd_create, sys_timerfd_settime};
+pub use crate::fs::timerfd::{sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime};

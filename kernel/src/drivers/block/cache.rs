@@ -61,7 +61,47 @@ struct CacheEntry {
 
 struct BlockCacheInner {
     entries: BTreeMap<u64, CacheEntry>,
+    /// Auxiliary index mapping last_access timestamp -> block_id for O(log N) LRU eviction.
+    /// Since BTreeMap orders keys lexicographically, the first element (`iter().next()`) is
+    /// guaranteed to be the Least Recently Used (minimum last_access) block.
+    access_map: BTreeMap<u64, u64>,
     counter: u64,
+}
+
+impl BlockCacheInner {
+    fn touch(&mut self, block: u64) {
+        if let Some(entry) = self.entries.get_mut(&block) {
+            let old_access = entry.last_access;
+            self.counter += 1;
+            let new_access = self.counter;
+            entry.last_access = new_access;
+            self.access_map.remove(&old_access);
+            self.access_map.insert(new_access, block);
+        }
+    }
+
+    fn insert(&mut self, block: u64, data: Vec<u8>, max_blocks: usize) {
+        if self.entries.len() >= max_blocks {
+            // Bolt Optimization: O(log N) LRU eviction via access_map index.
+            // BTreeMap keeps keys sorted by last_access timestamp, so the first entry is
+            // guaranteed to be the Least Recently Used (minimum last_access).
+            // This eliminates an O(N = 2048) linear scan over all entries.
+            if let Some((&lru_access, &lru_block)) = self.access_map.iter().next() {
+                self.entries.remove(&lru_block);
+                self.access_map.remove(&lru_access);
+            }
+        }
+        self.counter += 1;
+        let counter = self.counter;
+        self.entries.insert(
+            block,
+            CacheEntry {
+                data,
+                last_access: counter,
+            },
+        );
+        self.access_map.insert(counter, block);
+    }
 }
 
 /// A wrapper block device driver that caches reads and writes to an underlying block device.
@@ -78,6 +118,7 @@ impl BlockCache {
             device,
             inner: KMutex::new(BlockCacheInner {
                 entries: BTreeMap::new(),
+                access_map: BTreeMap::new(),
                 counter: 0,
             }),
             max_blocks,
@@ -97,8 +138,6 @@ impl BlockDevice for BlockCache {
 
         // 1. Acquire lock to check for cache hits
         let mut inner = self.inner.lock();
-        inner.counter += 1;
-        let counter = inner.counter;
 
         let mut all_hits = true;
         for i in 0..num_blocks {
@@ -113,8 +152,8 @@ impl BlockDevice for BlockCache {
             for i in 0..num_blocks {
                 let curr_block = block + i as u64;
                 let offset = i * block_size;
-                let entry = inner.entries.get_mut(&curr_block).unwrap();
-                entry.last_access = counter;
+                inner.touch(curr_block);
+                let entry = inner.entries.get(&curr_block).unwrap();
                 buf[offset..offset + block_size].copy_from_slice(&entry.data);
             }
             return Ok(());
@@ -136,31 +175,11 @@ impl BlockDevice for BlockCache {
             let block_slice = &disk_data[offset..offset + block_size];
 
             if !inner.entries.contains_key(&curr_block) {
-                if inner.entries.len() >= self.max_blocks {
-                    // Evict LRU entry
-                    let mut lru_block = None;
-                    let mut min_access = u64::MAX;
-                    for (&b, entry) in &inner.entries {
-                        if entry.last_access < min_access {
-                            min_access = entry.last_access;
-                            lru_block = Some(b);
-                        }
-                    }
-                    if let Some(b) = lru_block {
-                        inner.entries.remove(&b);
-                    }
-                }
-                inner.entries.insert(
-                    curr_block,
-                    CacheEntry {
-                        data: block_slice.to_vec(),
-                        last_access: counter,
-                    },
-                );
+                inner.insert(curr_block, block_slice.to_vec(), self.max_blocks);
                 buf[offset..offset + block_size].copy_from_slice(block_slice);
             } else {
-                let entry = inner.entries.get_mut(&curr_block).unwrap();
-                entry.last_access = counter;
+                inner.touch(curr_block);
+                let entry = inner.entries.get(&curr_block).unwrap();
                 buf[offset..offset + block_size].copy_from_slice(&entry.data);
             }
         }
@@ -181,39 +200,18 @@ impl BlockDevice for BlockCache {
         self.device.write_block(block, aligned_buf.as_slice())?;
 
         let mut inner = self.inner.lock();
-        inner.counter += 1;
-        let counter = inner.counter;
 
         for i in 0..num_blocks {
             let curr_block = block + i as u64;
             let offset = i * block_size;
             let block_slice = &data[offset..offset + block_size];
 
-            if let Some(entry) = inner.entries.get_mut(&curr_block) {
-                entry.last_access = counter;
+            if inner.entries.contains_key(&curr_block) {
+                inner.touch(curr_block);
+                let entry = inner.entries.get_mut(&curr_block).unwrap();
                 entry.data.copy_from_slice(block_slice);
             } else {
-                if inner.entries.len() >= self.max_blocks {
-                    // Evict LRU entry
-                    let mut lru_block = None;
-                    let mut min_access = u64::MAX;
-                    for (&b, entry) in &inner.entries {
-                        if entry.last_access < min_access {
-                            min_access = entry.last_access;
-                            lru_block = Some(b);
-                        }
-                    }
-                    if let Some(b) = lru_block {
-                        inner.entries.remove(&b);
-                    }
-                }
-                inner.entries.insert(
-                    curr_block,
-                    CacheEntry {
-                        data: block_slice.to_vec(),
-                        last_access: counter,
-                    },
-                );
+                inner.insert(curr_block, block_slice.to_vec(), self.max_blocks);
             }
         }
 

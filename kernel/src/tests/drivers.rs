@@ -313,3 +313,43 @@ fn test_nvme_identify_controller_parsing() {
     assert_eq!(0x1000 + (2 * 1 + 0) * stride, 0x1008); // IO SQ
     assert_eq!(0x1000 + (2 * 1 + 1) * stride, 0x100C); // IO CQ
 }
+
+#[test_case]
+fn test_block_cache_lru_eviction() {
+    use crate::drivers::block::cache::BlockCache;
+    use crate::drivers::traits::BlockDevice;
+
+    let ramdisk = crate::drivers::ramdisk::create_ext2_ramdisk();
+    let cache = BlockCache::new(ramdisk.clone(), 3);
+
+    // Write initial data to blocks 0, 1, 2
+    let buf0 = [0xAAu8; 512];
+    let buf1 = [0xBBu8; 512];
+    let buf2 = [0xCCu8; 512];
+    let buf3 = [0xDDu8; 512];
+
+    assert!(cache.write_block(0, &buf0).is_ok());
+    assert!(cache.write_block(1, &buf1).is_ok());
+    assert!(cache.write_block(2, &buf2).is_ok());
+
+    // Cache now holds blocks 0, 1, 2. Access block 0 again to touch it (make it MRU).
+    let mut read_buf = [0u8; 512];
+    assert!(cache.read_block(0, &mut read_buf).is_ok());
+    assert_eq!(&read_buf[..], &buf0[..]);
+
+    // LRU order is now: Block 1 (oldest), Block 2, Block 0 (newest).
+    // Write block 3 -> forces LRU eviction of Block 1!
+    assert!(cache.write_block(3, &buf3).is_ok());
+
+    // Update underlying ramdisk directly for block 1 (so cache miss fetches this new data)
+    let dirty_buf1 = [0x99u8; 512];
+    assert!(ramdisk.write_block(1, &dirty_buf1).is_ok());
+
+    // Reading block 1 must be a cache miss (since it was evicted) and fetch dirty_buf1 from ramdisk
+    assert!(cache.read_block(1, &mut read_buf).is_ok());
+    assert_eq!(&read_buf[..], &dirty_buf1[..]);
+
+    // Reading block 0 must still be a cache hit and return original buf0
+    assert!(cache.read_block(0, &mut read_buf).is_ok());
+    assert_eq!(&read_buf[..], &buf0[..]);
+}

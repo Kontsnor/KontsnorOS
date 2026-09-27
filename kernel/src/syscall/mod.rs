@@ -998,7 +998,7 @@ pub fn dispatch(
             arg3 as usize,
         ),
         438 => fs::sys_pidfd_getfd(arg0 as i32, arg1 as i32, arg2 as u32),
-        439 => fs::sys_faccessat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as i32),
+        439 => fs::sys_faccessat2(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as i32),
         441 => fs::sys_epoll_pwait2(
             arg0 as i32,
             arg1 as *mut crate::fs::epoll::EpollEvent,

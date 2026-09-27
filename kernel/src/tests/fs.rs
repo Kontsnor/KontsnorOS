@@ -605,6 +605,9 @@ fn test_vfs_lookup_dcache_benchmark() {
 
     let _ = test_dir.unlink("file.txt");
     let _ = tmp_dir.rmdir("bench_dir");
+}
+
+#[test_case]
 fn test_ext_readdir_streaming_benchmark() {
     kprintln!("[test] Starting Ext4 zero-allocation streaming readdir benchmark test...");
 
@@ -666,11 +669,8 @@ fn test_ext_readdir_streaming_benchmark() {
     let mut total_dents_read = 0;
 
     loop {
-        let nread = crate::syscall::fs::sys_getdents64(
-            dir_fd as i32,
-            dents_buf_addr as *mut u8,
-            4096,
-        );
+        let nread =
+            crate::syscall::fs::sys_getdents64(dir_fd as i32, dents_buf_addr as *mut u8, 4096);
         if nread <= 0 {
             break;
         }
@@ -719,4 +719,60 @@ fn test_ext_readdir_streaming_benchmark() {
     crate::syscall::memory::sys_munmap(dents_buf_addr, 4096);
 
     kprintln!("[test] Ext4 zero-allocation streaming readdir benchmark test PASSED!");
+}
+
+#[test_case]
+fn test_ftruncate_errno_semantics() {
+    let file_path = b"/tmp/test_ftruncate.txt\0";
+    let path_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
+    assert!(path_addr > 0);
+    unsafe {
+        core::ptr::copy_nonoverlapping(file_path.as_ptr(), path_addr as *mut u8, file_path.len());
+    }
+
+    // Create file and close it
+    let create_fd = crate::syscall::fs::sys_open(path_addr as *const u8, 0o102, 0o644); // O_CREAT | O_RDWR
+    assert!(create_fd >= 0);
+    let _ = crate::syscall::fs::sys_close(create_fd as i32);
+
+    // 1. Open O_RDONLY and verify sys_ftruncate returns -EBADF (-9)
+    let rdonly_fd = crate::syscall::fs::sys_open(path_addr as *const u8, 0o0, 0); // O_RDONLY
+    assert!(rdonly_fd >= 0);
+    let ftruncate_rdonly_res = crate::syscall::fs::sys_ftruncate(rdonly_fd as i32, 10);
+    assert_eq!(
+        ftruncate_rdonly_res,
+        crate::syscall::Errno::EBADF as i64,
+        "ftruncate on O_RDONLY fd must return -EBADF"
+    );
+    let _ = crate::syscall::fs::sys_close(rdonly_fd as i32);
+
+    // 2. Open O_WRONLY and verify sys_ftruncate succeeds (0)
+    let wronly_fd = crate::syscall::fs::sys_open(path_addr as *const u8, 0o1, 0); // O_WRONLY
+    assert!(wronly_fd >= 0);
+    let ftruncate_wronly_res = crate::syscall::fs::sys_ftruncate(wronly_fd as i32, 20);
+    assert_eq!(
+        ftruncate_wronly_res, 0,
+        "ftruncate on O_WRONLY fd must succeed"
+    );
+
+    // 3. Negative length check -> -EINVAL (-22)
+    let ftruncate_neg_res = crate::syscall::fs::sys_ftruncate(wronly_fd as i32, -5);
+    assert_eq!(
+        ftruncate_neg_res,
+        crate::syscall::Errno::EINVAL as i64,
+        "ftruncate with negative length must return -EINVAL"
+    );
+    let _ = crate::syscall::fs::sys_close(wronly_fd as i32);
+
+    // 4. Invalid fd check -> -EBADF (-9)
+    let ftruncate_badfd_res = crate::syscall::fs::sys_ftruncate(-1, 10);
+    assert_eq!(
+        ftruncate_badfd_res,
+        crate::syscall::Errno::EBADF as i64,
+        "ftruncate on negative fd must return -EBADF"
+    );
+
+    // Clean up
+    let _ = crate::syscall::fs::sys_unlink(path_addr as *const u8);
+    crate::syscall::memory::sys_munmap(path_addr, 4096);
 }

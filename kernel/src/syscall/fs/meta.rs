@@ -55,9 +55,8 @@ pub fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
     let mut bytes_written = 0;
     let mut einval = false;
 
-    let next_offset = match inode.iterate_dir_entries(
-        current_offset,
-        &mut |next_off, ino, file_type, name| {
+    let next_offset =
+        match inode.iterate_dir_entries(current_offset, &mut |next_off, ino, file_type, name| {
             let name_bytes = name.as_bytes();
             let name_len = name_bytes.len();
 
@@ -99,11 +98,10 @@ pub fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
 
             bytes_written += reclen;
             true
-        },
-    ) {
-        Ok(off) => off,
-        Err(e) => return e as SyscallResult,
-    };
+        }) {
+            Ok(off) => off,
+            Err(e) => return e as SyscallResult,
+        };
 
     if einval {
         return Errno::EINVAL.into();
@@ -319,21 +317,52 @@ pub fn sys_newfstatat(
 }
 
 /// `faccessat(dfd, pathname, mode, flags)` — Check user's permissions for a file relative to directory fd.
-pub fn sys_faccessat(dfd: i32, pathname: *const u8, mode: i32, _flags: i32) -> SyscallResult {
+pub fn sys_faccessat(dfd: i32, pathname: *const u8, mode: i32, flags: i32) -> SyscallResult {
+    sys_faccessat2(dfd, pathname, mode, flags)
+}
+
+/// `faccessat2(dfd, pathname, mode, flags)` — Check user's permissions for a file relative to directory fd with flag support.
+///
+/// Supported flags:
+/// - `AT_SYMLINK_NOFOLLOW` (0x100): Do not follow symbolic links.
+/// - `AT_EACCESS` (0x200): Check access using effective UID/GID instead of real UID/GID.
+/// - `AT_EMPTY_PATH` (0x1000): If pathname is empty, operate on the file referred to by dfd.
+pub fn sys_faccessat2(dfd: i32, pathname: *const u8, mode: i32, flags: i32) -> SyscallResult {
     if pathname.is_null() {
         return Errno::EFAULT.into();
     }
+
+    // Validate mode bits: mode must be F_OK (0) or a combination of R_OK (4), W_OK (2), X_OK (1).
+    if (mode & !7) != 0 {
+        return Errno::EINVAL.into();
+    }
+
+    // Validate flags: Linuxfaccesat2 supports AT_SYMLINK_NOFOLLOW (0x100), AT_EACCESS (0x200), and AT_EMPTY_PATH (0x1000).
+    const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+    const AT_EACCESS: i32 = 0x200;
+    const AT_EMPTY_PATH: i32 = 0x1000;
+    const ALLOWED_FLAGS: i32 = AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH;
+
+    if (flags & !ALLOWED_FLAGS) != 0 {
+        return Errno::EINVAL.into();
+    }
+
     let raw_path = match unsafe { copy_string_from_user(pathname) } {
         Some(p) => p,
         None => return Errno::EFAULT.into(),
     };
+
+    if raw_path.is_empty() && (flags & AT_EMPTY_PATH) == 0 {
+        return Errno::ENOENT.into();
+    }
 
     let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
         Ok(path) => path,
         Err(e) => return e.into(),
     };
 
-    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved_path, true) {
+    let follow_symlinks = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let inode_ops = match crate::fs::vfs::lookup_follow(&resolved_path, follow_symlinks) {
         Some(i) => i,
         None => return Errno::ENOENT.into(),
     };

@@ -48,7 +48,7 @@ impl PhysAddr {
 
     /// Check if this address is page-aligned (4 KiB boundary).
     pub const fn is_aligned(self) -> bool {
-        self.0 % super::PAGE_SIZE as u64 == 0
+        (self.0 & (super::PAGE_SIZE as u64 - 1)) == 0
     }
 
     /// Align this address down to the nearest page boundary.
@@ -130,7 +130,7 @@ impl VirtAddr {
 
     /// Check if this address is page-aligned.
     pub const fn is_aligned(self) -> bool {
-        self.0 % super::PAGE_SIZE as u64 == 0
+        (self.0 & (super::PAGE_SIZE as u64 - 1)) == 0
     }
 
     /// Align this address down to the nearest page boundary.

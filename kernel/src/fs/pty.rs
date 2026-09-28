@@ -764,7 +764,9 @@ fn pty_router_thread() {
         }
         if count > 0 {
             let current_version = ACTIVE_PTY_VERSION.load(Ordering::Acquire);
-            if current_version != cached_version || (cached_master.is_none() && current_version == 0) {
+            if current_version != cached_version
+                || (cached_master.is_none() && current_version == 0)
+            {
                 cached_master = ACTIVE_PTY_MASTER.lock().clone();
                 cached_version = current_version;
             }

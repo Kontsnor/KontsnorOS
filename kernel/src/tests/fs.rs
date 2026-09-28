@@ -552,6 +552,26 @@ fn test_ext4_extent_mapping() {
 }
 
 #[test_case]
+fn test_read_directory_returns_eisdir() {
+    let tmp_dir = crate::fs::vfs::lookup("/tmp").expect("Failed to lookup /tmp");
+    let test_dir = tmp_dir
+        .mkdir("read_dir_test")
+        .expect("Failed to create /tmp/read_dir_test");
+
+    let desc = crate::fs::file::FileDescription::new(
+        test_dir,
+        crate::fs::file::OpenFlags(crate::fs::file::OpenFlags::O_RDONLY),
+        Some(alloc::string::String::from("/tmp/read_dir_test")),
+    );
+
+    let mut buf = [0u8; 16];
+    let res = desc.read(&mut buf);
+    assert_eq!(res, Err(-(crate::syscall::Errno::EISDIR as i32)));
+
+    let _ = tmp_dir.rmdir("read_dir_test");
+}
+
+#[test_case]
 fn test_lseek_espipe_on_pipe() {
     let mut pipefds = [0i32; 2];
     let res = crate::syscall::fs::sys_pipe(pipefds.as_mut_ptr());
@@ -605,6 +625,9 @@ fn test_vfs_lookup_dcache_benchmark() {
 
     let _ = test_dir.unlink("file.txt");
     let _ = tmp_dir.rmdir("bench_dir");
+}
+
+#[test_case]
 fn test_ext_readdir_streaming_benchmark() {
     kprintln!("[test] Starting Ext4 zero-allocation streaming readdir benchmark test...");
 
@@ -666,11 +689,8 @@ fn test_ext_readdir_streaming_benchmark() {
     let mut total_dents_read = 0;
 
     loop {
-        let nread = crate::syscall::fs::sys_getdents64(
-            dir_fd as i32,
-            dents_buf_addr as *mut u8,
-            4096,
-        );
+        let nread =
+            crate::syscall::fs::sys_getdents64(dir_fd as i32, dents_buf_addr as *mut u8, 4096);
         if nread <= 0 {
             break;
         }

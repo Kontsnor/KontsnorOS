@@ -22,10 +22,9 @@
 
 use crate::kprintln;
 pub mod pipe;
-pub mod signal;
 pub mod socket;
 
 /// Initialize the IPC subsystem.
 pub fn init() {
-    kprintln!("[ipc] IPC subsystem ready (pipes, signals).");
+    kprintln!("[ipc] IPC subsystem ready (pipes).");
 }

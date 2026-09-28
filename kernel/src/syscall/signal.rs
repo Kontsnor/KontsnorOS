@@ -23,7 +23,6 @@ pub const DEBUG_SIGNALS: bool = false;
 /// Standard POSIX signals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
-#[allow(dead_code)]
 pub enum Signal {
     /// Hangup.
     SIGHUP = 1,

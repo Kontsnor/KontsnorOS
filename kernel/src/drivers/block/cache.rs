@@ -54,6 +54,11 @@ impl Drop for AlignedBuffer {
     }
 }
 
+#[repr(align(512))]
+struct AlignedStackBuf {
+    data: [u8; 4096],
+}
+
 struct CacheEntry {
     data: Vec<u8>,
     last_access: u64,
@@ -62,6 +67,25 @@ struct CacheEntry {
 struct BlockCacheInner {
     entries: BTreeMap<u64, CacheEntry>,
     counter: u64,
+}
+
+impl BlockCacheInner {
+    #[inline]
+    fn evict_lru(&mut self, max_blocks: usize) {
+        if self.entries.len() >= max_blocks {
+            let mut lru_block = None;
+            let mut min_access = u64::MAX;
+            for (&b, entry) in &self.entries {
+                if entry.last_access < min_access {
+                    min_access = entry.last_access;
+                    lru_block = Some(b);
+                }
+            }
+            if let Some(b) = lru_block {
+                self.entries.remove(&b);
+            }
+        }
+    }
 }
 
 /// A wrapper block device driver that caches reads and writes to an underlying block device.
@@ -93,8 +117,6 @@ impl BlockDevice for BlockCache {
         }
         let num_blocks = buf.len() / block_size;
 
-        // kprintln!("[cache] read_block: block={}, num_blocks={}", block, num_blocks);
-
         // 1. Acquire lock to check for cache hits
         let mut inner = self.inner.lock();
         inner.counter += 1;
@@ -109,7 +131,6 @@ impl BlockDevice for BlockCache {
         }
 
         if all_hits {
-            // kprintln!("[cache] read_block hit: block={}", block);
             for i in 0..num_blocks {
                 let curr_block = block + i as u64;
                 let offset = i * block_size;
@@ -120,13 +141,26 @@ impl BlockDevice for BlockCache {
             return Ok(());
         }
 
-        // kprintln!("[cache] read_block miss: block={}", block);
-
-        // 2. Cache miss: release lock and read the whole range from the underlying device into an aligned buffer
+        // 2. Cache miss: release lock and read from underlying device.
+        // If buf is already 512-byte aligned, read directly into it to avoid heap allocation.
         drop(inner);
-        let mut aligned_buf = AlignedBuffer::new(buf.len(), 512).ok_or(DriverError::IoError)?;
-        self.device.read_block(block, aligned_buf.as_mut_slice())?;
-        let disk_data = aligned_buf.as_slice();
+        let mut stack_buf;
+        let mut heap_buf;
+        let disk_data: &[u8] = if (buf.as_ptr() as usize) % 512 == 0 {
+            self.device.read_block(block, buf)?;
+            buf
+        } else if buf.len() <= 4096 {
+            stack_buf = AlignedStackBuf { data: [0u8; 4096] };
+            let slice = &mut stack_buf.data[..buf.len()];
+            self.device.read_block(block, slice)?;
+            buf.copy_from_slice(slice);
+            buf
+        } else {
+            heap_buf = AlignedBuffer::new(buf.len(), 512).ok_or(DriverError::IoError)?;
+            self.device.read_block(block, heap_buf.as_mut_slice())?;
+            buf.copy_from_slice(heap_buf.as_slice());
+            buf
+        };
 
         // 3. Re-acquire lock to insert new entries and update access times
         let mut inner = self.inner.lock();
@@ -136,20 +170,7 @@ impl BlockDevice for BlockCache {
             let block_slice = &disk_data[offset..offset + block_size];
 
             if !inner.entries.contains_key(&curr_block) {
-                if inner.entries.len() >= self.max_blocks {
-                    // Evict LRU entry
-                    let mut lru_block = None;
-                    let mut min_access = u64::MAX;
-                    for (&b, entry) in &inner.entries {
-                        if entry.last_access < min_access {
-                            min_access = entry.last_access;
-                            lru_block = Some(b);
-                        }
-                    }
-                    if let Some(b) = lru_block {
-                        inner.entries.remove(&b);
-                    }
-                }
+                inner.evict_lru(self.max_blocks);
                 inner.entries.insert(
                     curr_block,
                     CacheEntry {
@@ -157,11 +178,9 @@ impl BlockDevice for BlockCache {
                         last_access: counter,
                     },
                 );
-                buf[offset..offset + block_size].copy_from_slice(block_slice);
             } else {
                 let entry = inner.entries.get_mut(&curr_block).unwrap();
                 entry.last_access = counter;
-                buf[offset..offset + block_size].copy_from_slice(&entry.data);
             }
         }
 
@@ -175,10 +194,21 @@ impl BlockDevice for BlockCache {
         }
         let num_blocks = data.len() / block_size;
 
-        // Write-through: write the entire range to the physical device first via an aligned buffer
-        let mut aligned_buf = AlignedBuffer::new(data.len(), 512).ok_or(DriverError::IoError)?;
-        aligned_buf.as_mut_slice().copy_from_slice(data);
-        self.device.write_block(block, aligned_buf.as_slice())?;
+        // Write-through: write range to physical device.
+        // If data is already 512-byte aligned, pass directly to avoid intermediate buffer allocation and copy.
+        if (data.as_ptr() as usize) % 512 == 0 {
+            self.device.write_block(block, data)?;
+        } else if data.len() <= 4096 {
+            let mut stack_buf = AlignedStackBuf { data: [0u8; 4096] };
+            stack_buf.data[..data.len()].copy_from_slice(data);
+            self.device
+                .write_block(block, &stack_buf.data[..data.len()])?;
+        } else {
+            let mut aligned_buf =
+                AlignedBuffer::new(data.len(), 512).ok_or(DriverError::IoError)?;
+            aligned_buf.as_mut_slice().copy_from_slice(data);
+            self.device.write_block(block, aligned_buf.as_slice())?;
+        }
 
         let mut inner = self.inner.lock();
         inner.counter += 1;
@@ -193,20 +223,7 @@ impl BlockDevice for BlockCache {
                 entry.last_access = counter;
                 entry.data.copy_from_slice(block_slice);
             } else {
-                if inner.entries.len() >= self.max_blocks {
-                    // Evict LRU entry
-                    let mut lru_block = None;
-                    let mut min_access = u64::MAX;
-                    for (&b, entry) in &inner.entries {
-                        if entry.last_access < min_access {
-                            min_access = entry.last_access;
-                            lru_block = Some(b);
-                        }
-                    }
-                    if let Some(b) = lru_block {
-                        inner.entries.remove(&b);
-                    }
-                }
+                inner.evict_lru(self.max_blocks);
                 inner.entries.insert(
                     curr_block,
                     CacheEntry {

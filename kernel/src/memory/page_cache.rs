@@ -250,7 +250,6 @@ pub fn get_or_create_page_inner(inode: &dyn InodeOps, offset: u64) -> Result<u64
     // Read 4096 bytes from the inode at aligned_offset using read_direct
     let phys_offset = phys + crate::memory::r#virtual::phys_mem_offset();
     let dest_slice = unsafe { core::slice::from_raw_parts_mut(phys_offset as *mut u8, 4096) };
-    dest_slice.fill(0);
 
     let mut total_read = 0;
     while total_read < 4096 {
@@ -285,6 +284,11 @@ pub fn get_or_create_page_inner(inode: &dyn InodeOps, offset: u64) -> Result<u64
                 return Err(Errno::EIO);
             }
         }
+    }
+
+    // Only zero the trailing remainder if read_direct did not fill the entire 4KB frame (e.g. at EOF)
+    if total_read < 4096 {
+        dest_slice[total_read..].fill(0);
     }
     if DEBUG_PAGE_CACHE {
         crate::kprintln!(

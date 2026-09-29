@@ -180,12 +180,12 @@ impl Vfs {
     /// Returns the filesystem and the remaining path within it.
     pub fn resolve_mount(&self, path: &str) -> Option<(Arc<dyn FileSystem>, String)> {
         // First check current task's private mount namespace directly via CPU-local FsContext
-        if let Some(fs_ctx_arc) = crate::process::scheduler::current_fs_ctx() {
-            let mount_ns = fs_ctx_arc.read().mount_ns.clone();
-            let guard = mount_ns.read();
-            if let Some(res) = guard.resolve_mount(path) {
-                return Some(res);
-            }
+        if let Some(res) = crate::process::scheduler::with_current_fs_ctx(|fs_ctx| {
+            fs_ctx.mount_ns.read().resolve_mount(path)
+        })
+        .flatten()
+        {
+            return Some(res);
         }
 
         // Find the longest matching mount point
@@ -495,42 +495,62 @@ pub fn invalidate_dentry(path: &str) {
 /// If the task has a non-"/" `fs_ctx.root`, path resolution is clamped so
 /// that `..` traversal cannot escape the jail boundary.
 pub fn resolve_relative_path(path: &str) -> String {
-    // Retrieve current task's cwd and jail root directly from CPU-local FsContext
-    let (cwd, jail_root) = if let Some(fs_ctx_arc) = crate::process::scheduler::current_fs_ctx() {
-        let guard = fs_ctx_arc.read();
-        (guard.cwd.clone(), guard.root.clone())
-    } else {
-        (
-            alloc::string::String::from("/"),
-            alloc::string::String::from("/"),
-        )
-    };
-
-    if jail_root == "/" {
-        // Fast path: no jail active, behaviour identical to before.
-        if path.starts_with('/') {
-            crate::fs::path::normalize(path)
-        } else {
-            crate::fs::path::normalize(&crate::fs::path::join(&cwd, path))
-        }
-    } else {
-        // If the path already has the jail_root prefix (e.g. from an earlier resolution),
-        // don't prepend jail_root again.
-        if path == jail_root || path.starts_with(&alloc::format!("{}/", jail_root)) {
-            return crate::fs::path::normalize_jailed(path, &jail_root);
-        }
-
-        // Jail path: prepend the jail root to absolute paths, then clamp.
-        let full_path = if path.starts_with('/') {
-            if path == "/" {
-                jail_root.clone()
+    let resolve_inner = |cwd: &str, jail_root: &str| -> String {
+        if jail_root == "/" {
+            // Fast path: no jail active, behaviour identical to before.
+            if path.starts_with('/') {
+                crate::fs::path::normalize(path)
+            } else if cwd == "/" {
+                if crate::fs::path::is_normalized(path) {
+                    let mut s = String::with_capacity(1 + path.len());
+                    s.push('/');
+                    s.push_str(path);
+                    s
+                } else {
+                    crate::fs::path::normalize(&crate::fs::path::join(cwd, path))
+                }
+            } else if crate::fs::path::is_normalized(path) {
+                let extra = if cwd.ends_with('/') { 0 } else { 1 };
+                let mut s = String::with_capacity(cwd.len() + extra + path.len());
+                s.push_str(cwd);
+                if extra == 1 {
+                    s.push('/');
+                }
+                s.push_str(path);
+                s
             } else {
-                alloc::format!("{}{}", jail_root, path)
+                crate::fs::path::normalize(&crate::fs::path::join(cwd, path))
             }
         } else {
-            crate::fs::path::join(&cwd, path)
-        };
-        crate::fs::path::normalize_jailed(&full_path, &jail_root)
+            // If the path already has the jail_root prefix (e.g. from an earlier resolution),
+            // don't prepend jail_root again.
+            let is_prefixed = path == jail_root
+                || (path.starts_with(jail_root)
+                    && (jail_root.ends_with('/') || path[jail_root.len()..].starts_with('/')));
+            if is_prefixed {
+                return crate::fs::path::normalize_jailed(path, jail_root);
+            }
+
+            // Jail path: prepend the jail root to absolute paths, then clamp.
+            let full_path = if path.starts_with('/') {
+                if path == "/" {
+                    String::from(jail_root)
+                } else {
+                    alloc::format!("{}{}", jail_root, path)
+                }
+            } else {
+                crate::fs::path::join(cwd, path)
+            };
+            crate::fs::path::normalize_jailed(&full_path, jail_root)
+        }
+    };
+
+    if let Some(res) = crate::process::scheduler::with_current_fs_ctx(|fs_ctx| {
+        resolve_inner(&fs_ctx.cwd, &fs_ctx.root)
+    }) {
+        res
+    } else {
+        resolve_inner("/", "/")
     }
 }
 

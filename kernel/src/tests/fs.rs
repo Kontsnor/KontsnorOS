@@ -661,6 +661,8 @@ fn test_vfs_symlink_resolution_benchmark() {
 }
 
 #[test_case]
+}
+
 fn test_ext_readdir_streaming_benchmark() {
     crate::kprintln!("[test] Starting Ext4 zero-allocation streaming readdir benchmark test...");
 

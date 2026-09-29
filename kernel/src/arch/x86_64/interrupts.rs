@@ -853,15 +853,22 @@ fn page_fault_handler_inner(stack_frame: InterruptStackFrame, error_code: PageFa
             if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
                 let task = task_arc.lock();
                 let addr_space = task.address_space.lock();
+                crate::kprintln!(
+                    "  Process: \"{}\" (PID {:?}), cmdline: {:?}",
+                    task.name,
+                    pid,
+                    task.cmdline
+                );
                 crate::kprintln!("  mmap_regions (count {}):", addr_space.mmap_regions.len());
                 for (i, r) in addr_space.mmap_regions.iter().enumerate() {
                     crate::kprintln!(
-                        "    [{}] start={:#x}, len={:#x}, end={:#x}, prot={:#x}",
+                        "    [{}] start={:#x}, len={:#x}, end={:#x}, prot={:#x} path={}",
                         i,
                         r.start,
                         r.len,
                         r.start + r.len as u64,
-                        r.prot
+                        r.prot,
+                        r.pathname.as_deref().unwrap_or("anon")
                     );
                 }
             }

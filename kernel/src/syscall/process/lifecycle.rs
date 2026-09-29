@@ -720,96 +720,106 @@ pub fn sys_execve(
                 }
             }
 
-            let mut task = task_arc.lock();
+            let mut vfork_comp = None;
+            {
+                let mut task = task_arc.lock();
 
-            // Set-UID and Set-GID executable support
-            let exec_mode = inode.inode().permissions.mode;
-            let (new_euid, new_egid) = calculate_exec_creds(
-                exec_mode,
-                inode.inode().uid,
-                inode.inode().gid,
-                task.uid,
-                task.gid,
-            );
-            task.euid = new_euid;
-            task.egid = new_egid;
+                // Set-UID and Set-GID executable support
+                let exec_mode = inode.inode().permissions.mode;
+                let (new_euid, new_egid) = calculate_exec_creds(
+                    exec_mode,
+                    inode.inode().uid,
+                    inode.inode().gid,
+                    task.uid,
+                    task.gid,
+                );
+                task.euid = new_euid;
+                task.egid = new_egid;
 
-            let mut sigs = task.sigactions.lock();
-            for action in sigs.iter_mut() {
-                if action.sa_handler != 1 {
-                    // If not SIG_IGN
-                    *action = crate::process::task::SigAction::default();
-                }
-            }
-            drop(sigs);
-            task.pending_signals = 0;
-            let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
-            unsafe {
-                if apic_id < 32 {
-                    crate::syscall::CPU_SCRATCHES[apic_id].signals_pending = 0;
-                }
-            }
-            // Unshare fd_table if it was shared with threads across CLONE_FILES
-            if Arc::strong_count(&task.fd_table) > 1 {
-                let current_table = task.fd_table.lock();
-                let new_entries = current_table.entries.clone();
-                let new_cloexec = current_table.cloexec.clone();
-                for slot in &new_entries {
-                    if let Some(ref file_desc) = slot {
-                        *file_desc.ref_count.lock() += 1;
+                let mut sigs = task.sigactions.lock();
+                for action in sigs.iter_mut() {
+                    if action.sa_handler != 1 {
+                        // If not SIG_IGN
+                        *action = crate::process::task::SigAction::default();
                     }
                 }
-                drop(current_table);
-                task.fd_table = Arc::new(spin::Mutex::new(crate::process::task::FdTable {
-                    entries: new_entries,
-                    cloexec: new_cloexec,
-                    next_free_fd: 0,
-                }));
-            }
-
-            // Close O_CLOEXEC file descriptors
-            let mut fd_table = task.fd_table.lock();
-            for i in 0..fd_table.entries.len() {
-                if i < fd_table.cloexec.len() && fd_table.cloexec[i] {
-                    if let Some(desc) = fd_table.entries[i].take() {
-                        let mut rc = desc.ref_count.lock();
-                        if *rc > 0 {
-                            *rc -= 1;
+                drop(sigs);
+                task.pending_signals = 0;
+                let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
+                unsafe {
+                    if apic_id < 32 {
+                        crate::syscall::CPU_SCRATCHES[apic_id].signals_pending = 0;
+                    }
+                }
+                // Unshare fd_table if it was shared with threads across CLONE_FILES
+                if Arc::strong_count(&task.fd_table) > 1 {
+                    let current_table = task.fd_table.lock();
+                    let new_entries = current_table.entries.clone();
+                    let new_cloexec = current_table.cloexec.clone();
+                    for slot in &new_entries {
+                        if let Some(ref file_desc) = slot {
+                            *file_desc.ref_count.lock() += 1;
                         }
                     }
-                    fd_table.cloexec[i] = false;
+                    drop(current_table);
+                    task.fd_table = Arc::new(spin::Mutex::new(crate::process::task::FdTable {
+                        entries: new_entries,
+                        cloexec: new_cloexec,
+                        next_free_fd: 0,
+                    }));
                 }
+
+                // Close O_CLOEXEC file descriptors
+                let mut fd_table = task.fd_table.lock();
+                for i in 0..fd_table.entries.len() {
+                    if i < fd_table.cloexec.len() && fd_table.cloexec[i] {
+                        if let Some(desc) = fd_table.entries[i].take() {
+                            let mut rc = desc.ref_count.lock();
+                            if *rc > 0 {
+                                *rc -= 1;
+                            }
+                        }
+                        fd_table.cloexec[i] = false;
+                    }
+                }
+                drop(fd_table);
+
+                task.name = path.clone();
+                task.executable_path = canonical_exec_path.clone();
+                task.cmdline = argv.clone();
+                task.sigaltstack = None; // Reset alternate signal stack on execve
+
+                // Switch to the new page table first so the CPU is no longer using the old one.
+                unsafe {
+                    x86_64::registers::control::Cr3::write(
+                        x86_64::structures::paging::PhysFrame::containing_address(
+                            x86_64::PhysAddr::new(new_page_table),
+                        ),
+                        x86_64::registers::control::Cr3Flags::empty(),
+                    );
+                }
+
+                // Replace address space. This drops the old Arc<Mutex<AddressSpace>>.
+                // If no other processes (like a parent process in CLONE_VM/vfork) are sharing it,
+                // the old AddressSpace will be dropped and its page table root freed automatically.
+                task.address_space =
+                    Arc::new(spin::Mutex::new(crate::process::task::AddressSpace {
+                        page_table_root: new_page_table,
+                        start_brk: initial_brk,
+                        brk: initial_brk,
+                        mmap_bump: 0x0000_5000_0000_0000u64,
+                        mmap_regions: exec_mmap_regions,
+                    }));
+
+                task.context.fs_base = 0; // Clear TLS base for new process
+                task.context.cr3 = new_page_table; // Set the new page table root in CPU context!
+
+                vfork_comp = task.vfork_completion.take();
             }
-            drop(fd_table);
 
-            task.name = path.clone();
-            task.executable_path = canonical_exec_path.clone();
-            task.cmdline = argv.clone();
-            task.sigaltstack = None; // Reset alternate signal stack on execve
-
-            // Switch to the new page table first so the CPU is no longer using the old one.
-            unsafe {
-                x86_64::registers::control::Cr3::write(
-                    x86_64::structures::paging::PhysFrame::containing_address(
-                        x86_64::PhysAddr::new(new_page_table),
-                    ),
-                    x86_64::registers::control::Cr3Flags::empty(),
-                );
+            if let Some(comp) = vfork_comp {
+                comp.complete();
             }
-
-            // Replace address space. This drops the old Arc<Mutex<AddressSpace>>.
-            // If no other processes (like a parent process in CLONE_VM/vfork) are sharing it,
-            // the old AddressSpace will be dropped and its page table root freed automatically.
-            task.address_space = Arc::new(spin::Mutex::new(crate::process::task::AddressSpace {
-                page_table_root: new_page_table,
-                start_brk: initial_brk,
-                brk: initial_brk,
-                mmap_bump: 0x0000_5000_0000_0000u64,
-                mmap_regions: exec_mmap_regions,
-            }));
-
-            task.context.fs_base = 0; // Clear TLS base for new process
-            task.context.cr3 = new_page_table; // Set the new page table root in CPU context!
         }
     };
 
@@ -1359,6 +1369,24 @@ pub fn sys_prctl(_option: i32, _arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -
     0
 }
 
+// ── Clone and Namespace Flags ────────────────────────────────────────────────
+
+pub const CLONE_VM: u64 = 0x0000_0100;
+pub const CLONE_FS: u64 = 0x0000_0200;
+pub const CLONE_FILES: u64 = 0x0000_0400;
+pub const CLONE_SIGHAND: u64 = 0x0000_0800;
+pub const CLONE_PIDFD: u64 = 0x0000_1000;
+pub const CLONE_VFORK: u64 = 0x0000_4000;
+pub const CLONE_THREAD: u64 = 0x0001_0000;
+pub const CLONE_NEWNS: u64 = 0x0002_0000;
+pub const CLONE_SETTLS: u64 = 0x0008_0000;
+pub const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+pub const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+pub const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+pub const CLONE_NEWUTS: u64 = 0x0400_0000;
+pub const CLONE_NEWPID: u64 = 0x2000_0000;
+pub const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
+
 /// `clone(flags, child_stack, parent_tidptr, child_tidptr, newtls)`
 pub fn sys_clone(
     flags: u64,
@@ -1397,7 +1425,7 @@ pub fn sys_clone(
             None => return Errno::ESRCH.into(),
         };
 
-    let is_clone_vm = flags & 0x00000100 != 0;
+    let is_clone_vm = flags & CLONE_VM != 0;
     let child_page_table = if is_clone_vm {
         // CLONE_VM: share page tables
         parent_cr3
@@ -1415,7 +1443,16 @@ pub fn sys_clone(
         if is_clone_vm { 0 } else { child_page_table },
     );
 
-    if flags & 0x00200000 != 0 {
+    let is_vfork = flags & CLONE_VFORK != 0;
+    let vfork_comp = if is_vfork {
+        let comp = Arc::new(crate::sync::wait_queue::VforkCompletion::new());
+        child_task.vfork_completion = Some(comp.clone());
+        Some(comp)
+    } else {
+        None
+    };
+
+    if flags & CLONE_CHILD_CLEARTID != 0 {
         child_task.clear_child_tid = Some(child_tidptr as u64);
     }
 
@@ -1424,7 +1461,7 @@ pub fn sys_clone(
             let parent_task = parent_task_arc.lock();
 
             // CLONE_FILES
-            if flags & 0x00000400 != 0 {
+            if flags & CLONE_FILES != 0 {
                 child_task.fd_table = parent_task.fd_table.clone();
             } else {
                 let parent_fds = parent_task.fd_table.lock();
@@ -1439,7 +1476,7 @@ pub fn sys_clone(
             }
 
             // CLONE_VM
-            if flags & 0x00000100 != 0 {
+            if flags & CLONE_VM != 0 {
                 child_task.address_space = parent_task.address_space.clone();
             } else {
                 let parent_start_brk = parent_task.address_space.lock().start_brk;
@@ -1450,8 +1487,12 @@ pub fn sys_clone(
                 child_vm.mmap_regions = mmap_regions.clone();
             }
 
-            // CLONE_SIGHAND
-            if flags & 0x00000800 != 0 {
+            // CLONE_CLEAR_SIGHAND (0x1_0000_0000) or CLONE_SIGHAND (0x00000800)
+            if flags & CLONE_CLEAR_SIGHAND != 0 {
+                child_task.sigactions = Arc::new(spin::Mutex::new(
+                    [crate::process::task::SigAction::default(); 64],
+                ));
+            } else if flags & CLONE_SIGHAND != 0 {
                 child_task.sigactions = parent_task.sigactions.clone();
             } else {
                 let parent_sigs = parent_task.sigactions.lock();
@@ -1459,7 +1500,7 @@ pub fn sys_clone(
             }
 
             // CLONE_THREAD
-            if flags & 0x00010000 != 0 {
+            if flags & CLONE_THREAD != 0 {
                 child_task.tgid = parent_task.tgid;
             } else {
                 child_task.tgid = child_pid;
@@ -1485,7 +1526,7 @@ pub fn sys_clone(
             // ── Namespace propagation for clone() ─────────────────────────────
 
             // CLONE_FS (0x00000200): share the exact same FsContext Arc as the parent
-            if (flags & 0x0000_0200) != 0 {
+            if (flags & CLONE_FS) != 0 {
                 child_task.fs_ctx = parent_task.fs_ctx.clone();
             } else if flags & CLONE_NEWNS != 0 {
                 // CLONE_NEWNS: child gets a private copy of the mount namespace.
@@ -1502,13 +1543,9 @@ pub fn sys_clone(
             }
 
             // CLONE_NEWUTS: child gets its own UTS namespace copy.
-            // Since uts_ns is Clone the child always starts with parent's values;
-            // after CLONE_NEWUTS, sethostname() will not affect the parent.
             child_task.uts_ns = parent_task.uts_ns.clone();
 
             // CLONE_NEWPID: child becomes the init of a new PID namespace.
-            // We assign a fresh pid_ns_id; the child is still visible to the host
-            // with its real PID, but kill/wait4/procfs are restricted by pid_ns_id.
             if flags & CLONE_NEWPID != 0 {
                 child_task.pid_ns_id = crate::fs::namespace::alloc_pid_ns_id();
                 child_task.is_pid_ns_init = true;
@@ -1560,7 +1597,7 @@ pub fn sys_clone(
         child_page_table,
     );
 
-    if flags & 0x00080000 != 0 {
+    if flags & CLONE_SETTLS != 0 {
         child_context.fs_base = newtls;
     } else {
         child_context.fs_base = x86_64::registers::model_specific::FsBase::read().as_u64();
@@ -1593,7 +1630,7 @@ pub fn sys_clone(
         }
     }
 
-    if flags & 0x00001000 != 0 && !parent_tidptr.is_null() {
+    if flags & CLONE_PIDFD != 0 && !parent_tidptr.is_null() {
         if validate_user_ptr_write(parent_tidptr as *mut u8, core::mem::size_of::<i32>()).is_err() {
             return Errno::EFAULT.into();
         }
@@ -1611,7 +1648,7 @@ pub fn sys_clone(
         unsafe {
             parent_tidptr.write_volatile(fd);
         }
-    } else if flags & 0x00100000 != 0 && !parent_tidptr.is_null() {
+    } else if flags & CLONE_PARENT_SETTID != 0 && !parent_tidptr.is_null() {
         if validate_user_ptr_write(parent_tidptr as *mut u8, core::mem::size_of::<i32>()).is_err() {
             return Errno::EFAULT.into();
         }
@@ -1620,7 +1657,7 @@ pub fn sys_clone(
             parent_tidptr.write_volatile(child_pid.as_u64() as i32);
         }
     }
-    if flags & 0x01000000 != 0 && !child_tidptr.is_null() {
+    if flags & CLONE_CHILD_SETTID != 0 && !child_tidptr.is_null() {
         if validate_user_ptr_write(child_tidptr as *mut u8, core::mem::size_of::<i32>()).is_err() {
             return Errno::EFAULT.into();
         }
@@ -1631,6 +1668,12 @@ pub fn sys_clone(
     }
 
     scheduler::add_task(child_task);
+
+    // If CLONE_VFORK was specified, suspend the calling process until the child
+    // releases its virtual memory resources via execve() or _exit().
+    if let Some(comp) = vfork_comp {
+        comp.wait();
+    }
 
     if crate::syscall::DEBUG_SYSCALLS {
         kprintln!(
@@ -1685,17 +1728,17 @@ pub fn sys_clone3(
     let child_stack = if args.stack != 0 {
         if args.stack_size != 0 {
             match args.stack.checked_add(args.stack_size) {
-                Some(top) => top,
+                Some(top) => top & !15,
                 None => return Errno::EINVAL.into(),
             }
         } else {
-            args.stack
+            args.stack & !15
         }
     } else {
         0
     };
 
-    let parent_tidptr = if (args.flags & 0x00001000) != 0 {
+    let parent_tidptr = if (args.flags & CLONE_PIDFD) != 0 {
         args.pidfd as *mut i32
     } else {
         args.parent_tid as *mut i32
@@ -1712,15 +1755,6 @@ pub fn sys_clone3(
         regs,
     )
 }
-
-// ── Namespace Flags ───────────────────────────────────────────────────────────
-
-/// Linux `clone` flag: give the process a private copy of its mount namespace.
-pub const CLONE_NEWNS: u64 = 0x0002_0000;
-/// Linux `clone` flag: give the process a private UTS namespace.
-pub const CLONE_NEWUTS: u64 = 0x0400_0000;
-/// Linux `clone` flag: give the process a new PID namespace.
-pub const CLONE_NEWPID: u64 = 0x2000_0000;
 
 /// `unshare(flags)` — Disassociate parts of the process execution context.
 ///

@@ -281,6 +281,10 @@ pub struct Task {
     /// Dedicated pre-allocated wait queue for poll/select/epoll multiplexing.
     pub poll_wait_queue: Arc<crate::sync::wait_queue::WaitQueue>,
 
+    /// Optional vfork completion for tasks created with CLONE_VFORK.
+    /// The parent blocks until this child calls execve or exits.
+    pub vfork_completion: Option<Arc<crate::sync::wait_queue::VforkCompletion>>,
+
     /// Tracks whether this task is currently queued in the scheduler priority queues.
     pub in_queue: bool,
 
@@ -413,6 +417,7 @@ impl Task {
             pgid: pid.as_u64(),
             tgid: pid,
             in_queue: false,
+            vfork_completion: None,
             is_idle: false,
             uid: 0,
             gid: 0,

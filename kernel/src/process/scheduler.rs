@@ -369,6 +369,7 @@ impl Scheduler {
         let mut parent_pid = None;
         let mut fds_to_drop = Vec::new();
         let mut is_thread = false;
+        let mut vfork_comp = None;
         {
             let tasks = TASKS.read();
             if let Some(Some(task_arc)) = tasks.get(idx) {
@@ -377,6 +378,7 @@ impl Scheduler {
                 task.exit_code = Some(exit_code);
                 parent_pid = Some(task.parent_pid);
                 is_thread = task.tgid != pid;
+                vfork_comp = task.vfork_completion.take();
 
                 let old_fd_table = task.fd_table.clone();
                 task.fd_table = Arc::new(spin::Mutex::new(crate::process::task::FdTable {
@@ -407,6 +409,10 @@ impl Scheduler {
                     }
                 }
             }
+        }
+
+        if let Some(comp) = vfork_comp {
+            comp.complete_locked(self);
         }
 
         if is_thread {

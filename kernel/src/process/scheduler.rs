@@ -81,6 +81,45 @@ pub fn set_current_fs_ctx(
     }
 }
 
+/// CPU-local active FdTable mapping for lock-free descriptor resolutions.
+pub(crate) static CURRENT_FD_TABLE: [spin::RwLock<
+    Option<Arc<spin::Mutex<crate::process::task::FdTable>>>,
+>; 32] = [const { spin::RwLock::new(None) }; 32];
+
+/// Retrieve the active `FdTable` for the calling CPU core without acquiring scheduler or task locks.
+pub fn current_fd_table() -> Option<Arc<spin::Mutex<crate::process::task::FdTable>>> {
+    let core_id = (crate::arch::x86_64::smp::current_lapic_id() as usize) % 32;
+    CURRENT_FD_TABLE[core_id].read().clone()
+}
+
+/// Execute a closure with the active `FdTable` for the calling CPU core.
+pub fn with_current_fd_table<R>(
+    f: impl FnOnce(&mut crate::process::task::FdTable) -> Option<R>,
+) -> Option<R> {
+    let core_id = (crate::arch::x86_64::smp::current_lapic_id() as usize) % 32;
+    let slot = CURRENT_FD_TABLE[core_id].read();
+    if let Some(ref fd_table_arc) = *slot {
+        let mut guard = fd_table_arc.lock();
+        return f(&mut guard);
+    }
+    drop(slot);
+    let current_pid = current_pid()?;
+    let task_arc = get_task_arc(current_pid)?;
+    let task = task_arc.lock();
+    let mut guard = task.fd_table.lock();
+    f(&mut guard)
+}
+
+/// Update the active `FdTable` for `core_id`.
+pub fn set_current_fd_table(
+    core_id: usize,
+    fd_table: Option<Arc<spin::Mutex<crate::process::task::FdTable>>>,
+) {
+    if core_id < 32 {
+        *CURRENT_FD_TABLE[core_id].write() = fd_table;
+    }
+}
+
 /// Dummy CPU contexts to save old registers when the current task has already exited/been reaped.
 static mut DUMMY_CONTEXTS: [super::context::CpuContext; 32] = [super::context::CpuContext {
     rbx: 0,
@@ -802,7 +841,7 @@ pub fn schedule() {
             unsafe { core::ptr::addr_of_mut!(DUMMY_CONTEXTS[apic_id]) }
         };
 
-        let (new_ctx_ptr, pending_unblocked, next_fs_ctx) = {
+        let (new_ctx_ptr, pending_unblocked, next_fs_ctx, next_fd_table) = {
             let mut next_task = next_task_arc.lock();
             next_task.state = TaskState::Running;
 
@@ -815,16 +854,19 @@ pub fn schedule() {
 
             let pending = next_task.pending_signals & !next_task.blocked_signals;
             let fs_ctx = next_task.fs_ctx.clone();
+            let fd_table = next_task.fd_table.clone();
 
             (
                 &next_task.context as *const super::context::CpuContext,
                 pending,
                 fs_ctx,
+                fd_table,
             )
         };
 
         scheduler.current_cpus[apic_id] = Some(next_pid);
         set_current_fs_ctx(apic_id, Some(next_fs_ctx));
+        set_current_fd_table(apic_id, Some(next_fd_table));
         scheduler.context_switches += 1;
         crate::fs::kstats::KSTATS
             .context_switches

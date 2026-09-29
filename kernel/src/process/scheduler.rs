@@ -48,6 +48,27 @@ pub(crate) static TASK_TGIDS: [core::sync::atomic::AtomicU64; 4096] = {
     [ZERO; 4096]
 };
 
+/// CPU-local active FsContext mapping for lock-free VFS path resolutions.
+pub(crate) static CURRENT_FS_CTX: [spin::RwLock<
+    Option<Arc<spin::RwLock<crate::fs::namespace::FsContext>>>,
+>; 32] = [const { spin::RwLock::new(None) }; 32];
+
+/// Retrieve the active `FsContext` for the calling CPU core without acquiring scheduler or task locks.
+pub fn current_fs_ctx() -> Option<Arc<spin::RwLock<crate::fs::namespace::FsContext>>> {
+    let core_id = (crate::arch::x86_64::smp::current_lapic_id() as usize) % 32;
+    CURRENT_FS_CTX[core_id].read().clone()
+}
+
+/// Update the active `FsContext` for `core_id`.
+pub fn set_current_fs_ctx(
+    core_id: usize,
+    fs_ctx: Option<Arc<spin::RwLock<crate::fs::namespace::FsContext>>>,
+) {
+    if core_id < 32 {
+        *CURRENT_FS_CTX[core_id].write() = fs_ctx;
+    }
+}
+
 /// Dummy CPU contexts to save old registers when the current task has already exited/been reaped.
 static mut DUMMY_CONTEXTS: [super::context::CpuContext; 32] = [super::context::CpuContext {
     rbx: 0,
@@ -574,6 +595,7 @@ pub fn init() {
         idle_task.pid = Pid::from_raw(pid_val);
 
         let task_arc = Arc::new(spin::Mutex::new(idle_task));
+        let fs_ctx = task_arc.lock().fs_ctx.clone();
         let idx = pid_val as usize;
         while tasks.len() <= idx {
             tasks.push(None);
@@ -582,6 +604,7 @@ pub fn init() {
 
         scheduler.idle_cpus[i] = Pid::from_raw(pid_val);
         scheduler.current_cpus[i] = Some(Pid::from_raw(pid_val));
+        set_current_fs_ctx(i, Some(fs_ctx));
     }
     drop(tasks);
 
@@ -767,8 +790,7 @@ pub fn schedule() {
             unsafe { core::ptr::addr_of_mut!(DUMMY_CONTEXTS[apic_id]) }
         };
 
-        let pending_unblocked;
-        let new_ctx_ptr = {
+        let (new_ctx_ptr, pending_unblocked, next_fs_ctx) = {
             let mut next_task = next_task_arc.lock();
             next_task.state = TaskState::Running;
 
@@ -779,12 +801,18 @@ pub fn schedule() {
                 crate::arch::x86_64::gdt::set_interrupt_stack(stack_top);
             }
 
-            pending_unblocked = next_task.pending_signals & !next_task.blocked_signals;
+            let pending = next_task.pending_signals & !next_task.blocked_signals;
+            let fs_ctx = next_task.fs_ctx.clone();
 
-            &next_task.context as *const super::context::CpuContext
+            (
+                &next_task.context as *const super::context::CpuContext,
+                pending,
+                fs_ctx,
+            )
         };
 
         scheduler.current_cpus[apic_id] = Some(next_pid);
+        set_current_fs_ctx(apic_id, Some(next_fs_ctx));
         scheduler.context_switches += 1;
         crate::fs::kstats::KSTATS
             .context_switches
@@ -894,6 +922,7 @@ pub fn set_bootstrap_thread(task: Task) {
             }
 
             let task_arc = Arc::new(spin::Mutex::new(task));
+            let fs_ctx = task_arc.lock().fs_ctx.clone();
             task_arc.lock().state = TaskState::Running;
 
             let mut tasks = TASKS.write();
@@ -906,6 +935,7 @@ pub fn set_bootstrap_thread(task: Task) {
             let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;
             if apic_id < 32 {
                 scheduler.current_cpus[apic_id] = Some(pid);
+                set_current_fs_ctx(apic_id, Some(fs_ctx));
             }
 
             // Update CPU-local scratch space for the current bootstrap thread

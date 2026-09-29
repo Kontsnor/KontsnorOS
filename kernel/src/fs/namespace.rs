@@ -150,11 +150,12 @@ impl UtsNamespace {
 
 /// Per-task filesystem context.
 ///
-/// Combines the task's jail root (`root`) with the mount namespace it uses.
-/// The `cwd` field is kept on the `Task` itself for historical compatibility
-/// (many syscalls read `task.cwd` directly); `FsContext` tracks only the
-/// isolation boundaries.
+/// Combines the task's current working directory (`cwd`), jail root (`root`),
+/// and the mount namespace it uses.
 pub struct FsContext {
+    /// Current working directory for this task (always an absolute normalized path).
+    pub cwd: String,
+
     /// Jailed filesystem root for this task.
     ///
     /// Path resolution is clamped at this prefix: a `..` component that
@@ -174,7 +175,17 @@ impl FsContext {
     /// not called `unshare(CLONE_NEWNS)` or `chroot`.
     pub fn new_initial(mount_ns: Arc<RwLock<MountNamespace>>) -> Self {
         Self {
+            cwd: String::from("/"),
             root: String::from("/"),
+            mount_ns,
+        }
+    }
+
+    /// Create a new `FsContext` with explicitly specified `cwd`, `root`, and `mount_ns`.
+    pub fn new(cwd: String, root: String, mount_ns: Arc<RwLock<MountNamespace>>) -> Self {
+        Self {
+            cwd,
+            root,
             mount_ns,
         }
     }
@@ -182,10 +193,11 @@ impl FsContext {
     /// Clone this context for a child task (fork / clone without `CLONE_NEWNS`).
     ///
     /// The child shares the *same* `MountNamespace` `Arc` as the parent.
-    /// The `root` string is copied so that a subsequent `chroot` in the child
-    /// does not affect the parent.
+    /// The `cwd` and `root` strings are copied so that subsequent `chdir`/`chroot`
+    /// calls in the child do not affect the parent.
     pub fn fork(&self) -> Self {
         Self {
+            cwd: self.cwd.clone(),
             root: self.root.clone(),
             mount_ns: self.mount_ns.clone(),
         }

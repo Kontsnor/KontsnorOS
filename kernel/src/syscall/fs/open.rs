@@ -276,6 +276,11 @@ pub fn sys_fchdir(fd: i32) -> SyscallResult {
     if !file_desc.inode.inode().is_dir() {
         return Errno::ENOTDIR.into();
     }
+    if let Err(e) =
+        crate::fs::inode::check_permission(file_desc.inode.inode(), crate::fs::inode::MAY_EXEC)
+    {
+        return e as SyscallResult;
+    }
     let path = match file_desc.path {
         Some(ref p) => p.clone(),
         None => return 0,
@@ -285,7 +290,9 @@ pub fn sys_fchdir(fd: i32) -> SyscallResult {
         None => return Errno::ESRCH.into(),
     };
     if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
-        task_arc.lock().cwd = path;
+        let mut task = task_arc.lock();
+        task.fs_ctx.write().cwd = path.clone();
+        task.cwd = path;
     }
     0
 }
@@ -349,12 +356,15 @@ pub fn sys_chroot(path_ptr: *const u8) -> SyscallResult {
     if !inode.inode().is_dir() {
         return Errno::ENOTDIR.into();
     }
+    if let Err(e) = crate::fs::inode::check_permission(inode.inode(), crate::fs::inode::MAY_EXEC) {
+        return e as SyscallResult;
+    }
     // Update the jail root so that future path resolution is clamped here.
     // Also update cwd to be "/" (relative to the new root).
     if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
         let mut task = task_arc.lock();
         task.fs_ctx.write().root = resolved.clone();
-        // After chroot, cwd is "/" inside the new root (= resolved on the host).
+        task.fs_ctx.write().cwd = resolved.clone();
         task.cwd = resolved;
     }
     0
@@ -448,6 +458,7 @@ pub fn sys_pivot_root(new_root_ptr: *const u8, put_old_ptr: *const u8) -> Syscal
     if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
         let mut task = task_arc.lock();
         task.fs_ctx.write().root = String::from("/");
+        task.fs_ctx.write().cwd = String::from("/");
         task.cwd = String::from("/");
     }
 

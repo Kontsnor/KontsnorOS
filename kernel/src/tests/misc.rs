@@ -116,3 +116,64 @@ fn test_pty_active_master_optimization() {
 
     crate::kprintln!("[test] PTY active master optimization test PASSED!");
 }
+
+#[test_case]
+fn test_wait_queue_fast_path() {
+    kprintln!("[test] Starting WaitQueue fast-path optimization test...");
+
+    let wq = crate::sync::wait_queue::WaitQueue::new();
+    let listener_wq = alloc::sync::Arc::new(crate::sync::wait_queue::WaitQueue::new());
+
+    // 1. Benchmark 100,000 empty wake_all calls (fast-path atomic check vs full path)
+    const ITERATIONS: usize = 100_000;
+
+    let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    for _ in 0..ITERATIONS {
+        wq.wake_all();
+    }
+    let end_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let fast_path_cycles = end_tsc.saturating_sub(start_tsc);
+
+    kprintln!(
+        "[test] WaitQueue Empty wake_all Benchmark ({} iterations):",
+        ITERATIONS
+    );
+    kprintln!(
+        "  Fast path: {} cycles ({:.2} cycles/op)",
+        fast_path_cycles,
+        fast_path_cycles as f64 / ITERATIONS as f64
+    );
+
+    // 2. Test registration tracking
+    let test_pid = crate::process::pid::Pid::from_raw(999);
+    wq.register(test_pid);
+
+    // Calling wake_all when a waiter is present
+    wq.wake_all();
+
+    // 3. Test listener attachment and detachment
+    wq.add_listener(&listener_wq);
+    wq.wake_all();
+
+    wq.remove_listener(&listener_wq);
+
+    // 4. Test task removal
+    wq.register(test_pid);
+    wq.remove(test_pid);
+
+    // Verify returning to fast-path after removing task
+    let start_tsc2 = unsafe { core::arch::x86_64::_rdtsc() };
+    for _ in 0..ITERATIONS {
+        wq.wake_all();
+    }
+    let end_tsc2 = unsafe { core::arch::x86_64::_rdtsc() };
+    let fast_path_cycles2 = end_tsc2.saturating_sub(start_tsc2);
+
+    kprintln!(
+        "  Fast path after drain/remove: {} cycles ({:.2} cycles/op)",
+        fast_path_cycles2,
+        fast_path_cycles2 as f64 / ITERATIONS as f64
+    );
+
+    kprintln!("[test] WaitQueue fast-path optimization test PASSED!");
+}

@@ -61,28 +61,30 @@ struct AlignedStackBuf {
 
 struct CacheEntry {
     data: Vec<u8>,
-    last_access: u64,
+    referenced: bool,
 }
 
 struct BlockCacheInner {
     entries: BTreeMap<u64, CacheEntry>,
-    counter: u64,
+    fifo_queue: alloc::collections::VecDeque<u64>,
 }
 
 impl BlockCacheInner {
     #[inline]
-    fn evict_lru(&mut self, max_blocks: usize) {
-        if self.entries.len() >= max_blocks {
-            let mut lru_block = None;
-            let mut min_access = u64::MAX;
-            for (&b, entry) in &self.entries {
-                if entry.last_access < min_access {
-                    min_access = entry.last_access;
-                    lru_block = Some(b);
+    fn evict(&mut self, max_blocks: usize) {
+        while self.entries.len() >= max_blocks {
+            if let Some(b) = self.fifo_queue.pop_front() {
+                if let Some(entry) = self.entries.get_mut(&b) {
+                    if entry.referenced {
+                        entry.referenced = false;
+                        self.fifo_queue.push_back(b);
+                    } else {
+                        self.entries.remove(&b);
+                        break;
+                    }
                 }
-            }
-            if let Some(b) = lru_block {
-                self.entries.remove(&b);
+            } else {
+                break;
             }
         }
     }
@@ -102,7 +104,7 @@ impl BlockCache {
             device,
             inner: KMutex::new(BlockCacheInner {
                 entries: BTreeMap::new(),
-                counter: 0,
+                fifo_queue: alloc::collections::VecDeque::new(),
             }),
             max_blocks,
         }
@@ -119,8 +121,6 @@ impl BlockDevice for BlockCache {
 
         // 1. Acquire lock to check for cache hits
         let mut inner = self.inner.lock();
-        inner.counter += 1;
-        let counter = inner.counter;
 
         let mut all_hits = true;
         for i in 0..num_blocks {
@@ -135,7 +135,7 @@ impl BlockDevice for BlockCache {
                 let curr_block = block + i as u64;
                 let offset = i * block_size;
                 let entry = inner.entries.get_mut(&curr_block).unwrap();
-                entry.last_access = counter;
+                entry.referenced = true;
                 buf[offset..offset + block_size].copy_from_slice(&entry.data);
             }
             return Ok(());
@@ -175,17 +175,18 @@ impl BlockDevice for BlockCache {
             let block_slice = &disk_data[offset..offset + block_size];
 
             if !inner.entries.contains_key(&curr_block) {
-                inner.evict_lru(self.max_blocks);
+                inner.evict(self.max_blocks);
                 inner.entries.insert(
                     curr_block,
                     CacheEntry {
                         data: block_slice.to_vec(),
-                        last_access: counter,
+                        referenced: false,
                     },
                 );
+                inner.fifo_queue.push_back(curr_block);
             } else {
                 let entry = inner.entries.get_mut(&curr_block).unwrap();
-                entry.last_access = counter;
+                entry.referenced = true;
             }
         }
 
@@ -221,8 +222,6 @@ impl BlockDevice for BlockCache {
         }
 
         let mut inner = self.inner.lock();
-        inner.counter += 1;
-        let counter = inner.counter;
 
         for i in 0..num_blocks {
             let curr_block = block + i as u64;
@@ -230,17 +229,18 @@ impl BlockDevice for BlockCache {
             let block_slice = &data[offset..offset + block_size];
 
             if let Some(entry) = inner.entries.get_mut(&curr_block) {
-                entry.last_access = counter;
+                entry.referenced = true;
                 entry.data.copy_from_slice(block_slice);
             } else {
-                inner.evict_lru(self.max_blocks);
+                inner.evict(self.max_blocks);
                 inner.entries.insert(
                     curr_block,
                     CacheEntry {
                         data: block_slice.to_vec(),
-                        last_access: counter,
+                        referenced: false,
                     },
                 );
+                inner.fifo_queue.push_back(curr_block);
             }
         }
 

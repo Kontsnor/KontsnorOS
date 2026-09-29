@@ -1016,28 +1016,56 @@ impl ExtInode {
         while written_bytes < buf.len() {
             let file_block = (current_offset / self.fs.block_size as u64) as u32;
             let block_offset = (current_offset % self.fs.block_size as u64) as usize;
+            let block_size = self.fs.block_size as usize;
+            let remaining = buf.len() - written_bytes;
+
+            // Fast path: contiguous full-block write
+            if block_offset == 0 && remaining >= block_size {
+                let needed_blocks = (remaining / block_size) as u32;
+                let chunk_req = needed_blocks.min(64);
+                let (phys_start, alloc_count) = self
+                    .get_or_alloc_block_chunk(&mut raw, file_block, chunk_req)
+                    .map_err(|_| -5)?;
+                let bytes_to_write = (alloc_count as usize) * block_size;
+                let slice = &buf[written_bytes..written_bytes + bytes_to_write];
+
+                if write_blocks(
+                    &*self.fs.device,
+                    phys_start as u64,
+                    slice,
+                    self.fs.block_size,
+                )
+                .is_err()
+                {
+                    return Err(-5);
+                }
+
+                written_bytes += bytes_to_write;
+                current_offset += bytes_to_write as u64;
+                continue;
+            }
 
             let phys_block = self
                 .get_or_alloc_block(&mut raw, file_block)
                 .map_err(|_| -5)?; // EIO
 
-            let bytes_to_write = core::cmp::min(
-                buf.len() - written_bytes,
-                self.fs.block_size as usize - block_offset,
-            );
+            let bytes_to_write = core::cmp::min(remaining, block_size - block_offset);
 
+            let is_full_block = block_offset == 0 && bytes_to_write == block_size;
             let mut block_buf = [0u8; 4096];
-            let block_size = self.fs.block_size as usize;
             assert!(block_size <= 4096);
-            if read_blocks(
-                &*self.fs.device,
-                phys_block as u64,
-                &mut block_buf[..block_size],
-                self.fs.block_size,
-            )
-            .is_err()
-            {
-                return Err(-5); // EIO
+
+            if !is_full_block {
+                if read_blocks(
+                    &*self.fs.device,
+                    phys_block as u64,
+                    &mut block_buf[..block_size],
+                    self.fs.block_size,
+                )
+                .is_err()
+                {
+                    return Err(-5); // EIO
+                }
             }
 
             block_buf[block_offset..block_offset + bytes_to_write]
@@ -1377,9 +1405,11 @@ impl ExtInode {
             drop(raw);
             drop(vfs);
 
-            let page_phys = match crate::memory::page_cache::get_or_create_page_inner(
+            let is_full_page = page_offset == 0 && bytes_to_write == 4096;
+            let page_phys = match crate::memory::page_cache::get_or_create_page_for_write(
                 self,
                 file_block_offset,
+                is_full_page,
             ) {
                 Ok(p) => p,
                 Err(_) => return Err(-5), // EIO

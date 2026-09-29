@@ -75,7 +75,17 @@ impl ExtFileSystem {
             let mut curr_start = None;
             let mut curr_len = 0u32;
 
-            for i in 0..group_blocks {
+            let mut i = 0;
+            while i < group_blocks {
+                if curr_start.is_none() && i + 64 <= group_blocks && (i % 64 == 0) {
+                    let byte = (i / 8) as usize;
+                    let chunk = u64::from_le_bytes(bitmap[byte..byte + 8].try_into().unwrap());
+                    if chunk == u64::MAX {
+                        i += 64;
+                        continue;
+                    }
+                }
+
                 let byte = (i / 8) as usize;
                 let bit = i % 8;
                 if (bitmap[byte] & (1 << bit)) == 0 {
@@ -97,6 +107,7 @@ impl ExtFileSystem {
                     curr_start = None;
                     curr_len = 0;
                 }
+                i += 1;
             }
             if curr_len > best_len {
                 best_start = curr_start;
@@ -176,10 +187,8 @@ impl ExtFileSystem {
 
             sb.s_free_blocks_count += 1;
             gd.bg_free_blocks_count += 1;
-
-            self.write_superblock(&sb)?;
             drop(gds);
-            self.write_group_descriptors()?;
+            drop(sb);
         }
         Ok(())
     }
@@ -219,7 +228,22 @@ impl ExtFileSystem {
                 continue;
             }
 
-            for i in 0..group_inodes {
+            let mut i = 0;
+            while i + 64 <= group_inodes {
+                let byte = (i / 8) as usize;
+                let chunk = u64::from_le_bytes(bitmap[byte..byte + 8].try_into().unwrap());
+                if chunk != u64::MAX {
+                    let bit = (!chunk).trailing_zeros() as u32;
+                    let candidate = i + bit;
+                    if candidate < group_inodes {
+                        i = candidate;
+                        break;
+                    }
+                }
+                i += 64;
+            }
+
+            while i < group_inodes {
                 let byte = (i / 8) as usize;
                 let bit = i % 8;
                 if (bitmap[byte] & (1 << bit)) == 0 {
@@ -232,13 +256,13 @@ impl ExtFileSystem {
                         gds[g].bg_used_dirs_count += 1;
                     }
 
-                    self.write_superblock(&sb)?;
                     drop(gds);
-                    self.write_group_descriptors()?;
+                    drop(sb);
 
                     let ino = (g as u32) * inodes_per_group + i + 1;
                     return Ok(ino);
                 }
+                i += 1;
             }
             // Group bitmap had no free inodes despite descriptor; correct counter and check next group
             gds[g].bg_free_inodes_count = 0;
@@ -288,9 +312,8 @@ impl ExtFileSystem {
                 gd.bg_used_dirs_count -= 1;
             }
 
-            self.write_superblock(&sb)?;
             drop(gds);
-            self.write_group_descriptors()?;
+            drop(sb);
         }
         Ok(())
     }

@@ -330,6 +330,52 @@ pub fn get_or_create_page_inner(inode: &dyn InodeOps, offset: u64) -> Result<u64
     Ok(phys)
 }
 
+/// Helper function implementing page cache retrieval for writes.
+/// When `is_full_page` is true, skips calling `read_direct` and zeroing memory,
+/// since the entire 4KB frame will be overwritten immediately by the caller.
+pub fn get_or_create_page_for_write(
+    inode: &dyn InodeOps,
+    offset: u64,
+    is_full_page: bool,
+) -> Result<u64, Errno> {
+    if !is_full_page {
+        return get_or_create_page_inner(inode, offset);
+    }
+
+    let dev = inode.inode().dev;
+    let ino = inode.inode().ino;
+    let aligned_offset = offset & !4095;
+
+    // 1. Quick check: sharded O(1) lookup
+    if let Some(entry) = page_cache_get(dev, ino, aligned_offset) {
+        return Ok(entry.phys_addr);
+    }
+
+    // 2. Allocate frame directly without reading from disk
+    let phys = crate::memory::physical::allocate_frame().ok_or(Errno::ENOMEM)?;
+
+    // 3. Insert into cache
+    let shard = shard_index(dev, ino, aligned_offset);
+    let mut guard = PAGE_CACHE_SHARDS[shard].lock();
+    if let Some(entry) = guard.map.get(&(dev, ino, aligned_offset)) {
+        let phys_addr = entry.phys_addr;
+        drop(guard);
+        crate::memory::physical::deallocate_frame(phys);
+        return Ok(phys_addr);
+    }
+
+    guard.map.insert(
+        (dev, ino, aligned_offset),
+        PageCacheEntry {
+            phys_addr: phys,
+            dirty: false,
+        },
+    );
+    drop(guard);
+
+    Ok(phys)
+}
+
 /// Flush a dirty page cache frame back to disk using VFS writes.
 pub fn flush_page(inode: &Arc<dyn InodeOps>, offset: u64) -> Result<(), Errno> {
     flush_page_inner(&**inode, offset)

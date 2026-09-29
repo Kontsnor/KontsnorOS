@@ -42,10 +42,8 @@
 //! ## Performance & Concurrency Rationale
 //!
 //! - Sharding by 64 divides global lock contention by up to 64x under parallel VFS path lookups.
-//! - Atomic hit/miss counters eliminate write cacheline bounces on the dcache lock during read-heavy workloads.
-
 use crate::fs::inode::InodeOps;
-use crate::sync::spinlock::TicketLock;
+use crate::sync::rwlock::KRwLock;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -86,9 +84,9 @@ impl DcacheShard {
     }
 }
 
-/// Global sharded dentry cache instance (64 independent lock shards).
-static DCACHE_SHARDS: [TicketLock<DcacheShard>; DCACHE_SHARD_COUNT] = {
-    const SHARD: TicketLock<DcacheShard> = TicketLock::new(DcacheShard::new());
+/// Global sharded dentry cache instance (64 independent concurrent read/write shards).
+static DCACHE_SHARDS: [KRwLock<DcacheShard>; DCACHE_SHARD_COUNT] = {
+    const SHARD: KRwLock<DcacheShard> = KRwLock::new(DcacheShard::new());
     [SHARD; DCACHE_SHARD_COUNT]
 };
 
@@ -132,7 +130,7 @@ pub fn dcache_lookup(parent_ino: u64, name: &str) -> Option<Option<Arc<dyn Inode
     let name_hash = fnv1a(name.as_bytes());
     let (shard_idx, bucket_idx) = locate_bucket(parent_ino, name_hash);
 
-    let shard_guard = DCACHE_SHARDS[shard_idx].lock();
+    let shard_guard = DCACHE_SHARDS[shard_idx].read();
     if let Some(ref entry) = shard_guard.buckets[bucket_idx] {
         if entry.parent_ino == parent_ino && entry.name_hash == name_hash {
             let inode = entry.inode.clone();
@@ -154,7 +152,7 @@ pub fn dcache_insert(parent_ino: u64, name: &str, inode: Arc<dyn InodeOps>) {
     let name_hash = fnv1a(name.as_bytes());
     let (shard_idx, bucket_idx) = locate_bucket(parent_ino, name_hash);
 
-    let mut shard_guard = DCACHE_SHARDS[shard_idx].lock();
+    let mut shard_guard = DCACHE_SHARDS[shard_idx].write();
     let gen = shard_guard.generation;
     shard_guard.generation = gen.wrapping_add(1);
     shard_guard.buckets[bucket_idx] = Some(DcacheEntry {
@@ -174,7 +172,7 @@ pub fn dcache_insert_negative(parent_ino: u64, name: &str) {
     let name_hash = fnv1a(name.as_bytes());
     let (shard_idx, bucket_idx) = locate_bucket(parent_ino, name_hash);
 
-    let mut shard_guard = DCACHE_SHARDS[shard_idx].lock();
+    let mut shard_guard = DCACHE_SHARDS[shard_idx].write();
     let gen = shard_guard.generation;
     shard_guard.generation = gen.wrapping_add(1);
     shard_guard.buckets[bucket_idx] = Some(DcacheEntry {
@@ -191,7 +189,7 @@ pub fn dcache_insert_negative(parent_ino: u64, name: &str) {
 /// `unlink`, `rename`, `mkdir`, `rmdir`, `create`.
 pub fn dcache_invalidate_inode(parent_ino: u64) {
     for shard in &DCACHE_SHARDS {
-        let mut shard_guard = shard.lock();
+        let mut shard_guard = shard.write();
         for bucket in shard_guard.buckets.iter_mut() {
             if let Some(ref entry) = *bucket {
                 if entry.parent_ino == parent_ino {
@@ -210,7 +208,7 @@ pub fn dcache_invalidate_entry(parent_ino: u64, name: &str) {
     let name_hash = fnv1a(name.as_bytes());
     let (shard_idx, bucket_idx) = locate_bucket(parent_ino, name_hash);
 
-    let mut shard_guard = DCACHE_SHARDS[shard_idx].lock();
+    let mut shard_guard = DCACHE_SHARDS[shard_idx].write();
     if let Some(ref entry) = shard_guard.buckets[bucket_idx] {
         if entry.parent_ino == parent_ino && entry.name_hash == name_hash {
             shard_guard.buckets[bucket_idx] = None;
@@ -221,7 +219,7 @@ pub fn dcache_invalidate_entry(parent_ino: u64, name: &str) {
 /// Flush the entire dcache (e.g., after unmounting a filesystem).
 pub fn dcache_flush_all() {
     for shard in &DCACHE_SHARDS {
-        let mut shard_guard = shard.lock();
+        let mut shard_guard = shard.write();
         for bucket in shard_guard.buckets.iter_mut() {
             *bucket = None;
         }

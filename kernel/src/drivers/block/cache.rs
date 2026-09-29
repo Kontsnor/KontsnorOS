@@ -56,7 +56,7 @@ impl Drop for AlignedBuffer {
 
 #[repr(align(512))]
 struct AlignedStackBuf {
-    data: [u8; 4096],
+    data: [core::mem::MaybeUninit<u8>; 4096],
 }
 
 struct CacheEntry {
@@ -150,8 +150,13 @@ impl BlockDevice for BlockCache {
             self.device.read_block(block, buf)?;
             buf
         } else if buf.len() <= 4096 {
-            stack_buf = AlignedStackBuf { data: [0u8; 4096] };
-            let slice = &mut stack_buf.data[..buf.len()];
+            stack_buf = AlignedStackBuf {
+                data: [core::mem::MaybeUninit::uninit(); 4096],
+            };
+            // SAFETY: stack_buf.data is an aligned 4096-byte buffer.
+            let slice = unsafe {
+                core::slice::from_raw_parts_mut(stack_buf.data.as_mut_ptr() as *mut u8, buf.len())
+            };
             self.device.read_block(block, slice)?;
             buf.copy_from_slice(slice);
             buf
@@ -199,10 +204,15 @@ impl BlockDevice for BlockCache {
         if (data.as_ptr() as usize) % 512 == 0 {
             self.device.write_block(block, data)?;
         } else if data.len() <= 4096 {
-            let mut stack_buf = AlignedStackBuf { data: [0u8; 4096] };
-            stack_buf.data[..data.len()].copy_from_slice(data);
-            self.device
-                .write_block(block, &stack_buf.data[..data.len()])?;
+            let mut stack_buf = AlignedStackBuf {
+                data: [core::mem::MaybeUninit::uninit(); 4096],
+            };
+            // SAFETY: stack_buf.data is an aligned 4096-byte buffer.
+            let slice = unsafe {
+                core::slice::from_raw_parts_mut(stack_buf.data.as_mut_ptr() as *mut u8, data.len())
+            };
+            slice.copy_from_slice(data);
+            self.device.write_block(block, slice)?;
         } else {
             let mut aligned_buf =
                 AlignedBuffer::new(data.len(), 512).ok_or(DriverError::IoError)?;

@@ -15,6 +15,8 @@
 
 //! Miscellaneous / Trivial test cases.
 
+use crate::kprintln;
+
 #[test_case]
 fn test_trivial() {
     let two = 2;

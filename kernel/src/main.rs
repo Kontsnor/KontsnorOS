@@ -328,7 +328,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     x86_64::instructions::interrupts::enable();
     kprintln!("[kernel] Interrupts enabled. Yielding to ready threads...");
 
-    #[cfg(feature = "test")]
+    #[cfg(all(feature = "test", test))]
     {
         kprintln!("[boot] Running in test mode...");
         test_main();

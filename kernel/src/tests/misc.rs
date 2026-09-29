@@ -15,6 +15,8 @@
 
 //! Miscellaneous / Trivial test cases.
 
+use crate::kprintln;
+
 #[test_case]
 fn test_trivial() {
     let two = 2;
@@ -23,7 +25,7 @@ fn test_trivial() {
 
 #[test_case]
 fn test_pty_active_master_optimization() {
-    kprintln!("[test] Starting PTY active master optimization test...");
+    crate::kprintln!("[test] Starting PTY active master optimization test...");
 
     // 1. Verify initial active master setting
     let pty1 = crate::fs::pty::allocate_new_pty().expect("Failed to allocate PTY 1");
@@ -86,23 +88,23 @@ fn test_pty_active_master_optimization() {
     let end_tsc_opt = unsafe { core::arch::x86_64::_rdtsc() };
     let opt_cycles = end_tsc_opt.saturating_sub(start_tsc_opt);
 
-    kprintln!(
+    crate::kprintln!(
         "[test] PTY Master Access Benchmark ({} iterations):",
         ITERATIONS
     );
-    kprintln!(
+    crate::kprintln!(
         "  Unoptimized (lock + Arc clone): {} cycles ({:.2} cycles/op)",
         baseline_cycles,
         baseline_cycles as f64 / ITERATIONS as f64
     );
-    kprintln!(
+    crate::kprintln!(
         "  Optimized (version check + cached Arc): {} cycles ({:.2} cycles/op)",
         opt_cycles,
         opt_cycles as f64 / ITERATIONS as f64
     );
     if baseline_cycles > opt_cycles {
         let speedup = (baseline_cycles - opt_cycles) as f64 / baseline_cycles as f64 * 100.0;
-        kprintln!(
+        crate::kprintln!(
             "  Speedup: {:.1}% reduction in CPU cycles ({:.1}x faster)",
             speedup,
             baseline_cycles as f64 / opt_cycles.max(1) as f64
@@ -112,7 +114,7 @@ fn test_pty_active_master_optimization() {
     // Clean up active master
     crate::fs::pty::set_active_pty_master(None);
 
-    kprintln!("[test] PTY active master optimization test PASSED!");
+    crate::kprintln!("[test] PTY active master optimization test PASSED!");
 }
 
 #[test_case]

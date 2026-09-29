@@ -11,6 +11,7 @@
 ## 2026-03-30 - 32-Byte Unrolled Internet Checksum Optimization
 **Learning:** Computing Internet checksums (RFC 1071) byte-by-byte or 16 bits at a time in `internet_checksum` and `compute_transport_checksum` causes 16x excessive loop iterations and branch overhead during network packet processing. Loop unrolling over 32-byte (16 x 16-bit word) blocks dramatically reduces loop branch checks and instruction pipeline stalls without risk of `u32` accumulator overflow or endianness conversion bugs.
 **Action:** Use multi-word unrolled loops when calculating 16-bit Internet checksums over packet buffers to minimize loop branch overhead while keeping arithmetic safely within `u32`.
+
 ## 2026-03-30 - Sharded Dentry Cache Lock Contention Reduction
 **Learning:** In `kernel/src/fs/dcache.rs`, a single global `TicketLock` guarding all dcache lookup/insert operations creates severe lock contention under multi-core/multi-process VFS path lookups. Partitioning the cache into 64 independent `TicketLock` shards and replacing guarded counter updates with lock-free `AtomicU64` atomics reduces global lock contention by up to 64x without lock overhead on diagnostic counter updates.
 **Action:** For hot global kernel caches (such as dcache and page cache), prefer sharded locks indexed by hash or offset over single global spinlocks.
@@ -34,3 +35,7 @@
 ## 2026-03-30 - WaitQueue Fast-Path Atomic Check Optimization
 **Learning:** In `kernel/src/sync/wait_queue.rs`, calling `wake_all()` on every unblocked I/O event (pipe read/write, socket transfer, eventfd tick, epoll poll) unconditionally disables local CPU interrupts (`without_interrupts`) and acquires the global `SCHEDULER` spinlock, even when zero tasks or listeners are waiting (>99% of streaming I/O calls). Maintaining an atomic `waiter_count: AtomicUsize` tracking field allows `wake_all()` to execute a 1-cycle `load(Ordering::Acquire) == 0` fast-path check, returning immediately and bypassing interrupt toggles and global lock contention when empty.
 **Action:** For kernel event queues or notification channels, maintain a lock-free atomic active waiter count to fast-path empty wakeups and avoid global spinlock/interrupt overheads.
+
+## 2026-03-30 - Epoll Item Consolidation and Target Inode Caching
+**Learning:** In `kernel/src/fs/epoll.rs`, `sys_epoll_wait` was re-querying `current_task_read_fd(fd)` for every monitored descriptor on every poll loop iteration, acquiring task and file table locks repeatedly and incurring `Arc` reference count atomic increment/decrement churn. Consolidating `monitored` and `last_ready` into a single `items: Mutex<BTreeMap<i32, EpollItem>>` map and caching `Arc<dyn InodeOps>` at `epoll_ctl` time eliminates task/fd_table lock acquisitions during `epoll_wait` loops, reduces lock acquisitions from two mutexes to one, and completely removes atomic reference churn on hot event polling paths.
+**Action:** When building event notification or descriptor-monitoring facilities, cache target inode references in the monitored item struct at registration time to avoid repeated process descriptor table lookups and lock acquisitions in polling loops.

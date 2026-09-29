@@ -198,7 +198,7 @@ fn test_socket_read_wait_queue_hoist() {
     }
 
     // Measure time/cycles for repeated non-blocking reads or populated reads
-    let start_ticks = crate::arch::x86_64::time::rdtsc();
+    let start_ticks = unsafe { core::arch::x86_64::_rdtsc() };
     const ITERATIONS: usize = 10_000;
     for _ in 0..ITERATIONS {
         {
@@ -210,7 +210,7 @@ fn test_socket_read_wait_queue_hoist() {
         let read_res = sock_inode.read(0, &mut buf);
         assert!(read_res.is_ok());
     }
-    let end_ticks = crate::arch::x86_64::time::rdtsc();
+    let end_ticks = unsafe { core::arch::x86_64::_rdtsc() };
     let elapsed_ticks = end_ticks.saturating_sub(start_ticks);
 
     kprintln!(

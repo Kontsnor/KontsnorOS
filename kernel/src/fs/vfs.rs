@@ -295,7 +295,7 @@ impl Vfs {
                     let is_last = i == n_comp;
                     if !is_last || follow_last {
                         // Read symlink target
-                        let mut target_buf = alloc::vec![0u8; 4096];
+                        let mut target_buf = [0u8; 4096];
                         if let Ok(n) = next.read(0, &mut target_buf) {
                             if let Ok(target_str) = core::str::from_utf8(&target_buf[..n]) {
                                 let remainder = components[i..].to_vec();
@@ -442,7 +442,7 @@ pub fn resolve_canonical(path: &str) -> Option<String> {
             let next = current.lookup(component)?;
 
             if next.inode().file_type == FileType::Symlink {
-                let mut target_buf = alloc::vec![0u8; 4096];
+                let mut target_buf = [0u8; 4096];
                 if let Ok(n) = next.read(0, &mut target_buf) {
                     if let Ok(target_str) = core::str::from_utf8(&target_buf[..n]) {
                         let remainder = components[i..].to_vec();

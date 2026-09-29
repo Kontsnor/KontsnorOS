@@ -234,3 +234,67 @@ fn test_userspace_wrfsbase() {
         );
     }
 }
+
+#[test_case]
+fn test_cr3_context_switch_tlb_benchmark() {
+    let mut current_cr3: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) current_cr3, options(nomem, nostack));
+    }
+
+    let iterations = 10_000;
+
+    // Baseline: unconditional CR3 writes (flushes TLB every iteration)
+    let start_baseline = unsafe { core::arch::x86_64::_rdtsc() };
+    for _ in 0..iterations {
+        unsafe {
+            core::arch::asm!(
+                "test {0}, {0}",
+                "jz 4f",
+                "mov cr3, {0}",
+                "4:",
+                in(reg) current_cr3,
+                options(nostack)
+            );
+        }
+    }
+    let end_baseline = unsafe { core::arch::x86_64::_rdtsc() };
+    let cycles_baseline = end_baseline.saturating_sub(start_baseline);
+
+    // Optimized: conditional CR3 write (checks if CR3 matches, avoiding TLB invalidation)
+    let start_opt = unsafe { core::arch::x86_64::_rdtsc() };
+    for _ in 0..iterations {
+        unsafe {
+            core::arch::asm!(
+                "test {0}, {0}",
+                "jz 4f",
+                "mov rcx, cr3",
+                "cmp rcx, {0}",
+                "je 4f",
+                "mov cr3, {0}",
+                "4:",
+                in(reg) current_cr3,
+                out("rcx") _,
+                options(nostack)
+            );
+        }
+    }
+    let end_opt = unsafe { core::arch::x86_64::_rdtsc() };
+    let cycles_opt = end_opt.saturating_sub(start_opt);
+
+    let avg_baseline = cycles_baseline / iterations;
+    let avg_opt = cycles_opt / iterations;
+
+    crate::kprintln!(
+        "[bench] CR3 switch TLB preservation: {} total cycles (avg {}/op) vs baseline {} (avg {}/op)",
+        cycles_opt,
+        avg_opt,
+        cycles_baseline,
+        avg_baseline
+    );
+
+    assert!(
+        cycles_opt < cycles_baseline,
+        "Optimized conditional CR3 write must be faster than unconditional reload"
+    );
+}

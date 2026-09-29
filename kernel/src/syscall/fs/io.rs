@@ -16,7 +16,7 @@
 //! File I/O system calls: read, write, lseek, dup, pipe, fcntl, pread64, writev.
 
 use super::super::{Errno, SyscallResult};
-use crate::fs::file::OpenFlags;
+use crate::fs::file::{FileDescription, OpenFlags};
 use crate::kprintln;
 use crate::process::fd as proc_fd;
 use crate::sync::spinlock::TicketLock;
@@ -209,6 +209,47 @@ pub fn release_fcntl_locks_for_pid_and_ino(pid: u64, ino: u64) {
     }
 }
 
+/// Internal helper to read from an opened file description without zeroing stack buffers.
+pub(crate) fn file_desc_read(
+    file_desc: &FileDescription,
+    buf: *mut u8,
+    count: usize,
+) -> SyscallResult {
+    let mut total_read = 0;
+    let mut temp_buf = core::mem::MaybeUninit::<[u8; 4096]>::uninit();
+
+    while total_read < count {
+        let chunk_size = core::cmp::min(count - total_read, 4096);
+        let chunk_slice = unsafe {
+            core::slice::from_raw_parts_mut(temp_buf.as_mut_ptr() as *mut u8, chunk_size)
+        };
+        match file_desc.read(chunk_slice) {
+            Ok(0) => break,
+            Ok(n) => {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        temp_buf.as_ptr() as *const u8,
+                        buf.add(total_read),
+                        n,
+                    );
+                }
+                total_read += n;
+                if n < chunk_size {
+                    break;
+                }
+            }
+            Err(e) => {
+                if total_read > 0 {
+                    break;
+                }
+                return e as SyscallResult;
+            }
+        }
+    }
+
+    total_read as SyscallResult
+}
+
 /// `read(fd, buf, count)` — Read from a file descriptor.
 ///
 /// Reads up to `count` bytes from file descriptor `fd` into user buffer `buf`.
@@ -229,24 +270,65 @@ pub fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
         None => return Errno::EBADF.into(),
     };
 
-    let mut total_read = 0;
-    let mut temp_buf = [0u8; 4096];
+    file_desc_read(&file_desc, buf, count)
+}
 
-    while total_read < count {
-        let chunk_size = core::cmp::min(count - total_read, 4096);
-        match file_desc.read(&mut temp_buf[..chunk_size]) {
+/// Internal helper to write to an opened file description without zeroing stack buffers.
+pub(crate) fn file_desc_write(
+    file_desc: &FileDescription,
+    buf: *const u8,
+    count: usize,
+) -> SyscallResult {
+    let is_pipe = file_desc.inode.inode().file_type == crate::fs::inode::FileType::Pipe;
+    if is_pipe && crate::syscall::DEBUG_SYSCALLS {
+        let pid_str = crate::process::scheduler::current_pid()
+            .map(|p| p.as_u64())
+            .unwrap_or(0);
+        crate::kprintln!(
+            "[syscall pid={}] sys_write on pipe count {}",
+            pid_str,
+            count
+        );
+    }
+
+    let mut total_written = 0;
+    let mut temp_buf = core::mem::MaybeUninit::<[u8; 4096]>::uninit();
+
+    // Whether this fd is a regular file (seekable). For regular files POSIX
+    // requires write() to write all requested bytes; short writes must be
+    // retried internally. For non-seekable streams (pipes, sockets, TTYs)
+    // short writes are expected and we must not retry.
+    let is_regular = file_desc.inode.inode().file_type == crate::fs::inode::FileType::Regular;
+
+    while total_written < count {
+        let chunk_size = core::cmp::min(count - total_written, 4096);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                buf.add(total_written),
+                temp_buf.as_mut_ptr() as *mut u8,
+                chunk_size,
+            );
+        }
+        let chunk_slice =
+            unsafe { core::slice::from_raw_parts(temp_buf.as_ptr() as *const u8, chunk_size) };
+        match file_desc.write(chunk_slice) {
             Ok(0) => break,
             Ok(n) => {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(temp_buf.as_ptr(), buf.add(total_read), n);
-                }
-                total_read += n;
-                if n < chunk_size {
+                total_written += n;
+                // For non-seekable streams a short write signals the caller
+                // to stop. For regular files we must keep looping so that
+                // the full count is delivered — otherwise page-cache lock
+                // drop/reacquire inside write_page_cache would silently
+                // truncate writes, corrupting files.
+                if n < chunk_size && !is_regular {
                     break;
                 }
             }
             Err(e) => {
-                if total_read > 0 {
+                if is_pipe && crate::syscall::DEBUG_SYSCALLS {
+                    crate::kprintln!("[syscall] sys_write on pipe failed with error {}", e);
+                }
+                if total_written > 0 {
                     break;
                 }
                 return e as SyscallResult;
@@ -254,7 +336,7 @@ pub fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
         }
     }
 
-    total_read as SyscallResult
+    total_written as SyscallResult
 }
 
 /// `write(fd, buf, count)` — Write to a file descriptor.
@@ -277,67 +359,7 @@ pub fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
         None => return Errno::EBADF.into(),
     };
 
-    let is_pipe = file_desc.inode.inode().file_type == crate::fs::inode::FileType::Pipe;
-    if is_pipe && crate::syscall::DEBUG_SYSCALLS {
-        let pid_str = crate::process::scheduler::current_pid()
-            .map(|p| p.as_u64())
-            .unwrap_or(0);
-        crate::kprintln!(
-            "[syscall pid={}] sys_write on pipe fd {} count {}",
-            pid_str,
-            fd,
-            count
-        );
-    }
-
-    let mut total_written = 0;
-    let mut temp_buf = [0u8; 4096];
-
-    // Whether this fd is a regular file (seekable). For regular files POSIX
-    // requires write() to write all requested bytes; short writes must be
-    // retried internally. For non-seekable streams (pipes, sockets, TTYs)
-    // short writes are expected and we must not retry.
-    let is_regular = file_desc.inode.inode().file_type == crate::fs::inode::FileType::Regular;
-
-    while total_written < count {
-        let chunk_size = core::cmp::min(count - total_written, 4096);
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                buf.add(total_written),
-                temp_buf.as_mut_ptr(),
-                chunk_size,
-            );
-        }
-        match file_desc.write(&temp_buf[..chunk_size]) {
-            Ok(0) => break,
-            Ok(n) => {
-                total_written += n;
-                // For non-seekable streams a short write signals the caller
-                // to stop. For regular files we must keep looping so that
-                // the full count is delivered — otherwise page-cache lock
-                // drop/reacquire inside write_page_cache would silently
-                // truncate writes, corrupting files.
-                if n < chunk_size && !is_regular {
-                    break;
-                }
-            }
-            Err(e) => {
-                if is_pipe && crate::syscall::DEBUG_SYSCALLS {
-                    crate::kprintln!(
-                        "[syscall] sys_write on pipe fd {} failed with error {}",
-                        fd,
-                        e
-                    );
-                }
-                if total_written > 0 {
-                    break;
-                }
-                return e as SyscallResult;
-            }
-        }
-    }
-
-    total_written as SyscallResult
+    file_desc_write(&file_desc, buf, count)
 }
 
 /// `fsync(fd)` — Commit file buffer cache/page cache changes to disk.
@@ -894,19 +916,23 @@ pub fn sys_pread64(fd: i32, buf: *mut u8, count: usize, offset: i64) -> SyscallR
     };
 
     let mut total_read = 0;
-    let mut temp_buf = [0u8; 4096];
+    let mut temp_buf = core::mem::MaybeUninit::<[u8; 4096]>::uninit();
 
     while total_read < count {
         let chunk_size = core::cmp::min(count - total_read, 4096);
         let chunk_offset = offset + total_read as i64;
-        match file
-            .inode
-            .read(chunk_offset as u64, &mut temp_buf[..chunk_size])
-        {
+        let chunk_slice = unsafe {
+            core::slice::from_raw_parts_mut(temp_buf.as_mut_ptr() as *mut u8, chunk_size)
+        };
+        match file.inode.read(chunk_offset as u64, chunk_slice) {
             Ok(0) => break,
             Ok(n) => {
                 unsafe {
-                    core::ptr::copy_nonoverlapping(temp_buf.as_ptr(), buf.add(total_read), n);
+                    core::ptr::copy_nonoverlapping(
+                        temp_buf.as_ptr() as *const u8,
+                        buf.add(total_read),
+                        n,
+                    );
                 }
                 total_read += n;
                 if n < chunk_size {
@@ -945,7 +971,7 @@ pub fn sys_pwrite64(fd: i32, buf: *const u8, count: usize, offset: i64) -> Sysca
     };
 
     let mut total_written = 0;
-    let mut temp_buf = [0u8; 4096];
+    let mut temp_buf = core::mem::MaybeUninit::<[u8; 4096]>::uninit();
 
     while total_written < count {
         let chunk_size = core::cmp::min(count - total_written, 4096);
@@ -954,14 +980,13 @@ pub fn sys_pwrite64(fd: i32, buf: *const u8, count: usize, offset: i64) -> Sysca
         unsafe {
             core::ptr::copy_nonoverlapping(
                 buf.add(total_written),
-                temp_buf.as_mut_ptr(),
+                temp_buf.as_mut_ptr() as *mut u8,
                 chunk_size,
             );
         }
-        match file
-            .inode
-            .write(chunk_offset as u64, &temp_buf[..chunk_size])
-        {
+        let chunk_slice =
+            unsafe { core::slice::from_raw_parts(temp_buf.as_ptr() as *const u8, chunk_size) };
+        match file.inode.write(chunk_offset as u64, chunk_slice) {
             Ok(0) => break,
             Ok(n) => {
                 total_written += n;
@@ -1044,6 +1069,10 @@ fn copy_iovecs(
 
 /// `writev(fd, iov, iovcnt)` — Write vector.
 pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: i32) -> SyscallResult {
+    if fd < 0 {
+        return Errno::EBADF.into();
+    }
+
     let mut fast_buf = [IoVec {
         iov_base: core::ptr::null(),
         iov_len: 0,
@@ -1059,12 +1088,23 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: i32) -> SyscallResult {
         IoVecStorage::Heap(vec) => vec.as_slice(),
     };
 
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+
     let mut total_written = 0;
     for io in iov_slice {
         if io.iov_len == 0 {
             continue;
         }
-        let ret = sys_write(fd, io.iov_base, io.iov_len);
+        if !validate_user_ptr(io.iov_base, io.iov_len) {
+            if total_written > 0 {
+                break;
+            }
+            return Errno::EFAULT.into();
+        }
+        let ret = file_desc_write(&file_desc, io.iov_base, io.iov_len);
         if ret < 0 {
             if total_written > 0 {
                 break;
@@ -1151,6 +1191,10 @@ pub fn sys_flock(fd: i32, operation: i32) -> SyscallResult {
 
 /// `readv(fd, iov, iovcnt)` — Read vector.
 pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: i32) -> SyscallResult {
+    if fd < 0 {
+        return Errno::EBADF.into();
+    }
+
     let mut fast_buf = [IoVec {
         iov_base: core::ptr::null(),
         iov_len: 0,
@@ -1166,12 +1210,23 @@ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: i32) -> SyscallResult {
         IoVecStorage::Heap(vec) => vec.as_slice(),
     };
 
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+
     let mut total_read = 0;
     for io in iov_slice {
         if io.iov_len == 0 {
             continue;
         }
-        let ret = sys_read(fd, io.iov_base as *mut u8, io.iov_len);
+        if validate_user_ptr_write(io.iov_base as *mut u8, io.iov_len).is_err() {
+            if total_read > 0 {
+                break;
+            }
+            return Errno::EFAULT.into();
+        }
+        let ret = file_desc_read(&file_desc, io.iov_base as *mut u8, io.iov_len);
         if ret < 0 {
             if total_read > 0 {
                 break;

@@ -16,9 +16,11 @@
 //! Open, openat, and close system calls.
 
 use super::super::{Errno, SyscallResult};
+use crate::fs::inode::InodeOps;
 use crate::process::fd as proc_fd;
 use crate::syscall::validation::copy_string_from_user;
 use alloc::string::String;
+use alloc::sync::Arc;
 
 /// `open(pathname, flags, mode)` — Open a file.
 ///
@@ -32,6 +34,51 @@ pub fn sys_open(pathname: *const u8, flags: i32, mode: u32) -> SyscallResult {
 
     let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
     sys_open_with_resolved_path(resolved_path, flags, mode)
+}
+
+fn check_open_existing(
+    i: Arc<dyn InodeOps>,
+    flags_u32: u32,
+    follow_last: bool,
+) -> Result<Arc<dyn InodeOps>, SyscallResult> {
+    if !follow_last && i.inode().file_type == crate::fs::inode::FileType::Symlink {
+        return Err(Errno::ELOOP.into());
+    }
+    // If O_CREAT and O_EXCL are both set, return EEXIST
+    if (flags_u32 & crate::fs::file::OpenFlags::O_CREAT != 0)
+        && (flags_u32 & crate::fs::file::OpenFlags::O_EXCL != 0)
+    {
+        return Err(Errno::EEXIST.into());
+    }
+    // If O_DIRECTORY is set and it is not a directory, return ENOTDIR
+    if (flags_u32 & crate::fs::file::OpenFlags::O_DIRECTORY != 0) && !i.inode().is_dir() {
+        return Err(Errno::ENOTDIR.into());
+    }
+    // If opened for writing and the inode is a directory, return EISDIR
+    if i.inode().is_dir() && crate::fs::file::OpenFlags(flags_u32).is_writable() {
+        return Err(Errno::EISDIR.into());
+    }
+
+    // Check permissions on the existing file
+    let open_flags = crate::fs::file::OpenFlags(flags_u32);
+    if open_flags.is_readable() {
+        if let Err(e) = crate::fs::inode::check_permission(i.inode(), crate::fs::inode::MAY_READ) {
+            return Err(e as SyscallResult);
+        }
+    }
+    if open_flags.is_writable() {
+        if let Err(e) = crate::fs::inode::check_permission(i.inode(), crate::fs::inode::MAY_WRITE) {
+            return Err(e as SyscallResult);
+        }
+    }
+
+    // If O_TRUNC is set and it is a regular file, truncate it to 0 size
+    if (flags_u32 & crate::fs::file::OpenFlags::O_TRUNC != 0) && i.inode().is_file() {
+        if let Err(e) = i.truncate(0) {
+            return Err(e as SyscallResult);
+        }
+    }
+    Ok(i)
 }
 
 /// Core open logic with an already resolved path.
@@ -49,51 +96,10 @@ pub fn sys_open_with_resolved_path(resolved_path: String, flags: i32, _mode: u32
         let follow_last = (flags_u32 & 0x20000) == 0; // AT_SYMLINK_NOFOLLOW/O_NOFOLLOW
         let exists = crate::fs::vfs::lookup_follow(&resolved_path, follow_last);
         match exists {
-            Some(i) => {
-                if !follow_last && i.inode().file_type == crate::fs::inode::FileType::Symlink {
-                    return Errno::ELOOP.into();
-                }
-                // If O_CREAT and O_EXCL are both set, return EEXIST
-                if (flags_u32 & crate::fs::file::OpenFlags::O_CREAT != 0)
-                    && (flags_u32 & crate::fs::file::OpenFlags::O_EXCL != 0)
-                {
-                    return Errno::EEXIST.into();
-                }
-                // If O_DIRECTORY is set and it is not a directory, return ENOTDIR
-                if (flags_u32 & crate::fs::file::OpenFlags::O_DIRECTORY != 0) && !i.inode().is_dir()
-                {
-                    return Errno::ENOTDIR.into();
-                }
-                // If opened for writing and the inode is a directory, return EISDIR
-                if i.inode().is_dir() && crate::fs::file::OpenFlags(flags_u32).is_writable() {
-                    return Errno::EISDIR.into();
-                }
-
-                // Check permissions on the existing file
-                let open_flags = crate::fs::file::OpenFlags(flags_u32);
-                if open_flags.is_readable() {
-                    if let Err(e) =
-                        crate::fs::inode::check_permission(i.inode(), crate::fs::inode::MAY_READ)
-                    {
-                        return e as SyscallResult;
-                    }
-                }
-                if open_flags.is_writable() {
-                    if let Err(e) =
-                        crate::fs::inode::check_permission(i.inode(), crate::fs::inode::MAY_WRITE)
-                    {
-                        return e as SyscallResult;
-                    }
-                }
-
-                // If O_TRUNC is set and it is a regular file, truncate it to 0 size
-                if (flags_u32 & crate::fs::file::OpenFlags::O_TRUNC != 0) && i.inode().is_file() {
-                    if let Err(e) = i.truncate(0) {
-                        return e as SyscallResult;
-                    }
-                }
-                i
-            }
+            Some(i) => match check_open_existing(i, flags_u32, follow_last) {
+                Ok(inode) => inode,
+                Err(err) => return err,
+            },
             None => {
                 if flags_u32 & crate::fs::file::OpenFlags::O_CREAT != 0 {
                     // Split path to find parent directory
@@ -172,6 +178,88 @@ pub fn sys_openat(dfd: i32, pathname: *const u8, flags: i32, mode: u32) -> Sysca
         Some(p) => p,
         None => return Errno::EFAULT.into(),
     };
+
+    let flags_u32 = flags as u32;
+
+    // Fast path: relative to an open directory fd with a simple single-component name
+    if dfd != -100
+        && !raw_path.starts_with('/')
+        && !raw_path.contains('/')
+        && raw_path != "."
+        && raw_path != ".."
+    {
+        if let Some(desc) = proc_fd::current_task_get_file_desc(dfd) {
+            if desc.inode.inode().is_dir() {
+                let parent_inode = desc.inode.clone();
+                let desc_path = desc.path.as_deref().unwrap_or("/");
+                let resolved_path = crate::fs::path::join(desc_path, &raw_path);
+
+                let follow_last = (flags_u32 & 0x20000) == 0;
+                let child_opt = parent_inode.lookup(&raw_path);
+
+                let inode = match child_opt {
+                    Some(i) => match check_open_existing(i, flags_u32, follow_last) {
+                        Ok(inode) => inode,
+                        Err(err) => return err,
+                    },
+                    None => {
+                        if flags_u32 & crate::fs::file::OpenFlags::O_CREAT != 0 {
+                            if let Err(e) = crate::fs::inode::check_permission(
+                                parent_inode.inode(),
+                                crate::fs::inode::MAY_WRITE,
+                            ) {
+                                return e as SyscallResult;
+                            }
+                            if let Err(e) = crate::fs::inode::check_permission(
+                                parent_inode.inode(),
+                                crate::fs::inode::MAY_EXEC,
+                            ) {
+                                return e as SyscallResult;
+                            }
+
+                            let umask = if let Some(pid) = crate::process::scheduler::current_pid()
+                            {
+                                if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid)
+                                {
+                                    task_arc.lock().umask
+                                } else {
+                                    0o022
+                                }
+                            } else {
+                                0o022
+                            };
+                            let mode_val = if mode == 0 { 0o644 } else { mode };
+                            let file_mode = ((mode_val & 0x0FFF) & !umask) as u16;
+
+                            match parent_inode
+                                .create(&raw_path, crate::fs::inode::FileType::Regular)
+                            {
+                                Some(new_i) => {
+                                    let _ = new_i.set_permissions(file_mode);
+                                    crate::fs::vfs::invalidate_dentry(&resolved_path);
+                                    new_i
+                                }
+                                None => {
+                                    return Errno::ENOSPC.into();
+                                }
+                            }
+                        } else {
+                            return Errno::ENOENT.into();
+                        }
+                    }
+                };
+
+                return match proc_fd::current_task_alloc_fd_with_flags_and_path(
+                    inode,
+                    crate::fs::file::OpenFlags(flags_u32),
+                    Some(resolved_path),
+                ) {
+                    Some(fd) => fd as SyscallResult,
+                    None => Errno::EMFILE.into(),
+                };
+            }
+        }
+    }
 
     let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
         Ok(path) => path,

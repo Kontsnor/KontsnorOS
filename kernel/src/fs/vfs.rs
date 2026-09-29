@@ -354,9 +354,16 @@ impl Vfs {
         let prefix = if path.ends_with('/') {
             String::from(path)
         } else {
-            format!("{}/", path)
+            alloc::format!("{}/", path)
         };
-        cache.retain(|k, _| !k.starts_with(&prefix));
+        let to_remove: alloc::vec::Vec<String> = cache
+            .range(prefix.clone()..)
+            .take_while(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, _)| (*k).clone())
+            .collect();
+        for k in to_remove {
+            cache.remove(&k);
+        }
     }
 }
 

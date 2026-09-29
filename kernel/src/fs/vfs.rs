@@ -220,12 +220,32 @@ impl Vfs {
         loop {
             let (fs, remaining_path) = self.resolve_mount(&resolved_path)?;
             let root = fs.root()?;
-
             let mut current = root;
-            let components: Vec<&str> = remaining_path
-                .split('/')
-                .filter(|c| !c.is_empty())
-                .collect();
+
+            let mut comp_buf = [""; 16];
+            let mut comp_count = 0;
+            let mut heap_components = None;
+
+            for part in remaining_path.split('/').filter(|c| !c.is_empty()) {
+                if comp_count < 16 {
+                    comp_buf[comp_count] = part;
+                    comp_count += 1;
+                } else {
+                    let vec = heap_components.get_or_insert_with(|| {
+                        let mut v = Vec::with_capacity(32);
+                        v.extend_from_slice(&comp_buf[..comp_count]);
+                        v
+                    });
+                    vec.push(part);
+                    comp_count += 1;
+                }
+            }
+
+            let components: &[&str] = if let Some(ref v) = heap_components {
+                v.as_slice()
+            } else {
+                &comp_buf[..comp_count]
+            };
 
             let mount_path = if remaining_path == "/" {
                 resolved_path.as_str()
@@ -239,7 +259,7 @@ impl Vfs {
             let mut i = 0;
             let mut symlink_target: Option<(String, String, Vec<&str>)> = None;
 
-            for component in &components {
+            for component in components {
                 // Verify execute permission on the directory component before traversing/looking up the next one
                 if let Err(_) =
                     crate::fs::inode::check_permission(current.inode(), crate::fs::inode::MAY_EXEC)
@@ -386,12 +406,32 @@ pub fn resolve_canonical(path: &str) -> Option<String> {
     loop {
         let (fs, remaining_path) = vfs_ref.resolve_mount(&resolved_path)?;
         let root = fs.root()?;
-
         let mut current = root;
-        let components: Vec<&str> = remaining_path
-            .split('/')
-            .filter(|c| !c.is_empty())
-            .collect();
+
+        let mut comp_buf = [""; 16];
+        let mut comp_count = 0;
+        let mut heap_components = None;
+
+        for part in remaining_path.split('/').filter(|c| !c.is_empty()) {
+            if comp_count < 16 {
+                comp_buf[comp_count] = part;
+                comp_count += 1;
+            } else {
+                let vec = heap_components.get_or_insert_with(|| {
+                    let mut v = Vec::with_capacity(32);
+                    v.extend_from_slice(&comp_buf[..comp_count]);
+                    v
+                });
+                vec.push(part);
+                comp_count += 1;
+            }
+        }
+
+        let components: &[&str] = if let Some(ref v) = heap_components {
+            v.as_slice()
+        } else {
+            &comp_buf[..comp_count]
+        };
 
         let mount_path = if remaining_path == "/" {
             resolved_path.as_str()
@@ -405,7 +445,7 @@ pub fn resolve_canonical(path: &str) -> Option<String> {
         let mut i = 0;
         let mut symlink_target: Option<(String, String, Vec<&str>)> = None;
 
-        for component in &components {
+        for component in components {
             if let Err(_) =
                 crate::fs::inode::check_permission(current.inode(), crate::fs::inode::MAY_EXEC)
             {

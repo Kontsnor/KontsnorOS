@@ -277,14 +277,34 @@ fn test_timerfd() {
     assert_eq!(res, 0);
 
     let new_value = crate::fs::timerfd::Itimerspec {
-        it_interval: crate::fs::timerfd::Timespec::default(),
+        it_interval: crate::fs::timerfd::Timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        },
         it_value: crate::fs::timerfd::Timespec {
-            tv_sec: 0,
-            tv_nsec: 10_000_000,
+            tv_sec: 2,
+            tv_nsec: 0,
         },
     };
     let res = crate::fs::timerfd::sys_timerfd_settime(tfd, 0, &new_value, core::ptr::null_mut());
     assert_eq!(res, 0);
+
+    // Verify sys_timerfd_gettime
+    let mut curr_val = crate::fs::timerfd::Itimerspec::default();
+    let res = crate::fs::timerfd::sys_timerfd_gettime(tfd, &mut curr_val);
+    assert_eq!(res, 0);
+    assert_eq!(curr_val.it_interval.tv_sec, 1);
+    assert!(curr_val.it_value.tv_sec <= 2);
+
+    // Verify error cases
+    assert_eq!(
+        crate::fs::timerfd::sys_timerfd_gettime(-1, &mut curr_val),
+        crate::syscall::Errno::EBADF as i64
+    );
+    assert_eq!(
+        crate::fs::timerfd::sys_timerfd_gettime(tfd, core::ptr::null_mut()),
+        crate::syscall::Errno::EINVAL as i64
+    );
 
     let mut ready_evs = [crate::fs::epoll::EpollEvent::default(); 1];
     let n = crate::fs::epoll::sys_epoll_wait(epfd, ready_evs.as_mut_ptr(), 1, 100);
@@ -605,6 +625,9 @@ fn test_vfs_lookup_dcache_benchmark() {
 
     let _ = test_dir.unlink("file.txt");
     let _ = tmp_dir.rmdir("bench_dir");
+}
+
+#[test_case]
 fn test_ext_readdir_streaming_benchmark() {
     kprintln!("[test] Starting Ext4 zero-allocation streaming readdir benchmark test...");
 
@@ -666,11 +689,8 @@ fn test_ext_readdir_streaming_benchmark() {
     let mut total_dents_read = 0;
 
     loop {
-        let nread = crate::syscall::fs::sys_getdents64(
-            dir_fd as i32,
-            dents_buf_addr as *mut u8,
-            4096,
-        );
+        let nread =
+            crate::syscall::fs::sys_getdents64(dir_fd as i32, dents_buf_addr as *mut u8, 4096);
         if nread <= 0 {
             break;
         }

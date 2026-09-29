@@ -62,6 +62,7 @@ struct AlignedStackBuf {
 struct CacheEntry {
     data: Vec<u8>,
     referenced: bool,
+    dirty: bool,
 }
 
 struct BlockCacheInner {
@@ -70,8 +71,9 @@ struct BlockCacheInner {
 }
 
 impl BlockCacheInner {
-    #[inline]
-    fn evict(&mut self, max_blocks: usize) {
+    /// Evict one unreferenced entry when over capacity.
+    /// Returns Some((block, data)) if the evicted entry is dirty so caller can write it back.
+    fn evict_one(&mut self, max_blocks: usize) -> Option<(u64, Vec<u8>)> {
         while self.entries.len() >= max_blocks {
             if let Some(b) = self.fifo_queue.pop_front() {
                 if let Some(entry) = self.entries.get_mut(&b) {
@@ -79,14 +81,20 @@ impl BlockCacheInner {
                         entry.referenced = false;
                         self.fifo_queue.push_back(b);
                     } else {
-                        self.entries.remove(&b);
-                        break;
+                        let dirty = entry.dirty;
+                        let removed = self.entries.remove(&b).unwrap();
+                        if dirty {
+                            return Some((b, removed.data));
+                        } else {
+                            return None;
+                        }
                     }
                 }
             } else {
                 break;
             }
         }
+        None
     }
 }
 
@@ -108,6 +116,34 @@ impl BlockCache {
             }),
             max_blocks,
         }
+    }
+
+    /// Helper to write an aligned buffer to the underlying physical device.
+    fn write_device_aligned(&self, block: u64, data: &[u8]) -> Result<(), DriverError> {
+        if (data.as_ptr() as usize) % 512 == 0 {
+            self.device.write_block(block, data)
+        } else if data.len() <= 4096 {
+            let mut stack_buf = AlignedStackBuf {
+                data: [core::mem::MaybeUninit::uninit(); 4096],
+            };
+            // SAFETY: stack_buf.data is an aligned 4096-byte buffer, and slice length matches data.len() <= 4096.
+            let slice = unsafe {
+                core::slice::from_raw_parts_mut(stack_buf.data.as_mut_ptr() as *mut u8, data.len())
+            };
+            slice.copy_from_slice(data);
+            self.device.write_block(block, slice)
+        } else {
+            let mut aligned_buf =
+                AlignedBuffer::new(data.len(), 512).ok_or(DriverError::IoError)?;
+            aligned_buf.as_mut_slice().copy_from_slice(data);
+            self.device.write_block(block, aligned_buf.as_slice())
+        }
+    }
+}
+
+impl Drop for BlockCache {
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 
@@ -144,13 +180,10 @@ impl BlockDevice for BlockCache {
         // 2. Cache miss: release lock and read from underlying device.
         // If buf is already 512-byte aligned, read directly into it to avoid heap allocation.
         drop(inner);
-        let mut stack_buf;
-        let mut heap_buf;
-        let disk_data: &[u8] = if (buf.as_ptr() as usize) % 512 == 0 {
+        if (buf.as_ptr() as usize) % 512 == 0 {
             self.device.read_block(block, buf)?;
-            buf
         } else if buf.len() <= 4096 {
-            stack_buf = AlignedStackBuf {
+            let mut stack_buf = AlignedStackBuf {
                 data: [core::mem::MaybeUninit::uninit(); 4096],
             };
             // SAFETY: stack_buf.data is an aligned 4096-byte buffer.
@@ -159,34 +192,36 @@ impl BlockDevice for BlockCache {
             };
             self.device.read_block(block, slice)?;
             buf.copy_from_slice(slice);
-            buf
         } else {
-            heap_buf = AlignedBuffer::new(buf.len(), 512).ok_or(DriverError::IoError)?;
+            let mut heap_buf = AlignedBuffer::new(buf.len(), 512).ok_or(DriverError::IoError)?;
             self.device.read_block(block, heap_buf.as_mut_slice())?;
             buf.copy_from_slice(heap_buf.as_slice());
-            buf
-        };
+        }
 
         // 3. Re-acquire lock to insert new entries and update access times
         let mut inner = self.inner.lock();
         for i in 0..num_blocks {
             let curr_block = block + i as u64;
             let offset = i * block_size;
-            let block_slice = &disk_data[offset..offset + block_size];
 
-            if !inner.entries.contains_key(&curr_block) {
-                inner.evict(self.max_blocks);
+            if let Some(entry) = inner.entries.get_mut(&curr_block) {
+                entry.referenced = true;
+                // Cached entry (especially if modified/dirty) takes precedence over older disk data
+                buf[offset..offset + block_size].copy_from_slice(&entry.data);
+            } else {
+                while let Some((evicted_block, evicted_data)) = inner.evict_one(self.max_blocks) {
+                    self.write_device_aligned(evicted_block, &evicted_data)?;
+                }
+                let block_vec = buf[offset..offset + block_size].to_vec();
                 inner.entries.insert(
                     curr_block,
                     CacheEntry {
-                        data: block_slice.to_vec(),
+                        data: block_vec,
                         referenced: false,
+                        dirty: false,
                     },
                 );
                 inner.fifo_queue.push_back(curr_block);
-            } else {
-                let entry = inner.entries.get_mut(&curr_block).unwrap();
-                entry.referenced = true;
             }
         }
 
@@ -200,27 +235,6 @@ impl BlockDevice for BlockCache {
         }
         let num_blocks = data.len() / block_size;
 
-        // Write-through: write range to physical device.
-        // If data is already 512-byte aligned, pass directly to avoid intermediate buffer allocation and copy.
-        if (data.as_ptr() as usize) % 512 == 0 {
-            self.device.write_block(block, data)?;
-        } else if data.len() <= 4096 {
-            let mut stack_buf = AlignedStackBuf {
-                data: [core::mem::MaybeUninit::uninit(); 4096],
-            };
-            // SAFETY: stack_buf.data is an aligned 4096-byte buffer.
-            let slice = unsafe {
-                core::slice::from_raw_parts_mut(stack_buf.data.as_mut_ptr() as *mut u8, data.len())
-            };
-            slice.copy_from_slice(data);
-            self.device.write_block(block, slice)?;
-        } else {
-            let mut aligned_buf =
-                AlignedBuffer::new(data.len(), 512).ok_or(DriverError::IoError)?;
-            aligned_buf.as_mut_slice().copy_from_slice(data);
-            self.device.write_block(block, aligned_buf.as_slice())?;
-        }
-
         let mut inner = self.inner.lock();
 
         for i in 0..num_blocks {
@@ -230,14 +244,18 @@ impl BlockDevice for BlockCache {
 
             if let Some(entry) = inner.entries.get_mut(&curr_block) {
                 entry.referenced = true;
+                entry.dirty = true;
                 entry.data.copy_from_slice(block_slice);
             } else {
-                inner.evict(self.max_blocks);
+                while let Some((evicted_block, evicted_data)) = inner.evict_one(self.max_blocks) {
+                    self.write_device_aligned(evicted_block, &evicted_data)?;
+                }
                 inner.entries.insert(
                     curr_block,
                     CacheEntry {
                         data: block_slice.to_vec(),
                         referenced: false,
+                        dirty: true,
                     },
                 );
                 inner.fifo_queue.push_back(curr_block);
@@ -256,6 +274,40 @@ impl BlockDevice for BlockCache {
     }
 
     fn flush(&self) -> Result<(), DriverError> {
+        let dirty_blocks: Vec<(u64, Vec<u8>)> = {
+            let mut inner = self.inner.lock();
+            let mut list = Vec::new();
+            for (&block, entry) in inner.entries.iter_mut() {
+                if entry.dirty {
+                    entry.dirty = false;
+                    list.push((block, entry.data.clone()));
+                }
+            }
+            list
+        };
+
+        if !dirty_blocks.is_empty() {
+            let mut sorted_blocks = dirty_blocks;
+            sorted_blocks.sort_unstable_by_key(|(b, _)| *b);
+
+            let mut i = 0;
+            while i < sorted_blocks.len() {
+                let start_block = sorted_blocks[i].0;
+                let mut contiguous_data = Vec::new();
+                contiguous_data.extend_from_slice(&sorted_blocks[i].1);
+                let mut j = i + 1;
+                while j < sorted_blocks.len()
+                    && sorted_blocks[j].0 == start_block + (j - i) as u64
+                    && (j - i) < 64
+                {
+                    contiguous_data.extend_from_slice(&sorted_blocks[j].1);
+                    j += 1;
+                }
+                self.write_device_aligned(start_block, &contiguous_data)?;
+                i = j;
+            }
+        }
+
         self.device.flush()
     }
 

@@ -299,6 +299,34 @@ pub fn sys_newfstatat(
         None => return Errno::EFAULT.into(),
     };
 
+    if dfd != -100
+        && !raw_path.starts_with('/')
+        && !raw_path.contains('/')
+        && raw_path != "."
+        && raw_path != ".."
+    {
+        if let Some(desc) = proc_fd::current_task_get_file_desc(dfd) {
+            if desc.inode.inode().is_dir() {
+                let follow_last = (_flags & 0x100) == 0;
+                if let Some(child) = desc.inode.lookup(&raw_path) {
+                    let is_sym = child.inode().file_type == FileType::Symlink;
+                    let target = if is_sym && follow_last {
+                        None
+                    } else {
+                        Some(child)
+                    };
+                    if let Some(inode_ops) = target {
+                        let stat = populate_stat(inode_ops.as_ref());
+                        unsafe {
+                            statbuf.write(stat);
+                        }
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
+
     let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
         Ok(path) => path,
         Err(e) => return e.into(),
@@ -1937,6 +1965,35 @@ pub fn sys_unlinkat(dfd: i32, pathname: *const u8, flags: i32) -> SyscallResult 
         Some(p) => p,
         None => return Errno::EFAULT.into(),
     };
+
+    if dfd != -100
+        && !raw_path.starts_with('/')
+        && !raw_path.contains('/')
+        && raw_path != "."
+        && raw_path != ".."
+        && (flags & 0x200) == 0
+    {
+        if let Some(desc) = proc_fd::current_task_get_file_desc(dfd) {
+            if desc.inode.inode().is_dir() {
+                if let Err(e) = check_permission(desc.inode.inode(), MAY_WRITE) {
+                    return e as SyscallResult;
+                }
+                if let Err(e) = check_permission(desc.inode.inode(), MAY_EXEC) {
+                    return e as SyscallResult;
+                }
+                match desc.inode.unlink(&raw_path) {
+                    Ok(_) => {
+                        let desc_path = desc.path.as_deref().unwrap_or("/");
+                        let joined = crate::fs::path::join(desc_path, &raw_path);
+                        crate::fs::vfs::invalidate_dentry(&joined);
+                        return 0;
+                    }
+                    Err(e) => return e as SyscallResult,
+                }
+            }
+        }
+    }
+
     let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
         Ok(path) => path,
         Err(e) => return e.into(),
@@ -1959,6 +2016,45 @@ pub fn sys_mkdirat(dfd: i32, pathname: *const u8, mode: u32) -> SyscallResult {
         Some(p) => p,
         None => return Errno::EFAULT.into(),
     };
+
+    if dfd != -100
+        && !raw_path.starts_with('/')
+        && !raw_path.contains('/')
+        && raw_path != "."
+        && raw_path != ".."
+    {
+        if let Some(desc) = proc_fd::current_task_get_file_desc(dfd) {
+            if desc.inode.inode().is_dir() {
+                if let Err(e) = check_permission(desc.inode.inode(), MAY_WRITE) {
+                    return e as SyscallResult;
+                }
+                if let Err(e) = check_permission(desc.inode.inode(), MAY_EXEC) {
+                    return e as SyscallResult;
+                }
+                match desc.inode.mkdir(&raw_path) {
+                    Some(new_dir) => {
+                        let umask = if let Some(pid) = crate::process::scheduler::current_pid() {
+                            if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+                                task_arc.lock().umask
+                            } else {
+                                0o022
+                            }
+                        } else {
+                            0o022
+                        };
+                        let dir_mode = ((mode & 0x0FFF) & !umask) as u16;
+                        let _ = new_dir.set_permissions(dir_mode);
+                        let desc_path = desc.path.as_deref().unwrap_or("/");
+                        let joined = crate::fs::path::join(desc_path, &raw_path);
+                        crate::fs::vfs::invalidate_dentry(&joined);
+                        return 0;
+                    }
+                    None => return Errno::EIO.into(),
+                }
+            }
+        }
+    }
+
     let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
         Ok(path) => path,
         Err(e) => return e.into(),
@@ -2105,14 +2201,50 @@ pub fn sys_utimensat(
             Some(p) => p,
             None => return Errno::EFAULT.into(),
         };
-        let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dirfd, &raw_path) {
-            Ok(path) => path,
-            Err(e) => return e.into(),
+
+        let fast_child = if dirfd != -100
+            && !raw_path.starts_with('/')
+            && !raw_path.contains('/')
+            && raw_path != "."
+            && raw_path != ".."
+        {
+            if let Some(desc) = proc_fd::current_task_get_file_desc(dirfd) {
+                if desc.inode.inode().is_dir() {
+                    let follow_last = (flags & 0x100) == 0;
+                    if let Some(child) = desc.inode.lookup(&raw_path) {
+                        let is_sym = child.inode().file_type == FileType::Symlink;
+                        if !follow_last && is_sym {
+                            Some(child)
+                        } else if !is_sym {
+                            Some(child)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
         };
-        let follow_symlinks = (flags & 0x100) == 0; // AT_SYMLINK_NOFOLLOW = 0x100
-        match crate::fs::vfs::lookup_follow(&resolved_path, follow_symlinks) {
-            Some(i) => i,
-            None => return Errno::ENOENT.into(),
+
+        if let Some(child) = fast_child {
+            child
+        } else {
+            let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dirfd, &raw_path) {
+                Ok(path) => path,
+                Err(e) => return e.into(),
+            };
+            let follow_symlinks = (flags & 0x100) == 0; // AT_SYMLINK_NOFOLLOW = 0x100
+            match crate::fs::vfs::lookup_follow(&resolved_path, follow_symlinks) {
+                Some(i) => i,
+                None => return Errno::ENOENT.into(),
+            }
         }
     };
 

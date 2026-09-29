@@ -22,7 +22,7 @@ use crate::sync::spinlock::TicketLock;
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// A queue of task PIDs waiting for an event or resource.
 pub struct WaitQueue {
@@ -202,5 +202,49 @@ impl WaitQueue {
         if removed > 0 {
             self.waiter_count.fetch_sub(removed, Ordering::Release);
         }
+    }
+}
+
+/// A completion notification mechanism for `CLONE_VFORK` / `vfork`.
+///
+/// The parent process blocks until the child process either calls `execve`
+/// (releasing the shared address space) or terminates (`exit`).
+pub struct VforkCompletion {
+    completed: AtomicBool,
+    wait_queue: WaitQueue,
+}
+
+impl VforkCompletion {
+    /// Create a new vfork completion.
+    pub const fn new() -> Self {
+        Self {
+            completed: AtomicBool::new(false),
+            wait_queue: WaitQueue::new(),
+        }
+    }
+
+    /// Complete the vfork and wake the waiting parent.
+    pub fn complete(&self) {
+        self.completed.store(true, Ordering::Release);
+        self.wait_queue.wake_all();
+    }
+
+    /// Complete the vfork and wake the waiting parent while already holding the scheduler lock.
+    pub fn complete_locked(&self, sched: &mut scheduler::Scheduler) {
+        self.completed.store(true, Ordering::Release);
+        self.wait_queue.wake_all_locked(sched);
+    }
+
+    /// Wait until the child completes `execve` or exits.
+    pub fn wait(&self) {
+        while !self.completed.load(Ordering::Acquire) {
+            self.wait_queue.wait();
+        }
+    }
+}
+
+impl Default for VforkCompletion {
+    fn default() -> Self {
+        Self::new()
     }
 }

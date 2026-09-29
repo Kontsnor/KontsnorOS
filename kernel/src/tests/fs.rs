@@ -609,7 +609,7 @@ fn test_vfs_lookup_dcache_benchmark() {
 
 #[test_case]
 fn test_ext_readdir_streaming_benchmark() {
-    kprintln!("[test] Starting Ext4 zero-allocation streaming readdir benchmark test...");
+    crate::kprintln!("[test] Starting Ext4 zero-allocation streaming readdir benchmark test...");
 
     let dir_path = b"/disk/stream_bench_dir\0";
     let dir_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
@@ -693,7 +693,7 @@ fn test_ext_readdir_streaming_benchmark() {
     let _ = crate::syscall::fs::sys_close(dir_fd as i32);
 
     let stream_ms = (end_ticks_stream.saturating_sub(start_ticks_stream)) * 10;
-    kprintln!(
+    crate::kprintln!(
         "[test] Ext4 zero-allocation streaming readdir benchmark (100 iterations on {} entries): {} ms",
         entry_count,
         stream_ms
@@ -718,7 +718,7 @@ fn test_ext_readdir_streaming_benchmark() {
     crate::syscall::memory::sys_munmap(path_buf_addr, 4096);
     crate::syscall::memory::sys_munmap(dents_buf_addr, 4096);
 
-    kprintln!("[test] Ext4 zero-allocation streaming readdir benchmark test PASSED!");
+    crate::kprintln!("[test] Ext4 zero-allocation streaming readdir benchmark test PASSED!");
 }
 
 #[test_case]

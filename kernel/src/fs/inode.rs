@@ -182,19 +182,25 @@ pub const POLLOUT: u32 = 0x0004;
 pub const POLLERR: u32 = 0x0008;
 pub const POLLHUP: u32 = 0x0010;
 
-/// Check permission logic.
-pub fn check_permission(inode: &Inode, mask: u16) -> Result<(), Errno> {
-    let (euid, egid) = if let Some(pid) = crate::process::scheduler::current_pid() {
+/// Query the calling task's effective credentials (euid, egid).
+pub fn current_credentials() -> (u32, u32) {
+    if let Some(pid) = crate::process::scheduler::current_pid() {
         if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
             let task = task_arc.lock();
-            (task.euid, task.egid)
-        } else {
-            (0, 0)
+            return (task.euid, task.egid);
         }
-    } else {
-        (0, 0)
-    };
+    }
+    (0, 0)
+}
 
+/// Check permission logic against explicit credentials.
+#[inline(always)]
+pub fn check_permission_with_creds(
+    inode: &Inode,
+    mask: u16,
+    euid: u32,
+    egid: u32,
+) -> Result<(), Errno> {
     if euid == 0 {
         // Root Bypass
         if (mask & MAY_EXEC) != 0 && inode.file_type == FileType::Regular {
@@ -220,6 +226,12 @@ pub fn check_permission(inode: &Inode, mask: u16) -> Result<(), Errno> {
     }
 
     Err(Errno::EACCES)
+}
+
+/// Check permission logic.
+pub fn check_permission(inode: &Inode, mask: u16) -> Result<(), Errno> {
+    let (euid, egid) = current_credentials();
+    check_permission_with_creds(inode, mask, euid, egid)
 }
 
 /// Trait for inode operations — implemented by each filesystem.

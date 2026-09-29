@@ -259,11 +259,16 @@ impl Vfs {
             let mut i = 0;
             let mut symlink_target: Option<(String, String, Vec<&str>)> = None;
 
+            let (euid, egid) = crate::fs::inode::current_credentials();
+
             for component in components {
                 // Verify execute permission on the directory component before traversing/looking up the next one
-                if let Err(_) =
-                    crate::fs::inode::check_permission(current.inode(), crate::fs::inode::MAY_EXEC)
-                {
+                if let Err(_) = crate::fs::inode::check_permission_with_creds(
+                    current.inode(),
+                    crate::fs::inode::MAY_EXEC,
+                    euid,
+                    egid,
+                ) {
                     return None;
                 }
 
@@ -445,10 +450,15 @@ pub fn resolve_canonical(path: &str) -> Option<String> {
         let mut i = 0;
         let mut symlink_target: Option<(String, String, Vec<&str>)> = None;
 
+        let (euid, egid) = crate::fs::inode::current_credentials();
+
         for component in components {
-            if let Err(_) =
-                crate::fs::inode::check_permission(current.inode(), crate::fs::inode::MAY_EXEC)
-            {
+            if let Err(_) = crate::fs::inode::check_permission_with_creds(
+                current.inode(),
+                crate::fs::inode::MAY_EXEC,
+                euid,
+                egid,
+            ) {
                 return None;
             }
 

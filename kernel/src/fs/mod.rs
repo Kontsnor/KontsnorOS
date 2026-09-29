@@ -138,7 +138,7 @@ pub fn init() {
 
         let cached_drive = alloc::sync::Arc::new(crate::drivers::block::cache::BlockCache::new(
             nvme_drive.clone(),
-            2048,
+            16384,
         ));
         if let Ok(ext_fs) = ext::ExtFileSystem::mount(cached_drive) {
             vfs::mount(alloc::string::String::from("/disk"), ext_fs.clone());

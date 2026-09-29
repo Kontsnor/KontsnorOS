@@ -184,16 +184,21 @@ fn test_socket_read_wait_queue_hoist() {
 
     // Verify non-blocking read returns -EAGAIN (-11)
     let res = sock_inode.read(0, &mut buf);
-    assert_eq!(res, Err(-11), "Non-blocking empty read must return -EAGAIN (-11)");
+    assert_eq!(
+        res,
+        Err(-11),
+        "Non-blocking empty read must return -EAGAIN (-11)"
+    );
 
     // Populate data into tcp_recv_buf
     {
         let mut s = sock.lock();
-        s.tcp_recv_buf.extend_from_slice(b"benchmark_socket_read_data");
+        s.tcp_recv_buf
+            .extend_from_slice(b"benchmark_socket_read_data");
     }
 
     // Measure time/cycles for repeated non-blocking reads or populated reads
-    let start_ticks = crate::arch::x86_64::time::rdtsc();
+    let start_ticks = unsafe { core::arch::x86_64::_rdtsc() };
     const ITERATIONS: usize = 10_000;
     for _ in 0..ITERATIONS {
         {
@@ -205,7 +210,7 @@ fn test_socket_read_wait_queue_hoist() {
         let read_res = sock_inode.read(0, &mut buf);
         assert!(read_res.is_ok());
     }
-    let end_ticks = crate::arch::x86_64::time::rdtsc();
+    let end_ticks = unsafe { core::arch::x86_64::_rdtsc() };
     let elapsed_ticks = end_ticks.saturating_sub(start_ticks);
 
     kprintln!(

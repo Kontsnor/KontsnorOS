@@ -59,6 +59,18 @@ pub fn current_fs_ctx() -> Option<Arc<spin::RwLock<crate::fs::namespace::FsConte
     CURRENT_FS_CTX[core_id].read().clone()
 }
 
+/// Borrow the active `FsContext` for the calling CPU core without atomic Arc refcount increments.
+pub fn with_current_fs_ctx<R>(f: impl FnOnce(&crate::fs::namespace::FsContext) -> R) -> Option<R> {
+    let core_id = (crate::arch::x86_64::smp::current_lapic_id() as usize) % 32;
+    let slot = CURRENT_FS_CTX[core_id].read();
+    if let Some(ref fs_ctx_arc) = *slot {
+        let guard = fs_ctx_arc.read();
+        Some(f(&guard))
+    } else {
+        None
+    }
+}
+
 /// Update the active `FsContext` for `core_id`.
 pub fn set_current_fs_ctx(
     core_id: usize,

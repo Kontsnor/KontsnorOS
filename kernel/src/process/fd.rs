@@ -26,10 +26,13 @@ pub fn get_fd_offset(fd: i32) -> Option<u64> {
         return None;
     }
     let fd_idx = fd as usize;
-    scheduler::with_current_fd_table(|fd_table| {
-        let file_desc = fd_table.entries.get(fd_idx)?.as_ref()?;
-        Some(*file_desc.offset.lock())
-    })
+    let current_pid = scheduler::current_pid()?;
+    let task_arc = scheduler::get_task_arc(current_pid)?;
+    let task = task_arc.lock();
+    let fd_table = task.fd_table.lock();
+    let file_desc = fd_table.entries.get(fd_idx)?.as_ref()?;
+    let offset = *file_desc.offset.lock();
+    Some(offset)
 }
 
 /// Set the file seek offset for descriptor `fd`.
@@ -38,11 +41,13 @@ pub fn set_fd_offset(fd: i32, offset: u64) -> Option<()> {
         return None;
     }
     let fd_idx = fd as usize;
-    scheduler::with_current_fd_table(|fd_table| {
-        let file_desc = fd_table.entries.get(fd_idx)?.as_ref()?;
-        *file_desc.offset.lock() = offset;
-        Some(())
-    })
+    let current_pid = scheduler::current_pid()?;
+    let task_arc = scheduler::get_task_arc(current_pid)?;
+    let task = task_arc.lock();
+    let fd_table = task.fd_table.lock();
+    let file_desc = fd_table.entries.get(fd_idx)?.as_ref()?;
+    *file_desc.offset.lock() = offset;
+    Some(())
 }
 
 /// Retrieve a clone of the inode backing file descriptor `fd` in the
@@ -52,13 +57,15 @@ pub fn current_task_read_fd(fd: i32) -> Option<Arc<dyn InodeOps>> {
         return None;
     }
     let fd_idx = fd as usize;
-    scheduler::with_current_fd_table(|fd_table| {
-        fd_table
-            .entries
-            .get(fd_idx)?
-            .as_ref()
-            .map(|desc| desc.inode.clone())
-    })
+    let current_pid = scheduler::current_pid()?;
+    let task_arc = scheduler::get_task_arc(current_pid)?;
+    let task = task_arc.lock();
+    let fd_table = task.fd_table.lock();
+    fd_table
+        .entries
+        .get(fd_idx)?
+        .as_ref()
+        .map(|desc| desc.inode.clone())
 }
 
 /// Retrieve a clone of the FileDescription backing file descriptor `fd`
@@ -68,7 +75,11 @@ pub fn current_task_get_file_desc(fd: i32) -> Option<Arc<FileDescription>> {
         return None;
     }
     let fd_idx = fd as usize;
-    scheduler::with_current_fd_table(|fd_table| fd_table.entries.get(fd_idx)?.as_ref().cloned())
+    let current_pid = scheduler::current_pid()?;
+    let task_arc = scheduler::get_task_arc(current_pid)?;
+    let task = task_arc.lock();
+    let fd_table = task.fd_table.lock();
+    fd_table.entries.get(fd_idx)?.as_ref().cloned()
 }
 
 /// Allocate the next free file descriptor slot in the current task's fd_table
@@ -156,19 +167,31 @@ pub fn current_task_close_fd(fd: i32) -> bool {
         return false;
     }
     let fd_idx = fd as usize;
-    let desc = scheduler::with_current_fd_table(|fd_table| {
-        if fd_idx < fd_table.entries.len() && fd_table.entries[fd_idx].is_some() {
-            if fd_idx < fd_table.cloexec.len() {
-                fd_table.cloexec[fd_idx] = false;
-            }
-            if fd_idx < fd_table.next_free_fd {
-                fd_table.next_free_fd = fd_idx;
-            }
-            fd_table.entries[fd_idx].take()
-        } else {
-            None
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return false,
+    };
+    let task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return false,
+    };
+    let task = task_arc.lock();
+    let mut fd_table = task.fd_table.lock();
+
+    let desc = if fd_idx < fd_table.entries.len() && fd_table.entries[fd_idx].is_some() {
+        if fd_idx < fd_table.cloexec.len() {
+            fd_table.cloexec[fd_idx] = false;
         }
-    });
+        if fd_idx < fd_table.next_free_fd {
+            fd_table.next_free_fd = fd_idx;
+        }
+        fd_table.entries[fd_idx].take()
+    } else {
+        None
+    };
+
+    drop(fd_table);
+    drop(task); // Drop the task lock before dropping the desc (which might trigger Drop calling flush_all_for_inode)
 
     if let Some(desc) = desc {
         let mut rc = desc.ref_count.lock();

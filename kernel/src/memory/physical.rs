@@ -49,18 +49,18 @@ pub static FRAME_REFS: [AtomicU8; MAX_FRAMES] = {
 
 /// Increment the reference count of a physical frame.
 pub fn increment_ref(phys_addr: u64) {
-    let index = (phys_addr / PAGE_SIZE as u64) as usize;
+    let index = (phys_addr >> 12) as usize;
     if index < MAX_FRAMES {
-        FRAME_REFS[index].fetch_add(1, Ordering::SeqCst);
+        FRAME_REFS[index].fetch_add(1, Ordering::Relaxed);
     }
 }
 
 /// Decrement the reference count of a physical frame.
 /// Returns the new reference count.
 pub fn decrement_ref(phys_addr: u64) -> u8 {
-    let index = (phys_addr / PAGE_SIZE as u64) as usize;
+    let index = (phys_addr >> 12) as usize;
     if index < MAX_FRAMES {
-        let mut old = FRAME_REFS[index].load(Ordering::SeqCst);
+        let mut old = FRAME_REFS[index].load(Ordering::Relaxed);
         loop {
             if old == 0 {
                 return 0;
@@ -68,10 +68,17 @@ pub fn decrement_ref(phys_addr: u64) -> u8 {
             match FRAME_REFS[index].compare_exchange(
                 old,
                 old - 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
+                Ordering::Release,
+                Ordering::Relaxed,
             ) {
-                Ok(_) => return old - 1,
+                Ok(_) => {
+                    let new_ref = old - 1;
+                    if new_ref == 0 {
+                        // Synchronize prior writes from other cores when refcount drops to 0.
+                        core::sync::atomic::fence(Ordering::Acquire);
+                    }
+                    return new_ref;
+                }
                 Err(actual) => old = actual,
             }
         }
@@ -168,40 +175,51 @@ impl FrameAllocator {
         let mut searched = 0;
         let mut index = self.next_free_hint;
         while searched < MAX_FRAMES {
-            // Try to scan 64 frames (8 bytes) at once when 64-frame aligned and within MAX_FRAMES
-            if index % 64 == 0 && index + 64 <= MAX_FRAMES && searched + 64 <= MAX_FRAMES {
-                let byte_idx = index / 8;
-                if byte_idx + 8 <= self.bitmap.len() {
-                    let bytes = &self.bitmap[byte_idx..byte_idx + 8];
-                    let val = u64::from_ne_bytes(bytes.try_into().unwrap());
-                    if val == u64::MAX {
-                        // Fast path: All 64 frames in this word are allocated
-                        index = (index + 64) % MAX_FRAMES;
-                        searched += 64;
-                        continue;
-                    } else {
-                        // Fast path: At least one frame is free in this word.
-                        // Compute exact free bit index in O(1) time using (!val).trailing_zeros(),
-                        // which maps directly to the x86 hardware instruction TZCNT/BSF.
-                        let free_bit = (!val).trailing_zeros() as usize;
-                        let free_frame_index = index + free_bit;
-                        if free_frame_index < MAX_FRAMES {
-                            self.mark_used(free_frame_index);
-                            self.allocated_frames += 1;
-                            self.next_free_hint = (free_frame_index + 1) % MAX_FRAMES;
-                            return Some(free_frame_index as u64 * PAGE_SIZE as u64);
-                        }
+            let byte_idx = (index / 64) * 8;
+            if byte_idx + 8 <= self.bitmap.len() {
+                let bit_offset = index % 64;
+                let bytes = &self.bitmap[byte_idx..byte_idx + 8];
+                let val = u64::from_ne_bytes(bytes.try_into().unwrap());
+
+                // Mask out bits prior to bit_offset so they are treated as already allocated.
+                let mask = if bit_offset == 0 {
+                    0
+                } else {
+                    (1u64 << bit_offset) - 1
+                };
+                let masked_val = val | mask;
+
+                if masked_val == u64::MAX {
+                    // All remaining frames in this 64-frame word are allocated. Advance to next word.
+                    let advance = 64 - bit_offset;
+                    searched += advance;
+                    index = (index + advance) % MAX_FRAMES;
+                } else {
+                    // At least one frame >= index is free in this word.
+                    // Compute exact free bit index in O(1) time using (!masked_val).trailing_zeros(),
+                    // which maps directly to the x86 TZCNT/BSF hardware instruction.
+                    let free_bit = (!masked_val).trailing_zeros() as usize;
+                    let free_frame_index = (index / 64) * 64 + free_bit;
+                    if free_frame_index < MAX_FRAMES {
+                        self.mark_used(free_frame_index);
+                        self.allocated_frames += 1;
+                        self.next_free_hint = (free_frame_index + 1) % MAX_FRAMES;
+                        return Some(free_frame_index as u64 * PAGE_SIZE as u64);
                     }
+                    let advance = 64 - bit_offset;
+                    searched += advance;
+                    index = (index + advance) % MAX_FRAMES;
                 }
+            } else {
+                if self.is_free(index) {
+                    self.mark_used(index);
+                    self.allocated_frames += 1;
+                    self.next_free_hint = (index + 1) % MAX_FRAMES;
+                    return Some(index as u64 * PAGE_SIZE as u64);
+                }
+                searched += 1;
+                index = (index + 1) % MAX_FRAMES;
             }
-            if self.is_free(index) {
-                self.mark_used(index);
-                self.allocated_frames += 1;
-                self.next_free_hint = (index + 1) % MAX_FRAMES;
-                return Some(index as u64 * PAGE_SIZE as u64);
-            }
-            index = (index + 1) % MAX_FRAMES;
-            searched += 1;
         }
 
         None // Out of memory
@@ -209,7 +227,7 @@ impl FrameAllocator {
 
     /// Free a previously allocated frame.
     fn deallocate(&mut self, phys_addr: u64) {
-        let frame_index = (phys_addr / PAGE_SIZE as u64) as usize;
+        let frame_index = (phys_addr >> 12) as usize;
         if frame_index < MAX_FRAMES && !self.is_free(frame_index) {
             self.mark_free(frame_index);
             self.allocated_frames -= 1;
@@ -223,7 +241,7 @@ impl FrameAllocator {
 }
 
 fn reserve_page_table_frame(paddr: u64, allocator: &mut FrameAllocator) {
-    let frame_index = (paddr / PAGE_SIZE as u64) as usize;
+    let frame_index = (paddr >> 12) as usize;
     if frame_index < MAX_FRAMES {
         allocator.mark_used(frame_index);
     }
@@ -352,7 +370,7 @@ pub fn allocate_frame() -> Option<u64> {
                 let frame = cache.frames[cache.count];
                 #[cfg(debug_assertions)]
                 {
-                    let idx = (frame / PAGE_SIZE as u64) as usize;
+                    let idx = (frame >> 12) as usize;
                     debug_assert!(
                         !FRAME_ALLOCATOR.lock().is_free(idx),
                         "Frame {:#x} popped from core cache was already free in global bitmap (potential double-free)",
@@ -389,9 +407,9 @@ pub fn allocate_frame() -> Option<u64> {
     };
 
     if let Some(f) = frame {
-        let idx = (f / PAGE_SIZE as u64) as usize;
+        let idx = (f >> 12) as usize;
         if idx < MAX_FRAMES {
-            FRAME_REFS[idx].store(1, Ordering::SeqCst);
+            FRAME_REFS[idx].store(1, Ordering::Relaxed);
         }
     }
     frame
@@ -406,9 +424,9 @@ pub fn allocate_frame() -> Option<u64> {
 /// - The frame is no longer in use by any page table or data structure
 /// - The frame is not freed more than once
 pub fn deallocate_frame(phys_addr: u64) {
-    let frame_index = (phys_addr / PAGE_SIZE as u64) as usize;
+    let frame_index = (phys_addr >> 12) as usize;
     if frame_index < MAX_FRAMES {
-        let mut old = FRAME_REFS[frame_index].load(Ordering::SeqCst);
+        let mut old = FRAME_REFS[frame_index].load(Ordering::Relaxed);
         let mut new_val;
         loop {
             if old == 0 {
@@ -418,8 +436,8 @@ pub fn deallocate_frame(phys_addr: u64) {
             match FRAME_REFS[frame_index].compare_exchange(
                 old,
                 new_val,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
+                Ordering::Release,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => break,
                 Err(actual) => old = actual,
@@ -429,6 +447,8 @@ pub fn deallocate_frame(phys_addr: u64) {
             // Still referenced by other page tables. Do not reclaim yet!
             return;
         }
+        // Synchronize prior writes from other cores when refcount drops to 0.
+        core::sync::atomic::fence(Ordering::Acquire);
     }
 
     let apic_id = crate::arch::x86_64::smp::current_lapic_id() as usize;

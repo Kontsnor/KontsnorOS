@@ -209,9 +209,15 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut CpuContext, _new_ctx: *co
         "mov r11, [rsi + 0x48]", // r11 = new CR3
         "mov rax, [rsi + 0x50]", // rax = new FS_BASE
         "mov rdx, [rsi + 0x60]", // rdx = new KERNEL_GS_BASE
-        // 2. Switch CR3 page table (all values are already safely in CPU registers)
+        // 2. Switch CR3 page table only if changed (all values are already safely in CPU registers)
+        // Writing to CR3 unconditionally flushes all non-global TLB entries on x86_64.
+        // If the new task shares the current address space (e.g. threads within the same process
+        // or kernel-level contexts), skipping the reload preserves active TLB mappings and saves hundreds of cycles.
         "test r11, r11",
         "jz 4f",
+        "mov rcx, cr3",
+        "cmp rcx, r11",
+        "je 4f",
         "mov cr3, r11",
         "4:",
         // 3. Switch to the new stack (now mapped in the new address space)

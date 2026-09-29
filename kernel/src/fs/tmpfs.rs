@@ -128,9 +128,9 @@ impl InodeOps for TmpFsDir {
 
     fn create(&self, name: &str, file_type: FileType) -> Option<Arc<dyn InodeOps>> {
         let node: Arc<dyn InodeOps> = match file_type {
-            FileType::Regular => Arc::new(TmpFsFile {
+            FileType::Regular | FileType::Symlink => Arc::new(TmpFsFile {
                 inode: core::cell::UnsafeCell::new(
-                    Inode::new(alloc_ino(), FileType::Regular).with_dev(TMPFS_DEV_ID),
+                    Inode::new(alloc_ino(), file_type).with_dev(TMPFS_DEV_ID),
                 ),
                 data: RwLock::new(Vec::new()),
             }),

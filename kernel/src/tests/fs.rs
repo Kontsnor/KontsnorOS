@@ -17,8 +17,6 @@
 
 use crate::kprintln;
 
-use crate::kprintln;
-
 #[test_case]
 fn test_vfs_path_resolution() {
     // Lookup non-existent path
@@ -665,9 +663,6 @@ fn test_vfs_resolve_relative_path_benchmark() {
         iterations,
         cycles_per_resolve
     );
-}
-
-#[test_case]
 }
 
 #[test_case]

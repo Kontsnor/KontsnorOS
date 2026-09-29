@@ -215,17 +215,6 @@ impl Vfs {
     /// Lookup an inode by path, optionally following symlinks.
     pub fn lookup_follow(&self, path: &str, follow_last: bool) -> Option<Arc<dyn InodeOps>> {
         let mut resolved_path = resolve_relative_path(path);
-
-        // Fast path: check if the full resolved path is already in the dentry cache
-        {
-            let cache = self.dentry_cache.read();
-            if let Some(inode) = cache.get(resolved_path.as_str()) {
-                if inode.inode().file_type != FileType::Symlink || !follow_last {
-                    return Some(inode.clone());
-                }
-            }
-        }
-
         let mut symlink_count = 0;
 
         loop {

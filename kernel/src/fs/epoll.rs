@@ -33,10 +33,16 @@ pub struct EpollEvent {
     pub data: u64,
 }
 
+/// A monitored file descriptor entry in an epoll instance.
+pub struct EpollItem {
+    pub event: EpollEvent,
+    pub inode: Arc<dyn InodeOps>,
+    pub last_ready: u32,
+}
+
 pub struct EpollInstance {
     inode: Inode,
-    pub monitored: Mutex<BTreeMap<i32, EpollEvent>>,
-    pub last_ready: Mutex<BTreeMap<i32, u32>>,
+    pub items: Mutex<BTreeMap<i32, EpollItem>>,
     pub wait_queue: Arc<WaitQueue>,
 }
 
@@ -46,8 +52,7 @@ impl EpollInstance {
         register_epoll_wait_queue(&wq);
         Self {
             inode: Inode::new(0, FileType::Regular),
-            monitored: Mutex::new(BTreeMap::new()),
-            last_ready: Mutex::new(BTreeMap::new()),
+            items: Mutex::new(BTreeMap::new()),
             wait_queue: wq,
         }
     }
@@ -209,12 +214,18 @@ pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const EpollEvent) -> S
                 return Errno::EFAULT.into();
             }
             let ev = unsafe { *event };
-            let mut monitored = epoll.monitored.lock();
-            if monitored.contains_key(&fd) {
+            let mut items = epoll.items.lock();
+            if items.contains_key(&fd) {
                 return Errno::EEXIST.into();
             }
-            monitored.insert(fd, ev);
-            epoll.last_ready.lock().insert(fd, 0);
+            items.insert(
+                fd,
+                EpollItem {
+                    event: ev,
+                    inode: target_inode.clone(),
+                    last_ready: 0,
+                },
+            );
             if let Some(target_wq) = target_inode.wait_queue() {
                 target_wq.add_listener(&epoll.wait_queue);
             }
@@ -222,12 +233,10 @@ pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const EpollEvent) -> S
         }
         2 => {
             // EPOLL_CTL_DEL
-            let mut monitored = epoll.monitored.lock();
-            if !monitored.contains_key(&fd) {
+            let mut items = epoll.items.lock();
+            if items.remove(&fd).is_none() {
                 return Errno::ENOENT.into();
             }
-            monitored.remove(&fd);
-            epoll.last_ready.lock().remove(&fd);
             if let Some(target_wq) = target_inode.wait_queue() {
                 target_wq.remove_listener(&epoll.wait_queue);
             }
@@ -245,13 +254,14 @@ pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const EpollEvent) -> S
                 return Errno::EFAULT.into();
             }
             let ev = unsafe { *event };
-            let mut monitored = epoll.monitored.lock();
-            if !monitored.contains_key(&fd) {
-                return Errno::ENOENT.into();
+            let mut items = epoll.items.lock();
+            if let Some(item) = items.get_mut(&fd) {
+                item.event = ev;
+                item.last_ready = 0;
+                0
+            } else {
+                Errno::ENOENT.into()
             }
-            monitored.insert(fd, ev);
-            epoll.last_ready.lock().insert(fd, 0);
-            0
         }
         _ => Errno::EINVAL.into(),
     }
@@ -304,42 +314,39 @@ pub fn sys_epoll_wait(
     loop {
         ready_list.clear();
         {
-            let monitored = epoll.monitored.lock();
-            let mut last_ready = epoll.last_ready.lock();
+            let mut items = epoll.items.lock();
 
-            for (&fd, &ev) in monitored.iter() {
-                if let Some(inode) = crate::process::fd::current_task_read_fd(fd) {
-                    // Query readiness using the generalized poll method
-                    let current_poll = inode.poll(ev.events);
-                    let matched_ready = current_poll
-                        & (ev.events | crate::fs::inode::POLLHUP | crate::fs::inode::POLLERR);
+            for (_fd, item) in items.iter_mut() {
+                // Query readiness using the generalized poll method on cached inode
+                let current_poll = item.inode.poll(item.event.events);
+                let matched_ready = current_poll
+                    & (item.event.events | crate::fs::inode::POLLHUP | crate::fs::inode::POLLERR);
 
-                    if matched_ready != 0 {
-                        let is_et = (ev.events & EPOLLET) != 0;
-                        let last_ready_mask = last_ready.get(&fd).cloned().unwrap_or(0);
+                if matched_ready != 0 {
+                    let is_et = (item.event.events & EPOLLET) != 0;
 
-                        if is_et {
-                            // Edge-Triggered: Report only if it transitioned to ready or new events arose
-                            let newly_ready = matched_ready & !last_ready_mask;
-                            if newly_ready != 0 {
-                                ready_list.push(EpollEvent {
-                                    events: matched_ready,
-                                    data: ev.data,
-                                });
-                            }
-                        } else {
-                            // Level-Triggered: Report as long as matching flags are active
+                    if is_et {
+                        // Edge-Triggered: Report only if it transitioned to ready or new events arose
+                        let newly_ready = matched_ready & !item.last_ready;
+                        if newly_ready != 0 {
                             ready_list.push(EpollEvent {
                                 events: matched_ready,
-                                data: ev.data,
+                                data: item.event.data,
                             });
                         }
-                        last_ready.insert(fd, matched_ready);
                     } else {
-                        // Reset last ready mask if it goes back to 0
-                        last_ready.insert(fd, 0);
+                        // Level-Triggered: Report as long as matching flags are active
+                        ready_list.push(EpollEvent {
+                            events: matched_ready,
+                            data: item.event.data,
+                        });
                     }
+                    item.last_ready = matched_ready;
+                } else {
+                    // Reset last ready mask if it goes back to 0
+                    item.last_ready = 0;
                 }
+
                 if ready_list.len() >= maxevents as usize {
                     break;
                 }

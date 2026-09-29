@@ -15,6 +15,8 @@
 
 //! Filesystem and VFS unit & regression tests.
 
+use crate::kprintln;
+
 #[test_case]
 fn test_vfs_path_resolution() {
     // Lookup non-existent path
@@ -607,8 +609,62 @@ fn test_vfs_lookup_dcache_benchmark() {
     let _ = tmp_dir.rmdir("bench_dir");
 }
 
+#[test_case]
+fn test_vfs_symlink_resolution_benchmark() {
+    let tmp_dir = crate::fs::vfs::lookup("/tmp").expect("Failed to lookup /tmp");
+    let test_dir = tmp_dir
+        .mkdir("symlink_bench_dir")
+        .expect("Failed to create /tmp/symlink_bench_dir");
+
+    let target_file = test_dir
+        .create("target.txt", crate::fs::inode::FileType::Regular)
+        .expect("Failed to create /tmp/symlink_bench_dir/target.txt");
+    let test_data = b"Symlink Benchmark Data";
+    let _ = target_file.write(0, test_data);
+
+    // Create symlink: /tmp/symlink_bench_dir/link.txt -> target.txt
+    let link_inode = test_dir
+        .create("link.txt", crate::fs::inode::FileType::Symlink)
+        .expect("Failed to create symlink");
+    let _ = link_inode.write(0, b"target.txt");
+
+    // Warm up / verify symlink resolution
+    crate::fs::vfs::invalidate_dentry("/tmp/symlink_bench_dir/link.txt");
+    let resolved = crate::fs::vfs::lookup_follow("/tmp/symlink_bench_dir/link.txt", true)
+        .expect("Symlink resolution failed");
+    let mut read_buf = [0u8; 32];
+    let n = resolved.read(0, &mut read_buf).expect("Read failed");
+    assert_eq!(&read_buf[..n], test_data);
+
+    // Benchmark symlink lookup resolution with dcache invalidation
+    let iterations = 100;
+    let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    for _ in 0..iterations {
+        crate::fs::vfs::invalidate_dentry("/tmp/symlink_bench_dir/link.txt");
+        let node = crate::fs::vfs::lookup_follow("/tmp/symlink_bench_dir/link.txt", true);
+        core::hint::black_box(node);
+    }
+    let end_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let elapsed_tsc = end_tsc - start_tsc;
+    let cycles_per_lookup = elapsed_tsc / iterations;
+
+    crate::kprintln!(
+        "[bench] VFS symlink resolution (uncached): {} total cycles for {} iterations (avg {} cycles/lookup)",
+        elapsed_tsc,
+        iterations,
+        cycles_per_lookup
+    );
+
+    let _ = test_dir.unlink("link.txt");
+    let _ = test_dir.unlink("target.txt");
+    let _ = tmp_dir.rmdir("symlink_bench_dir");
+}
+
+#[test_case]
+}
+
 fn test_ext_readdir_streaming_benchmark() {
-    kprintln!("[test] Starting Ext4 zero-allocation streaming readdir benchmark test...");
+    crate::kprintln!("[test] Starting Ext4 zero-allocation streaming readdir benchmark test...");
 
     let dir_path = b"/disk/stream_bench_dir\0";
     let dir_addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0) as u64;
@@ -692,7 +748,7 @@ fn test_ext_readdir_streaming_benchmark() {
     let _ = crate::syscall::fs::sys_close(dir_fd as i32);
 
     let stream_ms = (end_ticks_stream.saturating_sub(start_ticks_stream)) * 10;
-    kprintln!(
+    crate::kprintln!(
         "[test] Ext4 zero-allocation streaming readdir benchmark (100 iterations on {} entries): {} ms",
         entry_count,
         stream_ms
@@ -717,5 +773,134 @@ fn test_ext_readdir_streaming_benchmark() {
     crate::syscall::memory::sys_munmap(path_buf_addr, 4096);
     crate::syscall::memory::sys_munmap(dents_buf_addr, 4096);
 
-    kprintln!("[test] Ext4 zero-allocation streaming readdir benchmark test PASSED!");
+    crate::kprintln!("[test] Ext4 zero-allocation streaming readdir benchmark test PASSED!");
+}
+
+#[test_case]
+fn test_readv_writev_optimization_and_benchmark() {
+    use crate::syscall::fs::{sys_close, sys_open, sys_readv, sys_writev, IoVec};
+    use crate::syscall::Errno;
+
+    crate::kprintln!(
+        "[test] Starting readv/writev stack allocation optimization & benchmark test..."
+    );
+
+    // Create a temporary file
+    let path = b"/tmp/test_iovec_opt.txt\0";
+    let fd = sys_open(path.as_ptr(), 0o102, 0o644); // O_CREAT | O_RDWR
+    assert!(fd >= 0, "Failed to open temporary file for writev test");
+    let fd = fd as i32;
+
+    // 1. Edge Case: Invalid iovcnt (<0, 0, >1024)
+    let dummy_iov = IoVec {
+        iov_base: core::ptr::null(),
+        iov_len: 0,
+    };
+    assert_eq!(sys_writev(fd, &dummy_iov, 0), Errno::EINVAL as i64);
+    assert_eq!(sys_writev(fd, &dummy_iov, -1), Errno::EINVAL as i64);
+    assert_eq!(sys_writev(fd, &dummy_iov, 1025), Errno::EINVAL as i64);
+
+    // 2. Edge Case: Null or invalid user pointer
+    assert_eq!(sys_writev(fd, core::ptr::null(), 2), Errno::EINVAL as i64);
+
+    // 3. Edge Case: Integer overflow of total iov_len (> isize::MAX)
+    let overflow_iovs = [
+        IoVec {
+            iov_base: 0x1000 as *const u8,
+            iov_len: isize::MAX as usize,
+        },
+        IoVec {
+            iov_base: 0x2000 as *const u8,
+            iov_len: 100,
+        },
+    ];
+    assert_eq!(
+        sys_writev(fd, overflow_iovs.as_ptr(), 2),
+        Errno::EINVAL as i64
+    );
+
+    // 4. Functionality test: Stack fast-path writev (3 vectors <= UIO_FASTIOV)
+    let buf1 = b"Hello, ";
+    let buf2 = b"writev ";
+    let buf3 = b"fast-path!";
+    let fast_iovs = [
+        IoVec {
+            iov_base: buf1.as_ptr(),
+            iov_len: buf1.len(),
+        },
+        IoVec {
+            iov_base: buf2.as_ptr(),
+            iov_len: buf2.len(),
+        },
+        IoVec {
+            iov_base: buf3.as_ptr(),
+            iov_len: buf3.len(),
+        },
+    ];
+
+    let written = sys_writev(fd, fast_iovs.as_ptr(), 3);
+    let expected_len = (buf1.len() + buf2.len() + buf3.len()) as i64;
+    assert_eq!(written, expected_len, "sys_writev fast-path short write");
+
+    // Rewind file offset
+    assert_eq!(crate::syscall::fs::sys_lseek(fd, 0, 0), 0);
+
+    // 5. Functionality test: Stack fast-path readv (3 vectors <= UIO_FASTIOV)
+    let mut read_buf1 = [0u8; 7];
+    let mut read_buf2 = [0u8; 7];
+    let mut read_buf3 = [0u8; 10];
+    let read_iovs = [
+        IoVec {
+            iov_base: read_buf1.as_mut_ptr(),
+            iov_len: read_buf1.len(),
+        },
+        IoVec {
+            iov_base: read_buf2.as_mut_ptr(),
+            iov_len: read_buf2.len(),
+        },
+        IoVec {
+            iov_base: read_buf3.as_mut_ptr(),
+            iov_len: read_buf3.len(),
+        },
+    ];
+
+    let nread = sys_readv(fd, read_iovs.as_ptr(), 3);
+    assert_eq!(nread, expected_len, "sys_readv fast-path short read");
+    assert_eq!(&read_buf1, buf1);
+    assert_eq!(&read_buf2, buf2);
+    assert_eq!(&read_buf3, buf3);
+
+    // 6. Functionality test: Heap fallback (> UIO_FASTIOV = 8, e.g., 10 vectors)
+    assert_eq!(crate::syscall::fs::sys_lseek(fd, 0, 0), 0);
+    let chunk = b"X";
+    let heap_iovs = [IoVec {
+        iov_base: chunk.as_ptr(),
+        iov_len: chunk.len(),
+    }; 10];
+
+    let written_heap = sys_writev(fd, heap_iovs.as_ptr(), 10);
+    assert_eq!(written_heap, 10);
+
+    // 7. Micro-benchmark: Measure TSC cycles for small writev calls
+    let iterations = 10_000;
+    let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    for _ in 0..iterations {
+        let ret = sys_writev(fd, fast_iovs.as_ptr(), 3);
+        core::hint::black_box(ret);
+    }
+    let end_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let total_cycles = end_tsc - start_tsc;
+    let avg_cycles = total_cycles / iterations;
+
+    crate::kprintln!(
+        "[bench] sys_writev fast-path (3 iovecs): {} total cycles across {} calls (avg {} cycles/call)",
+        total_cycles,
+        iterations,
+        avg_cycles
+    );
+
+    let _ = sys_close(fd);
+    let _ = crate::syscall::fs::sys_unlink(path.as_ptr());
+
+    crate::kprintln!("[test] readv/writev stack allocation optimization & benchmark test PASSED!");
 }

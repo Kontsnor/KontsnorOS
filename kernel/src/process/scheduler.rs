@@ -755,39 +755,39 @@ pub fn schedule() {
         // If the current task is already locked by the interrupted thread on this core,
         // we cannot safely reschedule. Skip this tick.
         let current_idx = current_pid.as_u64() as usize;
-        {
-            let tasks = TASKS.read();
-            if let Some(Some(current_task_arc)) = tasks.get(current_idx) {
-                if current_task_arc.try_lock().is_none() {
+
+        // Retrieve current task and verify it is not locked by the interrupted thread on this core.
+        // Acquire TASKS once to resolve both current and next tasks, eliminating multiple lock passes.
+        let tasks = TASKS.read();
+        let current_task_arc = match tasks.get(current_idx).and_then(|t| t.clone()) {
+            Some(arc) => {
+                if arc.try_lock().is_none() {
                     return;
                 }
+                Some(arc)
             }
-        }
+            None => None,
+        };
 
         // Pick the next task to run
-        let next_pid = match scheduler.pick_next() {
+        let (next_pid, next_task_arc) = match scheduler.pick_next() {
             Some((pid, prio)) => {
                 let next_idx = pid.as_u64() as usize;
-                let tasks = TASKS.read();
-                let is_locked = if let Some(Some(next_task_arc)) = tasks.get(next_idx) {
-                    next_task_arc.try_lock().is_none()
-                } else {
-                    false
+                let arc = match tasks.get(next_idx).and_then(|t| t.clone()) {
+                    Some(arc) => arc,
+                    None => return,
                 };
-                if is_locked {
+                if arc.try_lock().is_none() {
                     let prio_idx = prio as usize;
                     scheduler.queues[prio_idx].push_back(pid);
                     return;
                 }
-                pid
+                (pid, arc)
             }
             None => {
                 // No other ready tasks; keep running current if it's still runnable
-                let current_idx = current_pid.as_u64() as usize;
-                let tasks = TASKS.read();
-
-                if let Some(Some(current_task_arc)) = tasks.get(current_idx) {
-                    let mut current_task = current_task_arc.lock();
+                if let Some(ref current_arc) = current_task_arc {
+                    let mut current_task = current_arc.lock();
                     if current_task.state == TaskState::Running
                         || current_task.state == TaskState::Ready
                     {
@@ -798,35 +798,26 @@ pub fn schedule() {
                 }
 
                 // Otherwise, switch to this core's idle task
-                scheduler.idle_cpus[apic_id]
+                let idle_pid = scheduler.idle_cpus[apic_id];
+                let idle_idx = idle_pid.as_u64() as usize;
+                let arc = match tasks.get(idle_idx).and_then(|t| t.clone()) {
+                    Some(arc) => arc,
+                    None => return,
+                };
+                (idle_pid, arc)
             }
         };
+
+        // Release TASKS read lock immediately once both Arcs are held
+        drop(tasks);
 
         if next_pid == current_pid {
             // Restore current task's state to Running if it was set to Ready
-            let current_idx = current_pid.as_u64() as usize;
-            let tasks = TASKS.read();
-            if let Some(Some(current_task_arc)) = tasks.get(current_idx) {
-                current_task_arc.lock().state = TaskState::Running;
+            if let Some(ref current_arc) = current_task_arc {
+                current_arc.lock().state = TaskState::Running;
             }
             return; // No switch needed
         }
-
-        // Prepare for switch
-        let current_idx = current_pid.as_u64() as usize;
-        let next_idx = next_pid.as_u64() as usize;
-
-        // Get stable pointers to the task context structures from heap-allocated Tasks in Arc.
-        let tasks = TASKS.read();
-        let current_task_arc = tasks.get(current_idx).and_then(|t| t.clone());
-        let next_task_arc = match tasks.get(next_idx).and_then(|t| t.clone()) {
-            Some(t) => t,
-            None => {
-                drop(tasks);
-                return;
-            }
-        };
-        drop(tasks); // Release TASKS read lock
 
         let old_ctx_ptr = if let Some(ref current_task_arc) = current_task_arc {
             let mut current_task = current_task_arc.lock();

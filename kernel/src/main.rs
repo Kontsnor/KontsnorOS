@@ -251,6 +251,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let master = crate::fs::pty::allocate_new_pty().expect("Failed to allocate PTY");
         crate::fs::pty::set_active_pty_master(Some(master.clone()));
         crate::fs::pty::start_pty_io_loop();
+        crate::fs::start_sync_daemon();
 
         // Spawn Ring 3 user init from ext RAM disk as PID 1
         let init_candidates = ["/sbin/init", "/usr/sbin/init", "/init", "/bin/init"];

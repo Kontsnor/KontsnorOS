@@ -232,3 +232,26 @@ pub fn init() {
 
     kprintln!("[fs] VFS initialized with devfs, tmpfs, procfs, ext.");
 }
+
+/// Periodic background write-back daemon thread.
+fn sync_daemon_thread() {
+    let mut last_sync_tick = crate::arch::x86_64::interrupts::timer_ticks();
+    loop {
+        for _ in 0..50 {
+            crate::process::scheduler::yield_now();
+        }
+        let current_tick = crate::arch::x86_64::interrupts::timer_ticks();
+        if current_tick.saturating_sub(last_sync_tick) >= 100 {
+            last_sync_tick = current_tick;
+            crate::fs::vfs::sync_dirty();
+        }
+    }
+}
+
+/// Starts the periodic write-back flusher daemon.
+pub fn start_sync_daemon() {
+    crate::process::spawn_kernel_thread(
+        alloc::string::String::from("kswapd_sync"),
+        sync_daemon_thread,
+    );
+}

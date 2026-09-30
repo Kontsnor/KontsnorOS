@@ -118,6 +118,11 @@ pub fn sys_chdir(pathname: *const u8) -> SyscallResult {
         None => return Errno::EFAULT.into(),
     };
 
+    // POSIX.1-2017 Base Definitions 4.13 & Linux chdir(2): An empty pathname shall fail with ENOENT.
+    if raw_path.is_empty() {
+        return Errno::ENOENT.into();
+    }
+
     let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
 
     // Lookup the directory in VFS

@@ -76,7 +76,10 @@ impl<T> KRwLock<T> {
 
         loop {
             // Respect writer priority: spin while a writer is pending or active.
-            if self.writer_pending.load(Ordering::Acquire) {
+            // Using Relaxed ordering during the spin loop avoids acquire-fence overhead
+            // on every spin iteration. The required acquire memory barrier is established
+            // below when compare_exchange_weak succeeds on self.state.
+            if self.writer_pending.load(Ordering::Relaxed) {
                 if crate::arch::x86_64::smp::has_pending_tlb_shootdown() {
                     x86_64::instructions::tlb::flush_all();
                     crate::arch::x86_64::smp::tlb_shootdown_ack();

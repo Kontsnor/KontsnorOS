@@ -297,6 +297,12 @@ pub trait InodeOps: Send + Sync {
         self.write(offset, data)
     }
 
+    /// Flush dirty page cache frames and raw inode to block cache without issuing
+    /// expensive hardware flush barriers or full filesystem metadata writes.
+    fn flush_dirty(&self) -> Result<(), i32> {
+        Ok(())
+    }
+
     /// Commit all dirty cached data and metadata for this inode to persistent storage.
     fn fsync(&self) -> Result<(), i32> {
         Ok(())

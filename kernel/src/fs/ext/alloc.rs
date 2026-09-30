@@ -58,15 +58,9 @@ impl ExtFileSystem {
             };
 
             let block_bitmap_num = gds[g].bg_block_bitmap as u64;
-            let mut bitmap = alloc::vec![0u8; self.block_size as usize];
-            if read_blocks(
-                &*self.device,
-                block_bitmap_num,
-                &mut bitmap,
-                self.block_size,
-            )
-            .is_err()
-            {
+            let mut bitmap_buf = [0u8; 4096];
+            let bitmap = &mut bitmap_buf[..self.block_size as usize];
+            if read_blocks(&*self.device, block_bitmap_num, bitmap, self.block_size).is_err() {
                 continue;
             }
 
@@ -122,7 +116,7 @@ impl ExtFileSystem {
                         let bit = i % 8;
                         bitmap[byte] |= 1 << bit;
                     }
-                    write_blocks(&*self.device, block_bitmap_num, &bitmap, self.block_size)?;
+                    write_blocks(&*self.device, block_bitmap_num, bitmap, self.block_size)?;
 
                     let start_block_num =
                         (g as u32) * blocks_per_group + sb.s_first_data_block + start_idx;
@@ -169,11 +163,12 @@ impl ExtFileSystem {
             return Err("Block number out of filesystem bounds");
         }
         let gd = &mut gds[g];
-        let mut bitmap = alloc::vec![0u8; self.block_size as usize];
+        let mut bitmap_buf = [0u8; 4096];
+        let bitmap = &mut bitmap_buf[..self.block_size as usize];
         read_blocks(
             &*self.device,
             gd.bg_block_bitmap as u64,
-            &mut bitmap,
+            bitmap,
             self.block_size,
         )?;
 
@@ -184,7 +179,7 @@ impl ExtFileSystem {
             write_blocks(
                 &*self.device,
                 gd.bg_block_bitmap as u64,
-                &bitmap,
+                bitmap,
                 self.block_size,
             )?;
 
@@ -221,15 +216,9 @@ impl ExtFileSystem {
             };
 
             let inode_bitmap_num = gds[g].bg_inode_bitmap as u64;
-            let mut bitmap = alloc::vec![0u8; self.block_size as usize];
-            if read_blocks(
-                &*self.device,
-                inode_bitmap_num,
-                &mut bitmap,
-                self.block_size,
-            )
-            .is_err()
-            {
+            let mut bitmap_buf = [0u8; 4096];
+            let bitmap = &mut bitmap_buf[..self.block_size as usize];
+            if read_blocks(&*self.device, inode_bitmap_num, bitmap, self.block_size).is_err() {
                 continue;
             }
 
@@ -253,7 +242,7 @@ impl ExtFileSystem {
                 let bit = i % 8;
                 if (bitmap[byte] & (1 << bit)) == 0 {
                     bitmap[byte] |= 1 << bit;
-                    write_blocks(&*self.device, inode_bitmap_num, &bitmap, self.block_size)?;
+                    write_blocks(&*self.device, inode_bitmap_num, bitmap, self.block_size)?;
 
                     sb.s_free_inodes_count = sb.s_free_inodes_count.saturating_sub(1);
                     gds[g].bg_free_inodes_count = gds[g].bg_free_inodes_count.saturating_sub(1);
@@ -295,11 +284,12 @@ impl ExtFileSystem {
             return Err("Inode number out of filesystem bounds");
         }
         let gd = &mut gds[g];
-        let mut bitmap = alloc::vec![0u8; self.block_size as usize];
+        let mut bitmap_buf = [0u8; 4096];
+        let bitmap = &mut bitmap_buf[..self.block_size as usize];
         read_blocks(
             &*self.device,
             gd.bg_inode_bitmap as u64,
-            &mut bitmap,
+            bitmap,
             self.block_size,
         )?;
 
@@ -310,7 +300,7 @@ impl ExtFileSystem {
             write_blocks(
                 &*self.device,
                 gd.bg_inode_bitmap as u64,
-                &bitmap,
+                bitmap,
                 self.block_size,
             )?;
 
@@ -347,15 +337,11 @@ impl ExtFileSystem {
         let logical_block = table_block + (inode_offset_in_table / self.block_size as u64);
         let offset_in_block = (inode_offset_in_table % self.block_size as u64) as usize;
 
-        let mut block_buf = alloc::vec![0u8; self.block_size as usize];
-        read_blocks(
-            &*self.device,
-            logical_block,
-            &mut block_buf,
-            self.block_size,
-        )?;
+        let mut block_buf = [0u8; 4096];
+        let block_slice = &mut block_buf[..self.block_size as usize];
+        read_blocks(&*self.device, logical_block, block_slice, self.block_size)?;
 
-        let dst_ptr = block_buf[offset_in_block..].as_mut_ptr();
+        let dst_ptr = block_slice[offset_in_block..].as_mut_ptr();
         let src_ptr = raw_inode as *const ExtRawInode as *const u8;
         let copy_size = core::cmp::min(
             self.inode_size as usize,
@@ -367,7 +353,7 @@ impl ExtFileSystem {
             core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_size);
         }
 
-        write_blocks(&*self.device, logical_block, &block_buf, self.block_size)?;
+        write_blocks(&*self.device, logical_block, block_slice, self.block_size)?;
         Ok(())
     }
 
@@ -393,16 +379,17 @@ impl ExtFileSystem {
             // Free indirect block if present
             let sib = i_block[12];
             if sib != 0 {
-                let mut ind_buf = alloc::vec![0u8; self.block_size as usize];
-                if read_blocks(&*self.device, sib as u64, &mut ind_buf, self.block_size).is_ok() {
+                let mut ind_buf = [0u8; 4096];
+                let ind_slice = &mut ind_buf[..self.block_size as usize];
+                if read_blocks(&*self.device, sib as u64, ind_slice, self.block_size).is_ok() {
                     let refs_per_block = self.block_size / 4;
                     for j in 0..refs_per_block {
                         let ptr_offset = (j * 4) as usize;
                         let phys_block = u32::from_le_bytes([
-                            ind_buf[ptr_offset],
-                            ind_buf[ptr_offset + 1],
-                            ind_buf[ptr_offset + 2],
-                            ind_buf[ptr_offset + 3],
+                            ind_slice[ptr_offset],
+                            ind_slice[ptr_offset + 1],
+                            ind_slice[ptr_offset + 2],
+                            ind_slice[ptr_offset + 3],
                         ]);
                         if phys_block != 0 {
                             let _ = self.deallocate_block(phys_block);
@@ -415,29 +402,31 @@ impl ExtFileSystem {
             // Free double indirect block if present
             let dib = i_block[13];
             if dib != 0 {
-                let mut dib_buf = alloc::vec![0u8; self.block_size as usize];
-                if read_blocks(&*self.device, dib as u64, &mut dib_buf, self.block_size).is_ok() {
+                let mut dib_buf = [0u8; 4096];
+                let dib_slice = &mut dib_buf[..self.block_size as usize];
+                if read_blocks(&*self.device, dib as u64, dib_slice, self.block_size).is_ok() {
                     let refs_per_block = self.block_size / 4;
                     for i in 0..refs_per_block {
                         let sib_offset = (i * 4) as usize;
                         let sib = u32::from_le_bytes([
-                            dib_buf[sib_offset],
-                            dib_buf[sib_offset + 1],
-                            dib_buf[sib_offset + 2],
-                            dib_buf[sib_offset + 3],
+                            dib_slice[sib_offset],
+                            dib_slice[sib_offset + 1],
+                            dib_slice[sib_offset + 2],
+                            dib_slice[sib_offset + 3],
                         ]);
                         if sib != 0 {
-                            let mut sib_buf = alloc::vec![0u8; self.block_size as usize];
-                            if read_blocks(&*self.device, sib as u64, &mut sib_buf, self.block_size)
+                            let mut sib_buf = [0u8; 4096];
+                            let sib_slice = &mut sib_buf[..self.block_size as usize];
+                            if read_blocks(&*self.device, sib as u64, sib_slice, self.block_size)
                                 .is_ok()
                             {
                                 for j in 0..refs_per_block {
                                     let ptr_offset = (j * 4) as usize;
                                     let phys_block = u32::from_le_bytes([
-                                        sib_buf[ptr_offset],
-                                        sib_buf[ptr_offset + 1],
-                                        sib_buf[ptr_offset + 2],
-                                        sib_buf[ptr_offset + 3],
+                                        sib_slice[ptr_offset],
+                                        sib_slice[ptr_offset + 1],
+                                        sib_slice[ptr_offset + 2],
+                                        sib_slice[ptr_offset + 3],
                                     ]);
                                     if phys_block != 0 {
                                         let _ = self.deallocate_block(phys_block);
@@ -473,16 +462,12 @@ impl ExtFileSystem {
         let logical_block = table_block + (inode_offset_in_table / self.block_size as u64);
         let offset_in_block = (inode_offset_in_table % self.block_size as u64) as usize;
 
-        let mut block_buf = alloc::vec![0u8; self.block_size as usize];
-        read_blocks(
-            &*self.device,
-            logical_block,
-            &mut block_buf,
-            self.block_size,
-        )?;
+        let mut block_buf = [0u8; 4096];
+        let block_slice = &mut block_buf[..self.block_size as usize];
+        read_blocks(&*self.device, logical_block, block_slice, self.block_size)?;
 
         let mut raw_inode = unsafe {
-            core::ptr::read_unaligned(block_buf[offset_in_block..].as_ptr() as *const ExtRawInode)
+            core::ptr::read_unaligned(block_slice[offset_in_block..].as_ptr() as *const ExtRawInode)
         };
 
         if raw_inode.i_links_count > 0 {
@@ -492,7 +477,7 @@ impl ExtFileSystem {
         if raw_inode.i_links_count == 0 {
             self.deallocate_inode_and_blocks(ino, &raw_inode, is_dir)?;
         } else {
-            let dst_ptr = block_buf[offset_in_block..].as_mut_ptr();
+            let dst_ptr = block_slice[offset_in_block..].as_mut_ptr();
             let src_ptr = &raw_inode as *const ExtRawInode as *const u8;
             let copy_size = core::cmp::min(
                 self.inode_size as usize,
@@ -503,7 +488,7 @@ impl ExtFileSystem {
             unsafe {
                 core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_size);
             }
-            write_blocks(&*self.device, logical_block, &block_buf, self.block_size)?;
+            write_blocks(&*self.device, logical_block, block_slice, self.block_size)?;
         }
         Ok(())
     }

@@ -57,24 +57,21 @@ impl ExtInode {
                 return Ok(false);
             }
 
-            let mut block_buf = alloc::vec![0u8; block_size as usize];
-            read_blocks(
-                &*self.fs.device,
-                phys_block as u64,
-                &mut block_buf,
-                block_size,
-            )?;
+            let mut block_buf = [0u8; 4096];
+            let block_slice = &mut block_buf[..block_size as usize];
+            read_blocks(&*self.fs.device, phys_block as u64, block_slice, block_size)?;
 
             let mut ptr = 0;
             while ptr < block_size as usize {
                 let inode = u32::from_le_bytes([
-                    block_buf[ptr],
-                    block_buf[ptr + 1],
-                    block_buf[ptr + 2],
-                    block_buf[ptr + 3],
+                    block_slice[ptr],
+                    block_slice[ptr + 1],
+                    block_slice[ptr + 2],
+                    block_slice[ptr + 3],
                 ]);
-                let rec_len = u16::from_le_bytes([block_buf[ptr + 4], block_buf[ptr + 5]]) as usize;
-                let name_len = block_buf[ptr + 6] as usize;
+                let rec_len =
+                    u16::from_le_bytes([block_slice[ptr + 4], block_slice[ptr + 5]]) as usize;
+                let name_len = block_slice[ptr + 6] as usize;
 
                 if rec_len == 0 {
                     break;
@@ -86,33 +83,33 @@ impl ExtInode {
                     let free_space = rec_len - actual_rec_len;
                     if free_space >= new_entry_min_len {
                         let new_rec_len = actual_rec_len as u16;
-                        block_buf[ptr + 4..ptr + 6].copy_from_slice(&new_rec_len.to_le_bytes());
+                        block_slice[ptr + 4..ptr + 6].copy_from_slice(&new_rec_len.to_le_bytes());
 
                         let new_ptr = ptr + actual_rec_len;
                         let remaining_rec_len = free_space as u16;
 
-                        block_buf[new_ptr..new_ptr + 4].copy_from_slice(&child_ino.to_le_bytes());
-                        block_buf[new_ptr + 4..new_ptr + 6]
+                        block_slice[new_ptr..new_ptr + 4].copy_from_slice(&child_ino.to_le_bytes());
+                        block_slice[new_ptr + 4..new_ptr + 6]
                             .copy_from_slice(&remaining_rec_len.to_le_bytes());
-                        block_buf[new_ptr + 6] = child_name.len() as u8;
-                        block_buf[new_ptr + 7] = file_type_byte;
-                        block_buf[new_ptr + 8..new_ptr + 8 + child_name.len()]
+                        block_slice[new_ptr + 6] = child_name.len() as u8;
+                        block_slice[new_ptr + 7] = file_type_byte;
+                        block_slice[new_ptr + 8..new_ptr + 8 + child_name.len()]
                             .copy_from_slice(child_name.as_bytes());
 
-                        write_blocks(&*self.fs.device, phys_block as u64, &block_buf, block_size)?;
+                        write_blocks(&*self.fs.device, phys_block as u64, block_slice, block_size)?;
                         return Ok(true);
                     }
                 } else {
                     // Reuse deleted slot (skip checksum tail if present)
-                    let ft = block_buf[ptr + 7];
+                    let ft = block_slice[ptr + 7];
                     if ft != 0xDE && rec_len >= new_entry_min_len {
-                        block_buf[ptr..ptr + 4].copy_from_slice(&child_ino.to_le_bytes());
-                        block_buf[ptr + 6] = child_name.len() as u8;
-                        block_buf[ptr + 7] = file_type_byte;
-                        block_buf[ptr + 8..ptr + 8 + child_name.len()]
+                        block_slice[ptr..ptr + 4].copy_from_slice(&child_ino.to_le_bytes());
+                        block_slice[ptr + 6] = child_name.len() as u8;
+                        block_slice[ptr + 7] = file_type_byte;
+                        block_slice[ptr + 8..ptr + 8 + child_name.len()]
                             .copy_from_slice(child_name.as_bytes());
 
-                        write_blocks(&*self.fs.device, phys_block as u64, &block_buf, block_size)?;
+                        write_blocks(&*self.fs.device, phys_block as u64, block_slice, block_size)?;
                         return Ok(true);
                     }
                 }
@@ -139,8 +136,9 @@ impl ExtInode {
         let file_block = (file_size / block_size as u64) as u32;
         let phys_block = self.get_or_alloc_block(&mut raw, file_block)?;
 
-        let mut block_buf = alloc::vec![0u8; block_size as usize];
-        block_buf[0..4].copy_from_slice(&child_ino.to_le_bytes());
+        let mut block_buf = [0u8; 4096];
+        let block_slice = &mut block_buf[..block_size as usize];
+        block_slice[0..4].copy_from_slice(&child_ino.to_le_bytes());
 
         let has_csum = (self.fs.superblock.lock().s_feature_ro_compat
             & super::types::RO_COMPAT_METADATA_CSUM)
@@ -151,21 +149,21 @@ impl ExtInode {
             (block_size as u16, false)
         };
 
-        block_buf[4..6].copy_from_slice(&rec_len.to_le_bytes());
-        block_buf[6] = child_name.len() as u8;
-        block_buf[7] = file_type_byte;
-        block_buf[8..8 + child_name.len()].copy_from_slice(child_name.as_bytes());
+        block_slice[4..6].copy_from_slice(&rec_len.to_le_bytes());
+        block_slice[6] = child_name.len() as u8;
+        block_slice[7] = file_type_byte;
+        block_slice[8..8 + child_name.len()].copy_from_slice(child_name.as_bytes());
 
         if has_tail {
             let tail_ptr = (block_size - 12) as usize;
             // inode = 0, rec_len = 12, name_len = 0, file_type = 0xDE
-            block_buf[tail_ptr..tail_ptr + 4].copy_from_slice(&0u32.to_le_bytes());
-            block_buf[tail_ptr + 4..tail_ptr + 6].copy_from_slice(&12u16.to_le_bytes());
-            block_buf[tail_ptr + 6] = 0;
-            block_buf[tail_ptr + 7] = 0xDE;
+            block_slice[tail_ptr..tail_ptr + 4].copy_from_slice(&0u32.to_le_bytes());
+            block_slice[tail_ptr + 4..tail_ptr + 6].copy_from_slice(&12u16.to_le_bytes());
+            block_slice[tail_ptr + 6] = 0;
+            block_slice[tail_ptr + 7] = 0xDE;
         }
 
-        write_blocks(&*self.fs.device, phys_block as u64, &block_buf, block_size)?;
+        write_blocks(&*self.fs.device, phys_block as u64, block_slice, block_size)?;
 
         vfs.size += block_size as u64;
         vfs.blocks = raw.i_blocks as u64;
@@ -189,25 +187,22 @@ impl ExtInode {
                 break;
             }
 
-            let mut block_buf = alloc::vec![0u8; block_size as usize];
-            read_blocks(
-                &*self.fs.device,
-                phys_block as u64,
-                &mut block_buf,
-                block_size,
-            )?;
+            let mut block_buf = [0u8; 4096];
+            let block_slice = &mut block_buf[..block_size as usize];
+            read_blocks(&*self.fs.device, phys_block as u64, block_slice, block_size)?;
 
             let mut ptr = 0;
             let mut prev_ptr = None;
             while ptr < block_size as usize {
                 let inode = u32::from_le_bytes([
-                    block_buf[ptr],
-                    block_buf[ptr + 1],
-                    block_buf[ptr + 2],
-                    block_buf[ptr + 3],
+                    block_slice[ptr],
+                    block_slice[ptr + 1],
+                    block_slice[ptr + 2],
+                    block_slice[ptr + 3],
                 ]);
-                let rec_len = u16::from_le_bytes([block_buf[ptr + 4], block_buf[ptr + 5]]) as usize;
-                let name_len = block_buf[ptr + 6] as usize;
+                let rec_len =
+                    u16::from_le_bytes([block_slice[ptr + 4], block_slice[ptr + 5]]) as usize;
+                let name_len = block_slice[ptr + 6] as usize;
 
                 if rec_len == 0 {
                     break;
@@ -217,18 +212,18 @@ impl ExtInode {
                     && name_len == child_name.len()
                     && ptr + 8 + name_len <= block_size as usize
                 {
-                    if &block_buf[ptr + 8..ptr + 8 + name_len] == child_name.as_bytes() {
+                    if &block_slice[ptr + 8..ptr + 8 + name_len] == child_name.as_bytes() {
                         let zero_ino = 0u32;
-                        block_buf[ptr..ptr + 4].copy_from_slice(&zero_ino.to_le_bytes());
+                        block_slice[ptr..ptr + 4].copy_from_slice(&zero_ino.to_le_bytes());
                         if let Some(prev) = prev_ptr {
                             let prev_rec_len =
-                                u16::from_le_bytes([block_buf[prev + 4], block_buf[prev + 5]])
+                                u16::from_le_bytes([block_slice[prev + 4], block_slice[prev + 5]])
                                     as usize;
                             let merged_rec_len = (prev_rec_len + rec_len) as u16;
-                            block_buf[prev + 4..prev + 6]
+                            block_slice[prev + 4..prev + 6]
                                 .copy_from_slice(&merged_rec_len.to_le_bytes());
                         }
-                        write_blocks(&*self.fs.device, phys_block as u64, &block_buf, block_size)?;
+                        write_blocks(&*self.fs.device, phys_block as u64, block_slice, block_size)?;
                         crate::fs::dcache::dcache_invalidate_entry(self.ino as u64, child_name);
                         crate::fs::dcache::dcache_insert_negative(self.ino as u64, child_name);
                         return Ok(inode);
@@ -278,31 +273,32 @@ impl ExtInode {
             raw_child.i_blocks = self.fs.block_size / 512;
             raw_child.i_size = self.fs.block_size;
 
-            let mut block_buf = alloc::vec![0u8; self.fs.block_size as usize];
+            let mut block_buf = [0u8; 4096];
+            let block_slice = &mut block_buf[..self.fs.block_size as usize];
 
             let dot_ino = child_ino;
-            block_buf[0..4].copy_from_slice(&dot_ino.to_le_bytes());
+            block_slice[0..4].copy_from_slice(&dot_ino.to_le_bytes());
             let dot_rec_len = 12u16;
-            block_buf[4..6].copy_from_slice(&dot_rec_len.to_le_bytes());
-            block_buf[6] = 1;
-            block_buf[7] = 2;
-            block_buf[8] = b'.';
+            block_slice[4..6].copy_from_slice(&dot_rec_len.to_le_bytes());
+            block_slice[6] = 1;
+            block_slice[7] = 2;
+            block_slice[8] = b'.';
 
             let dotdot_ino = self.ino;
             let dotdot_ptr = 12usize;
-            block_buf[dotdot_ptr..dotdot_ptr + 4].copy_from_slice(&dotdot_ino.to_le_bytes());
+            block_slice[dotdot_ptr..dotdot_ptr + 4].copy_from_slice(&dotdot_ino.to_le_bytes());
             let dotdot_rec_len = (self.fs.block_size - 12) as u16;
-            block_buf[dotdot_ptr + 4..dotdot_ptr + 6]
+            block_slice[dotdot_ptr + 4..dotdot_ptr + 6]
                 .copy_from_slice(&dotdot_rec_len.to_le_bytes());
-            block_buf[dotdot_ptr + 6] = 2;
-            block_buf[dotdot_ptr + 7] = 2;
-            block_buf[dotdot_ptr + 8] = b'.';
-            block_buf[dotdot_ptr + 9] = b'.';
+            block_slice[dotdot_ptr + 6] = 2;
+            block_slice[dotdot_ptr + 7] = 2;
+            block_slice[dotdot_ptr + 8] = b'.';
+            block_slice[dotdot_ptr + 9] = b'.';
 
             write_blocks(
                 &*self.fs.device,
                 block as u64,
-                &block_buf,
+                block_slice,
                 self.fs.block_size,
             )
             .ok()?;
@@ -402,11 +398,12 @@ impl ExtInode {
                 break;
             }
 
-            let mut block_buf = alloc::vec![0u8; self.fs.block_size as usize];
+            let mut block_buf = [0u8; 4096];
+            let block_slice = &mut block_buf[..self.fs.block_size as usize];
             if read_blocks(
                 &*self.fs.device,
                 phys_block as u64,
-                &mut block_buf,
+                block_slice,
                 self.fs.block_size,
             )
             .is_err()
@@ -417,21 +414,22 @@ impl ExtInode {
             let mut ptr = block_offset;
             while ptr + 8 <= self.fs.block_size as usize {
                 let inode = u32::from_le_bytes([
-                    block_buf[ptr],
-                    block_buf[ptr + 1],
-                    block_buf[ptr + 2],
-                    block_buf[ptr + 3],
+                    block_slice[ptr],
+                    block_slice[ptr + 1],
+                    block_slice[ptr + 2],
+                    block_slice[ptr + 3],
                 ]);
-                let rec_len = u16::from_le_bytes([block_buf[ptr + 4], block_buf[ptr + 5]]) as usize;
-                let name_len = block_buf[ptr + 6] as usize;
-                let file_type_byte = block_buf[ptr + 7];
+                let rec_len =
+                    u16::from_le_bytes([block_slice[ptr + 4], block_slice[ptr + 5]]) as usize;
+                let name_len = block_slice[ptr + 6] as usize;
+                let file_type_byte = block_slice[ptr + 7];
 
                 if rec_len == 0 {
                     break;
                 }
 
                 if inode != 0 && ptr + 8 + name_len <= self.fs.block_size as usize {
-                    let name_bytes = &block_buf[ptr + 8..ptr + 8 + name_len];
+                    let name_bytes = &block_slice[ptr + 8..ptr + 8 + name_len];
                     if let Ok(name_str) = core::str::from_utf8(name_bytes) {
                         let file_type = match file_type_byte {
                             1 => FileType::Regular,
@@ -482,11 +480,12 @@ impl ExtInode {
                 _ => break,
             };
 
-            let mut block_buf = alloc::vec![0u8; self.fs.block_size as usize];
+            let mut block_buf = [0u8; 4096];
+            let block_slice = &mut block_buf[..self.fs.block_size as usize];
             if read_blocks(
                 &*self.fs.device,
                 phys_block as u64,
-                &mut block_buf,
+                block_slice,
                 self.fs.block_size,
             )
             .is_err()
@@ -498,14 +497,15 @@ impl ExtInode {
             while ptr + 8 <= self.fs.block_size as usize {
                 let entry_offset = (file_block as u64) * block_size + ptr as u64;
                 let inode = u32::from_le_bytes([
-                    block_buf[ptr],
-                    block_buf[ptr + 1],
-                    block_buf[ptr + 2],
-                    block_buf[ptr + 3],
+                    block_slice[ptr],
+                    block_slice[ptr + 1],
+                    block_slice[ptr + 2],
+                    block_slice[ptr + 3],
                 ]);
-                let rec_len = u16::from_le_bytes([block_buf[ptr + 4], block_buf[ptr + 5]]) as usize;
-                let name_len = block_buf[ptr + 6] as usize;
-                let file_type_byte = block_buf[ptr + 7];
+                let rec_len =
+                    u16::from_le_bytes([block_slice[ptr + 4], block_slice[ptr + 5]]) as usize;
+                let name_len = block_slice[ptr + 6] as usize;
+                let file_type_byte = block_slice[ptr + 7];
 
                 if rec_len == 0 || ptr + rec_len > self.fs.block_size as usize {
                     break;
@@ -514,7 +514,7 @@ impl ExtInode {
                 let next_entry_offset = entry_offset + rec_len as u64;
 
                 if inode != 0 && ptr + 8 + name_len <= self.fs.block_size as usize {
-                    let name_bytes = &block_buf[ptr + 8..ptr + 8 + name_len];
+                    let name_bytes = &block_slice[ptr + 8..ptr + 8 + name_len];
                     if let Ok(name_str) = core::str::from_utf8(name_bytes) {
                         let file_type = match file_type_byte {
                             1 => FileType::Regular,
@@ -567,28 +567,23 @@ impl ExtInode {
                 break;
             }
 
-            let mut block_buf = alloc::vec![0u8; block_size as usize];
-            if read_blocks(
-                &*self.fs.device,
-                phys_block as u64,
-                &mut block_buf,
-                block_size,
-            )
-            .is_err()
-            {
+            let mut block_buf = [0u8; 4096];
+            let block_slice = &mut block_buf[..block_size as usize];
+            if read_blocks(&*self.fs.device, phys_block as u64, block_slice, block_size).is_err() {
                 break;
             }
 
             let mut ptr = 0;
             while ptr + 8 <= block_size as usize {
                 let inode = u32::from_le_bytes([
-                    block_buf[ptr],
-                    block_buf[ptr + 1],
-                    block_buf[ptr + 2],
-                    block_buf[ptr + 3],
+                    block_slice[ptr],
+                    block_slice[ptr + 1],
+                    block_slice[ptr + 2],
+                    block_slice[ptr + 3],
                 ]);
-                let rec_len = u16::from_le_bytes([block_buf[ptr + 4], block_buf[ptr + 5]]) as usize;
-                let name_len = block_buf[ptr + 6] as usize;
+                let rec_len =
+                    u16::from_le_bytes([block_slice[ptr + 4], block_slice[ptr + 5]]) as usize;
+                let name_len = block_slice[ptr + 6] as usize;
 
                 if rec_len == 0 {
                     break;
@@ -596,7 +591,7 @@ impl ExtInode {
 
                 if inode != 0 && name_len == target_len && ptr + 8 + name_len <= block_size as usize
                 {
-                    if &block_buf[ptr + 8..ptr + 8 + name_len] == target_bytes {
+                    if &block_slice[ptr + 8..ptr + 8 + name_len] == target_bytes {
                         if let Ok(child_inode) = self.fs.get_inode(inode) {
                             crate::fs::dcache::dcache_insert(
                                 self.ino as u64,

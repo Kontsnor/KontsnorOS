@@ -377,41 +377,56 @@ pub fn get_or_create_page_for_write(
     offset: u64,
     is_full_page: bool,
 ) -> Result<u64, Errno> {
-    if !is_full_page {
-        return get_or_create_page_inner(inode, offset);
-    }
-
     let dev = inode.inode().dev;
     let ino = inode.inode().ino;
     let aligned_offset = offset & !4095;
 
-    // 1. Quick check: sharded O(1) lookup
-    if let Some(entry) = page_cache_get(dev, ino, aligned_offset) {
-        return Ok(entry.phys_addr);
-    }
-
-    // 2. Allocate frame directly without reading from disk
-    let phys = crate::memory::physical::allocate_frame().ok_or(Errno::ENOMEM)?;
-
-    // 3. Insert into cache
     let shard = shard_index(dev, ino, aligned_offset);
-    let mut guard = PAGE_CACHE_SHARDS[shard].lock();
-    if let Some(entry) = guard.map.get(&(dev, ino, aligned_offset)) {
-        let phys_addr = entry.phys_addr;
-        drop(guard);
-        crate::memory::physical::deallocate_frame(phys);
-        return Ok(phys_addr);
+    {
+        let mut guard = PAGE_CACHE_SHARDS[shard].lock();
+        if let Some(entry) = guard.map.get_mut(&(dev, ino, aligned_offset)) {
+            entry.dirty = true;
+            return Ok(entry.phys_addr);
+        }
     }
 
-    guard.map.insert(
-        (dev, ino, aligned_offset),
-        PageCacheEntry {
-            phys_addr: phys,
-            dirty: false,
-        },
-    );
-    drop(guard);
+    let file_size = inode.inode().size;
+    let beyond_eof = aligned_offset >= file_size;
 
+    if is_full_page || beyond_eof {
+        // Allocate frame directly without reading from disk
+        let phys = crate::memory::physical::allocate_frame().ok_or(Errno::ENOMEM)?;
+        let phys_offset = phys + crate::memory::r#virtual::phys_mem_offset();
+        // SAFETY: phys_offset points to a newly allocated 4KB physical frame in the direct physical mapping.
+        let dest_slice = unsafe { core::slice::from_raw_parts_mut(phys_offset as *mut u8, 4096) };
+        if !is_full_page {
+            dest_slice.fill(0);
+        }
+
+        // Insert into cache with dirty marked true
+        let mut guard = PAGE_CACHE_SHARDS[shard].lock();
+        if let Some(entry) = guard.map.get_mut(&(dev, ino, aligned_offset)) {
+            let phys_addr = entry.phys_addr;
+            entry.dirty = true;
+            drop(guard);
+            crate::memory::physical::deallocate_frame(phys);
+            return Ok(phys_addr);
+        }
+
+        guard.map.insert(
+            (dev, ino, aligned_offset),
+            PageCacheEntry {
+                phys_addr: phys,
+                dirty: true,
+            },
+        );
+        drop(guard);
+
+        return Ok(phys);
+    }
+
+    let phys = get_or_create_page_inner(inode, offset)?;
+    page_cache_mark_dirty(dev, ino, aligned_offset);
     Ok(phys)
 }
 

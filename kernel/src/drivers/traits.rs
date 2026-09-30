@@ -98,6 +98,11 @@ pub trait BlockDevice: Send + Sync {
         Ok(())
     }
 
+    /// Check whether the device or cache has pending unwritten dirty blocks.
+    fn has_dirty_blocks(&self) -> bool {
+        false
+    }
+
     /// Get driver information.
     fn info(&self) -> DriverInfo;
 }

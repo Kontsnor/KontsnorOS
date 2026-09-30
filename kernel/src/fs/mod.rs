@@ -235,16 +235,10 @@ pub fn init() {
 
 /// Periodic background write-back daemon thread.
 fn sync_daemon_thread() {
-    let mut last_sync_tick = crate::arch::x86_64::interrupts::timer_ticks();
     loop {
-        for _ in 0..50 {
-            crate::process::scheduler::yield_now();
-        }
-        let current_tick = crate::arch::x86_64::interrupts::timer_ticks();
-        if current_tick.saturating_sub(last_sync_tick) >= 100 {
-            last_sync_tick = current_tick;
-            crate::fs::vfs::sync_dirty();
-        }
+        let deadline = crate::syscall::process::get_monotonic_ns().saturating_add(1_000_000_000);
+        let _ = crate::syscall::process::info::sleep_until(deadline, core::ptr::null_mut());
+        crate::fs::vfs::sync_dirty();
     }
 }
 

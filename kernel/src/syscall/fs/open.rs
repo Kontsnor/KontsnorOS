@@ -275,24 +275,16 @@ pub fn sys_close(fd: i32) -> SyscallResult {
         return Errno::EBADF.into();
     }
 
-    // Retrieve PID, Inode number, and FileDescription prior to close to flush & clean up locks
-    let (lock_cleanup_info, file_desc) = if let Some(desc) = proc_fd::current_task_get_file_desc(fd)
-    {
+    // Retrieve PID and Inode number prior to close to clean up fcntl locks
+    let lock_cleanup_info = if let Some(desc) = proc_fd::current_task_get_file_desc(fd) {
         let current_pid = crate::process::scheduler::current_pid()
             .map(|p| p.as_u64())
             .unwrap_or(0);
         let ino = desc.inode.inode().ino;
-        (Some((current_pid, ino)), Some(desc))
+        Some((current_pid, ino))
     } else {
-        (None, None)
+        None
     };
-
-    if let Some(desc) = file_desc {
-        let is_writable = desc.flags.lock().is_writable();
-        if is_writable && desc.inode.inode().file_type == crate::fs::inode::FileType::Regular {
-            let _ = desc.inode.fsync();
-        }
-    }
 
     if proc_fd::current_task_close_fd(fd) {
         if let Some((pid, ino)) = lock_cleanup_info {

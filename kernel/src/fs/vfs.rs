@@ -43,6 +43,17 @@ pub fn sync_all() {
     }
 }
 
+/// Sync all mounted filesystems that report having dirty data or metadata.
+pub fn sync_dirty() {
+    if let Some(ref vfs) = *VFS.read() {
+        for entry in vfs.mounts.values() {
+            if entry.filesystem.is_dirty() {
+                entry.filesystem.sync();
+            }
+        }
+    }
+}
+
 /// VFS drive map (global block devices registry).
 pub static BLOCK_DEVICES: RwLock<BTreeMap<String, Arc<dyn BlockDevice>>> =
     RwLock::new(BTreeMap::new());
@@ -84,6 +95,11 @@ pub trait FileSystem: Send + Sync {
 
     /// Sync all dirty data to persistent storage.
     fn sync(&self) {}
+
+    /// Check if the filesystem has pending dirty data or metadata.
+    fn is_dirty(&self) -> bool {
+        false
+    }
 
     /// Get filesystem statistics.
     fn statfs(&self) -> FsStats {

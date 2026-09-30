@@ -139,6 +139,12 @@ impl BlockCache {
             self.device.write_block(block, aligned_buf.as_slice())
         }
     }
+
+    /// Check whether the cache currently holds any dirty blocks.
+    pub fn has_dirty_blocks(&self) -> bool {
+        let inner = self.inner.lock();
+        inner.entries.values().any(|e| e.dirty)
+    }
 }
 
 impl Drop for BlockCache {
@@ -262,6 +268,41 @@ impl BlockDevice for BlockCache {
             }
         }
 
+        // Writeback threshold: if dirty blocks exceed 25% of capacity (or >= 64 blocks),
+        // write back dirty blocks in contiguous batches to prevent memory pressure and I/O stalls
+        let dirty_count = inner.entries.values().filter(|e| e.dirty).count();
+        let high_water = (self.max_blocks / 4).max(64);
+        if dirty_count >= high_water {
+            let mut dirty_to_write = Vec::with_capacity(64);
+            for (&b, entry) in inner.entries.iter_mut() {
+                if entry.dirty {
+                    entry.dirty = false;
+                    dirty_to_write.push((b, entry.data.clone()));
+                    if dirty_to_write.len() >= 64 {
+                        break;
+                    }
+                }
+            }
+            drop(inner);
+            dirty_to_write.sort_unstable_by_key(|(b, _)| *b);
+            let mut i = 0;
+            while i < dirty_to_write.len() {
+                let start_b = dirty_to_write[i].0;
+                let mut contiguous = Vec::new();
+                contiguous.extend_from_slice(&dirty_to_write[i].1);
+                let mut j = i + 1;
+                while j < dirty_to_write.len()
+                    && dirty_to_write[j].0 == start_b + (j - i) as u64
+                    && (j - i) < 64
+                {
+                    contiguous.extend_from_slice(&dirty_to_write[j].1);
+                    j += 1;
+                }
+                let _ = self.write_device_aligned(start_b, &contiguous);
+                i = j;
+            }
+        }
+
         Ok(())
     }
 
@@ -306,9 +347,10 @@ impl BlockDevice for BlockCache {
                 self.write_device_aligned(start_block, &contiguous_data)?;
                 i = j;
             }
+            self.device.flush()
+        } else {
+            Ok(())
         }
-
-        self.device.flush()
     }
 
     fn info(&self) -> DriverInfo {

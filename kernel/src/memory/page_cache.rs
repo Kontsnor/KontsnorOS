@@ -167,6 +167,45 @@ pub fn dirty_inodes_for_dev(dev: u64) -> alloc::vec::Vec<u64> {
     inodes
 }
 
+/// Check if any page cache entry across all shards is marked dirty.
+pub fn has_dirty_pages() -> bool {
+    for shard in &PAGE_CACHE_SHARDS {
+        let guard = shard.lock();
+        for entry in guard.map.values() {
+            if entry.dirty {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Check if any page cache entry for a specific filesystem device is marked dirty.
+pub fn has_dirty_pages_for_dev(dev: u64) -> bool {
+    for shard in &PAGE_CACHE_SHARDS {
+        let guard = shard.lock();
+        for (key, entry) in guard.map.iter() {
+            if key.0 == dev && entry.dirty {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Check if any page cache entry for a specific inode is marked dirty.
+pub fn has_dirty_pages_for_inode(dev: u64, ino: u64) -> bool {
+    for shard in &PAGE_CACHE_SHARDS {
+        let guard = shard.lock();
+        for (key, entry) in guard.map.iter() {
+            if key.0 == dev && key.1 == ino && entry.dirty {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Walk the page table of a task to get a mutable reference to the target page table entry.
 ///
 /// # Safety

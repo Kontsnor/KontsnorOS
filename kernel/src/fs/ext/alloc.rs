@@ -132,6 +132,9 @@ impl ExtFileSystem {
                     let free_total = sb.free_blocks();
                     sb.set_free_blocks(free_total.saturating_sub(alloc_len as u64));
 
+                    self.metadata_dirty
+                        .store(true, core::sync::atomic::Ordering::Release);
+
                     drop(gds);
                     drop(sb);
 
@@ -187,6 +190,8 @@ impl ExtFileSystem {
 
             sb.s_free_blocks_count += 1;
             gd.bg_free_blocks_count += 1;
+            self.metadata_dirty
+                .store(true, core::sync::atomic::Ordering::Release);
             drop(gds);
             drop(sb);
         }
@@ -256,6 +261,9 @@ impl ExtFileSystem {
                         gds[g].bg_used_dirs_count += 1;
                     }
 
+                    self.metadata_dirty
+                        .store(true, core::sync::atomic::Ordering::Release);
+
                     drop(gds);
                     drop(sb);
 
@@ -311,6 +319,9 @@ impl ExtFileSystem {
             if is_dir && gd.bg_used_dirs_count > 0 {
                 gd.bg_used_dirs_count -= 1;
             }
+
+            self.metadata_dirty
+                .store(true, core::sync::atomic::Ordering::Release);
 
             drop(gds);
             drop(sb);

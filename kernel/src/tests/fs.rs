@@ -958,3 +958,81 @@ fn test_readv_writev_optimization_and_benchmark() {
 
     crate::kprintln!("[test] readv/writev stack allocation optimization & benchmark test PASSED!");
 }
+
+#[test_case]
+fn test_ext_fsync_and_close_persistence() {
+    use crate::drivers::traits::BlockDevice;
+    use crate::fs::vfs::FileSystem;
+
+    crate::kprintln!("[test] Starting Ext4 fsync and close disk persistence test...");
+
+    // 1. Create a raw underlying ramdisk
+    let raw_ramdisk = crate::drivers::ramdisk::create_ext2_ramdisk();
+
+    // 2. Wrap it in BlockCache
+    let cached_device = alloc::sync::Arc::new(crate::drivers::block::cache::BlockCache::new(
+        raw_ramdisk.clone(),
+        1024,
+    ));
+
+    // 3. Mount ext filesystem on the cached device
+    let fs = crate::fs::ext::ExtFileSystem::mount(cached_device.clone())
+        .expect("Failed to mount ext on cached device");
+
+    let root_inode = fs.root().expect("No root inode");
+
+    // 4. Create a test file
+    let file = root_inode
+        .create("persist_test.txt", crate::fs::inode::FileType::Regular)
+        .expect("Failed to create persist_test.txt");
+
+    // 5. Write distinct test payload
+    let test_payload = b"PERSISTENT_DATA_ACROSS_MOUNTS_12345678";
+    let n = file.write(0, test_payload).expect("Write failed");
+    assert_eq!(n, test_payload.len());
+
+    // 6. Call fsync on the file to commit data and metadata
+    let fsync_res = file.fsync();
+    assert_eq!(fsync_res, Ok(()));
+
+    // 7. Directly verify that the underlying raw_ramdisk has the payload
+    // Search the raw ramdisk sectors for the test_payload bytes!
+    let mut found_in_raw_disk = false;
+    let total_sectors = raw_ramdisk.block_count();
+    let mut sector_buf = [0u8; 512];
+    for sec in 0..total_sectors {
+        if raw_ramdisk.read_block(sec, &mut sector_buf).is_ok()
+            && sector_buf
+                .windows(test_payload.len())
+                .any(|w| w == test_payload)
+        {
+            found_in_raw_disk = true;
+            break;
+        }
+    }
+    assert!(
+        found_in_raw_disk,
+        "Payload not found in raw disk storage after fsync!"
+    );
+
+    // 8. Test remounting on raw disk from scratch (simulating clean reboot/remount)
+    // Create an entirely new BlockCache and ExtFileSystem instance on the same raw_ramdisk
+    let fresh_cached = alloc::sync::Arc::new(crate::drivers::block::cache::BlockCache::new(
+        raw_ramdisk.clone(),
+        1024,
+    ));
+    let fresh_fs = crate::fs::ext::ExtFileSystem::mount(fresh_cached)
+        .expect("Failed to remount fresh ExtFileSystem");
+    let fresh_root = fresh_fs.root().expect("Fresh root missing");
+    let fresh_file = fresh_root
+        .lookup("persist_test.txt")
+        .expect("File not found on fresh remount!");
+    let mut read_buf = [0u8; 64];
+    let bytes_read = fresh_file
+        .read(0, &mut read_buf)
+        .expect("Read from fresh file failed");
+    assert_eq!(bytes_read, test_payload.len());
+    assert_eq!(&read_buf[..bytes_read], test_payload);
+
+    crate::kprintln!("[test] Ext4 fsync and close disk persistence test PASSED!");
+}

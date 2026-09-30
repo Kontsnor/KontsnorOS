@@ -297,6 +297,11 @@ pub trait InodeOps: Send + Sync {
         self.write(offset, data)
     }
 
+    /// Commit all dirty cached data and metadata for this inode to persistent storage.
+    fn fsync(&self) -> Result<(), i32> {
+        Ok(())
+    }
+
     /// Create a new file in this directory.
     fn create(&self, _name: &str, _file_type: FileType) -> Option<Arc<dyn InodeOps>> {
         None

@@ -243,6 +243,7 @@ pub struct ExtFileSystem {
     pub(crate) root_node: TicketLock<Option<Arc<dyn InodeOps>>>,
     pub(crate) self_weak: spin::Mutex<Option<::alloc::sync::Weak<ExtFileSystem>>>,
     pub(crate) inode_cache: TicketLock<BTreeMap<u32, Weak<ExtInode>>>,
+    pub(crate) metadata_dirty: core::sync::atomic::AtomicBool,
 }
 
 impl ExtFileSystem {
@@ -980,6 +981,7 @@ impl ExtFileSystem {
             root_node: TicketLock::new(None),
             self_weak: spin::Mutex::new(None),
             inode_cache: TicketLock::new(BTreeMap::new()),
+            metadata_dirty: core::sync::atomic::AtomicBool::new(false),
         });
 
         *fs.self_weak.lock() = Some(Arc::downgrade(&fs));
@@ -1165,6 +1167,19 @@ impl ExtFileSystem {
         }
         Ok(())
     }
+
+    /// Write updated superblock and group descriptors if marked dirty.
+    pub fn sync_metadata(&self) -> Result<(), &'static str> {
+        if self
+            .metadata_dirty
+            .swap(false, core::sync::atomic::Ordering::AcqRel)
+        {
+            let sb = *self.superblock.lock();
+            self.write_superblock(&sb)?;
+            self.write_group_descriptors()?;
+        }
+        Ok(())
+    }
 }
 
 /// ext Inode wrapper implementing InodeOps.
@@ -1327,6 +1342,23 @@ impl InodeOps for ExtInode {
     fn truncate(&self, size: u64) -> Result<(), i32> {
         self.truncate_file(size)
     }
+
+    fn fsync(&self) -> Result<(), i32> {
+        // 1. Flush all dirty pages in the page cache for this inode to block cache
+        let _ = crate::memory::page_cache::flush_all_for_inode_inner(self);
+
+        // 2. Commit the raw inode metadata table entry
+        let raw = self.raw.lock();
+        self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?;
+
+        // 3. Commit superblock and group descriptor metadata if dirty
+        let _ = self.fs.sync_metadata();
+
+        // 4. Issue cache flush barrier to the underlying block device
+        self.fs.device.flush().map_err(|_| -5)?;
+
+        Ok(())
+    }
 }
 
 impl Drop for ExtInode {
@@ -1373,18 +1405,26 @@ impl FileSystem for ExtFileSystem {
         let dirty_inodes = crate::memory::page_cache::dirty_inodes_for_dev(EXT_DEV_ID);
 
         for ino in dirty_inodes {
-            if let Ok(inode) = self_arc.get_inode(ino as u32) {
-                let _ = crate::memory::page_cache::flush_all_for_inode(&inode);
+            if let Ok(inode) = self_arc.get_ext_inode(ino as u32) {
+                let _ = inode.fsync();
             }
         }
 
-        // Flush metadata: updated superblock and all group descriptors
-        let sb = *self.superblock.lock();
-        let _ = self.write_superblock(&sb);
-        let _ = self.write_group_descriptors();
+        // Flush metadata: updated superblock and all group descriptors if dirty
+        let _ = self.sync_metadata();
 
         // Issue cache flush barrier to the underlying block device
         let _ = self.device.flush();
+    }
+
+    fn is_dirty(&self) -> bool {
+        if self
+            .metadata_dirty
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return true;
+        }
+        crate::memory::page_cache::has_dirty_pages_for_dev(EXT_DEV_ID)
     }
 
     fn statfs(&self) -> FsStats {

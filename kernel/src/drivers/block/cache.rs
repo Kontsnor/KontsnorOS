@@ -297,85 +297,120 @@ impl BlockDevice for BlockCache {
     }
 
     fn flush(&self) -> Result<(), DriverError> {
-        let mut dirty_block_nums: Vec<u64> = {
-            let mut inner = self.inner.lock();
+        let dirty_block_nums: Vec<u64> = {
+            let inner = self.inner.lock();
             let mut list = Vec::with_capacity(inner.dirty_count);
-            for (&block, entry) in inner.entries.iter_mut() {
+            for (&block, entry) in inner.entries.iter() {
                 if entry.dirty {
-                    entry.dirty = false;
                     list.push(block);
                 }
             }
-            inner.dirty_count = 0;
             list
         };
 
         if !dirty_block_nums.is_empty() {
-            dirty_block_nums.sort_unstable();
+            let mut sorted_blocks = dirty_block_nums;
+            sorted_blocks.sort_unstable();
+            sorted_blocks.dedup();
 
             let max_chunk_blocks = 128;
             let block_size = self.device.block_size() as usize;
             let mut staging_buf = AlignedBuffer::new(max_chunk_blocks * block_size, 512);
 
             let mut i = 0;
-            while i < dirty_block_nums.len() {
-                let start_block = dirty_block_nums[i];
+            while i < sorted_blocks.len() {
+                let start_block = sorted_blocks[i];
                 let mut chunk_blocks = 0;
 
                 if let Some(ref mut staging) = staging_buf {
                     let staging_slice = staging.as_mut_slice();
-                    let inner = self.inner.lock();
-                    let mut j = i;
-                    while j < dirty_block_nums.len()
-                        && dirty_block_nums[j] == start_block + (j - i) as u64
-                        && (j - i) < max_chunk_blocks
                     {
-                        if let Some(entry) = inner.entries.get(&dirty_block_nums[j]) {
-                            let offset = (j - i) * block_size;
-                            staging_slice[offset..offset + block_size].copy_from_slice(&entry.data);
-                            chunk_blocks += 1;
-                            j += 1;
-                        } else {
-                            if j == i {
+                        let inner = self.inner.lock();
+                        let mut j = i;
+                        while j < sorted_blocks.len()
+                            && sorted_blocks[j] == start_block + (j - i) as u64
+                            && (j - i) < max_chunk_blocks
+                        {
+                            if let Some(entry) = inner.entries.get(&sorted_blocks[j]) {
+                                let offset = (j - i) * block_size;
+                                staging_slice[offset..offset + block_size]
+                                    .copy_from_slice(&entry.data);
+                                chunk_blocks += 1;
                                 j += 1;
+                            } else {
+                                if j == i {
+                                    j += 1;
+                                }
+                                break;
                             }
-                            break;
                         }
+                        i = j;
                     }
-                    i = j;
 
                     if chunk_blocks > 0 {
                         let total_bytes = chunk_blocks * block_size;
                         self.device
                             .write_block(start_block, &staging.as_slice()[..total_bytes])?;
+
+                        let mut inner = self.inner.lock();
+                        for k in 0..chunk_blocks {
+                            let curr_b = start_block + k as u64;
+                            if let Some(entry) = inner.entries.get_mut(&curr_b) {
+                                let offset = k * block_size;
+                                if entry.data == staging.as_slice()[offset..offset + block_size] {
+                                    if entry.dirty {
+                                        entry.dirty = false;
+                                        inner.dirty_count = inner.dirty_count.saturating_sub(1);
+                                    }
+                                }
+                            }
+                        }
                     }
                 } else {
                     let mut write_buf = Vec::new();
-                    let inner = self.inner.lock();
-                    let mut j = i;
-                    while j < dirty_block_nums.len()
-                        && dirty_block_nums[j] == start_block + (j - i) as u64
-                        && (j - i) < max_chunk_blocks
                     {
-                        if let Some(entry) = inner.entries.get(&dirty_block_nums[j]) {
-                            write_buf.extend_from_slice(&entry.data);
-                            j += 1;
-                        } else {
-                            if j == i {
+                        let inner = self.inner.lock();
+                        let mut j = i;
+                        while j < sorted_blocks.len()
+                            && sorted_blocks[j] == start_block + (j - i) as u64
+                            && (j - i) < max_chunk_blocks
+                        {
+                            if let Some(entry) = inner.entries.get(&sorted_blocks[j]) {
+                                write_buf.extend_from_slice(&entry.data);
+                                chunk_blocks += 1;
                                 j += 1;
+                            } else {
+                                if j == i {
+                                    j += 1;
+                                }
+                                break;
                             }
-                            break;
                         }
+                        i = j;
                     }
-                    i = j;
-                    if !write_buf.is_empty() {
+
+                    if chunk_blocks > 0 {
                         self.write_device_aligned(start_block, &write_buf)?;
+
+                        let mut inner = self.inner.lock();
+                        for k in 0..chunk_blocks {
+                            let curr_b = start_block + k as u64;
+                            if let Some(entry) = inner.entries.get_mut(&curr_b) {
+                                let offset = k * block_size;
+                                if entry.data == write_buf[offset..offset + block_size] {
+                                    if entry.dirty {
+                                        entry.dirty = false;
+                                        inner.dirty_count = inner.dirty_count.saturating_sub(1);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
             self.device.flush()
         } else {
-            Ok(())
+            self.device.flush()
         }
     }
 

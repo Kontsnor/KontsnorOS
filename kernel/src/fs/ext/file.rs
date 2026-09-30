@@ -21,12 +21,12 @@ use super::{ExtInode, ExtRawInode};
 use crate::fs::inode::{FileType, InodeOps};
 
 impl ExtInode {
-    /// Resolve an Ext4 extent-mapped block.
-    pub fn resolve_extent_block(
+    /// Resolve an Ext4 extent-mapped block along with the remaining contiguous blocks in the extent.
+    pub fn resolve_extent_block_len(
         &self,
         i_block: &[u32; 15],
         file_block: u32,
-    ) -> Result<u32, &'static str> {
+    ) -> Result<(u32, u32), &'static str> {
         let mut current_buf = [0u8; 4096];
         let mut current_len = 60;
         for i in 0..15 {
@@ -68,10 +68,11 @@ impl ExtInode {
                         let phys_start =
                             ((ext.ee_start_hi as u64) << 32) | (ext.ee_start_lo as u64);
                         let phys_block = phys_start + (file_block - ext.ee_block) as u64;
-                        return Ok(phys_block as u32);
+                        let remaining = (ext.ee_block + ext.ee_len as u32) - file_block;
+                        return Ok((phys_block as u32, remaining));
                     }
                 }
-                return Ok(0); // Sparse block / hole
+                return Ok((0, 0)); // Sparse block / hole
             } else {
                 // Index node. Followed by index entries.
                 let entry_size = core::mem::size_of::<Ext4ExtentIdx>(); // 12 bytes
@@ -111,10 +112,20 @@ impl ExtInode {
                     )?;
                     current_len = block_size;
                 } else {
-                    return Ok(0); // Not found
+                    return Ok((0, 0)); // Not found
                 }
             }
         }
+    }
+
+    /// Resolve an Ext4 extent-mapped block.
+    pub fn resolve_extent_block(
+        &self,
+        i_block: &[u32; 15],
+        file_block: u32,
+    ) -> Result<u32, &'static str> {
+        self.resolve_extent_block_len(i_block, file_block)
+            .map(|(phys, _)| phys)
     }
 
     /// Resolve logical block number to physical disk block using a provided raw inode reference.
@@ -719,9 +730,9 @@ impl ExtInode {
     ) -> Result<(u32, u32), &'static str> {
         if (raw.i_flags & 0x80000) != 0 {
             let i_block = raw.i_block;
-            if let Ok(phys_block) = self.resolve_extent_block(&i_block, file_block) {
+            if let Ok((phys_block, len)) = self.resolve_extent_block_len(&i_block, file_block) {
                 if phys_block != 0 {
-                    return Ok((phys_block, 1));
+                    return Ok((phys_block, len.min(count).max(1)));
                 }
             }
             return self.allocate_extent_block_chunk(raw, file_block, count);
@@ -1366,7 +1377,6 @@ impl ExtInode {
         let mut written_bytes = 0;
         let mut current_offset = offset;
 
-        let mut cached_phys_start = 0u32;
         let mut cached_alloc_count = 0u32;
         let mut cached_start_file_block = 0u32;
 
@@ -1374,29 +1384,35 @@ impl ExtInode {
             let file_block = (current_offset / self.fs.block_size as u64) as u32;
             let page_offset = (current_offset % 4096) as usize;
             let bytes_to_write = core::cmp::min(buf.len() - written_bytes, 4096 - page_offset);
-            let blocks_needed = ((bytes_to_write
-                + (current_offset % self.fs.block_size as u64) as usize
-                + self.fs.block_size as usize
-                - 1)
-                / self.fs.block_size as usize) as u32;
+            let end_offset = current_offset + bytes_to_write as u64 - 1;
+            let end_file_block = (end_offset / self.fs.block_size as u64) as u32;
 
-            if !(file_block >= cached_start_file_block
-                && file_block + blocks_needed <= cached_start_file_block + cached_alloc_count)
-            {
-                let remaining_bytes = buf.len() - written_bytes;
-                let needed_blocks = ((remaining_bytes + self.fs.block_size as usize - 1)
-                    / self.fs.block_size as usize) as u32;
-                let chunk_req = needed_blocks.clamp(32, 128);
+            let mut b = file_block;
+            while b <= end_file_block {
+                if !(b >= cached_start_file_block
+                    && b < cached_start_file_block + cached_alloc_count)
+                {
+                    let remaining_bytes = buf.len() - written_bytes;
+                    let needed_blocks = ((remaining_bytes + self.fs.block_size as usize - 1)
+                        / self.fs.block_size as usize)
+                        as u32;
+                    let chunk_req = needed_blocks.clamp(32, 128);
 
-                let (p_start, p_count) = self
-                    .get_or_alloc_block_chunk(&mut raw, file_block, chunk_req)
-                    .map_err(|_| -5)?; // EIO
-                cached_phys_start = p_start;
-                cached_alloc_count = p_count;
-                cached_start_file_block = file_block;
+                    let (_p_start, p_count) = self
+                        .get_or_alloc_block_chunk(&mut raw, b, chunk_req)
+                        .map_err(|_| -5)?; // EIO
+                    cached_alloc_count = p_count.max(1);
+                    cached_start_file_block = b;
+                }
+                b = cached_start_file_block + cached_alloc_count;
             }
 
             let file_block_offset = current_offset & !4095;
+            let target_end = current_offset + bytes_to_write as u64;
+            if target_end > vfs.size {
+                vfs.size = target_end;
+                raw.i_size = target_end as u32;
+            }
 
             // Drop locks before accessing page cache to prevent double-locking deadlocks on self.vfs_inode
             drop(raw);
@@ -1420,17 +1436,18 @@ impl ExtInode {
             dest_slice[page_offset..page_offset + bytes_to_write]
                 .copy_from_slice(&buf[written_bytes..written_bytes + bytes_to_write]);
 
+            crate::memory::page_cache::mark_dirty(
+                crate::fs::ext::EXT_DEV_ID,
+                self.ino as u64,
+                file_block_offset,
+            );
+
             written_bytes += bytes_to_write;
             current_offset += bytes_to_write as u64;
 
             // Re-acquire locks for the next block allocation check or loop finalization
             raw = self.raw.lock();
             vfs = self.vfs_inode.write();
-
-            if current_offset > vfs.size {
-                vfs.size = current_offset;
-                raw.i_size = current_offset as u32;
-            }
         }
 
         vfs.blocks = raw.i_blocks as u64;

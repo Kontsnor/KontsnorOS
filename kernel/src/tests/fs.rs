@@ -958,3 +958,46 @@ fn test_readv_writev_optimization_and_benchmark() {
 
     crate::kprintln!("[test] readv/writev stack allocation optimization & benchmark test PASSED!");
 }
+
+#[test_case]
+fn test_empty_pathname_conformance() {
+    let empty_path = b"\0";
+    let ptr = empty_path.as_ptr();
+
+    // 1. sys_open with empty pathname -> -ENOENT (-2)
+    let res = crate::syscall::fs::sys_open(ptr, 0, 0);
+    assert_eq!(res, -2, "sys_open(\"\") must return -ENOENT (-2)");
+
+    // 2. sys_openat with empty pathname and no AT_EMPTY_PATH -> -ENOENT (-2)
+    let res = crate::syscall::fs::sys_openat(-100, ptr, 0, 0);
+    assert_eq!(
+        res, -2,
+        "sys_openat(AT_FDCWD, \"\", 0, 0) must return -ENOENT (-2)"
+    );
+
+    // 3. sys_openat with empty pathname and AT_EMPTY_PATH (0x1000) on AT_FDCWD -> returns valid fd
+    let fd = crate::syscall::fs::sys_openat(-100, ptr, 0x1000, 0);
+    assert!(
+        fd >= 0,
+        "sys_openat(AT_FDCWD, \"\", AT_EMPTY_PATH, 0) must succeed, got {}",
+        fd
+    );
+    let _ = crate::syscall::fs::sys_close(fd as i32);
+
+    // 4. sys_openat with empty pathname and AT_EMPTY_PATH on invalid fd -> -EBADF (-9)
+    let res = crate::syscall::fs::sys_openat(9999, ptr, 0x1000, 0);
+    assert_eq!(
+        res, -9,
+        "sys_openat(9999, \"\", AT_EMPTY_PATH, 0) must return -EBADF (-9)"
+    );
+
+    // 5. sys_truncate with empty pathname -> -ENOENT (-2)
+    let res = crate::syscall::fs::sys_truncate(ptr, 0);
+    assert_eq!(res, -2, "sys_truncate(\"\") must return -ENOENT (-2)");
+
+    // 6. sys_chdir with empty pathname -> -ENOENT (-2)
+    let res = crate::syscall::fs::sys_chdir(ptr);
+    assert_eq!(res, -2, "sys_chdir(\"\") must return -ENOENT (-2)");
+
+    crate::kprintln!("[test] empty pathname POSIX conformance test PASSED!");
+}

@@ -32,6 +32,11 @@ pub fn sys_open(pathname: *const u8, flags: i32, mode: u32) -> SyscallResult {
         None => return Errno::EFAULT.into(),
     };
 
+    // POSIX.1-2017 Base Definitions 4.13: An empty pathname shall not be resolved to any file and shall fail with ENOENT.
+    if raw_path.is_empty() {
+        return Errno::ENOENT.into();
+    }
+
     let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
     sys_open_with_resolved_path(resolved_path, flags, mode)
 }
@@ -181,6 +186,31 @@ pub fn sys_openat(dfd: i32, pathname: *const u8, flags: i32, mode: u32) -> Sysca
 
     let flags_u32 = flags as u32;
 
+    // POSIX.1-2017 4.13 & Linux openat(2): An empty pathname returns ENOENT unless AT_EMPTY_PATH (0x1000) is specified.
+    if raw_path.is_empty() {
+        if (flags_u32 & 0x1000) == 0 {
+            return Errno::ENOENT.into();
+        }
+        // AT_EMPTY_PATH is set
+        if dfd == -100 {
+            let cwd = crate::process::scheduler::with_current_fs_ctx(|fs| fs.cwd.clone())
+                .unwrap_or_else(|| String::from("/"));
+            return sys_open_with_resolved_path(cwd, flags, mode);
+        }
+        let desc = match proc_fd::current_task_get_file_desc(dfd) {
+            Some(d) => d,
+            None => return Errno::EBADF.into(),
+        };
+        return match proc_fd::current_task_alloc_fd_with_flags_and_path(
+            desc.inode.clone(),
+            crate::fs::file::OpenFlags(flags_u32),
+            desc.path.clone(),
+        ) {
+            Some(fd) => fd as SyscallResult,
+            None => Errno::EMFILE.into(),
+        };
+    }
+
     // Fast path: relative to an open directory fd with a simple single-component name
     if dfd != -100
         && !raw_path.starts_with('/')
@@ -320,6 +350,11 @@ pub fn sys_truncate(pathname: *const u8, length: i64) -> SyscallResult {
         Some(p) => p,
         None => return Errno::EFAULT.into(),
     };
+
+    // POSIX.1-2017 Base Definitions 4.13 & Linux truncate(2): An empty pathname shall fail with ENOENT.
+    if raw_path.is_empty() {
+        return Errno::ENOENT.into();
+    }
 
     let resolved_path = crate::fs::vfs::resolve_relative_path(&raw_path);
     let inode = match crate::fs::vfs::lookup_follow(&resolved_path, true) {

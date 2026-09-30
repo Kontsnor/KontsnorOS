@@ -152,6 +152,11 @@ impl InodeOps for EventFd {
     }
 }
 
+/// `sys_eventfd(initval)` — Create an eventfd with default flags (0).
+pub fn sys_eventfd(initval: u32) -> SyscallResult {
+    sys_eventfd2(initval, 0)
+}
+
 /// `sys_eventfd2(initval, flags)` — Create an eventfd.
 pub fn sys_eventfd2(initval: u32, flags: i32) -> SyscallResult {
     let semaphore = (flags & 1) != 0; // EFD_SEMAPHORE = 1

@@ -68,6 +68,7 @@ struct CacheEntry {
 struct BlockCacheInner {
     entries: BTreeMap<u64, CacheEntry>,
     fifo_queue: alloc::collections::VecDeque<u64>,
+    dirty_count: usize,
 }
 
 impl BlockCacheInner {
@@ -84,6 +85,7 @@ impl BlockCacheInner {
                         let dirty = entry.dirty;
                         let removed = self.entries.remove(&b).unwrap();
                         if dirty {
+                            self.dirty_count = self.dirty_count.saturating_sub(1);
                             return Some((b, removed.data));
                         } else {
                             return None;
@@ -113,6 +115,7 @@ impl BlockCache {
             inner: KMutex::new(BlockCacheInner {
                 entries: BTreeMap::new(),
                 fifo_queue: alloc::collections::VecDeque::new(),
+                dirty_count: 0,
             }),
             max_blocks,
         }
@@ -143,7 +146,7 @@ impl BlockCache {
     /// Check whether the cache currently holds any dirty blocks.
     pub fn has_dirty_blocks(&self) -> bool {
         let inner = self.inner.lock();
-        inner.entries.values().any(|e| e.dirty)
+        inner.dirty_count > 0
     }
 }
 
@@ -248,58 +251,37 @@ impl BlockDevice for BlockCache {
             let offset = i * block_size;
             let block_slice = &data[offset..offset + block_size];
 
-            if let Some(entry) = inner.entries.get_mut(&curr_block) {
+            let was_clean = if let Some(entry) = inner.entries.get_mut(&curr_block) {
                 entry.referenced = true;
+                let clean = !entry.dirty;
                 entry.dirty = true;
                 entry.data.copy_from_slice(block_slice);
+                Some(clean)
             } else {
-                while let Some((evicted_block, evicted_data)) = inner.evict_one(self.max_blocks) {
-                    self.write_device_aligned(evicted_block, &evicted_data)?;
-                }
-                inner.entries.insert(
-                    curr_block,
-                    CacheEntry {
-                        data: block_slice.to_vec(),
-                        referenced: false,
-                        dirty: true,
-                    },
-                );
-                inner.fifo_queue.push_back(curr_block);
-            }
-        }
+                None
+            };
 
-        // Writeback threshold: if dirty blocks exceed 25% of capacity (or >= 64 blocks),
-        // write back dirty blocks in contiguous batches to prevent memory pressure and I/O stalls
-        let dirty_count = inner.entries.values().filter(|e| e.dirty).count();
-        let high_water = (self.max_blocks / 4).max(64);
-        if dirty_count >= high_water {
-            let mut dirty_to_write = Vec::with_capacity(64);
-            for (&b, entry) in inner.entries.iter_mut() {
-                if entry.dirty {
-                    entry.dirty = false;
-                    dirty_to_write.push((b, entry.data.clone()));
-                    if dirty_to_write.len() >= 64 {
-                        break;
+            match was_clean {
+                Some(true) => {
+                    inner.dirty_count += 1;
+                }
+                Some(false) => {}
+                None => {
+                    while let Some((evicted_block, evicted_data)) = inner.evict_one(self.max_blocks)
+                    {
+                        self.write_device_aligned(evicted_block, &evicted_data)?;
                     }
+                    inner.entries.insert(
+                        curr_block,
+                        CacheEntry {
+                            data: block_slice.to_vec(),
+                            referenced: false,
+                            dirty: true,
+                        },
+                    );
+                    inner.dirty_count += 1;
+                    inner.fifo_queue.push_back(curr_block);
                 }
-            }
-            drop(inner);
-            dirty_to_write.sort_unstable_by_key(|(b, _)| *b);
-            let mut i = 0;
-            while i < dirty_to_write.len() {
-                let start_b = dirty_to_write[i].0;
-                let mut contiguous = Vec::new();
-                contiguous.extend_from_slice(&dirty_to_write[i].1);
-                let mut j = i + 1;
-                while j < dirty_to_write.len()
-                    && dirty_to_write[j].0 == start_b + (j - i) as u64
-                    && (j - i) < 64
-                {
-                    contiguous.extend_from_slice(&dirty_to_write[j].1);
-                    j += 1;
-                }
-                let _ = self.write_device_aligned(start_b, &contiguous);
-                i = j;
             }
         }
 
@@ -315,42 +297,90 @@ impl BlockDevice for BlockCache {
     }
 
     fn flush(&self) -> Result<(), DriverError> {
-        let dirty_blocks: Vec<(u64, Vec<u8>)> = {
+        let mut dirty_block_nums: Vec<u64> = {
             let mut inner = self.inner.lock();
-            let mut list = Vec::new();
+            let mut list = Vec::with_capacity(inner.dirty_count);
             for (&block, entry) in inner.entries.iter_mut() {
                 if entry.dirty {
                     entry.dirty = false;
-                    list.push((block, entry.data.clone()));
+                    list.push(block);
                 }
             }
+            inner.dirty_count = 0;
             list
         };
 
-        if !dirty_blocks.is_empty() {
-            let mut sorted_blocks = dirty_blocks;
-            sorted_blocks.sort_unstable_by_key(|(b, _)| *b);
+        if !dirty_block_nums.is_empty() {
+            dirty_block_nums.sort_unstable();
+
+            let max_chunk_blocks = 128;
+            let block_size = self.device.block_size() as usize;
+            let mut staging_buf = AlignedBuffer::new(max_chunk_blocks * block_size, 512);
 
             let mut i = 0;
-            while i < sorted_blocks.len() {
-                let start_block = sorted_blocks[i].0;
-                let mut contiguous_data = Vec::new();
-                contiguous_data.extend_from_slice(&sorted_blocks[i].1);
-                let mut j = i + 1;
-                while j < sorted_blocks.len()
-                    && sorted_blocks[j].0 == start_block + (j - i) as u64
-                    && (j - i) < 64
-                {
-                    contiguous_data.extend_from_slice(&sorted_blocks[j].1);
-                    j += 1;
+            while i < dirty_block_nums.len() {
+                let start_block = dirty_block_nums[i];
+                let mut chunk_blocks = 0;
+
+                if let Some(ref mut staging) = staging_buf {
+                    let staging_slice = staging.as_mut_slice();
+                    let inner = self.inner.lock();
+                    let mut j = i;
+                    while j < dirty_block_nums.len()
+                        && dirty_block_nums[j] == start_block + (j - i) as u64
+                        && (j - i) < max_chunk_blocks
+                    {
+                        if let Some(entry) = inner.entries.get(&dirty_block_nums[j]) {
+                            let offset = (j - i) * block_size;
+                            staging_slice[offset..offset + block_size].copy_from_slice(&entry.data);
+                            chunk_blocks += 1;
+                            j += 1;
+                        } else {
+                            if j == i {
+                                j += 1;
+                            }
+                            break;
+                        }
+                    }
+                    i = j;
+
+                    if chunk_blocks > 0 {
+                        let total_bytes = chunk_blocks * block_size;
+                        self.device
+                            .write_block(start_block, &staging.as_slice()[..total_bytes])?;
+                    }
+                } else {
+                    let mut write_buf = Vec::new();
+                    let inner = self.inner.lock();
+                    let mut j = i;
+                    while j < dirty_block_nums.len()
+                        && dirty_block_nums[j] == start_block + (j - i) as u64
+                        && (j - i) < max_chunk_blocks
+                    {
+                        if let Some(entry) = inner.entries.get(&dirty_block_nums[j]) {
+                            write_buf.extend_from_slice(&entry.data);
+                            j += 1;
+                        } else {
+                            if j == i {
+                                j += 1;
+                            }
+                            break;
+                        }
+                    }
+                    i = j;
+                    if !write_buf.is_empty() {
+                        self.write_device_aligned(start_block, &write_buf)?;
+                    }
                 }
-                self.write_device_aligned(start_block, &contiguous_data)?;
-                i = j;
             }
             self.device.flush()
         } else {
             Ok(())
         }
+    }
+
+    fn has_dirty_blocks(&self) -> bool {
+        self.inner.lock().dirty_count > 0
     }
 
     fn info(&self) -> DriverInfo {

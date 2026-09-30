@@ -341,8 +341,8 @@ pacman -Q rust
 echo "                -> PASS: pacman query handled without database corruption error!"
 echo ""
 
-echo "[ARCH TEST 6/6] Executing pacman -Sy --noconfirm rust..."
-pacman -Sy --noconfirm rust
+echo "[ARCH TEST 6/6] Executing pacman --debug --noconfirm -Sv perl..."
+time pacman --debug --noconfirm -Sv perl
 PACMAN_STATUS=$?
 echo "Pacman exit code: $PACMAN_STATUS"
 

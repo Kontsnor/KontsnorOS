@@ -1372,13 +1372,17 @@ impl ExtInode {
 
         while written_bytes < buf.len() {
             let file_block = (current_offset / self.fs.block_size as u64) as u32;
-            let block_offset = (current_offset % self.fs.block_size as u64) as usize;
+            let page_offset = (current_offset % 4096) as usize;
+            let bytes_to_write = core::cmp::min(buf.len() - written_bytes, 4096 - page_offset);
+            let blocks_needed = ((bytes_to_write
+                + (current_offset % self.fs.block_size as u64) as usize
+                + self.fs.block_size as usize
+                - 1)
+                / self.fs.block_size as usize) as u32;
 
-            let phys_block = if file_block >= cached_start_file_block
-                && file_block < cached_start_file_block + cached_alloc_count
+            if !(file_block >= cached_start_file_block
+                && file_block + blocks_needed <= cached_start_file_block + cached_alloc_count)
             {
-                cached_phys_start + (file_block - cached_start_file_block)
-            } else {
                 let remaining_bytes = buf.len() - written_bytes;
                 let needed_blocks = ((remaining_bytes + self.fs.block_size as usize - 1)
                     / self.fs.block_size as usize) as u32;
@@ -1390,16 +1394,9 @@ impl ExtInode {
                 cached_phys_start = p_start;
                 cached_alloc_count = p_count;
                 cached_start_file_block = file_block;
-                p_start
-            };
-
-            let bytes_to_write = core::cmp::min(
-                buf.len() - written_bytes,
-                self.fs.block_size as usize - block_offset,
-            );
+            }
 
             let file_block_offset = current_offset & !4095;
-            let page_offset = (current_offset % 4096) as usize;
 
             // Drop locks before accessing page cache to prevent double-locking deadlocks on self.vfs_inode
             drop(raw);
@@ -1422,12 +1419,6 @@ impl ExtInode {
 
             dest_slice[page_offset..page_offset + bytes_to_write]
                 .copy_from_slice(&buf[written_bytes..written_bytes + bytes_to_write]);
-
-            crate::memory::page_cache::mark_dirty(
-                crate::fs::ext::EXT_DEV_ID,
-                self.ino as u64,
-                file_block_offset,
-            );
 
             written_bytes += bytes_to_write;
             current_offset += bytes_to_write as u64;

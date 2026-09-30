@@ -199,11 +199,6 @@ impl Drop for FileDescription {
         let fd_desc_ptr = self as *mut FileDescription as usize;
         let ino = self.inode.inode().ino;
         crate::syscall::fs::io::release_flock_locks(fd_desc_ptr, ino);
-
-        let is_writable = self.flags.lock().is_writable();
-        if is_writable && self.inode.inode().file_type == crate::fs::inode::FileType::Regular {
-            let _ = self.inode.fsync();
-        }
     }
 }
 

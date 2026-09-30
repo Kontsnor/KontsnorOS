@@ -1343,18 +1343,25 @@ impl InodeOps for ExtInode {
         self.truncate_file(size)
     }
 
-    fn fsync(&self) -> Result<(), i32> {
+    fn flush_dirty(&self) -> Result<(), i32> {
         // 1. Flush all dirty pages in the page cache for this inode to block cache
         let _ = crate::memory::page_cache::flush_all_for_inode_inner(self);
 
-        // 2. Commit the raw inode metadata table entry
+        // 2. Commit the raw inode metadata table entry to block cache
         let raw = self.raw.lock();
         self.fs.write_inode(self.ino, &raw).map_err(|_| -5)?;
 
-        // 3. Commit superblock and group descriptor metadata if dirty
+        Ok(())
+    }
+
+    fn fsync(&self) -> Result<(), i32> {
+        // 1. Flush dirty pages and commit raw inode to block cache
+        self.flush_dirty()?;
+
+        // 2. Commit superblock and group descriptor metadata if dirty
         let _ = self.fs.sync_metadata();
 
-        // 4. Issue cache flush barrier to the underlying block device
+        // 3. Issue cache flush barrier to the underlying block device
         self.fs.device.flush().map_err(|_| -5)?;
 
         Ok(())
@@ -1406,7 +1413,7 @@ impl FileSystem for ExtFileSystem {
 
         for ino in dirty_inodes {
             if let Ok(inode) = self_arc.get_ext_inode(ino as u32) {
-                let _ = inode.fsync();
+                let _ = inode.flush_dirty();
             }
         }
 
@@ -1424,7 +1431,10 @@ impl FileSystem for ExtFileSystem {
         {
             return true;
         }
-        crate::memory::page_cache::has_dirty_pages_for_dev(EXT_DEV_ID)
+        if crate::memory::page_cache::has_dirty_pages_for_dev(EXT_DEV_ID) {
+            return true;
+        }
+        self.device.has_dirty_blocks()
     }
 
     fn statfs(&self) -> FsStats {

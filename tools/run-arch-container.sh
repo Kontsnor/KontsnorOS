@@ -341,8 +341,18 @@ pacman -Q rust
 echo "                -> PASS: pacman query handled without database corruption error!"
 echo ""
 
-echo "[ARCH TEST 6/6] Executing pacman --debug --noconfirm -Sv perl..."
-time pacman --debug --noconfirm -Sv perl
+echo "[ARCH TEST 6/6] Executing pacman -Sy..."
+pacman -Sy
+echo "Inspecting /var/lib/pacman/sync:"
+ls -l /var/lib/pacman/sync/
+md5sum /var/lib/pacman/sync/* || true
+echo "Testing tar on core.db:"
+tar -ztvf /var/lib/pacman/sync/core.db | tail -n 5
+echo "Testing tar on extra.db:"
+tar -ztvf /var/lib/pacman/sync/extra.db | tail -n 5
+echo "Done testing tar."
+echo "[ARCH TEST 6/6] Executing pacman --debug --noconfirm -Sv git..."
+pacman --debug --noconfirm -Sv git
 PACMAN_STATUS=$?
 echo "Pacman exit code: $PACMAN_STATUS"
 
@@ -441,6 +451,76 @@ set -e
 echo ""
 echo "QEMU exit code: $QEMU_STATUS"
 
+# ===================== POST-VM BINARY COMPARISON =====================
+echo ""
+echo "======================================================================"
+echo "  POST-VM: Binary comparison of extra.db (host curl vs disk image)"
+echo "======================================================================"
+
+# Download a fresh copy from the mirror
+MIRROR_URL="http://geo.mirror.pkgbuild.com/extra/os/x86_64/extra.db"
+HOST_EXTRA="/tmp/host_extra.db"
+echo "Downloading fresh extra.db from $MIRROR_URL ..."
+curl -sL -o "$HOST_EXTRA" "$MIRROR_URL" 2>/dev/null || wget -q -O "$HOST_EXTRA" "$MIRROR_URL" 2>/dev/null || true
+
+if [ -f "$HOST_EXTRA" ] && [ -s "$HOST_EXTRA" ]; then
+    echo "  Host extra.db size: $(stat -c%s "$HOST_EXTRA") bytes"
+    echo "  Host extra.db md5:  $(md5sum "$HOST_EXTRA" | awk '{print $1}')"
+
+    # Extract the VM's copy from the disk image
+    VM_EXTRA="/tmp/vm_extra.db"
+    debugfs -R "dump containers/arch/var/lib/pacman/sync/extra.db $VM_EXTRA" "$DISK_IMG" 2>/dev/null || true
+
+    if [ -f "$VM_EXTRA" ] && [ -s "$VM_EXTRA" ]; then
+        echo "  VM   extra.db size: $(stat -c%s "$VM_EXTRA") bytes"
+        echo "  VM   extra.db md5:  $(md5sum "$VM_EXTRA" | awk '{print $1}')"
+
+        if cmp -s "$HOST_EXTRA" "$VM_EXTRA"; then
+            echo "  MATCH: Files are byte-identical!"
+        else
+            echo "  MISMATCH: Files differ!"
+            echo "  First 10 differences (cmp -l output: byte_offset host_byte vm_byte):"
+            cmp -l "$HOST_EXTRA" "$VM_EXTRA" 2>/dev/null | head -n 20 || true
+            echo ""
+            echo "  Differing byte ranges (block-level):"
+            # Show which 4KB blocks differ
+            HOST_SIZE=$(stat -c%s "$HOST_EXTRA")
+            VM_SIZE=$(stat -c%s "$VM_EXTRA")
+            MIN_SIZE=$HOST_SIZE
+            [ "$VM_SIZE" -lt "$MIN_SIZE" ] 2>/dev/null && MIN_SIZE=$VM_SIZE
+            BLOCK_COUNT=$(( (MIN_SIZE + 4095) / 4096 ))
+            echo "  Checking $BLOCK_COUNT 4KB blocks..."
+            DIFF_BLOCKS=""
+            for i in $(seq 0 $((BLOCK_COUNT - 1))); do
+                OFFSET=$((i * 4096))
+                HOST_HASH=$(dd if="$HOST_EXTRA" bs=4096 skip=$i count=1 2>/dev/null | md5sum | awk '{print $1}')
+                VM_HASH=$(dd if="$VM_EXTRA" bs=4096 skip=$i count=1 2>/dev/null | md5sum | awk '{print $1}')
+                if [ "$HOST_HASH" != "$VM_HASH" ]; then
+                    DIFF_BLOCKS="$DIFF_BLOCKS $i"
+                    OFFSET_HEX=$(printf "0x%x" $OFFSET)
+                    echo "    Block $i (offset $OFFSET_HEX): HOST=$HOST_HASH VM=$VM_HASH"
+                    echo "    Host bytes at offset $OFFSET_HEX:"
+                    xxd -s $OFFSET -l 64 "$HOST_EXTRA" 2>/dev/null || true
+                    echo "    VM bytes at offset $OFFSET_HEX:"
+                    xxd -s $OFFSET -l 64 "$VM_EXTRA" 2>/dev/null || true
+                    echo ""
+                fi
+            done
+            if [ -z "$DIFF_BLOCKS" ]; then
+                echo "  No 4KB block differences detected (file size mismatch only?)"
+                echo "  Host size: $HOST_SIZE, VM size: $VM_SIZE"
+            else
+                echo "  Total differing blocks:$DIFF_BLOCKS"
+            fi
+        fi
+    else
+        echo "  WARNING: Could not extract VM extra.db from disk image"
+    fi
+else
+    echo "  WARNING: Could not download fresh extra.db from mirror"
+fi
+echo "======================================================================"
+
 if grep -q "ARCH LINUX CONTAINER" "$QEMU_LOG" || grep -q "\[ARCH_CONTAINER_SUCCESS\]" "$QEMU_LOG" || grep -q "I RUN ARCH BTW" "$QEMU_LOG"; then
     echo "======================================================================"
     echo "  SUCCESS: ARCH LINUX CONTAINER RUN SUCCEEDED!"
@@ -454,3 +534,4 @@ else
     echo "======================================================================"
     exit 1
 fi
+

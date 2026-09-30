@@ -1412,7 +1412,7 @@ impl FileSystem for ExtFileSystem {
         let dirty_inodes = crate::memory::page_cache::dirty_inodes_for_dev(EXT_DEV_ID);
 
         for ino in dirty_inodes {
-            if let Ok(inode) = self_arc.get_ext_inode(ino as u32) {
+            if let Ok(inode) = self_arc.get_inode(ino as u32) {
                 let _ = inode.flush_dirty();
             }
         }

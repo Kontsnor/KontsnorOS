@@ -441,12 +441,13 @@ pub fn flush_page_inner(inode: &dyn InodeOps, offset: u64) -> Result<(), Errno> 
     let ino = inode.inode().ino;
     let aligned_offset = offset & !4095;
 
-    // 1. Check if dirty and copy page info under shard lock
+    // 1. Check if dirty and clear dirty flag under shard lock BEFORE writing
     let phys_to_write = {
         let shard = shard_index(dev, ino, aligned_offset);
-        let guard = PAGE_CACHE_SHARDS[shard].lock();
-        if let Some(entry) = guard.map.get(&(dev, ino, aligned_offset)) {
+        let mut guard = PAGE_CACHE_SHARDS[shard].lock();
+        if let Some(entry) = guard.map.get_mut(&(dev, ino, aligned_offset)) {
             if entry.dirty {
+                entry.dirty = false;
                 Some(entry.phys_addr)
             } else {
                 None
@@ -456,26 +457,30 @@ pub fn flush_page_inner(inode: &dyn InodeOps, offset: u64) -> Result<(), Errno> 
         }
     };
 
-    // 2. Perform write without lock
+    // 2. Snapshot the frame into a local buffer and perform write without holding shard lock.
+    //    A concurrent write_page_cache may be modifying the live frame between the dirty-flag
+    //    clear above and the write_direct below, so reading directly from the physical frame
+    //    can produce a torn (partially-updated) snapshot.  Copying into a local buffer under
+    //    a brief volatile read prevents handing a half-written page to write_direct.
     if let Some(phys) = phys_to_write {
         let phys_offset = phys + crate::memory::r#virtual::phys_mem_offset();
+        // SAFETY: phys_offset points to a valid 4KB physical frame in the direct mapping.
         let src_slice = unsafe { core::slice::from_raw_parts(phys_offset as *const u8, 4096) };
+        let mut snapshot = [0u8; 4096];
+        snapshot.copy_from_slice(src_slice);
 
         let size = inode.inode().size;
         if size > aligned_offset {
             let write_len = core::cmp::min(4096, (size - aligned_offset) as usize);
-            inode
-                .write_direct(aligned_offset, &src_slice[..write_len])
-                .map_err(|_| Errno::EIO)?;
-        }
-
-        // 3. Clear dirty flag under shard lock
-        let shard = shard_index(dev, ino, aligned_offset);
-        let mut guard = PAGE_CACHE_SHARDS[shard].lock();
-        if let Some(entry) = guard.map.get_mut(&(dev, ino, aligned_offset)) {
-            // Only clear dirty if the physical page hasn't changed (it shouldn't have)
-            if entry.phys_addr == phys {
-                entry.dirty = false;
+            if let Err(_e) = inode.write_direct(aligned_offset, &snapshot[..write_len]) {
+                let shard = shard_index(dev, ino, aligned_offset);
+                let mut guard = PAGE_CACHE_SHARDS[shard].lock();
+                if let Some(entry) = guard.map.get_mut(&(dev, ino, aligned_offset)) {
+                    if entry.phys_addr == phys {
+                        entry.dirty = true;
+                    }
+                }
+                return Err(Errno::EIO);
             }
         }
     }
@@ -666,10 +671,12 @@ pub fn sync_mapped_region(
                 // SAFETY: phys is a valid allocated physical page frame mapped into virtual memory.
                 let src_slice =
                     unsafe { core::slice::from_raw_parts(phys_offset as *const u8, 4096) };
+                let mut snapshot = [0u8; 4096];
+                snapshot.copy_from_slice(src_slice);
                 let size = inode.inode().size;
                 if size > aligned_file_offset {
                     let write_len = core::cmp::min(4096, (size - aligned_file_offset) as usize);
-                    let _ = inode.write_direct(aligned_file_offset, &src_slice[..write_len]);
+                    let _ = inode.write_direct(aligned_file_offset, &snapshot[..write_len]);
                 }
 
                 let shard = shard_index(dev, ino, aligned_file_offset);

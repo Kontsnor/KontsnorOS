@@ -1222,8 +1222,8 @@ impl InodeOps for ExtInode {
     }
 
     fn set_permissions(&self, mode: u16) -> Result<(), i32> {
-        let mut vfs = self.vfs_inode.write();
         let mut raw = self.raw.lock();
+        let mut vfs = self.vfs_inode.write();
         let new_mode = (raw.i_mode & 0xF000) | (mode & 0x0FFF);
         raw.i_mode = new_mode;
         vfs.permissions.mode = new_mode;
@@ -1232,8 +1232,8 @@ impl InodeOps for ExtInode {
     }
 
     fn set_owner(&self, uid: u32, gid: u32) -> Result<(), i32> {
-        let mut vfs = self.vfs_inode.write();
         let mut raw = self.raw.lock();
+        let mut vfs = self.vfs_inode.write();
         raw.i_uid = uid as u16;
         raw.i_gid = gid as u16;
         vfs.uid = uid;
@@ -1243,8 +1243,8 @@ impl InodeOps for ExtInode {
     }
 
     fn set_times(&self, atime: u64, mtime: u64) -> Result<(), i32> {
-        let mut vfs = self.vfs_inode.write();
         let mut raw = self.raw.lock();
+        let mut vfs = self.vfs_inode.write();
         raw.i_atime = atime as u32;
         raw.i_mtime = mtime as u32;
         let now = crate::fs::vfs::current_time_sec();

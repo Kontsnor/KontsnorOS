@@ -312,7 +312,7 @@ echo ""
 
 echo "[ARCH PACMAN CLEAN] Cleaning broken local db entries, locks, and package cache..."
 rm -f /var/lib/pacman/db.lck
-rm -f /var/cache/pacman/pkg/rust* /var/cache/pacman/pkg/llvm*
+rm -f /var/cache/pacman/pkg/*.part /var/cache/pacman/pkg/rust* /var/cache/pacman/pkg/llvm*
 for d in /var/lib/pacman/local/*/; do
   if [ -d "$d" ] && [ ! -f "$d/desc" ]; then
     echo "Pruning corrupt db entry: $d"
@@ -351,8 +351,8 @@ tar -ztvf /var/lib/pacman/sync/core.db | tail -n 5
 echo "Testing tar on extra.db:"
 tar -ztvf /var/lib/pacman/sync/extra.db | tail -n 5
 echo "Done testing tar."
-echo "[ARCH TEST 6/6] Executing pacman --debug --noconfirm -Sv git..."
-pacman --debug --noconfirm -Sv git
+echo "[ARCH TEST 6/6] Executing pacman --debug --noconfirm -Sv perl..."
+time pacman --debug --noconfirm -Sv perl
 PACMAN_STATUS=$?
 echo "Pacman exit code: $PACMAN_STATUS"
 

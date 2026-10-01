@@ -278,8 +278,32 @@ fn test_timerfd() {
     let res = crate::fs::epoll::sys_epoll_ctl(epfd, 1, tfd, &mut ev);
     assert_eq!(res, 0);
 
+    // Test timerfd_gettime error handling and disarmed query
+    let mut cur_value = crate::fs::timerfd::Itimerspec::default();
+    assert_eq!(
+        crate::fs::timerfd::sys_timerfd_gettime(tfd, core::ptr::null_mut()),
+        crate::syscall::Errno::EFAULT as i64
+    );
+    assert_eq!(
+        crate::fs::timerfd::sys_timerfd_gettime(-1, &mut cur_value),
+        crate::syscall::Errno::EBADF as i64
+    );
+    assert_eq!(
+        crate::fs::timerfd::sys_timerfd_gettime(epfd, &mut cur_value),
+        crate::syscall::Errno::EINVAL as i64
+    );
+    assert_eq!(
+        crate::fs::timerfd::sys_timerfd_gettime(tfd, &mut cur_value),
+        0
+    );
+    assert_eq!(cur_value.it_value.tv_sec, 0);
+    assert_eq!(cur_value.it_value.tv_nsec, 0);
+
     let new_value = crate::fs::timerfd::Itimerspec {
-        it_interval: crate::fs::timerfd::Timespec::default(),
+        it_interval: crate::fs::timerfd::Timespec {
+            tv_sec: 0,
+            tv_nsec: 20_000_000,
+        },
         it_value: crate::fs::timerfd::Timespec {
             tv_sec: 0,
             tv_nsec: 10_000_000,
@@ -287,6 +311,11 @@ fn test_timerfd() {
     };
     let res = crate::fs::timerfd::sys_timerfd_settime(tfd, 0, &new_value, core::ptr::null_mut());
     assert_eq!(res, 0);
+
+    let res_get = crate::fs::timerfd::sys_timerfd_gettime(tfd, &mut cur_value);
+    assert_eq!(res_get, 0);
+    assert_eq!(cur_value.it_interval.tv_nsec, 20_000_000);
+    assert!(cur_value.it_value.tv_nsec > 0 && cur_value.it_value.tv_nsec <= 10_000_000);
 
     let mut ready_evs = [crate::fs::epoll::EpollEvent::default(); 1];
     let n = crate::fs::epoll::sys_epoll_wait(epfd, ready_evs.as_mut_ptr(), 1, 100);

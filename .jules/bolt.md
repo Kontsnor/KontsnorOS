@@ -38,3 +38,7 @@
 ## 2026-03-30 - Lock-Free WaitQueue Empty Fast Path Optimization
 **Learning:** In `kernel/src/sync/wait_queue.rs`, calling `wake_all()` unconditionally disabled interrupts (`without_interrupts`) and attempted/acquired the global `SCHEDULER` spinlock on every notification, even when no tasks or listeners were sleeping on the wait queue. Adding `waiter_count: AtomicUsize` to `WaitQueue` and performing an atomic `Ordering::Acquire` load in `wake_all()` allows empty wait queues to immediately return in O(1) time without disabling interrupts or contending on the `SCHEDULER` spinlock.
 **Action:** For synchronization primitives that wake tasks, track active waiter counts atomically so empty wake notifications can bypass global scheduler spinlocks and CPU interrupt masking.
+
+## 2026-03-31 - KRwLock Reader Spin-Loop Atomic Memory Ordering Optimization
+**Learning:** In `kernel/src/sync/rwlock.rs`, `KRwLock::read` was loading `writer_pending` with `Ordering::Acquire` on every iteration of its spin-wait loop. Using `Ordering::Acquire` in a tight loop incurs atomic memory pipeline fence stalls on x86_64 CPUs. Switching the spin-check to `Ordering::Relaxed` eliminates memory pipeline stalls during spin-waits while the subsequent `compare_exchange_weak(..., Ordering::Acquire, ...)` guarantees proper acquire memory synchronization when the read lock is acquired.
+**Action:** When spin-checking atomic state flags prior to acquiring a lock via RMW CAS/exchanges, use `Ordering::Relaxed` for the polling loads to prevent CPU pipeline stalls during spin loops.

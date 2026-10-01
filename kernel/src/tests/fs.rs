@@ -262,6 +262,26 @@ fn test_eventfd() {
 }
 
 #[test_case]
+fn test_epoll_create1_invalid_flags() {
+    // Valid call with flags = 0
+    let epfd = crate::fs::epoll::sys_epoll_create1(0);
+    assert!(epfd >= 0);
+    crate::process::fd::current_task_close_fd(epfd as i32);
+
+    // Valid call with EPOLL_CLOEXEC (0x80000)
+    let epfd_cloexec = crate::fs::epoll::sys_epoll_create1(0x80000);
+    assert!(epfd_cloexec >= 0);
+    crate::process::fd::current_task_close_fd(epfd_cloexec as i32);
+
+    // Invalid flag bits set
+    let res1 = crate::fs::epoll::sys_epoll_create1(1);
+    assert_eq!(res1, crate::syscall::Errno::EINVAL as i64);
+
+    let res2 = crate::fs::epoll::sys_epoll_create1(!0x80000);
+    assert_eq!(res2, crate::syscall::Errno::EINVAL as i64);
+}
+
+#[test_case]
 fn test_timerfd() {
     let epfd = crate::fs::epoll::sys_epoll_create1(0);
     assert!(epfd >= 0);

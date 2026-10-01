@@ -161,8 +161,17 @@ pub fn check_sleep_timeouts() {
 }
 
 /// `sys_epoll_create1(flags)` — Create an epoll instance.
+///
+/// Ref: Linux `epoll_create1(2)` man page:
+/// Returns `-EINVAL` if `flags` contains an invalid value (bits other than `EPOLL_CLOEXEC`).
 pub fn sys_epoll_create1(flags: i32) -> SyscallResult {
-    let cloexec = (flags & 0x80000) != 0; // EPOLL_CLOEXEC = O_CLOEXEC = 0x80000
+    const EPOLL_CLOEXEC: i32 = 0x80000; // EPOLL_CLOEXEC = O_CLOEXEC = 0x80000
+
+    if (flags & !EPOLL_CLOEXEC) != 0 {
+        return Errno::EINVAL.into();
+    }
+
+    let cloexec = (flags & EPOLL_CLOEXEC) != 0;
 
     let mut open_flags = crate::fs::file::OpenFlags::O_RDWR;
     if cloexec {

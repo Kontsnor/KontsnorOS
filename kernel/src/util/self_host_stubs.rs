@@ -27,71 +27,59 @@ pub extern "C" fn _Unwind_Resume() -> ! {
 }
 
 #[cfg(not(target_os = "none"))]
+#[allow(suspicious_runtime_symbol_definitions)]
 #[no_mangle]
 /// # Safety
 /// Caller must pass valid pointers for `dest` and `src` with at least `n` bytes.
 pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    let mut i = 0;
-    while i < n {
-        // SAFETY: Pointer offsets up to n are valid per caller contract.
-        unsafe {
-            *dest.add(i) = *src.add(i);
-        }
-        i += 1;
+    // SAFETY: Caller guarantees `src` and `dest` are valid for `n` bytes and non-overlapping.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, dest, n);
     }
     dest
 }
 
 #[cfg(not(target_os = "none"))]
+#[allow(suspicious_runtime_symbol_definitions)]
 #[no_mangle]
 /// # Safety
 /// Caller must pass a valid pointer `s` with at least `n` bytes.
 pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
-    let mut i = 0;
-    while i < n {
-        // SAFETY: Pointer offset up to n is valid per caller contract.
-        unsafe {
-            *s.add(i) = c as u8;
-        }
-        i += 1;
+    // SAFETY: Caller guarantees `s` is valid for `n` bytes.
+    unsafe {
+        core::ptr::write_bytes(s, c as u8, n);
     }
     s
 }
 
 #[cfg(not(target_os = "none"))]
+#[allow(suspicious_runtime_symbol_definitions)]
 #[no_mangle]
 /// # Safety
 /// Caller must pass valid pointers for `dest` and `src` with at least `n` bytes.
 pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    if (dest as usize) < (src as usize) {
-        // SAFETY: Delegating to memcpy with the same bounds contract.
-        unsafe { memcpy(dest, src, n) }
-    } else {
-        let mut i = n;
-        while i > 0 {
-            i -= 1;
-            // SAFETY: Decrementing within bounds [0..n).
-            unsafe {
-                *dest.add(i) = *src.add(i);
-            }
-        }
-        dest
+    // SAFETY: Caller guarantees `src` and `dest` are valid for `n` bytes.
+    unsafe {
+        core::ptr::copy(src, dest, n);
     }
+    dest
 }
 
 #[cfg(not(target_os = "none"))]
+#[allow(suspicious_runtime_symbol_definitions)]
 #[no_mangle]
 /// # Safety
 /// Caller must pass valid pointers `s1` and `s2` with at least `n` bytes.
 pub unsafe extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
-    let mut i = 0;
-    while i < n {
-        // SAFETY: Reading within bounds [0..n).
-        let (a, b) = unsafe { (*s1.add(i), *s2.add(i)) };
-        if a != b {
-            return a as i32 - b as i32;
-        }
-        i += 1;
+    if n == 0 {
+        return 0;
     }
-    0
+    // SAFETY: Caller guarantees `s1` and `s2` point to valid memory for `n` bytes.
+    let slice1 = unsafe { core::slice::from_raw_parts(s1, n) };
+    let slice2 = unsafe { core::slice::from_raw_parts(s2, n) };
+    match slice1.cmp(slice2) {
+        core::cmp::Ordering::Less => -1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => 1,
+    }
 }

@@ -38,3 +38,7 @@
 ## 2026-03-30 - Lock-Free WaitQueue Empty Fast Path Optimization
 **Learning:** In `kernel/src/sync/wait_queue.rs`, calling `wake_all()` unconditionally disabled interrupts (`without_interrupts`) and attempted/acquired the global `SCHEDULER` spinlock on every notification, even when no tasks or listeners were sleeping on the wait queue. Adding `waiter_count: AtomicUsize` to `WaitQueue` and performing an atomic `Ordering::Acquire` load in `wake_all()` allows empty wait queues to immediately return in O(1) time without disabling interrupts or contending on the `SCHEDULER` spinlock.
 **Action:** For synchronization primitives that wake tasks, track active waiter counts atomically so empty wake notifications can bypass global scheduler spinlocks and CPU interrupt masking.
+
+## 2026-03-30 - Zero-Allocation TCP Socket Write Payload Slicing
+**Learning:** In `kernel/src/net/socket.rs`, `SocketInode::write` was creating a heap-allocated `Vec<u8>` (`data[..chunk_len].to_vec()`) for every TCP chunk sent. Since `build_tcp_packet` accepts a `&[u8]` slice and copies bytes into the packet frame buffer, allocating a heap vector was completely redundant. Using a slice reference `&data[..chunk_len]` eliminates heap allocation and deallocation overhead and kernel allocator lock contention on every transmitted TCP socket chunk.
+**Action:** Avoid calling `.to_vec()` on input buffer slices when passing data to packet-building functions that only require `&[u8]` slice references.

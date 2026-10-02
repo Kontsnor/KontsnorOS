@@ -554,6 +554,32 @@ fn test_ext4_extent_mapping() {
 }
 
 #[test_case]
+fn test_sys_ftruncate_ebadf_on_read_only_fd() {
+    let tmp_dir = crate::fs::vfs::lookup("/tmp").expect("Failed to lookup /tmp");
+    let test_file = tmp_dir
+        .create("ftruncate_ro.txt", crate::fs::inode::FileType::Regular)
+        .expect("Failed to create /tmp/ftruncate_ro.txt");
+    let _ = test_file.write(0, b"Initial file contents");
+
+    // Open path O_RDONLY (flags = 0)
+    let path = b"/tmp/ftruncate_ro.txt\0";
+    let fd = crate::syscall::fs::sys_open(path.as_ptr(), 0, 0);
+    assert!(fd >= 0, "Failed to open file O_RDONLY");
+    let fd = fd as i32;
+
+    // ftruncate on read-only fd must fail with -EBADF (-9) per POSIX / Linux spec
+    let ret = crate::syscall::fs::sys_ftruncate(fd, 0);
+    assert_eq!(
+        ret,
+        crate::syscall::Errno::EBADF as i64,
+        "ftruncate on read-only fd did not return EBADF"
+    );
+
+    crate::syscall::fs::sys_close(fd);
+    let _ = tmp_dir.unlink("ftruncate_ro.txt");
+}
+
+#[test_case]
 fn test_lseek_espipe_on_pipe() {
     let mut pipefds = [0i32; 2];
     let res = crate::syscall::fs::sys_pipe(pipefds.as_mut_ptr());

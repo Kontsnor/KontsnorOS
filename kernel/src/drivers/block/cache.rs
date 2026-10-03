@@ -76,24 +76,19 @@ impl BlockCacheInner {
     /// Returns Some((block, data)) if the evicted entry is dirty so caller can write it back.
     fn evict_one(&mut self, max_blocks: usize) -> Option<(u64, Vec<u8>)> {
         while self.entries.len() >= max_blocks {
-            if let Some(b) = self.fifo_queue.pop_front() {
-                if let Some(entry) = self.entries.get_mut(&b) {
-                    if entry.referenced {
-                        entry.referenced = false;
-                        self.fifo_queue.push_back(b);
-                    } else {
-                        let dirty = entry.dirty;
-                        let removed = self.entries.remove(&b).unwrap();
-                        if dirty {
-                            self.dirty_count = self.dirty_count.saturating_sub(1);
-                            return Some((b, removed.data));
-                        } else {
-                            return None;
-                        }
+            let b = self.fifo_queue.pop_front()?;
+            if let Some(entry) = self.entries.get_mut(&b) {
+                if entry.referenced {
+                    entry.referenced = false;
+                    self.fifo_queue.push_back(b);
+                } else {
+                    let removed = self.entries.remove(&b).unwrap();
+                    if removed.dirty {
+                        self.dirty_count = self.dirty_count.saturating_sub(1);
+                        return Some((b, removed.data));
                     }
+                    return None;
                 }
-            } else {
-                break;
             }
         }
         None
@@ -167,13 +162,7 @@ impl BlockDevice for BlockCache {
         // 1. Acquire lock to check for cache hits
         let mut inner = self.inner.lock();
 
-        let mut all_hits = true;
-        for i in 0..num_blocks {
-            if !inner.entries.contains_key(&(block + i as u64)) {
-                all_hits = false;
-                break;
-            }
-        }
+        let all_hits = (0..num_blocks).all(|i| inner.entries.contains_key(&(block + i as u64)));
 
         if all_hits {
             for i in 0..num_blocks {
@@ -299,13 +288,12 @@ impl BlockDevice for BlockCache {
     fn flush(&self) -> Result<(), DriverError> {
         let dirty_block_nums: Vec<u64> = {
             let inner = self.inner.lock();
-            let mut list = Vec::with_capacity(inner.dirty_count);
-            for (&block, entry) in inner.entries.iter() {
-                if entry.dirty {
-                    list.push(block);
-                }
-            }
-            list
+            inner
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.dirty)
+                .map(|(&block, _)| block)
+                .collect()
         };
 
         if !dirty_block_nums.is_empty() {

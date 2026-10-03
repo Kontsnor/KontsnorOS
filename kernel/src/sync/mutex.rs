@@ -62,8 +62,14 @@ impl<T> KMutex<T> {
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            // TODO: Add to wait queue and yield to scheduler
-            core::hint::spin_loop();
+            // Test-and-Test-and-Set (TTAS) optimization:
+            // Spin on a read-only relaxed load while the lock is held. This keeps
+            // the cache line in Shared (S) state in L1/L2 caches across CPU cores,
+            // avoiding repeated bus-locking `LOCK CMPXCHG` instructions and interconnect
+            // cache invalidation traffic until the lock holder drops the lock.
+            while self.locked.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
+            }
         }
 
         KMutexGuard { mutex: self }

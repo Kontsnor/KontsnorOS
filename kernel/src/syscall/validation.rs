@@ -166,6 +166,17 @@ fn ensure_page_mapped(vaddr: u64) -> bool {
     resolved.unwrap_or(false)
 }
 
+/// Validate that a user-space read source at `[ptr, ptr+size)` is safe.
+///
+/// Returns `Ok(())` if valid, or `Err(())` if invalid.
+pub fn validate_user_ptr_read(ptr: *const u8, size: usize) -> Result<(), ()> {
+    if validate_user_ptr(ptr, size) {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
 /// Enforce that a user-space pointer range [ptr, ptr + size) is valid.
 ///
 /// 1. Must lie strictly below 0x0000_7FFF_FFFF_FFFF.

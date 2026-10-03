@@ -22,7 +22,9 @@ use super::creds::calculate_exec_creds;
 use crate::kprintln;
 use crate::process::scheduler;
 use crate::syscall::fs::copy_string_from_user_pub;
-use crate::syscall::validation::{validate_user_ptr, validate_user_ptr_write};
+use crate::syscall::validation::{
+    validate_user_ptr, validate_user_ptr_read, validate_user_ptr_write,
+};
 
 /// `fork()` — Create a child process.
 ///
@@ -1364,9 +1366,73 @@ pub fn sys_set_tid_address(tidptr: *mut i32) -> SyscallResult {
     pid.as_u64() as i64
 }
 
-/// `prctl(option, ...)` — Process control (stub).
-pub fn sys_prctl(_option: i32, _arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> SyscallResult {
-    0
+pub const PR_SET_NAME: i32 = 15;
+pub const PR_GET_NAME: i32 = 16;
+
+/// `prctl(option, ...)` — Process control.
+///
+/// Implements process/thread control operations including `PR_SET_NAME` (15) and `PR_GET_NAME` (16).
+///
+/// Linux man page reference: prctl(2)
+pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> SyscallResult {
+    match option {
+        PR_SET_NAME => {
+            let ptr = arg2 as *const u8;
+            if ptr.is_null() || validate_user_ptr_read(ptr, 16).is_err() {
+                return Errno::EFAULT.into();
+            }
+
+            let mut buf = [0u8; 16];
+            // SAFETY: Pointer validated with validate_user_ptr for 16 bytes.
+            unsafe {
+                core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), 16);
+            }
+
+            let len = buf.iter().position(|&b| b == 0).unwrap_or(16);
+            let name_str = match core::str::from_utf8(&buf[..len]) {
+                Ok(s) => s,
+                Err(_) => return Errno::EINVAL.into(),
+            };
+
+            let current_pid = match scheduler::current_pid() {
+                Some(p) => p,
+                None => return Errno::ESRCH.into(),
+            };
+
+            if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+                task_arc.lock().name = alloc::string::String::from(name_str);
+            }
+            0
+        }
+        PR_GET_NAME => {
+            let ptr = arg2 as *mut u8;
+            if ptr.is_null() || validate_user_ptr_write(ptr, 16).is_err() {
+                return Errno::EFAULT.into();
+            }
+
+            let current_pid = match scheduler::current_pid() {
+                Some(p) => p,
+                None => return Errno::ESRCH.into(),
+            };
+
+            let task_name = match scheduler::get_task_arc(current_pid) {
+                Some(task_arc) => task_arc.lock().name.clone(),
+                None => return Errno::ESRCH.into(),
+            };
+
+            let mut buf = [0u8; 16];
+            let bytes = task_name.as_bytes();
+            let copy_len = core::cmp::min(bytes.len(), 15);
+            buf[..copy_len].copy_from_slice(&bytes[..copy_len]);
+
+            // SAFETY: Pointer validated with validate_user_ptr_write for 16 bytes.
+            unsafe {
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr, 16);
+            }
+            0
+        }
+        _ => Errno::EINVAL.into(),
+    }
 }
 
 // ── Clone and Namespace Flags ────────────────────────────────────────────────

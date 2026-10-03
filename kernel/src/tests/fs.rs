@@ -1036,3 +1036,32 @@ fn test_ext_fsync_and_close_persistence() {
 
     crate::kprintln!("[test] Ext4 fsync and close disk persistence test PASSED!");
 }
+
+#[test_case]
+fn test_sys_fcntl_conformance() {
+    use crate::syscall::fs::{sys_close, sys_fcntl, sys_open};
+    use crate::syscall::Errno;
+
+    // 1. Invalid file descriptor (< 0) -> EBADF
+    assert_eq!(sys_fcntl(-1, 0, 0), Errno::EBADF as i64);
+    assert_eq!(sys_fcntl(-100, 1, 0), Errno::EBADF as i64);
+
+    // 2. Unallocated/closed file descriptor -> EBADF
+    assert_eq!(sys_fcntl(9999, 0, 0), Errno::EBADF as i64);
+
+    // 3. Valid file descriptor tests
+    let path = b"/tmp/test_fcntl.txt\0";
+    let fd = sys_open(path.as_ptr(), 0o102, 0o644); // O_CREAT | O_RDWR
+    assert!(fd >= 0, "Failed to open temporary file for fcntl test");
+    let fd = fd as i32;
+
+    // Command F_GETFD (1) -> should return 0 (no FD_CLOEXEC)
+    let flags = sys_fcntl(fd, 1, 0);
+    assert_eq!(flags, 0);
+
+    // Unknown/unsupported command (e.g. 9999) -> EINVAL per POSIX/Linux fcntl(2)
+    assert_eq!(sys_fcntl(fd, 9999, 0), Errno::EINVAL as i64);
+
+    let _ = sys_close(fd);
+    let _ = crate::syscall::fs::sys_unlink(path.as_ptr());
+}

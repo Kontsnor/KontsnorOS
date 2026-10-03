@@ -75,14 +75,13 @@ impl<T> KRwLock<T> {
         }
 
         loop {
-            // Respect writer priority: spin while a writer is pending or active.
-            if self.writer_pending.load(Ordering::Acquire) {
+            // Respect writer priority: spin on a read-only relaxed load while a writer is pending or active.
+            while self.writer_pending.load(Ordering::Relaxed) {
                 if crate::arch::x86_64::smp::has_pending_tlb_shootdown() {
                     x86_64::instructions::tlb::flush_all();
                     crate::arch::x86_64::smp::tlb_shootdown_ack();
                 }
                 core::hint::spin_loop();
-                continue;
             }
 
             let state = self.state.load(Ordering::Relaxed);
@@ -96,6 +95,16 @@ impl<T> KRwLock<T> {
                         lock: self,
                         interrupts_enabled,
                     };
+                }
+            } else {
+                // Writer currently holds the lock (state < 0).
+                // Spin in read-only mode until state >= 0 before attempting CAS again.
+                while self.state.load(Ordering::Relaxed) < 0 {
+                    if crate::arch::x86_64::smp::has_pending_tlb_shootdown() {
+                        x86_64::instructions::tlb::flush_all();
+                        crate::arch::x86_64::smp::tlb_shootdown_ack();
+                    }
+                    core::hint::spin_loop();
                 }
             }
             if crate::arch::x86_64::smp::has_pending_tlb_shootdown() {
@@ -125,11 +134,17 @@ impl<T> KRwLock<T> {
             .compare_exchange_weak(0, -1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            if crate::arch::x86_64::smp::has_pending_tlb_shootdown() {
-                x86_64::instructions::tlb::flush_all();
-                crate::arch::x86_64::smp::tlb_shootdown_ack();
+            // Test-and-Test-and-Set (TTAS) read-only spin loop:
+            // Spin-wait using a relaxed read while active readers or another writer holds the lock (state != 0).
+            // This prevents a waiting writer from executing repeated `LOCK CMPXCHG` bus-locking
+            // instructions and invalidating active reader cache lines until the lock is released.
+            while self.state.load(Ordering::Relaxed) != 0 {
+                if crate::arch::x86_64::smp::has_pending_tlb_shootdown() {
+                    x86_64::instructions::tlb::flush_all();
+                    crate::arch::x86_64::smp::tlb_shootdown_ack();
+                }
+                core::hint::spin_loop();
             }
-            core::hint::spin_loop();
         }
 
         // Lock acquired; the guard's Drop will clear writer_pending.

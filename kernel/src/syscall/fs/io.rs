@@ -595,7 +595,19 @@ pub fn sys_memfd_create(name_ptr: *const u8, flags: u32) -> SyscallResult {
 }
 
 /// `fcntl(fd, cmd, arg)` — File control.
+///
+/// Complies with POSIX.1-2017 and Linux `fcntl(2)` specifications:
+/// - Returns `-EBADF` if `fd` is invalid or not an open file descriptor.
+/// - Returns `-EINVAL` if `cmd` is unhandled or invalid.
 pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
+    if fd < 0 {
+        return Errno::EBADF.into();
+    }
+
+    if proc_fd::current_task_get_file_desc(fd).is_none() {
+        return Errno::EBADF.into();
+    }
+
     match cmd {
         0 | 1030 => {
             // F_DUPFD or F_DUPFD_CLOEXEC
@@ -885,13 +897,14 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
         _ => {
             if crate::syscall::DEBUG_SYSCALLS {
                 kprintln!(
-                    "[syscall] fcntl(fd={}, cmd={}, arg={}) -> ENOSYS",
+                    "[syscall] fcntl(fd={}, cmd={}, arg={}) -> EINVAL",
                     fd,
                     cmd,
                     arg
                 );
             }
-            Errno::ENOSYS.into()
+            // Per POSIX.1-2017 and Linux fcntl(2), invalid or unsupported cmd arguments must return EINVAL.
+            Errno::EINVAL.into()
         }
     }
 }

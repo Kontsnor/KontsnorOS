@@ -38,3 +38,7 @@
 ## 2026-03-30 - Lock-Free WaitQueue Empty Fast Path Optimization
 **Learning:** In `kernel/src/sync/wait_queue.rs`, calling `wake_all()` unconditionally disabled interrupts (`without_interrupts`) and attempted/acquired the global `SCHEDULER` spinlock on every notification, even when no tasks or listeners were sleeping on the wait queue. Adding `waiter_count: AtomicUsize` to `WaitQueue` and performing an atomic `Ordering::Acquire` load in `wake_all()` allows empty wait queues to immediately return in O(1) time without disabling interrupts or contending on the `SCHEDULER` spinlock.
 **Action:** For synchronization primitives that wake tasks, track active waiter counts atomically so empty wake notifications can bypass global scheduler spinlocks and CPU interrupt masking.
+
+## 2026-03-30 - Test-and-Test-and-Set (TTAS) Spinlock Read Loop Optimization
+**Learning:** In `kernel/src/sync/mutex.rs` (`KMutex::lock`) and `kernel/src/sync/rwlock.rs` (`KRwLock::write`), repeatedly executing `compare_exchange_weak` in spin loops forces bus-locking `LOCK CMPXCHG` instructions on x86_64, causing cache-line invalidation traffic across all CPU cores. Inserting an inner read-only spin loop (`while self.locked.load(Ordering::Relaxed) { spin_loop(); }`) keeps the cache line in Shared (S) state on waiting CPUs, drastically reducing CPU interconnect contention and cache invalidations until the lock is freed.
+**Action:** Always prefer Test-and-Test-and-Set (TTAS) spin loops with read-only relaxed loads over plain Atomic CAS loops in busy-spin synchronization primitives.

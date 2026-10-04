@@ -356,6 +356,13 @@ impl BlockDevice for AtaDrive {
         let sector_count = (buf.len() / 512) as u32;
         let mut sectors_read = 0;
 
+        crate::fs::kstats::KSTATS
+            .block_reads
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        crate::fs::kstats::KSTATS
+            .sectors_read
+            .fetch_add(sector_count as u64, core::sync::atomic::Ordering::Relaxed);
+
         while sectors_read < sector_count {
             let chunk = core::cmp::min(sector_count - sectors_read, 256);
             let chunk_len = (chunk * 512) as usize;

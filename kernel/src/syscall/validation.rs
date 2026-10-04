@@ -171,6 +171,17 @@ fn ensure_page_mapped(vaddr: u64) -> bool {
 /// 1. Must lie strictly below 0x0000_7FFF_FFFF_FFFF.
 /// 2. Must not wrap around.
 /// 3. Every page in the range must be mapped or lazy-mapped in the active page directory.
+/// Validate that a user-space read source at `[ptr, ptr+size)` is safe.
+///
+/// This is the read-variant wrapping `validate_user_ptr`.
+pub fn validate_user_ptr_read(ptr: *const u8, size: usize) -> Result<(), ()> {
+    if validate_user_ptr(ptr, size) {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
 pub fn validate_user_ptr(ptr: *const u8, size: usize) -> bool {
     if ptr.is_null() {
         return false;

@@ -187,13 +187,13 @@ fn gen_version() -> String {
 fn gen_meminfo() -> String {
     let (total, allocated, free) = crate::memory::physical::stats();
     let page_size = crate::memory::PAGE_SIZE;
+    let total_kb = (total * page_size) / 1024;
+    let free_kb = (free * page_size) / 1024;
+    let used_kb = (allocated * page_size) / 1024;
 
     format!(
-        "MemTotal:    {} kB\nMemFree:     {} kB\nMemUsed:     {} kB\nPageSize:    {} B\n",
-        (total * page_size) / 1024,
-        (free * page_size) / 1024,
-        (allocated * page_size) / 1024,
-        page_size
+        "MemTotal:       {:8} kB\nMemFree:        {:8} kB\nMemAvailable:   {:8} kB\nBuffers:               0 kB\nCached:                0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nMemUsed:        {:8} kB\nPageSize:       {:8} B\n",
+        total_kb, free_kb, free_kb, used_kb, page_size
     )
 }
 

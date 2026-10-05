@@ -116,3 +116,61 @@ fn test_pty_active_master_optimization() {
 
     crate::kprintln!("[test] PTY active master optimization test PASSED!");
 }
+
+#[test_case]
+fn test_kmutex_ttas_concurrency() {
+    use crate::sync::mutex::KMutex;
+
+    let mutex = KMutex::new(42);
+
+    // Test initial lock and deref/deref_mut
+    {
+        let mut guard = mutex.lock();
+        assert_eq!(*guard, 42);
+        *guard = 100;
+    }
+
+    // Verify state mutation after release
+    {
+        let guard = mutex.lock();
+        assert_eq!(*guard, 100);
+    }
+
+    // Test try_lock behavior when unlocked vs locked
+    {
+        let guard1 = mutex.try_lock();
+        assert!(guard1.is_some());
+        assert!(mutex.try_lock().is_none());
+    }
+
+    // Verify unlocked after guard drop
+    assert!(mutex.try_lock().is_some());
+}
+
+#[test_case]
+fn test_krwlock_ttas_concurrency() {
+    use crate::sync::rwlock::KRwLock;
+
+    let rwlock = KRwLock::new(10);
+
+    // Concurrent read locks
+    {
+        let r1 = rwlock.read();
+        let r2 = rwlock.read();
+        assert_eq!(*r1, 10);
+        assert_eq!(*r2, 10);
+    }
+
+    // Exclusive write lock
+    {
+        let mut w = rwlock.write();
+        assert_eq!(*w, 10);
+        *w = 25;
+    }
+
+    // Verify updated value on subsequent read
+    {
+        let r = rwlock.read();
+        assert_eq!(*r, 25);
+    }
+}

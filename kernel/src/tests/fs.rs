@@ -220,6 +220,10 @@ fn test_vfs_permissions() {
 
 #[test_case]
 fn test_eventfd() {
+    let legacy_fd = crate::syscall::fs::sys_eventfd(15);
+    assert!(legacy_fd >= 0);
+    crate::process::fd::current_task_close_fd(legacy_fd as i32);
+
     let fd = crate::fs::eventfd::sys_eventfd2(10, 0);
     assert!(fd >= 0);
     let fd = fd as i32;
@@ -288,6 +292,10 @@ fn test_timerfd() {
     let res = crate::fs::timerfd::sys_timerfd_settime(tfd, 0, &new_value, core::ptr::null_mut());
     assert_eq!(res, 0);
 
+    let mut curr_val = crate::fs::timerfd::Itimerspec::default();
+    let gettime_res = crate::syscall::fs::sys_timerfd_gettime(tfd, &mut curr_val);
+    assert_eq!(gettime_res, 0);
+
     let mut ready_evs = [crate::fs::epoll::EpollEvent::default(); 1];
     let n = crate::fs::epoll::sys_epoll_wait(epfd, ready_evs.as_mut_ptr(), 1, 100);
     assert_eq!(n, 1);
@@ -313,6 +321,10 @@ fn test_timerfd() {
 #[test_case]
 fn test_signalfd() {
     let mask = 1u64 << (10 - 1);
+    let legacy_sfd = crate::syscall::fs::sys_signalfd(-1, &mask, 8);
+    assert!(legacy_sfd >= 0);
+    crate::process::fd::current_task_close_fd(legacy_sfd as i32);
+
     let sfd = crate::fs::signalfd::sys_signalfd4(-1, &mask, 8, 0);
     assert!(sfd >= 0);
     let sfd = sfd as i32;
@@ -1035,4 +1047,222 @@ fn test_ext_fsync_and_close_persistence() {
     assert_eq!(&read_buf[..bytes_read], test_payload);
 
     crate::kprintln!("[test] Ext4 fsync and close disk persistence test PASSED!");
+}
+
+#[test_case]
+fn test_fs_sequential_read_benchmark() {
+    crate::kprintln!("[bench] Starting large file sequential read benchmark...");
+    let file = if let Some(inode) = crate::fs::vfs::lookup("/usr/bin/cargo") {
+        inode
+    } else if let Some(inode) = crate::fs::vfs::lookup("/disk/usr/bin/cargo") {
+        inode
+    } else if let Some(inode) = crate::fs::vfs::lookup("/hello.txt") {
+        inode
+    } else {
+        panic!("No benchmark target file found!");
+    };
+
+    let target_size: usize = core::cmp::min(16 * 1024 * 1024, file.inode().size as usize);
+    assert!(target_size > 0, "Target file has 0 size");
+
+    let chunk_size: usize = 64 * 1024;
+    let mut chunk_buf = alloc::vec![0u8; chunk_size];
+
+    // Cold read benchmark
+    let stats_before_cold = crate::fs::kstats::take_fs_stats_snapshot();
+    let start_ns_cold = crate::syscall::process::get_monotonic_ns();
+    let start_tsc_cold = unsafe { core::arch::x86_64::_rdtsc() };
+
+    let mut bytes_read = 0;
+    while bytes_read < target_size {
+        let to_read = core::cmp::min(chunk_size, target_size - bytes_read);
+        let n = file
+            .read(bytes_read as u64, &mut chunk_buf[..to_read])
+            .expect("Cold read failed");
+        assert!(n > 0, "Unexpected early EOF");
+        bytes_read += n;
+    }
+
+    let end_tsc_cold = unsafe { core::arch::x86_64::_rdtsc() };
+    let end_ns_cold = crate::syscall::process::get_monotonic_ns();
+    let stats_after_cold = crate::fs::kstats::take_fs_stats_snapshot();
+    let cold_delta = stats_after_cold.delta_from(&stats_before_cold);
+    let cold_cycles = end_tsc_cold.saturating_sub(start_tsc_cold);
+    let cold_ns = end_ns_cold.saturating_sub(start_ns_cold);
+
+    crate::kprintln!(
+        "[bench] Cold read {} bytes: {} ns (~{} ms), {} TSC cycles | reads: {}, sectors: {}, hits: {}, misses: {}, resolves: {}",
+        target_size,
+        cold_ns,
+        cold_ns / 1_000_000,
+        cold_cycles,
+        cold_delta.block_reads,
+        cold_delta.sectors_read,
+        cold_delta.page_cache_hits,
+        cold_delta.page_cache_misses,
+        cold_delta.resolve_block_calls
+    );
+
+    // Warm read benchmark (file data is now cached in page cache)
+    let stats_before_warm = crate::fs::kstats::take_fs_stats_snapshot();
+    let start_ns_warm = crate::syscall::process::get_monotonic_ns();
+    let start_tsc_warm = unsafe { core::arch::x86_64::_rdtsc() };
+
+    let mut bytes_read_warm = 0;
+    while bytes_read_warm < target_size {
+        let to_read = core::cmp::min(chunk_size, target_size - bytes_read_warm);
+        let n = file
+            .read(bytes_read_warm as u64, &mut chunk_buf[..to_read])
+            .expect("Warm read failed");
+        assert!(n > 0, "Unexpected early EOF in warm read");
+        bytes_read_warm += n;
+    }
+
+    let end_tsc_warm = unsafe { core::arch::x86_64::_rdtsc() };
+    let end_ns_warm = crate::syscall::process::get_monotonic_ns();
+    let stats_after_warm = crate::fs::kstats::take_fs_stats_snapshot();
+    let warm_delta = stats_after_warm.delta_from(&stats_before_warm);
+    let warm_cycles = end_tsc_warm.saturating_sub(start_tsc_warm);
+    let warm_ns = end_ns_warm.saturating_sub(start_ns_warm);
+
+    crate::kprintln!(
+        "[bench] Warm read {} bytes: {} ns (~{} ms), {} TSC cycles | reads: {}, sectors: {}, hits: {}, misses: {}, resolves: {}",
+        target_size,
+        warm_ns,
+        warm_ns / 1_000_000,
+        warm_cycles,
+        warm_delta.block_reads,
+        warm_delta.sectors_read,
+        warm_delta.page_cache_hits,
+        warm_delta.page_cache_misses,
+        warm_delta.resolve_block_calls
+    );
+}
+
+#[test_case]
+fn test_ext4_extent_resolution_benchmark() {
+    crate::kprintln!("[bench] Starting Ext4 extent resolve benchmark...");
+    let device = crate::drivers::ramdisk::create_ext2_ramdisk();
+    let fs = crate::fs::ext::ExtFileSystem::mount(device).expect("Failed to mount ext");
+    let inode = fs.get_ext_inode(12).expect("Failed to get ext inode");
+
+    // Populate depth-0 extent in i_block
+    let mut i_block = [0u32; 15];
+    let mut bytes = [0u8; 60];
+    let header = crate::fs::ext::types::Ext4ExtentHeader {
+        eh_magic: 0xF30A,
+        eh_entries: 3,
+        eh_max: 4,
+        eh_depth: 0,
+        eh_generation: 0,
+    };
+    let ext1 = crate::fs::ext::types::Ext4Extent {
+        ee_block: 0,
+        ee_len: 1000,
+        ee_start_hi: 0,
+        ee_start_lo: 10000,
+    };
+    let ext2 = crate::fs::ext::types::Ext4Extent {
+        ee_block: 1000,
+        ee_len: 2000,
+        ee_start_hi: 0,
+        ee_start_lo: 20000,
+    };
+    let ext3 = crate::fs::ext::types::Ext4Extent {
+        ee_block: 3000,
+        ee_len: 3000,
+        ee_start_hi: 0,
+        ee_start_lo: 30000,
+    };
+
+    // SAFETY: bytes has 60 bytes, exactly enough for Ext4ExtentHeader (12) + 3 Ext4Extent (3 * 12 = 36).
+    unsafe {
+        core::ptr::write_unaligned(
+            bytes.as_mut_ptr() as *mut crate::fs::ext::types::Ext4ExtentHeader,
+            header,
+        );
+        core::ptr::write_unaligned(
+            bytes[12..].as_mut_ptr() as *mut crate::fs::ext::types::Ext4Extent,
+            ext1,
+        );
+        core::ptr::write_unaligned(
+            bytes[24..].as_mut_ptr() as *mut crate::fs::ext::types::Ext4Extent,
+            ext2,
+        );
+        core::ptr::write_unaligned(
+            bytes[36..].as_mut_ptr() as *mut crate::fs::ext::types::Ext4Extent,
+            ext3,
+        );
+    }
+    for i in 0..15 {
+        i_block[i] = u32::from_le_bytes([
+            bytes[i * 4],
+            bytes[i * 4 + 1],
+            bytes[i * 4 + 2],
+            bytes[i * 4 + 3],
+        ]);
+    }
+
+    {
+        let mut raw = inode.raw.lock();
+        raw.i_flags |= 0x80000;
+        raw.i_block = i_block;
+    }
+
+    // Benchmark 10,000 resolve_block calls
+    let stats_before = crate::fs::kstats::take_fs_stats_snapshot();
+    let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+
+    let iterations = 10_000u32;
+    for i in 0..iterations {
+        let file_block = i % 5000;
+        let res = inode.resolve_block(file_block);
+        assert!(res.is_ok());
+    }
+
+    let end_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let stats_after = crate::fs::kstats::take_fs_stats_snapshot();
+    let delta = stats_after.delta_from(&stats_before);
+    let elapsed = end_tsc.saturating_sub(start_tsc);
+
+    crate::kprintln!(
+        "[bench] Ext4 extent resolve (10000 lookups): {} cycles (avg {} cycles/lookup) | resolves: {}",
+        elapsed,
+        elapsed / (iterations as u64),
+        delta.resolve_block_calls
+    );
+}
+
+#[test_case]
+fn test_page_cache_eviction_and_dirty_stats() {
+    let file = if let Some(inode) = crate::fs::vfs::lookup("/disk/usr/bin/cargo") {
+        inode
+    } else if let Some(inode) = crate::fs::vfs::lookup("/disk/test.txt") {
+        inode
+    } else {
+        return;
+    };
+
+    // Read 32 KiB (8 pages) to populate the page cache
+    let mut buf = [0u8; 32768];
+    let n = file.read(0, &mut buf).expect("Read failed");
+    assert!(n > 0);
+
+    // Verify O(1) dirty page count check
+    let _has_dirty = crate::memory::page_cache::has_dirty_pages();
+    let dev = file.inode().dev;
+    let ino = file.inode().ino;
+    let inode_dirty = crate::memory::page_cache::has_dirty_pages_for_inode(dev, ino);
+    // Since we only read, this inode should not have dirty pages
+    assert!(!inode_dirty);
+
+    // Evict clean pages
+    let evicted = crate::memory::page_cache::page_cache_evict_clean_pages(4);
+    assert!(evicted > 0, "Expected at least 1 page evicted");
+
+    // Reading again should succeed (transparent re-fault / re-read)
+    let mut buf2 = [0u8; 4096];
+    let n2 = file.read(0, &mut buf2).expect("Re-read failed");
+    assert_eq!(n2, 4096);
+    assert_eq!(buf[..4096], buf2[..4096]);
 }

@@ -269,7 +269,7 @@ impl InodeOps for SocketInode {
             };
 
             let chunk_len = data.len().min(1460);
-            let payload = data[..chunk_len].to_vec();
+            let payload = &data[..chunk_len];
             let mut tcp_buf = [0u8; 1500];
             let flags = 0x10 | 0x08; // ACK | PSH
 
@@ -290,7 +290,7 @@ impl InodeOps for SocketInode {
                 tcp_rcv_nxt,
                 flags,
                 window,
-                &payload,
+                payload,
             )
             .ok_or(-5)?; // EIO
 

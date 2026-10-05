@@ -120,11 +120,27 @@ impl<T> KRwLock<T> {
         // This prevents starvation by blocking new readers from entering.
         self.writer_pending.store(true, Ordering::Release);
 
-        while self
-            .state
-            .compare_exchange_weak(0, -1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
+        // Test-and-Test-and-Set (TTAS) optimization for exclusive write acquisition:
+        // Read-only relaxed load (`self.state.load(Ordering::Relaxed)`) keeps the lock's cache
+        // line in Shared (S) state while waiting for active readers or writer to release.
+        // This avoids continuous bus-locking `LOCK CMPXCHG` instructions during spin waiting.
+        loop {
+            while self.state.load(Ordering::Relaxed) != 0 {
+                if crate::arch::x86_64::smp::has_pending_tlb_shootdown() {
+                    x86_64::instructions::tlb::flush_all();
+                    crate::arch::x86_64::smp::tlb_shootdown_ack();
+                }
+                core::hint::spin_loop();
+            }
+
+            if self
+                .state
+                .compare_exchange_weak(0, -1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+
             if crate::arch::x86_64::smp::has_pending_tlb_shootdown() {
                 x86_64::instructions::tlb::flush_all();
                 crate::arch::x86_64::smp::tlb_shootdown_ack();

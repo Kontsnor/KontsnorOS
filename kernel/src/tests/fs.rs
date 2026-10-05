@@ -220,6 +220,10 @@ fn test_vfs_permissions() {
 
 #[test_case]
 fn test_eventfd() {
+    let legacy_fd = crate::syscall::fs::sys_eventfd(15);
+    assert!(legacy_fd >= 0);
+    crate::process::fd::current_task_close_fd(legacy_fd as i32);
+
     let fd = crate::fs::eventfd::sys_eventfd2(10, 0);
     assert!(fd >= 0);
     let fd = fd as i32;
@@ -288,6 +292,10 @@ fn test_timerfd() {
     let res = crate::fs::timerfd::sys_timerfd_settime(tfd, 0, &new_value, core::ptr::null_mut());
     assert_eq!(res, 0);
 
+    let mut curr_val = crate::fs::timerfd::Itimerspec::default();
+    let gettime_res = crate::syscall::fs::sys_timerfd_gettime(tfd, &mut curr_val);
+    assert_eq!(gettime_res, 0);
+
     let mut ready_evs = [crate::fs::epoll::EpollEvent::default(); 1];
     let n = crate::fs::epoll::sys_epoll_wait(epfd, ready_evs.as_mut_ptr(), 1, 100);
     assert_eq!(n, 1);
@@ -313,6 +321,10 @@ fn test_timerfd() {
 #[test_case]
 fn test_signalfd() {
     let mask = 1u64 << (10 - 1);
+    let legacy_sfd = crate::syscall::fs::sys_signalfd(-1, &mask, 8);
+    assert!(legacy_sfd >= 0);
+    crate::process::fd::current_task_close_fd(legacy_sfd as i32);
+
     let sfd = crate::fs::signalfd::sys_signalfd4(-1, &mask, 8, 0);
     assert!(sfd >= 0);
     let sfd = sfd as i32;

@@ -75,6 +75,7 @@ impl InodeOps for TimerFd {
         }
 
         loop {
+            let tok = self.wait_queue.token();
             let val_opt = x86_64::instructions::interrupts::without_interrupts(|| {
                 let mut num_exp = self.num_expirations.lock();
                 if *num_exp > 0 {
@@ -95,7 +96,7 @@ impl InodeOps for TimerFd {
                 return Err(-11); // EAGAIN
             }
 
-            self.wait_queue.wait();
+            self.wait_queue.wait_since(tok);
         }
     }
 

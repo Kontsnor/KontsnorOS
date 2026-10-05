@@ -94,6 +94,7 @@ const ENABLE_NET_TESTS: bool = false;
 /// - A kernel stack
 /// - Boot information from the bootloader
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    let boot_start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
     // ── Phase 1: Early initialization ──────────────────────────────────
     // Initialize serial output first so we can log everything else
     arch::x86_64::serial::init();
@@ -328,6 +329,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::arch::x86_64::smp::BOOT_COMPLETE.store(true, core::sync::atomic::Ordering::Relaxed);
     x86_64::instructions::interrupts::enable();
     kprintln!("[kernel] Interrupts enabled. Yielding to ready threads...");
+
+    let boot_end_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let boot_cycles = boot_end_tsc.saturating_sub(boot_start_tsc);
+    // TSC is nominally ~2.0 GHz
+    let boot_ms = boot_cycles / 2_000_000;
+    kprintln!(
+        "[boot] Boot completed in {} cycles (~{} ms)",
+        boot_cycles,
+        boot_ms
+    );
 
     #[cfg(feature = "test")]
     {

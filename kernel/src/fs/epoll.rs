@@ -312,6 +312,7 @@ pub fn sys_epoll_wait(
     let mut ready_list = Vec::with_capacity(initial_cap);
 
     loop {
+        let tok = epoll.wait_queue.token();
         ready_list.clear();
         {
             let mut items = epoll.items.lock();
@@ -382,7 +383,7 @@ pub fn sys_epoll_wait(
         }
 
         // Block on wait queue
-        epoll.wait_queue.wait();
+        epoll.wait_queue.wait_since(tok);
 
         // Remove sleep timeout when woken up
         remove_sleep_timeout(current_pid);

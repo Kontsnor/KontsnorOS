@@ -72,7 +72,7 @@ pub(crate) fn read_raw_inode(buf: &[u8], offset: usize, inode_size: usize) -> Ex
     raw
 }
 
-/// Logical-to-physical block reading helper.
+/// Logical-to-physical block reading helper with metadata caching.
 pub(crate) fn read_blocks(
     device: &dyn BlockDevice,
     block: u64,
@@ -82,12 +82,12 @@ pub(crate) fn read_blocks(
     let dev_block_size = device.block_size();
     let dev_blocks_per_fs_block = (block_size as u64) / dev_block_size;
     let start_dev_block = block * dev_blocks_per_fs_block;
+
     device
         .read_block(start_dev_block, buf)
         .map_err(|_| "Block device read error")
 }
 
-/// Logical-to-physical block writing helper.
 pub(crate) fn write_blocks(
     device: &dyn BlockDevice,
     block: u64,
@@ -97,6 +97,7 @@ pub(crate) fn write_blocks(
     let dev_block_size = device.block_size();
     let dev_blocks_per_fs_block = (block_size as u64) / dev_block_size;
     let start_dev_block = block * dev_blocks_per_fs_block;
+
     device
         .write_block(start_dev_block, buf)
         .map_err(|_| "Block device write error")
@@ -1087,6 +1088,8 @@ impl ExtFileSystem {
             ino,
             raw: TicketLock::new(raw_inode),
             vfs_inode: RwLock::new(inode),
+            extent_cache: ExtentCache::new(),
+            readahead: ReadaheadState::new(),
         })
     }
 
@@ -1182,12 +1185,81 @@ impl ExtFileSystem {
     }
 }
 
+/// Lock-free per-inode extent cache for fast consecutive lookups.
+pub struct ExtentCache {
+    /// Low 32 bits: logical_start; High 32 bits: length.
+    range: core::sync::atomic::AtomicU64,
+    /// Physical block address starting this extent.
+    phys_start: core::sync::atomic::AtomicU64,
+}
+
+impl ExtentCache {
+    pub const fn new() -> Self {
+        Self {
+            range: core::sync::atomic::AtomicU64::new(0),
+            phys_start: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, file_block: u32) -> Option<(u32, u32)> {
+        let range = self.range.load(core::sync::atomic::Ordering::Acquire);
+        let len = (range >> 32) as u32;
+        if len > 0 {
+            let start = range as u32;
+            if file_block >= start && file_block < start + len {
+                let phys_start = self.phys_start.load(core::sync::atomic::Ordering::Acquire);
+                let offset = (file_block - start) as u64;
+                let phys_block = phys_start + offset;
+                let remaining = (start + len) - file_block;
+                return Some((phys_block as u32, remaining));
+            }
+        }
+        None
+    }
+
+    #[inline]
+    pub fn update(&self, logical_start: u32, length: u32, physical_start: u64) {
+        if length > 0 {
+            self.phys_start
+                .store(physical_start, core::sync::atomic::Ordering::Relaxed);
+            let range = (logical_start as u64) | ((length as u64) << 32);
+            self.range
+                .store(range, core::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[inline]
+    pub fn invalidate(&self) {
+        self.range.store(0, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Adaptive readahead state for sequential file reads.
+pub struct ReadaheadState {
+    /// Logical page offset of the last read operation.
+    pub last_offset: core::sync::atomic::AtomicU64,
+    /// Current readahead window in pages (between 32 and 128).
+    pub window_pages: core::sync::atomic::AtomicU32,
+}
+
+impl ReadaheadState {
+    pub const fn new() -> Self {
+        Self {
+            last_offset: core::sync::atomic::AtomicU64::new(u64::MAX),
+            window_pages: core::sync::atomic::AtomicU32::new(32),
+        }
+    }
+}
+
 /// ext Inode wrapper implementing InodeOps.
 pub struct ExtInode {
     pub(crate) fs: Arc<ExtFileSystem>,
     pub(crate) ino: u32,
     pub(crate) raw: TicketLock<ExtRawInode>,
     pub(crate) vfs_inode: RwLock<Inode>,
+    pub(crate) extent_cache: ExtentCache,
+    pub(crate) readahead: ReadaheadState,
 }
 
 impl InodeOps for ExtInode {

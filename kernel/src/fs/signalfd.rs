@@ -177,6 +177,11 @@ impl InodeOps for SignalFd {
     }
 }
 
+/// `sys_signalfd(fd, mask, sizemask)` — Create or update a signalfd with default flags.
+pub fn sys_signalfd(fd: i32, mask: *const u64, sizemask: usize) -> SyscallResult {
+    sys_signalfd4(fd, mask, sizemask, 0)
+}
+
 /// `sys_signalfd4(fd, mask, sizemask, flags)` — Create or update a signalfd.
 pub fn sys_signalfd4(fd: i32, mask: *const u64, sizemask: usize, flags: i32) -> SyscallResult {
     if mask.is_null() || sizemask != 8 {

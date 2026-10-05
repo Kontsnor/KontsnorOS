@@ -134,6 +134,7 @@ impl InodeOps for SocketInode {
             }
             let mut wq_opt: Option<Arc<WaitQueue>> = None;
             while sock.tcp_recv_buf.is_empty() {
+                let tok = sock.wait_queue.token();
                 match sock.tcp_state {
                     TcpState::CloseWait | TcpState::TimeWait => {
                         return Ok(0); // Graceful EOF
@@ -154,7 +155,7 @@ impl InodeOps for SocketInode {
                 // Block/Wait - lazily clone wait_queue on first wait iteration only
                 let wq = wq_opt.get_or_insert_with(|| sock.wait_queue.clone());
                 drop(sock);
-                wq.wait();
+                wq.wait_since(tok);
                 sock = self.socket.lock();
             }
             let prev_buf_len = sock.tcp_recv_buf.len();
@@ -221,13 +222,14 @@ impl InodeOps for SocketInode {
             Ok(n)
         } else if sock.sock_type == 2 || sock.sock_type == 3 {
             // SOCK_DGRAM (UDP) or SOCK_RAW / ICMP
+            let tok = sock.wait_queue.token();
             if sock.udp_recv_queue.is_empty() {
                 if sock.nonblocking {
                     return Err(-11); // -EAGAIN
                 }
                 let wq = sock.wait_queue.clone();
                 drop(sock);
-                wq.wait();
+                wq.wait_since(tok);
                 sock = self.socket.lock();
             }
             if let Some(dg) = sock.udp_recv_queue.pop_front() {

@@ -1144,6 +1144,7 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, timeout: i32) -> SyscallResult {
         .unwrap_or(false);
 
     loop {
+        let tok = poll_wq.token();
         let mut ready = 0i64;
         for pfd in local_fds.iter_mut() {
             if pfd.fd >= 0 {
@@ -1209,7 +1210,7 @@ pub fn sys_poll(fds: *mut u8, nfds: u64, timeout: i32) -> SyscallResult {
         if let Some(limit) = effective_limit {
             crate::fs::epoll::add_sleep_timeout(current_pid, start_ticks + limit);
         }
-        poll_wq.wait();
+        poll_wq.wait_since(tok);
         if effective_limit.is_some() {
             crate::fs::epoll::remove_sleep_timeout(current_pid);
         }
@@ -1371,6 +1372,7 @@ pub fn sys_pselect6(
         .unwrap_or(false);
 
     loop {
+        let tok = poll_wq.token();
         let mut out_read = [0u64; 16];
         let mut out_write = [0u64; 16];
         let mut out_except = [0u64; 16];
@@ -1474,7 +1476,7 @@ pub fn sys_pselect6(
         if let Some(limit) = effective_limit {
             crate::fs::epoll::add_sleep_timeout(current_pid, start_ticks + limit);
         }
-        poll_wq.wait();
+        poll_wq.wait_since(tok);
         if effective_limit.is_some() {
             crate::fs::epoll::remove_sleep_timeout(current_pid);
         }

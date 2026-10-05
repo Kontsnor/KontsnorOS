@@ -215,6 +215,14 @@ unsafe impl Sync for NvmeNamespace {}
 
 impl BlockDevice for NvmeNamespace {
     fn read_block(&self, block: u64, buf: &mut [u8]) -> Result<(), DriverError> {
+        let sector_count = (buf.len() as u64) / self.block_size;
+        crate::fs::kstats::KSTATS
+            .block_reads
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        crate::fs::kstats::KSTATS
+            .sectors_read
+            .fetch_add(sector_count, core::sync::atomic::Ordering::Relaxed);
+
         let mut ctrl = self.controller.lock();
         let io_queue = ctrl.io_queue.as_mut().ok_or(DriverError::NotReady)?;
 

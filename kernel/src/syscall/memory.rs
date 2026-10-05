@@ -47,7 +47,8 @@ pub fn sys_mmap(
     use crate::process::fd as proc_fd;
     use crate::process::scheduler;
 
-    if length == 0 {
+    // POSIX.1-2017/2024 & Linux mmap(2): EINVAL if length is zero or offset is not a multiple of page size
+    if length == 0 || (offset as u64 & 4095) != 0 {
         return Errno::EINVAL.into();
     }
 

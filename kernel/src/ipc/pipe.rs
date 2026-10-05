@@ -75,6 +75,7 @@ impl Pipe {
 
         let mut written = 0;
         while written < data.len() {
+            let tok = self.wait_queue.token();
             if !*self.read_open.lock() {
                 if written > 0 {
                     return Ok(written);
@@ -103,11 +104,7 @@ impl Pipe {
             };
 
             if !space_available {
-                // Pre-check before blocking: re-evaluate if space freed or read end closed
-                if self.buffer.lock().count < PIPE_BUF_SIZE || !*self.read_open.lock() {
-                    continue;
-                }
-                self.wait_queue.wait();
+                self.wait_queue.wait_since(tok);
             }
         }
 
@@ -124,6 +121,7 @@ impl Pipe {
         }
 
         loop {
+            let tok = self.wait_queue.token();
             let mut buf = self.buffer.lock();
 
             if buf.count > 0 {
@@ -145,12 +143,7 @@ impl Pipe {
 
             drop(buf);
 
-            // Pre-check before blocking: re-evaluate if data arrived or write end closed
-            if self.buffer.lock().count > 0 || !*self.write_open.lock() {
-                continue;
-            }
-
-            self.wait_queue.wait();
+            self.wait_queue.wait_since(tok);
         }
     }
 

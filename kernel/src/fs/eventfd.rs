@@ -61,6 +61,7 @@ impl InodeOps for EventFd {
         }
 
         loop {
+            let tok = self.wait_queue.token();
             let mut val = 0u64;
             let ready = {
                 let mut counter = self.counter.lock();
@@ -89,7 +90,7 @@ impl InodeOps for EventFd {
             }
 
             // Sleep/block
-            self.wait_queue.wait();
+            self.wait_queue.wait_since(tok);
         }
     }
 
@@ -107,6 +108,7 @@ impl InodeOps for EventFd {
         }
 
         loop {
+            let tok = self.wait_queue.token();
             let ready = {
                 let mut counter = self.counter.lock();
                 if *counter < u64::MAX - 1 - val {
@@ -127,7 +129,7 @@ impl InodeOps for EventFd {
             }
 
             // Sleep/block
-            self.wait_queue.wait();
+            self.wait_queue.wait_since(tok);
         }
     }
 
@@ -150,6 +152,11 @@ impl InodeOps for EventFd {
     fn readdir(&self) -> Vec<DirEntry> {
         Vec::new()
     }
+}
+
+/// `sys_eventfd(initval)` — Create an eventfd with default flags.
+pub fn sys_eventfd(initval: u32) -> SyscallResult {
+    sys_eventfd2(initval, 0)
 }
 
 /// `sys_eventfd2(initval, flags)` — Create an eventfd.

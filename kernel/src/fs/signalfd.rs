@@ -106,6 +106,7 @@ impl InodeOps for SignalFd {
         let task_arc = crate::process::scheduler::get_task_arc(pid).ok_or(-3)?; // ESRCH
 
         loop {
+            let tok = self.wait_queue.token();
             let mut task = task_arc.lock();
             let mask = self.mask.lock();
             let pending_matching = task.pending_signals & *mask;
@@ -151,7 +152,7 @@ impl InodeOps for SignalFd {
             drop(task);
 
             // Wait/block
-            self.wait_queue.wait();
+            self.wait_queue.wait_since(tok);
         }
     }
 
@@ -174,6 +175,11 @@ impl InodeOps for SignalFd {
     fn readdir(&self) -> Vec<DirEntry> {
         Vec::new()
     }
+}
+
+/// `sys_signalfd(fd, mask, sizemask)` — Create or update a signalfd with default flags.
+pub fn sys_signalfd(fd: i32, mask: *const u64, sizemask: usize) -> SyscallResult {
+    sys_signalfd4(fd, mask, sizemask, 0)
 }
 
 /// `sys_signalfd4(fd, mask, sizemask, flags)` — Create or update a signalfd.

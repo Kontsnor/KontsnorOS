@@ -419,6 +419,12 @@ impl BlockDevice for SataDrive {
     fn read_block(&self, block: u64, buf: &mut [u8]) -> Result<(), DriverError> {
         let port = self.port.lock();
         let sector_count = (buf.len() / 512) as u32;
+        crate::fs::kstats::KSTATS
+            .block_reads
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        crate::fs::kstats::KSTATS
+            .sectors_read
+            .fetch_add(sector_count as u64, core::sync::atomic::Ordering::Relaxed);
         port.dma_transfer(block, sector_count, buf, false)
     }
 

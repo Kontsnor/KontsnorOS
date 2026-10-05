@@ -75,6 +75,7 @@ impl InodeOps for TimerFd {
         }
 
         loop {
+            let tok = self.wait_queue.token();
             let val_opt = x86_64::instructions::interrupts::without_interrupts(|| {
                 let mut num_exp = self.num_expirations.lock();
                 if *num_exp > 0 {
@@ -95,7 +96,7 @@ impl InodeOps for TimerFd {
                 return Err(-11); // EAGAIN
             }
 
-            self.wait_queue.wait();
+            self.wait_queue.wait_since(tok);
         }
     }
 
@@ -170,6 +171,56 @@ fn ticks_to_timespec(ticks: u64) -> Timespec {
         tv_sec: (ticks / 100) as i64,
         tv_nsec: ((ticks % 100) * 10_000_000) as i64,
     }
+}
+
+/// `timerfd_gettime(fd, curr_value)` — Get current timer expiration setting.
+pub fn sys_timerfd_gettime(fd: i32, curr_value: *mut Itimerspec) -> SyscallResult {
+    if curr_value.is_null() {
+        return Errno::EINVAL.into();
+    }
+    if crate::syscall::validation::validate_user_ptr_write(
+        curr_value as *mut u8,
+        core::mem::size_of::<Itimerspec>(),
+    )
+    .is_err()
+    {
+        return Errno::EFAULT.into();
+    }
+
+    let inode = match crate::process::fd::current_task_read_fd(fd) {
+        Some(i) => i,
+        None => return Errno::EBADF.into(),
+    };
+
+    let timerfd = match inode.as_timerfd() {
+        Some(t) => t,
+        None => return Errno::EINVAL.into(),
+    };
+
+    let val = x86_64::instructions::interrupts::without_interrupts(|| {
+        let current_ticks = crate::arch::x86_64::interrupts::timer_ticks();
+        let exp = *timerfd.expiration_ticks.lock();
+        let it_value = if let Some(ticks) = exp {
+            if ticks > current_ticks {
+                ticks_to_timespec(ticks - current_ticks)
+            } else {
+                Timespec::default()
+            }
+        } else {
+            Timespec::default()
+        };
+        let it_interval = ticks_to_timespec(*timerfd.interval_ticks.lock());
+        Itimerspec {
+            it_interval,
+            it_value,
+        }
+    });
+
+    unsafe {
+        core::ptr::write(curr_value, val);
+    }
+
+    0
 }
 
 /// `timerfd_create(clockid, flags)` — Create a timerfd.

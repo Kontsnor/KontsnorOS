@@ -38,3 +38,7 @@
 ## 2026-03-30 - Lock-Free WaitQueue Empty Fast Path Optimization
 **Learning:** In `kernel/src/sync/wait_queue.rs`, calling `wake_all()` unconditionally disabled interrupts (`without_interrupts`) and attempted/acquired the global `SCHEDULER` spinlock on every notification, even when no tasks or listeners were sleeping on the wait queue. Adding `waiter_count: AtomicUsize` to `WaitQueue` and performing an atomic `Ordering::Acquire` load in `wake_all()` allows empty wait queues to immediately return in O(1) time without disabling interrupts or contending on the `SCHEDULER` spinlock.
 **Action:** For synchronization primitives that wake tasks, track active waiter counts atomically so empty wake notifications can bypass global scheduler spinlocks and CPU interrupt masking.
+
+## 2026-03-30 - SPSC Lock-Free RingBuffer Bulk Slice Operation
+**Learning:** In `kernel/src/util/ring_buffer.rs`, pushing or popping multiple elements from `RingBuffer` one by one incurred per-element atomic load/store instructions and loop branch overheads. Implementing `push_slice` and `pop_slice` with `core::ptr::copy_nonoverlapping` (`memcpy`/`rep movsb`) reduces stream transfers to at most two contiguous bulk memory moves and a single atomic release store on `head` or `tail`.
+**Action:** When transferring data slices into or out of lock-free circular ring buffers, prefer chunked `copy_nonoverlapping` memory operations over per-element push/pop loops.

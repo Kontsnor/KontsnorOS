@@ -92,6 +92,14 @@ pub struct KStats {
     /// Page cache misses (block I/O required).
     pub page_cache_misses: AtomicU64,
 
+    // ── Block Device & Extent Resolution ──────────────────────────────────
+    /// Total block read operations issued to underlying block devices.
+    pub block_reads: AtomicU64,
+    /// Total disk sectors read from block devices.
+    pub sectors_read: AtomicU64,
+    /// Extent/indirect block resolution lookups.
+    pub resolve_block_calls: AtomicU64,
+
     // ── IPC ─────────────────────────────────────────────────────────────
     /// Futex wake operations performed.
     pub futex_wakes: AtomicU64,
@@ -116,9 +124,48 @@ impl KStats {
             dcache_misses: AtomicU64::new(0),
             page_cache_hits: AtomicU64::new(0),
             page_cache_misses: AtomicU64::new(0),
+            block_reads: AtomicU64::new(0),
+            sectors_read: AtomicU64::new(0),
+            resolve_block_calls: AtomicU64::new(0),
             futex_wakes: AtomicU64::new(0),
             futex_waits: AtomicU64::new(0),
         }
+    }
+}
+
+/// Snapshot of filesystem I/O statistics for performance benchmarking.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FsStatsSnapshot {
+    pub block_reads: u64,
+    pub sectors_read: u64,
+    pub page_cache_hits: u64,
+    pub page_cache_misses: u64,
+    pub resolve_block_calls: u64,
+}
+
+impl FsStatsSnapshot {
+    pub fn delta_from(&self, before: &FsStatsSnapshot) -> FsStatsSnapshot {
+        FsStatsSnapshot {
+            block_reads: self.block_reads.saturating_sub(before.block_reads),
+            sectors_read: self.sectors_read.saturating_sub(before.sectors_read),
+            page_cache_hits: self.page_cache_hits.saturating_sub(before.page_cache_hits),
+            page_cache_misses: self
+                .page_cache_misses
+                .saturating_sub(before.page_cache_misses),
+            resolve_block_calls: self
+                .resolve_block_calls
+                .saturating_sub(before.resolve_block_calls),
+        }
+    }
+}
+
+pub fn take_fs_stats_snapshot() -> FsStatsSnapshot {
+    FsStatsSnapshot {
+        block_reads: KSTATS.block_reads.load(Ordering::Relaxed),
+        sectors_read: KSTATS.sectors_read.load(Ordering::Relaxed),
+        page_cache_hits: KSTATS.page_cache_hits.load(Ordering::Relaxed),
+        page_cache_misses: KSTATS.page_cache_misses.load(Ordering::Relaxed),
+        resolve_block_calls: KSTATS.resolve_block_calls.load(Ordering::Relaxed),
     }
 }
 
@@ -155,6 +202,9 @@ pub fn render() -> alloc::string::String {
          dcache_misses           {}\n\
          page_cache_hits         {}\n\
          page_cache_misses       {}\n\
+         block_reads             {}\n\
+         sectors_read            {}\n\
+         resolve_block_calls     {}\n\
          futex_wakes             {}\n\
          futex_waits             {}\n",
         KSTATS.context_switches.load(Ordering::Relaxed),
@@ -171,6 +221,9 @@ pub fn render() -> alloc::string::String {
         dcache_misses,
         KSTATS.page_cache_hits.load(Ordering::Relaxed),
         KSTATS.page_cache_misses.load(Ordering::Relaxed),
+        KSTATS.block_reads.load(Ordering::Relaxed),
+        KSTATS.sectors_read.load(Ordering::Relaxed),
+        KSTATS.resolve_block_calls.load(Ordering::Relaxed),
         KSTATS.futex_wakes.load(Ordering::Relaxed),
         KSTATS.futex_waits.load(Ordering::Relaxed),
     )

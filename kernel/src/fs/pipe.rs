@@ -148,6 +148,8 @@ impl InodeOps for PipeReader {
         }
 
         loop {
+            let tok = self.state.wait_queue.token();
+
             // Atomic check under buffer lock: read data if present, or detect EOF if writers closed
             {
                 let mut guard = self.state.buffer.lock();
@@ -169,15 +171,8 @@ impl InodeOps for PipeReader {
                 return Err(-11); // EAGAIN / EWOULDBLOCK
             }
 
-            // Pre-check before blocking: re-evaluate if data arrived or writers closed
-            if !self.state.buffer.lock().is_empty()
-                || self.state.writers.load(Ordering::SeqCst) == 0
-            {
-                continue;
-            }
-
             // Sleep on wait queue until data is written or writers close
-            self.state.wait_queue.wait();
+            self.state.wait_queue.wait_since(tok);
 
             // Interrupted by signal
             if let Some(current_pid) = crate::process::scheduler::current_pid() {
@@ -261,6 +256,8 @@ impl InodeOps for PipeWriter {
 
         let mut written = 0;
         while written < data.len() {
+            let tok = self.state.wait_queue.token();
+
             // Check if readers are closed
             if self.state.readers.load(Ordering::SeqCst) == 0 {
                 if let Some(current_pid) = crate::process::scheduler::current_pid() {
@@ -290,14 +287,8 @@ impl InodeOps for PipeWriter {
                         return Err(-11); // EAGAIN
                     }
                 }
-                // Pre-check before blocking: re-evaluate if space freed or readers closed
-                if !self.state.buffer.lock().is_full()
-                    || self.state.readers.load(Ordering::SeqCst) == 0
-                {
-                    continue;
-                }
                 // Sleep on wait queue until space is freed or readers close
-                self.state.wait_queue.wait();
+                self.state.wait_queue.wait_since(tok);
 
                 // Interrupted by signal
                 if let Some(current_pid) = crate::process::scheduler::current_pid() {

@@ -31,7 +31,14 @@ pub struct RamDisk {
 
 impl BlockDevice for RamDisk {
     fn read_block(&self, block: u64, buf: &mut [u8]) -> Result<(), DriverError> {
-        let block_size = 512; // Sector size is 512 bytes
+        let block_size: u64 = 512; // Sector size is 512 bytes
+        let sector_count = buf.len() as u64 / block_size;
+        crate::fs::kstats::KSTATS
+            .block_reads
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        crate::fs::kstats::KSTATS
+            .sectors_read
+            .fetch_add(sector_count, core::sync::atomic::Ordering::Relaxed);
         let offset = (block * block_size) as usize;
         let data = self.data.lock();
         if offset + buf.len() > data.len() {

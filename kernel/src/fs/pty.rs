@@ -75,6 +75,8 @@ impl InodeOps for PtyMaster {
         }
 
         loop {
+            let tok = self.shared.wait_queue.token();
+
             {
                 let mut queue = self.shared.master_read_queue.lock();
                 if !queue.is_empty() {
@@ -106,7 +108,7 @@ impl InodeOps for PtyMaster {
                 }
             }
 
-            self.shared.wait_queue.wait();
+            self.shared.wait_queue.wait_since(tok);
 
             if let Some(current_pid) = crate::process::scheduler::current_pid() {
                 if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
@@ -367,6 +369,8 @@ impl InodeOps for PtySlave {
         }
 
         loop {
+            let tok = self.shared.wait_queue.token();
+
             {
                 let mut queue = self.shared.slave_read_queue.lock();
                 if !queue.is_empty() {
@@ -414,7 +418,7 @@ impl InodeOps for PtySlave {
                 }
             }
 
-            self.shared.wait_queue.wait();
+            self.shared.wait_queue.wait_since(tok);
 
             if let Some(current_pid) = crate::process::scheduler::current_pid() {
                 if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {

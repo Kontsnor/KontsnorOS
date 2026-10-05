@@ -11,6 +11,7 @@
 ## 2026-03-30 - 32-Byte Unrolled Internet Checksum Optimization
 **Learning:** Computing Internet checksums (RFC 1071) byte-by-byte or 16 bits at a time in `internet_checksum` and `compute_transport_checksum` causes 16x excessive loop iterations and branch overhead during network packet processing. Loop unrolling over 32-byte (16 x 16-bit word) blocks dramatically reduces loop branch checks and instruction pipeline stalls without risk of `u32` accumulator overflow or endianness conversion bugs.
 **Action:** Use multi-word unrolled loops when calculating 16-bit Internet checksums over packet buffers to minimize loop branch overhead while keeping arithmetic safely within `u32`.
+
 ## 2026-03-30 - Sharded Dentry Cache Lock Contention Reduction
 **Learning:** In `kernel/src/fs/dcache.rs`, a single global `TicketLock` guarding all dcache lookup/insert operations creates severe lock contention under multi-core/multi-process VFS path lookups. Partitioning the cache into 64 independent `TicketLock` shards and replacing guarded counter updates with lock-free `AtomicU64` atomics reduces global lock contention by up to 64x without lock overhead on diagnostic counter updates.
 **Action:** For hot global kernel caches (such as dcache and page cache), prefer sharded locks indexed by hash or offset over single global spinlocks.
@@ -42,3 +43,7 @@
 ## 2026-03-30 - Test-and-Test-and-Set (TTAS) Spinlock Read Loop Optimization
 **Learning:** In `kernel/src/sync/mutex.rs` (`KMutex::lock`) and `kernel/src/sync/rwlock.rs` (`KRwLock::write`), repeatedly executing `compare_exchange_weak` in spin loops forces bus-locking `LOCK CMPXCHG` instructions on x86_64, causing cache-line invalidation traffic across all CPU cores. Inserting an inner read-only spin loop (`while self.locked.load(Ordering::Relaxed) { spin_loop(); }`) keeps the cache line in Shared (S) state on waiting CPUs, drastically reducing CPU interconnect contention and cache invalidations until the lock is freed.
 **Action:** Always prefer Test-and-Test-and-Set (TTAS) spin loops with read-only relaxed loads over plain Atomic CAS loops in busy-spin synchronization primitives.
+
+## 2026-03-30 - SPSC Lock-Free RingBuffer Bulk Slice Operation
+**Learning:** In `kernel/src/util/ring_buffer.rs`, pushing or popping multiple elements from `RingBuffer` one by one incurred per-element atomic load/store instructions and loop branch overheads. Implementing `push_slice` and `pop_slice` with `core::ptr::copy_nonoverlapping` (`memcpy`/`rep movsb`) reduces stream transfers to at most two contiguous bulk memory moves and a single atomic release store on `head` or `tail`.
+**Action:** When transferring data slices into or out of lock-free circular ring buffers, prefer chunked `copy_nonoverlapping` memory operations over per-element push/pop loops.

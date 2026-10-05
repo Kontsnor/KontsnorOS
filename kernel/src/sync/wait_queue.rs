@@ -22,7 +22,7 @@ use crate::sync::spinlock::TicketLock;
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// A queue of task PIDs waiting for an event or resource.
 pub struct WaitQueue {
@@ -32,6 +32,9 @@ pub struct WaitQueue {
     /// Enables O(1) lock-free fast path in `wake_all()`, bypassing interrupt disabling
     /// and global `SCHEDULER` spinlock acquisition when the queue is empty.
     waiter_count: AtomicUsize,
+    /// Monotonically incrementing sequence counter bumped on every wakeup.
+    /// Enables lock-free lost wakeup prevention via `token()` and `wait_since(token)`.
+    sequence: AtomicU64,
 }
 
 impl WaitQueue {
@@ -41,7 +44,14 @@ impl WaitQueue {
             pids: TicketLock::new(VecDeque::new()),
             listeners: TicketLock::new(Vec::new()),
             waiter_count: AtomicUsize::new(0),
+            sequence: AtomicU64::new(0),
         }
+    }
+
+    /// Read the current sequence token of this wait queue.
+    /// Sample this token before checking wait conditions to ensure no wakeup event is missed.
+    pub fn token(&self) -> u64 {
+        self.sequence.load(Ordering::Acquire)
     }
 
     /// Attach a listener wait queue (e.g. epoll or poll) to receive wakeups from this queue.
@@ -72,14 +82,49 @@ impl WaitQueue {
 
     /// Sleep the current task on this wait queue.
     pub fn wait(&self) {
+        let token = self.token();
+        self.wait_since(token);
+    }
+
+    /// Sleep the current task on this wait queue if the queue's sequence number has not changed since `token`.
+    ///
+    /// If `self.sequence != token`, an event occurred between token acquisition and this call;
+    /// `wait_since` returns `false` immediately without blocking.
+    ///
+    /// If the current task has unblocked pending signals, `wait_since` returns `false` immediately
+    /// without blocking, allowing the caller or syscall layer to handle signals (e.g. -EINTR).
+    ///
+    /// Returns `true` if the task blocked and was subsequently woken up.
+    pub fn wait_since(&self, token: u64) -> bool {
         let current_pid = match scheduler::current_pid() {
             Some(pid) => pid,
-            None => return,
+            None => return false,
         };
+
+        let mut should_abort = false;
 
         x86_64::instructions::interrupts::without_interrupts(|| {
             // F-09: Acquire SCHEDULER lock first to close the missed wakeup TOCTOU window
             let sched_lock = scheduler::SCHEDULER.lock();
+
+            // If sequence changed since token was sampled, an event occurred!
+            if self.sequence.load(Ordering::SeqCst) != token {
+                should_abort = true;
+                drop(sched_lock);
+                return;
+            }
+
+            // If task has unblocked pending signals, do not block!
+            if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
+                let mut task = task_arc.lock();
+                if (task.pending_signals & !task.blocked_signals) != 0 {
+                    should_abort = true;
+                    drop(task);
+                    drop(sched_lock);
+                    return;
+                }
+                task.state = TaskState::Blocked;
+            }
 
             // Add the current task to the wait queue under both locks
             let mut pids = self.pids.lock();
@@ -87,19 +132,21 @@ impl WaitQueue {
             pids.push_back(current_pid);
             drop(pids);
 
-            // Mark the task as Blocked
-            if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
-                task_arc.lock().state = TaskState::Blocked;
-            }
-
             // Release the scheduler lock before rescheduling
             drop(sched_lock);
         });
 
+        if should_abort {
+            return false;
+        }
+
         // Verify state validity before descheduling: if a concurrent wake_all() already
         // transitioned the task to Ready, clean up and return immediately to avoid a missed wakeup.
         if let Some(task_arc) = scheduler::get_task_arc(current_pid) {
-            if task_arc.lock().state != TaskState::Blocked {
+            let mut task = task_arc.lock();
+            if task.state != TaskState::Blocked {
+                task.state = TaskState::Running;
+                drop(task);
                 let mut pids = self.pids.lock();
                 let prev_len = pids.len();
                 pids.retain(|&x| x != current_pid);
@@ -107,7 +154,7 @@ impl WaitQueue {
                 if removed > 0 {
                     self.waiter_count.fetch_sub(removed, Ordering::Release);
                 }
-                return;
+                return false;
             }
         }
 
@@ -122,10 +169,14 @@ impl WaitQueue {
         if removed > 0 {
             self.waiter_count.fetch_sub(removed, Ordering::Release);
         }
+
+        true
     }
 
     /// Wake up all tasks currently sleeping on this wait queue.
     pub fn wake_all(&self) {
+        self.sequence.fetch_add(1, Ordering::SeqCst);
+
         // Fast path: if waiter_count is 0, avoid disabling interrupts and acquiring SCHEDULER spinlock.
         if self.waiter_count.load(Ordering::Acquire) == 0 {
             return;
@@ -158,6 +209,7 @@ impl WaitQueue {
     /// Wake up all tasks currently sleeping on this wait queue and propagate to attached listeners.
     /// The caller must already hold the scheduler lock.
     pub fn wake_all_locked(&self, sched: &mut scheduler::Scheduler) {
+        self.sequence.fetch_add(1, Ordering::SeqCst);
         let mut pids = self.pids.lock();
         let num_pids = pids.len();
         while let Some(pid) = pids.pop_front() {
@@ -238,7 +290,11 @@ impl VforkCompletion {
     /// Wait until the child completes `execve` or exits.
     pub fn wait(&self) {
         while !self.completed.load(Ordering::Acquire) {
-            self.wait_queue.wait();
+            let tok = self.wait_queue.token();
+            if self.completed.load(Ordering::Acquire) {
+                break;
+            }
+            self.wait_queue.wait_since(tok);
         }
     }
 }

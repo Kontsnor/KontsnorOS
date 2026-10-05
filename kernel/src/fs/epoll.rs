@@ -25,6 +25,8 @@ use spin::Mutex;
 
 /// EPOLLET flag.
 pub const EPOLLET: u32 = 0x80000000;
+/// EPOLLONESHOT flag.
+pub const EPOLLONESHOT: u32 = 0x40000000;
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -38,6 +40,8 @@ pub struct EpollItem {
     pub event: EpollEvent,
     pub inode: Arc<dyn InodeOps>,
     pub last_ready: u32,
+    pub last_seq: u64,
+    pub disabled: bool,
 }
 
 pub struct EpollInstance {
@@ -224,11 +228,14 @@ pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const EpollEvent) -> S
                     event: ev,
                     inode: target_inode.clone(),
                     last_ready: 0,
+                    last_seq: u64::MAX,
+                    disabled: false,
                 },
             );
             if let Some(target_wq) = target_inode.wait_queue() {
                 target_wq.add_listener(&epoll.wait_queue);
             }
+            epoll.wait_queue.wake_all();
             0
         }
         2 => {
@@ -258,6 +265,9 @@ pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const EpollEvent) -> S
             if let Some(item) = items.get_mut(&fd) {
                 item.event = ev;
                 item.last_ready = 0;
+                item.last_seq = u64::MAX;
+                item.disabled = false;
+                epoll.wait_queue.wake_all();
                 0
             } else {
                 Errno::ENOENT.into()
@@ -312,36 +322,50 @@ pub fn sys_epoll_wait(
     let mut ready_list = Vec::with_capacity(initial_cap);
 
     loop {
+        let tok = epoll.wait_queue.token();
         ready_list.clear();
         {
             let mut items = epoll.items.lock();
 
             for (_fd, item) in items.iter_mut() {
+                if item.disabled {
+                    continue;
+                }
+
                 // Query readiness using the generalized poll method on cached inode
                 let current_poll = item.inode.poll(item.event.events);
                 let matched_ready = current_poll
                     & (item.event.events | crate::fs::inode::POLLHUP | crate::fs::inode::POLLERR);
 
+                let current_seq = item.inode.wait_queue().map(|w| w.token()).unwrap_or(0);
+
                 if matched_ready != 0 {
                     let is_et = (item.event.events & EPOLLET) != 0;
 
-                    if is_et {
-                        // Edge-Triggered: Report only if it transitioned to ready or new events arose
-                        let newly_ready = matched_ready & !item.last_ready;
-                        if newly_ready != 0 {
-                            ready_list.push(EpollEvent {
-                                events: matched_ready,
-                                data: item.event.data,
-                            });
-                        }
+                    let report = if is_et {
+                        // Edge-Triggered: Report if a wakeup occurred on this item's wait queue,
+                        // or if new readiness bits became set, or if it hasn't been reported yet.
+                        (current_seq != item.last_seq) || ((matched_ready & !item.last_ready) != 0)
                     } else {
                         // Level-Triggered: Report as long as matching flags are active
+                        true
+                    };
+
+                    if report {
                         ready_list.push(EpollEvent {
                             events: matched_ready,
                             data: item.event.data,
                         });
+                        item.last_seq = current_seq;
+                        item.last_ready = matched_ready;
+
+                        if (item.event.events & EPOLLONESHOT) != 0 {
+                            item.disabled = true;
+                        }
+                    } else {
+                        // Keep track of any cleared bits
+                        item.last_ready &= matched_ready;
                     }
-                    item.last_ready = matched_ready;
                 } else {
                     // Reset last ready mask if it goes back to 0
                     item.last_ready = 0;
@@ -382,7 +406,7 @@ pub fn sys_epoll_wait(
         }
 
         // Block on wait queue
-        epoll.wait_queue.wait();
+        epoll.wait_queue.wait_since(tok);
 
         // Remove sleep timeout when woken up
         remove_sleep_timeout(current_pid);

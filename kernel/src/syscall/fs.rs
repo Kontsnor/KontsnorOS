@@ -49,10 +49,10 @@ pub use crate::syscall::validation::{
 };
 
 pub use crate::fs::epoll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait};
-pub use crate::fs::eventfd::sys_eventfd2;
+pub use crate::fs::eventfd::{sys_eventfd, sys_eventfd2};
 pub use crate::fs::inotify::{
     sys_inotify_add_watch, sys_inotify_init, sys_inotify_init1, sys_inotify_rm_watch,
 };
 pub use crate::fs::pidfd::{sys_pidfd_getfd, sys_pidfd_open, sys_pidfd_send_signal};
-pub use crate::fs::signalfd::sys_signalfd4;
-pub use crate::fs::timerfd::{sys_timerfd_create, sys_timerfd_settime};
+pub use crate::fs::signalfd::{sys_signalfd, sys_signalfd4};
+pub use crate::fs::timerfd::{sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime};

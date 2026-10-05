@@ -225,6 +225,68 @@ impl FrameAllocator {
         None // Out of memory
     }
 
+    /// Find and allocate `count` contiguous free frames, returning the starting physical address.
+    fn allocate_contiguous(&mut self, count: usize) -> Option<u64> {
+        if !self.initialized || count == 0 {
+            return None;
+        }
+        if count == 1 {
+            return self.allocate();
+        }
+
+        let count = count.min(32);
+
+        let mut searched = 0;
+        let mut index = self.next_free_hint;
+        while searched < MAX_FRAMES {
+            let byte_idx = (index / 64) * 8;
+            if byte_idx + 8 <= self.bitmap.len() {
+                let bit_offset = index % 64;
+                let bytes = &self.bitmap[byte_idx..byte_idx + 8];
+                let val = u64::from_ne_bytes(bytes.try_into().unwrap());
+
+                // Fast path: if all remaining bits in this 64-bit word are allocated, advance to next word
+                let mask = if bit_offset == 0 {
+                    0
+                } else {
+                    (1u64 << bit_offset) - 1
+                };
+                if (val | mask) == u64::MAX {
+                    let advance = 64 - bit_offset;
+                    searched += advance;
+                    index = (index + advance) % MAX_FRAMES;
+                    continue;
+                }
+            }
+
+            if self.is_free(index) {
+                let mut all_free = true;
+                for i in 1..count {
+                    let next_frame = index + i;
+                    if next_frame >= MAX_FRAMES || !self.is_free(next_frame) {
+                        all_free = false;
+                        let advance = i + 1;
+                        searched += advance;
+                        index = (index + advance) % MAX_FRAMES;
+                        break;
+                    }
+                }
+                if all_free {
+                    for i in 0..count {
+                        self.mark_used(index + i);
+                    }
+                    self.allocated_frames += count;
+                    self.next_free_hint = (index + count) % MAX_FRAMES;
+                    return Some(index as u64 * PAGE_SIZE as u64);
+                }
+            } else {
+                searched += 1;
+                index = (index + 1) % MAX_FRAMES;
+            }
+        }
+        None
+    }
+
     /// Free a previously allocated frame.
     fn deallocate(&mut self, phys_addr: u64) {
         let frame_index = (phys_addr >> 12) as usize;
@@ -410,6 +472,32 @@ pub fn allocate_frame() -> Option<u64> {
         let idx = (f >> 12) as usize;
         if idx < MAX_FRAMES {
             FRAME_REFS[idx].store(1, Ordering::Relaxed);
+        }
+    }
+    frame
+}
+
+/// Allocate multiple physically contiguous frames.
+///
+/// Returns the physical starting address of the contiguous block, or `None` if unavailable.
+pub fn allocate_contiguous_frames(count: usize) -> Option<u64> {
+    if count == 0 {
+        return None;
+    }
+    if count == 1 {
+        return allocate_frame();
+    }
+    let frame = {
+        let mut allocator = FRAME_ALLOCATOR.lock();
+        allocator.allocate_contiguous(count)
+    };
+
+    if let Some(start_phys) = frame {
+        for i in 0..count {
+            let idx = ((start_phys >> 12) + i as u64) as usize;
+            if idx < MAX_FRAMES {
+                FRAME_REFS[idx].store(1, Ordering::Relaxed);
+            }
         }
     }
     frame

@@ -78,5 +78,26 @@ fn test_ring_buffer_comprehensive() {
     assert_eq!(rb.pop(), None);
     assert!(rb.is_empty());
 
+    // 7. Bulk slice operations (`push_slice` and `pop_slice`)
+    let src = [10u8, 11, 12, 13, 14];
+    assert_eq!(rb.push_slice(&src), 5);
+    assert_eq!(rb.len(), 5);
+
+    let mut dst = [0u8; 8];
+    assert_eq!(rb.pop_slice(&mut dst[..3]), 3);
+    assert_eq!(&dst[..3], &[10, 11, 12]);
+    assert_eq!(rb.len(), 2);
+
+    // Overfill push_slice (capacity = 8, 2 remaining -> pushes 6 bytes out of 8)
+    let src2 = [20u8, 21, 22, 23, 24, 25, 26, 27];
+    assert_eq!(rb.push_slice(&src2), 6);
+    assert_eq!(rb.len(), 8);
+
+    // Drain all 8 bytes via pop_slice across circular boundary
+    let mut dst2 = [0u8; 8];
+    assert_eq!(rb.pop_slice(&mut dst2), 8);
+    assert_eq!(&dst2, &[13, 14, 20, 21, 22, 23, 24, 25]);
+    assert!(rb.is_empty());
+
     kprintln!("[test] RingBuffer unit tests PASSED!");
 }

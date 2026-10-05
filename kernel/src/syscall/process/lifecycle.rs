@@ -1364,9 +1364,68 @@ pub fn sys_set_tid_address(tidptr: *mut i32) -> SyscallResult {
     pid.as_u64() as i64
 }
 
-/// `prctl(option, ...)` — Process control (stub).
-pub fn sys_prctl(_option: i32, _arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> SyscallResult {
-    0
+pub const PR_SET_NAME: i32 = 15;
+pub const PR_GET_NAME: i32 = 16;
+
+/// `prctl(option, ...)` — Process control.
+///
+/// Implements `PR_SET_NAME` (15) and `PR_GET_NAME` (16) for setting and getting task name.
+pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> SyscallResult {
+    use crate::process::scheduler;
+    use crate::syscall::validation::{validate_user_ptr_read, validate_user_ptr_write};
+
+    let current_pid = match scheduler::current_pid() {
+        Some(p) => p,
+        None => return Errno::ESRCH.into(),
+    };
+
+    let task_arc = match scheduler::get_task_arc(current_pid) {
+        Some(t) => t,
+        None => return Errno::ESRCH.into(),
+    };
+
+    match option {
+        PR_SET_NAME => {
+            let name_ptr = arg2 as *const u8;
+            if validate_user_ptr_read(name_ptr, 16).is_err() {
+                return Errno::EFAULT.into();
+            }
+
+            let mut name_buf = [0u8; 16];
+            // SAFETY: name_ptr is non-null and validated for 16 bytes read access.
+            unsafe {
+                core::ptr::copy_nonoverlapping(name_ptr, name_buf.as_mut_ptr(), 16);
+            }
+
+            // Task names are max 16 bytes including null byte
+            let len = name_buf.iter().position(|&b| b == 0).unwrap_or(16);
+            let name_str = alloc::string::String::from_utf8_lossy(&name_buf[..len]).into_owned();
+
+            let mut task = task_arc.lock();
+            task.name = name_str;
+            0
+        }
+        PR_GET_NAME => {
+            let out_ptr = arg2 as *mut u8;
+            if validate_user_ptr_write(out_ptr, 16).is_err() {
+                return Errno::EFAULT.into();
+            }
+
+            let mut name_buf = [0u8; 16];
+            let task = task_arc.lock();
+            let name_bytes = task.name.as_bytes();
+            let copy_len = name_bytes.len().min(15);
+            name_buf[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+            name_buf[copy_len] = 0;
+
+            // SAFETY: out_ptr is non-null and validated for 16 bytes write access.
+            unsafe {
+                core::ptr::copy_nonoverlapping(name_buf.as_ptr(), out_ptr, 16);
+            }
+            0
+        }
+        _ => Errno::EINVAL.into(),
+    }
 }
 
 // ── Clone and Namespace Flags ────────────────────────────────────────────────

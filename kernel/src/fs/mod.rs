@@ -200,7 +200,7 @@ pub fn init() {
 
             // Try mounting the physical ATA drive
             let cached_drive = alloc::sync::Arc::new(
-                crate::drivers::block::cache::BlockCache::new(ata_drive, 2048),
+                crate::drivers::block::cache::BlockCache::new(ata_drive, 65536),
             );
             if let Ok(ext_fs) = ext::ExtFileSystem::mount(cached_drive) {
                 vfs::mount(alloc::string::String::from("/disk"), ext_fs.clone());

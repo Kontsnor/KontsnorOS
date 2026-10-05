@@ -89,7 +89,7 @@ cmds.append("write /tmp/kontsnor_ubuntu_issue /etc/issue")
 
 # 6. Configure DNS nameservers in /etc/resolv.conf
 with open("/tmp/kontsnor_resolv_conf", "w") as f:
-    f.write("nameserver 10.0.2.3\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n")
+    f.write("options single-request-reopen\nnameserver 10.0.2.3\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n")
 cmds.append("rm /etc/resolv.conf")
 cmds.append("write /tmp/kontsnor_resolv_conf /etc/resolv.conf")
 

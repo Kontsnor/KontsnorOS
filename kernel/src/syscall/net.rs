@@ -330,6 +330,7 @@ pub fn sys_connect(fd: i32, addr_ptr: *const SockAddrIn, addrlen: u32) -> Syscal
     let start_ticks = crate::arch::x86_64::interrupts::timer_ticks();
     let wq = socket.lock().wait_queue.clone();
     loop {
+        let tok = wq.token();
         {
             let sock = socket.lock();
             tcp_state = sock.tcp_state;
@@ -345,7 +346,7 @@ pub fn sys_connect(fd: i32, addr_ptr: *const SockAddrIn, addrlen: u32) -> Syscal
             sock.tcp_state = crate::net::tcp::TcpState::Closed;
             return -110; // ETIMEDOUT
         }
-        wq.wait();
+        wq.wait_since(tok);
     }
 
     0
@@ -393,6 +394,7 @@ pub fn sys_accept4(
 
     let child = loop {
         let wq;
+        let tok;
         {
             let mut sock = socket.lock();
             if sock.sock_type != 1 || sock.tcp_state != crate::net::tcp::TcpState::Listen {
@@ -405,9 +407,10 @@ pub fn sys_accept4(
             if (flags & sock_nonblock) != 0 {
                 return Errno::EAGAIN.into();
             }
+            tok = sock.wait_queue.token();
             wq = sock.wait_queue.clone();
         }
-        wq.wait();
+        wq.wait_since(tok);
     };
 
     let child_sock = child.lock();
@@ -615,6 +618,7 @@ pub fn recvfrom_kernel(
         let mut sock = socket.lock();
         if sock.sock_type == 2 || sock.sock_type == 3 {
             // UDP or RAW/ICMP
+            let tok = sock.wait_queue.token();
             if sock.udp_recv_queue.is_empty() {
                 let flags_guard = file_desc.flags.lock();
                 if sock.nonblocking
@@ -626,7 +630,7 @@ pub fn recvfrom_kernel(
                 drop(flags_guard);
                 let wq = sock.wait_queue.clone();
                 drop(sock);
-                wq.wait();
+                wq.wait_since(tok);
                 sock = socket.lock();
             }
 

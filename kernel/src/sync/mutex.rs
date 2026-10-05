@@ -57,12 +57,24 @@ impl<T> KMutex<T> {
     /// Currently spins; will block the thread once the scheduler
     /// supports wait queues.
     pub fn lock(&self) -> KMutexGuard<'_, T> {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            // TODO: Add to wait queue and yield to scheduler
+        // Test-and-Test-and-Set (TTAS) optimization:
+        // First spin-wait on a read-only relaxed load (`self.locked.load(Ordering::Relaxed)`).
+        // A read-only load keeps the cache line in Shared (S) state across CPU cores and avoids
+        // emitting bus-locking `LOCK CMPXCHG` instructions during spin waiting.
+        // Only attempt the atomic CAS operation (`compare_exchange_weak`) when the lock appears free.
+        loop {
+            while self.locked.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
+            }
+
+            if self
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+
             core::hint::spin_loop();
         }
 

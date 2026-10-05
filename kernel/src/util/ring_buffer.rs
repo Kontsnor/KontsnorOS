@@ -106,6 +106,94 @@ impl<T: Copy, const N: usize> RingBuffer<T, N> {
     pub fn len(&self) -> usize {
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
-        head - tail
+        head.wrapping_sub(tail)
+    }
+
+    /// Push a slice of elements into the ring buffer using fast bulk memory copies.
+    ///
+    /// # Performance
+    ///
+    /// Replaces byte-by-byte or element-by-element push loops with at most two
+    /// contiguous bulk memory copies (`copy_nonoverlapping`), compiling down to hardware
+    /// vector / `rep movsb` instructions for maximum throughput in SPSC streams.
+    ///
+    /// Returns the number of elements successfully pushed.
+    pub fn push_slice(&self, src: &[T]) -> usize {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+
+        let occupied = head.wrapping_sub(tail);
+        let available = N.saturating_sub(occupied);
+        if available == 0 || src.is_empty() {
+            return 0;
+        }
+
+        let to_write = core::cmp::min(src.len(), available);
+        let write_index = head & (N - 1);
+        let first_chunk = core::cmp::min(to_write, N - write_index);
+        let second_chunk = to_write - first_chunk;
+
+        // SAFETY:
+        // - `write_index` and `first_chunk`/`second_chunk` are strictly bounded within `[0..N)`.
+        // - Single-producer invariant guarantees exclusive producer write access to `buffer[head..head+to_write]`.
+        // - `T: Copy` ensures bitwise memory duplication (`copy_nonoverlapping`) is safe.
+        unsafe {
+            let buf_ptr = (*self.buffer.get()).as_mut_ptr() as *mut T;
+            core::ptr::copy_nonoverlapping(src.as_ptr(), buf_ptr.add(write_index), first_chunk);
+            if second_chunk > 0 {
+                core::ptr::copy_nonoverlapping(
+                    src.as_ptr().add(first_chunk),
+                    buf_ptr,
+                    second_chunk,
+                );
+            }
+        }
+
+        self.head
+            .store(head.wrapping_add(to_write), Ordering::Release);
+        to_write
+    }
+
+    /// Pop elements from the ring buffer into a target slice using fast bulk memory copies.
+    ///
+    /// # Performance
+    ///
+    /// Replaces byte-by-byte or element-by-element pop loops with at most two
+    /// contiguous bulk memory copies (`copy_nonoverlapping`), maximizing read performance.
+    ///
+    /// Returns the number of elements successfully popped.
+    pub fn pop_slice(&self, dst: &mut [T]) -> usize {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+
+        let available = head.wrapping_sub(tail);
+        if available == 0 || dst.is_empty() {
+            return 0;
+        }
+
+        let to_read = core::cmp::min(dst.len(), available);
+        let read_index = tail & (N - 1);
+        let first_chunk = core::cmp::min(to_read, N - read_index);
+        let second_chunk = to_read - first_chunk;
+
+        // SAFETY:
+        // - `read_index` and `first_chunk`/`second_chunk` are strictly bounded within `[0..N)`.
+        // - Single-consumer invariant guarantees exclusive consumer read access to `buffer[tail..tail+to_read]`.
+        // - `T: Copy` ensures bitwise memory duplication (`copy_nonoverlapping`) is safe.
+        unsafe {
+            let buf_ptr = (*self.buffer.get()).as_ptr() as *const T;
+            core::ptr::copy_nonoverlapping(buf_ptr.add(read_index), dst.as_mut_ptr(), first_chunk);
+            if second_chunk > 0 {
+                core::ptr::copy_nonoverlapping(
+                    buf_ptr,
+                    dst.as_mut_ptr().add(first_chunk),
+                    second_chunk,
+                );
+            }
+        }
+
+        self.tail
+            .store(tail.wrapping_add(to_read), Ordering::Release);
+        to_read
     }
 }

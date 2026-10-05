@@ -106,7 +106,7 @@ if [ ! -f "$DISK_IMG" ] || [ "$REBUILD_DISK" = true ]; then
     # Ensure SigLevel line exists even if the default conf omits it
     grep -q '^SigLevel' "$DISK_STAGE/containers/arch/etc/pacman.conf" || \
         sed -i '/^\[options\]/a SigLevel = Never\nLocalFileSigLevel = Never' "$DISK_STAGE/containers/arch/etc/pacman.conf"
-    echo -e "nameserver 10.0.2.3\nnameserver 1.1.1.1\nnameserver 8.8.8.8" > "$DISK_STAGE/containers/arch/etc/resolv.conf"
+    echo -e "options single-request-reopen\nnameserver 10.0.2.3\nnameserver 1.1.1.1\nnameserver 8.8.8.8" > "$DISK_STAGE/containers/arch/etc/resolv.conf"
     echo "Server = https://geo.mirror.pkgbuild.com/\$repo/os/\$arch" > "$DISK_STAGE/containers/arch/etc/pacman.d/mirrorlist"
 
     # Prioritize IPv4 in getaddrinfo (RFC 3484 / RFC 6555)
@@ -234,7 +234,7 @@ else
     debugfs -w -R "write $TEMP_PACMAN containers/arch/etc/pacman.conf" "$DISK_IMG" >/dev/null 2>&1
 
     TEMP_RESOLV="/tmp/resolv_arch_fixed.conf"
-    echo -e "nameserver 10.0.2.3\nnameserver 1.1.1.1\nnameserver 8.8.8.8" > "$TEMP_RESOLV"
+    echo -e "options single-request-reopen\nnameserver 10.0.2.3\nnameserver 1.1.1.1\nnameserver 8.8.8.8" > "$TEMP_RESOLV"
     debugfs -w -R "rm containers/arch/etc/resolv.conf" "$DISK_IMG" >/dev/null 2>&1 || true
     debugfs -w -R "write $TEMP_RESOLV containers/arch/etc/resolv.conf" "$DISK_IMG" >/dev/null 2>&1
 
@@ -351,6 +351,8 @@ tar -ztvf /var/lib/pacman/sync/core.db | tail -n 5
 echo "Testing tar on extra.db:"
 tar -ztvf /var/lib/pacman/sync/extra.db | tail -n 5
 echo "Done testing tar."
+echo "[ARCH TEST RUSTUP] Verifying rustup check (reqwest TLS & HTTP/2 over epoll)..."
+rustup -v check || true
 echo "[ARCH TEST 6/6] Executing pacman --debug --noconfirm -Sv perl..."
 time pacman --debug --noconfirm -Sv perl
 PACMAN_STATUS=$?

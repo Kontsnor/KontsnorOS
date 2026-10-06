@@ -79,6 +79,8 @@ pub enum SyscallNumber {
     EventFd2 = 290,
     EpollCreate1 = 291,
     SchedGetAffinity = 204,
+    Mknod = 133,
+    Mknodat = 259,
 }
 
 /// Result type for syscalls.
@@ -745,7 +747,9 @@ pub fn dispatch(
         ),
         166 => fs::sys_umount2(arg0 as *const u8, arg1 as i32),
         132 => fs::sys_utime(arg0 as *const u8, arg1 as *const fs::UTimeBuf),
+        133 => fs::sys_mknod(arg0 as *const u8, arg1 as u32, arg2 as u64),
         235 => fs::sys_utimes(arg0 as *const u8, arg1 as *const fs::TimeVal),
+        259 => fs::sys_mknodat(arg0 as i32, arg1 as *const u8, arg2 as u32, arg3 as u64),
         280 => fs::sys_utimensat(
             arg0 as i32,
             arg1 as *const u8,

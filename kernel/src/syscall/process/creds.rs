@@ -161,7 +161,14 @@ pub fn sys_getppid() -> SyscallResult {
 }
 
 /// `setpgid(pid, pgid)` — Set the process group ID of a process.
+///
+/// POSIX.1-2017 & Linux `setpgid(2)`:
+/// Return `EINVAL` if `pid` or `pgid` is negative (< 0).
 pub fn sys_setpgid(pid: i32, pgid: i32) -> SyscallResult {
+    if pid < 0 || pgid < 0 {
+        return Errno::EINVAL.into();
+    }
+
     let target_pid = if pid == 0 {
         match scheduler::current_pid() {
             Some(p) => p,

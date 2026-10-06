@@ -182,107 +182,131 @@ impl Ipv4Header {
 /// Performance optimization: loop unrolling over 32-byte chunks reduces loop branch
 /// checks and instruction fetch stalls by 16x over naive byte-pair iteration while
 /// avoiding accumulator overflow in `u32`.
+#[inline(always)]
+fn add64_carry(sum: u64, val: u64) -> u64 {
+    let (s, carry) = sum.overflowing_add(val);
+    s + (carry as u64)
+}
+
 pub fn internet_checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
+    let mut sum: u64 = 0;
     let mut i = 0;
     let len = data.len();
 
-    // 32-byte unrolled loop (16 16-bit words per block)
+    // 32-byte unrolled loop processing 4 64-bit big-endian words
     while i + 32 <= len {
-        sum += (u16::from_be_bytes([data[i], data[i + 1]]) as u32)
-            + (u16::from_be_bytes([data[i + 2], data[i + 3]]) as u32)
-            + (u16::from_be_bytes([data[i + 4], data[i + 5]]) as u32)
-            + (u16::from_be_bytes([data[i + 6], data[i + 7]]) as u32)
-            + (u16::from_be_bytes([data[i + 8], data[i + 9]]) as u32)
-            + (u16::from_be_bytes([data[i + 10], data[i + 11]]) as u32)
-            + (u16::from_be_bytes([data[i + 12], data[i + 13]]) as u32)
-            + (u16::from_be_bytes([data[i + 14], data[i + 15]]) as u32)
-            + (u16::from_be_bytes([data[i + 16], data[i + 17]]) as u32)
-            + (u16::from_be_bytes([data[i + 18], data[i + 19]]) as u32)
-            + (u16::from_be_bytes([data[i + 20], data[i + 21]]) as u32)
-            + (u16::from_be_bytes([data[i + 22], data[i + 23]]) as u32)
-            + (u16::from_be_bytes([data[i + 24], data[i + 25]]) as u32)
-            + (u16::from_be_bytes([data[i + 26], data[i + 27]]) as u32)
-            + (u16::from_be_bytes([data[i + 28], data[i + 29]]) as u32)
-            + (u16::from_be_bytes([data[i + 30], data[i + 31]]) as u32);
+        let w0 = u64::from_be_bytes(data[i..i + 8].try_into().unwrap());
+        let w1 = u64::from_be_bytes(data[i + 8..i + 16].try_into().unwrap());
+        let w2 = u64::from_be_bytes(data[i + 16..i + 24].try_into().unwrap());
+        let w3 = u64::from_be_bytes(data[i + 24..i + 32].try_into().unwrap());
+        sum = add64_carry(sum, w0);
+        sum = add64_carry(sum, w1);
+        sum = add64_carry(sum, w2);
+        sum = add64_carry(sum, w3);
         i += 32;
     }
 
-    // Sum remaining 16-bit words
+    // Process remaining 8-byte chunks
+    while i + 8 <= len {
+        let w = u64::from_be_bytes(data[i..i + 8].try_into().unwrap());
+        sum = add64_carry(sum, w);
+        i += 8;
+    }
+
+    // Process remaining 16-bit words
     while i + 1 < len {
-        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        let w = u16::from_be_bytes([data[i], data[i + 1]]) as u64;
+        sum = add64_carry(sum, w);
         i += 2;
     }
 
     // Handle odd trailing byte
     if i < len {
-        sum += (data[i] as u32) << 8;
+        sum = add64_carry(sum, (data[i] as u64) << 8);
     }
+
+    // Fold 64-bit sum to 32 bits
+    let sum32 = (sum >> 32) + (sum & 0xFFFFFFFF);
+    let sum32 = (sum32 >> 32) + (sum32 & 0xFFFFFFFF);
 
     // Fold 32-bit sum to 16 bits
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
+    let sum16 = (sum32 >> 16) + (sum32 & 0xFFFF);
+    let sum16 = (sum16 >> 16) + (sum16 & 0xFFFF);
 
-    !(sum as u16)
+    !(sum16 as u16)
 }
 
 /// Compute TCP/UDP checksum with IPv4 pseudo-header (RFC 793, RFC 768).
 ///
-/// Performance optimization: loop unrolling over 32-byte chunks reduces loop branch
-/// checks and instruction fetch stalls by 16x during transport payload processing.
+/// Performance optimization: 64-bit word unrolling with carry addition reduces loop byte swap and
+/// instruction fetch overhead by 4x during transport payload processing.
 pub fn compute_transport_checksum(
     src_ip: Ipv4Addr,
     dst_ip: Ipv4Addr,
     protocol: u8,
     segment: &[u8],
 ) -> u16 {
-    let mut sum: u32 = 0;
+    let mut sum: u64 = 0;
 
     // Pseudo-header:
-    sum += u16::from_be_bytes([src_ip.octets[0], src_ip.octets[1]]) as u32;
-    sum += u16::from_be_bytes([src_ip.octets[2], src_ip.octets[3]]) as u32;
-    sum += u16::from_be_bytes([dst_ip.octets[0], dst_ip.octets[1]]) as u32;
-    sum += u16::from_be_bytes([dst_ip.octets[2], dst_ip.octets[3]]) as u32;
-    sum += protocol as u32;
-    sum += segment.len() as u32;
+    sum = add64_carry(
+        sum,
+        u16::from_be_bytes([src_ip.octets[0], src_ip.octets[1]]) as u64,
+    );
+    sum = add64_carry(
+        sum,
+        u16::from_be_bytes([src_ip.octets[2], src_ip.octets[3]]) as u64,
+    );
+    sum = add64_carry(
+        sum,
+        u16::from_be_bytes([dst_ip.octets[0], dst_ip.octets[1]]) as u64,
+    );
+    sum = add64_carry(
+        sum,
+        u16::from_be_bytes([dst_ip.octets[2], dst_ip.octets[3]]) as u64,
+    );
+    sum = add64_carry(sum, protocol as u64);
+    sum = add64_carry(sum, segment.len() as u64);
 
-    // Segment data: 32-byte unrolled loop
+    // Segment data: 32-byte unrolled loop with 64-bit words
     let mut i = 0;
     let len = segment.len();
     while i + 32 <= len {
-        sum += (u16::from_be_bytes([segment[i], segment[i + 1]]) as u32)
-            + (u16::from_be_bytes([segment[i + 2], segment[i + 3]]) as u32)
-            + (u16::from_be_bytes([segment[i + 4], segment[i + 5]]) as u32)
-            + (u16::from_be_bytes([segment[i + 6], segment[i + 7]]) as u32)
-            + (u16::from_be_bytes([segment[i + 8], segment[i + 9]]) as u32)
-            + (u16::from_be_bytes([segment[i + 10], segment[i + 11]]) as u32)
-            + (u16::from_be_bytes([segment[i + 12], segment[i + 13]]) as u32)
-            + (u16::from_be_bytes([segment[i + 14], segment[i + 15]]) as u32)
-            + (u16::from_be_bytes([segment[i + 16], segment[i + 17]]) as u32)
-            + (u16::from_be_bytes([segment[i + 18], segment[i + 19]]) as u32)
-            + (u16::from_be_bytes([segment[i + 20], segment[i + 21]]) as u32)
-            + (u16::from_be_bytes([segment[i + 22], segment[i + 23]]) as u32)
-            + (u16::from_be_bytes([segment[i + 24], segment[i + 25]]) as u32)
-            + (u16::from_be_bytes([segment[i + 26], segment[i + 27]]) as u32)
-            + (u16::from_be_bytes([segment[i + 28], segment[i + 29]]) as u32)
-            + (u16::from_be_bytes([segment[i + 30], segment[i + 31]]) as u32);
+        let w0 = u64::from_be_bytes(segment[i..i + 8].try_into().unwrap());
+        let w1 = u64::from_be_bytes(segment[i + 8..i + 16].try_into().unwrap());
+        let w2 = u64::from_be_bytes(segment[i + 16..i + 24].try_into().unwrap());
+        let w3 = u64::from_be_bytes(segment[i + 24..i + 32].try_into().unwrap());
+        sum = add64_carry(sum, w0);
+        sum = add64_carry(sum, w1);
+        sum = add64_carry(sum, w2);
+        sum = add64_carry(sum, w3);
         i += 32;
     }
 
+    while i + 8 <= len {
+        let w = u64::from_be_bytes(segment[i..i + 8].try_into().unwrap());
+        sum = add64_carry(sum, w);
+        i += 8;
+    }
+
     while i + 1 < len {
-        sum += u16::from_be_bytes([segment[i], segment[i + 1]]) as u32;
+        let w = u16::from_be_bytes([segment[i], segment[i + 1]]) as u64;
+        sum = add64_carry(sum, w);
         i += 2;
     }
     if i < len {
-        sum += (segment[i] as u32) << 8;
+        sum = add64_carry(sum, (segment[i] as u64) << 8);
     }
 
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
+    // Fold 64-bit sum to 32 bits
+    let sum32 = (sum >> 32) + (sum & 0xFFFFFFFF);
+    let sum32 = (sum32 >> 32) + (sum32 & 0xFFFFFFFF);
 
-    let csum = !(sum as u16);
+    // Fold 32-bit sum to 16 bits
+    let sum16 = (sum32 >> 16) + (sum32 & 0xFFFF);
+    let sum16 = (sum16 >> 16) + (sum16 & 0xFFFF);
+
+    let csum = !(sum16 as u16);
     if csum == 0 {
         0xFFFF
     } else {

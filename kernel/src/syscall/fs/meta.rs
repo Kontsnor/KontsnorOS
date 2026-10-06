@@ -2771,6 +2771,82 @@ pub fn sys_setxattr(
     }
 }
 
+/// `mknodat(dfd, pathname, mode, dev)` — Create a special or ordinary file relative to directory fd.
+pub fn sys_mknodat(dfd: i32, pathname: *const u8, mode: u32, _dev: u64) -> SyscallResult {
+    if pathname.is_null() {
+        return Errno::EFAULT.into();
+    }
+    // SAFETY: copy_string_from_user validates user bounds and reads until null terminator.
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+
+    if raw_path.is_empty() {
+        return Errno::ENOENT.into();
+    }
+
+    let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
+        Ok(path) => path,
+        Err(e) => return e.into(),
+    };
+
+    if crate::fs::vfs::lookup(&resolved_path).is_some() {
+        return Errno::EEXIST.into();
+    }
+
+    let (parent_path, name) = crate::fs::path::split_path(&resolved_path);
+    let parent_inode = match crate::fs::vfs::lookup(parent_path) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    if !parent_inode.inode().is_dir() {
+        return Errno::ENOTDIR.into();
+    }
+
+    if let Err(e) = check_permission(parent_inode.inode(), MAY_WRITE) {
+        return e as SyscallResult;
+    }
+    if let Err(e) = check_permission(parent_inode.inode(), MAY_EXEC) {
+        return e as SyscallResult;
+    }
+
+    let s_ifmt = mode & 0o170000;
+    let file_type = match s_ifmt {
+        0o010000 => FileType::Pipe,
+        0o020000 => FileType::CharDevice,
+        0o060000 => FileType::BlockDevice,
+        0o100000 | 0 => FileType::Regular,
+        0o140000 => FileType::Socket,
+        _ => return Errno::EINVAL.into(),
+    };
+
+    match parent_inode.create(name, file_type) {
+        Some(new_inode) => {
+            let umask = if let Some(pid) = crate::process::scheduler::current_pid() {
+                if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+                    task_arc.lock().umask
+                } else {
+                    0o022
+                }
+            } else {
+                0o022
+            };
+            let permissions = ((mode & 0o7777) & !umask) as u16;
+            let _ = new_inode.set_permissions(permissions);
+            crate::fs::vfs::invalidate_dentry(&resolved_path);
+            0
+        }
+        None => Errno::EACCES.into(),
+    }
+}
+
+/// `mknod(pathname, mode, dev)` — Create a special or ordinary file.
+pub fn sys_mknod(pathname: *const u8, mode: u32, dev: u64) -> SyscallResult {
+    sys_mknodat(-100, pathname, mode, dev)
+}
+
 pub fn sys_lsetxattr(
     path: *const u8,
     name: *const u8,

@@ -51,3 +51,7 @@
 ## 2026-03-30 - SPSC Lock-Free RingBuffer Bulk Slice Operation
 **Learning:** In `kernel/src/util/ring_buffer.rs`, pushing or popping multiple elements from `RingBuffer` one by one incurred per-element atomic load/store instructions and loop branch overheads. Implementing `push_slice` and `pop_slice` with `core::ptr::copy_nonoverlapping` (`memcpy`/`rep movsb`) reduces stream transfers to at most two contiguous bulk memory moves and a single atomic release store on `head` or `tail`.
 **Action:** When transferring data slices into or out of lock-free circular ring buffers, prefer chunked `copy_nonoverlapping` memory operations over per-element push/pop loops.
+
+## 2026-03-30 - 64-Bit Word Internet Checksum Unrolling Optimization
+**Learning:** In `kernel/src/net/ipv4.rs`, calculating IP/TCP/UDP Internet checksums by loading 16-bit words (`u16::from_be_bytes`) required 16 separate byte-swaps, bit-extensions, and additions per 32-byte block. Updating the unrolled loop to load 64-bit words (`u64::from_be_bytes`) with 1's complement carry addition (`add64_carry`) reduces byte-swapping and loop arithmetic by 4x per block on 64-bit architectures before folding down to 16 bits.
+**Action:** On 64-bit targets, process network packet checksum payloads in 64-bit big-endian words with carry propagation to minimize endianness conversion and register pressure.

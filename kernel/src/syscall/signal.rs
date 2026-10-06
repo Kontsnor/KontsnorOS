@@ -70,12 +70,7 @@ pub fn deliver_signal(pid: crate::process::pid::Pid, sig: i32) {
         x86_64::instructions::interrupts::without_interrupts(|| {
             let sched_lock = scheduler::SCHEDULER.lock();
             if let Some(ref sched) = *sched_lock {
-                for core_id in 0..32 {
-                    if sched.current_cpus[core_id] == Some(pid) {
-                        target_core = Some(core_id);
-                        break;
-                    }
-                }
+                target_core = sched.current_cpus.iter().position(|&p| p == Some(pid));
             }
         });
 
@@ -127,14 +122,9 @@ pub fn sys_kill(pid: i32, sig: i32) -> SyscallResult {
             let target_pgid = (-pid) as u64;
             use crate::process::scheduler;
             let tasks = scheduler::TASKS.read();
-            let exists = tasks.iter().any(|t| {
-                if let Some(task_arc) = t {
-                    let task = task_arc.lock();
-                    (caller_ns_id == 0 || task.pid_ns_id == caller_ns_id)
-                        && task.pgid == target_pgid
-                } else {
-                    false
-                }
+            let exists = tasks.iter().flatten().any(|task_arc| {
+                let task = task_arc.lock();
+                (caller_ns_id == 0 || task.pid_ns_id == caller_ns_id) && task.pgid == target_pgid
             });
             if exists {
                 return 0;
@@ -182,24 +172,22 @@ pub fn sys_kill(pid: i32, sig: i32) -> SyscallResult {
         let tasks = scheduler::TASKS.read();
         let mut pids = alloc::vec::Vec::new();
         let mut seen_tgids = alloc::vec::Vec::new();
-        for task_opt in tasks.iter() {
-            if let Some(task_arc) = task_opt {
-                if let Some(task) = task_arc.try_lock() {
-                    if caller_ns_id != 0 && task.pid_ns_id != caller_ns_id {
-                        continue;
-                    }
-                    let host_pid = task.pid.as_u64();
-                    if host_pid == caller_pid || host_pid <= 1 || task.is_pid_ns_init {
-                        continue;
-                    }
-                    if !task.is_user() {
-                        continue;
-                    }
-                    let tgid = task.tgid;
-                    if !seen_tgids.contains(&tgid) {
-                        seen_tgids.push(tgid);
-                        pids.push(tgid);
-                    }
+        for task_arc in tasks.iter().flatten() {
+            if let Some(task) = task_arc.try_lock() {
+                if caller_ns_id != 0 && task.pid_ns_id != caller_ns_id {
+                    continue;
+                }
+                let host_pid = task.pid.as_u64();
+                if host_pid == caller_pid || host_pid <= 1 || task.is_pid_ns_init {
+                    continue;
+                }
+                if !task.is_user() {
+                    continue;
+                }
+                let tgid = task.tgid;
+                if !seen_tgids.contains(&tgid) {
+                    seen_tgids.push(tgid);
+                    pids.push(tgid);
                 }
             }
         }
@@ -479,17 +467,7 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
             return;
         }
 
-        let mut active_sig = 0;
-        for i in 1..=64 {
-            if (unblocked & (1 << (i - 1))) != 0 {
-                active_sig = i;
-                break;
-            }
-        }
-
-        if active_sig == 0 {
-            return;
-        }
+        let active_sig = (unblocked.trailing_zeros() + 1) as i32;
 
         task.pending_signals &= !(1 << (active_sig - 1));
 

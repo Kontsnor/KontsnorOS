@@ -32,9 +32,9 @@ impl CharDevice for SerialConsole {
     }
 
     fn write(&self, data: &[u8]) -> Result<usize, DriverError> {
-        // Write each byte through the serial port
+        // Write each byte through the serial port and mirror console
         for &byte in data {
-            crate::arch::x86_64::serial::_print(format_args!("{}", byte as char));
+            crate::arch::x86_64::serial::write_byte(byte);
         }
         Ok(data.len())
     }

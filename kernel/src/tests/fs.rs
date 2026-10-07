@@ -1266,3 +1266,49 @@ fn test_page_cache_eviction_and_dirty_stats() {
     assert_eq!(n2, 4096);
     assert_eq!(buf[..4096], buf2[..4096]);
 }
+
+#[test_case]
+fn test_sys_mknod() {
+    let tmp_dir = match crate::fs::vfs::lookup("/tmp") {
+        Some(dir) => dir,
+        None => return,
+    };
+
+    // 1. Test null pointer error check
+    assert_eq!(
+        crate::syscall::fs::sys_mknod(core::ptr::null(), 0o100644, 0),
+        crate::syscall::Errno::EFAULT as i64
+    );
+
+    // 2. Test empty path error check
+    let empty_path = b"\0";
+    assert_eq!(
+        crate::syscall::fs::sys_mknod(empty_path.as_ptr(), 0o100644, 0),
+        crate::syscall::Errno::ENOENT as i64
+    );
+
+    // 3. Test creating a regular file node via mknod
+    let file_path = b"/tmp/mknod_test_file.txt\0";
+    let res = crate::syscall::fs::sys_mknod(file_path.as_ptr(), 0o100644, 0);
+    assert_eq!(res, 0);
+
+    // Verify created node via VFS lookup
+    let looked_up = crate::fs::vfs::lookup("/tmp/mknod_test_file.txt")
+        .expect("Failed to lookup /tmp/mknod_test_file.txt");
+    assert_eq!(
+        looked_up.inode().file_type,
+        crate::fs::inode::FileType::Regular
+    );
+
+    // 4. Test duplicate creation returns EEXIST
+    let res_dup = crate::syscall::fs::sys_mknod(file_path.as_ptr(), 0o100644, 0);
+    assert_eq!(res_dup, crate::syscall::Errno::EEXIST as i64);
+
+    // 5. Test invalid directory creation attempt via mknod (S_IFDIR returns -EINVAL)
+    let dir_path = b"/tmp/mknod_dir_fail\0";
+    let res_dir = crate::syscall::fs::sys_mknod(dir_path.as_ptr(), 0o040755, 0);
+    assert_eq!(res_dir, crate::syscall::Errno::EINVAL as i64);
+
+    // Cleanup
+    let _ = tmp_dir.unlink("mknod_test_file.txt");
+}

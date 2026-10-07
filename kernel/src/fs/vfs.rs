@@ -300,20 +300,31 @@ impl Vfs {
                     resolved_till_now.push_str(component);
                 }
 
-                let cached = self
-                    .dentry_cache
-                    .read()
-                    .get(resolved_till_now.as_str())
-                    .cloned();
+                let parent_ino = current.inode().ino;
+                let next = match crate::fs::dcache::dcache_lookup(parent_ino, component) {
+                    Some(Some(cached_node)) => cached_node,
+                    Some(None) => return None,
+                    None => {
+                        let cached = self
+                            .dentry_cache
+                            .read()
+                            .get(resolved_till_now.as_str())
+                            .cloned();
 
-                let next = if let Some(n) = cached {
-                    n
-                } else {
-                    let n = current.lookup(component)?;
-                    self.dentry_cache
-                        .write()
-                        .insert(resolved_till_now.clone(), n.clone());
-                    n
+                        if let Some(n) = cached {
+                            crate::fs::dcache::dcache_insert(parent_ino, component, n.clone());
+                            n
+                        } else if let Some(n) = current.lookup(component) {
+                            self.dentry_cache
+                                .write()
+                                .insert(resolved_till_now.clone(), n.clone());
+                            crate::fs::dcache::dcache_insert(parent_ino, component, n.clone());
+                            n
+                        } else {
+                            crate::fs::dcache::dcache_insert_negative(parent_ino, component);
+                            return None;
+                        }
+                    }
                 };
 
                 // Check if this component is a symlink
@@ -365,6 +376,18 @@ impl Vfs {
 
     /// Invalidate a dentry and all its descendants.
     pub fn invalidate_dentry(&self, path: &str) {
+        if let Some(pos) = path.rfind('/') {
+            let parent_path = if pos == 0 { "/" } else { &path[..pos] };
+            let name = &path[pos + 1..];
+            if !name.is_empty() {
+                if let Some(parent_node) = self.dentry_cache.read().get(parent_path).cloned() {
+                    crate::fs::dcache::dcache_invalidate_entry(parent_node.inode().ino, name);
+                } else if let Some(parent_node) = self.lookup(parent_path) {
+                    crate::fs::dcache::dcache_invalidate_entry(parent_node.inode().ino, name);
+                }
+            }
+        }
+
         let mut cache = self.dentry_cache.write();
         cache.remove(path);
         let prefix = if path.ends_with('/') {

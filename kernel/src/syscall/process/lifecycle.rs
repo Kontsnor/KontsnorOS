@@ -1464,6 +1464,16 @@ pub fn sys_clone(
         return Errno::EINVAL.into();
     }
 
+    // Linux clone(2) spec: CLONE_SIGHAND requires CLONE_VM
+    if (flags & CLONE_SIGHAND) != 0 && (flags & CLONE_VM) == 0 {
+        return Errno::EINVAL.into();
+    }
+
+    // Linux clone(2) spec: CLONE_THREAD requires CLONE_SIGHAND
+    if (flags & CLONE_THREAD) != 0 && (flags & CLONE_SIGHAND) == 0 {
+        return Errno::EINVAL.into();
+    }
+
     let current_pid = match scheduler::current_pid() {
         Some(p) => p,
         None => return Errno::ESRCH.into(),

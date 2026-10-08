@@ -109,56 +109,12 @@ pub fn current_task_alloc_fd_with_flags_and_path(
     let task = task_arc.lock();
     let mut fd_table = task.fd_table.lock();
     let file_desc = Arc::new(FileDescription::new(inode, flags, path));
-
-    // Fast-path: start searching from `next_free_fd` to achieve O(1) FD allocation
-    let start_idx = fd_table.next_free_fd;
+    let cloexec = (flags.0 & OpenFlags::O_CLOEXEC) != 0;
     let rlimit = task.rlimit_nofile_cur as usize;
 
-    for i in start_idx..fd_table.entries.len() {
-        if i >= rlimit {
-            return None;
-        }
-        if fd_table.entries[i].is_none() {
-            fd_table.entries[i] = Some(file_desc);
-            if i >= fd_table.cloexec.len() {
-                fd_table.cloexec.resize(i + 1, false);
-            }
-            fd_table.cloexec[i] = (flags.0 & OpenFlags::O_CLOEXEC) != 0;
-            fd_table.next_free_fd = i + 1;
-            return Some(i as i32);
-        }
-    }
-
-    // Fallback scan if next_free_fd hint was stale (slots before start_idx were freed)
-    if start_idx > 0 {
-        let max_search = core::cmp::min(start_idx, fd_table.entries.len());
-        for i in 0..max_search {
-            if i >= rlimit {
-                return None;
-            }
-            if fd_table.entries[i].is_none() {
-                fd_table.entries[i] = Some(file_desc);
-                if i >= fd_table.cloexec.len() {
-                    fd_table.cloexec.resize(i + 1, false);
-                }
-                fd_table.cloexec[i] = (flags.0 & OpenFlags::O_CLOEXEC) != 0;
-                fd_table.next_free_fd = i + 1;
-                return Some(i as i32);
-            }
-        }
-    }
-
-    // No free slot found in existing entries — extend table up to rlimit
-    let next_idx = fd_table.entries.len();
-    if next_idx < rlimit {
-        fd_table.entries.push(Some(file_desc));
-        fd_table.cloexec.resize(next_idx + 1, false);
-        fd_table.cloexec[next_idx] = (flags.0 & OpenFlags::O_CLOEXEC) != 0;
-        fd_table.next_free_fd = next_idx + 1;
-        Some(next_idx as i32)
-    } else {
-        None // EMFILE
-    }
+    fd_table
+        .alloc_slot(file_desc, cloexec, rlimit)
+        .map(|fd| fd as i32)
 }
 
 /// Close file descriptor `fd` in the current task's fd_table.
@@ -218,54 +174,10 @@ pub fn current_task_dup_fd(fd: i32) -> Option<i32> {
     let file_desc = fd_table.entries.get(fd_idx)?.as_ref().cloned()?;
     *file_desc.ref_count.lock() += 1;
 
-    let start_idx = fd_table.next_free_fd;
     let rlimit = task.rlimit_nofile_cur as usize;
-
-    for i in start_idx..fd_table.entries.len() {
-        if i >= rlimit {
-            return None;
-        }
-        if fd_table.entries[i].is_none() {
-            fd_table.entries[i] = Some(file_desc);
-            if i >= fd_table.cloexec.len() {
-                fd_table.cloexec.resize(i + 1, false);
-            }
-            fd_table.cloexec[i] = false; // dup clears close-on-exec
-            fd_table.next_free_fd = i + 1;
-            return Some(i as i32);
-        }
-    }
-
-    // Fallback scan if next_free_fd hint was stale
-    if start_idx > 0 {
-        let max_search = core::cmp::min(start_idx, fd_table.entries.len());
-        for i in 0..max_search {
-            if i >= rlimit {
-                return None;
-            }
-            if fd_table.entries[i].is_none() {
-                fd_table.entries[i] = Some(file_desc);
-                if i >= fd_table.cloexec.len() {
-                    fd_table.cloexec.resize(i + 1, false);
-                }
-                fd_table.cloexec[i] = false; // dup clears close-on-exec
-                fd_table.next_free_fd = i + 1;
-                return Some(i as i32);
-            }
-        }
-    }
-
-    // Extend table up to rlimit_nofile_cur
-    let next_idx = fd_table.entries.len();
-    if next_idx < rlimit {
-        fd_table.entries.push(Some(file_desc));
-        fd_table.cloexec.resize(next_idx + 1, false);
-        fd_table.cloexec[next_idx] = false; // dup clears close-on-exec
-        fd_table.next_free_fd = next_idx + 1;
-        Some(next_idx as i32)
-    } else {
-        None
-    }
+    fd_table
+        .alloc_slot(file_desc, false, rlimit)
+        .map(|fd| fd as i32)
 }
 
 /// Duplicate an existing file descriptor `oldfd` onto `newfd` in the current task's fd_table.

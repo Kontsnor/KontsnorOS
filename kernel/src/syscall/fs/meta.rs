@@ -2009,6 +2009,90 @@ pub fn sys_unlinkat(dfd: i32, pathname: *const u8, flags: i32) -> SyscallResult 
     }
 }
 
+/// `mknodat(dfd, pathname, mode, dev)` — Create a filesystem node relative to directory fd.
+pub fn sys_mknodat(dfd: i32, pathname: *const u8, mode: u32, _dev: u64) -> SyscallResult {
+    if pathname.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    if raw_path.is_empty() {
+        return Errno::ENOENT.into();
+    }
+
+    let file_type = match mode & 0o170000 {
+        0 | 0o100000 => FileType::Regular,
+        0o010000 => FileType::Pipe,
+        0o020000 => FileType::CharDevice,
+        0o060000 => FileType::BlockDevice,
+        0o140000 => FileType::Socket,
+        _ => return Errno::EINVAL.into(),
+    };
+
+    let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
+        Ok(path) => path,
+        Err(e) => return e.into(),
+    };
+
+    if crate::fs::vfs::lookup(&resolved_path).is_some() {
+        return Errno::EEXIST.into();
+    }
+
+    let (parent_path, name) = crate::fs::path::split_path(&resolved_path);
+    let parent_inode = match crate::fs::vfs::lookup(parent_path) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    if parent_inode.inode().file_type != FileType::Directory {
+        return Errno::ENOTDIR.into();
+    }
+
+    if let Err(e) = check_permission(parent_inode.inode(), MAY_WRITE) {
+        return e as SyscallResult;
+    }
+    if let Err(e) = check_permission(parent_inode.inode(), MAY_EXEC) {
+        return e as SyscallResult;
+    }
+
+    match parent_inode.create(name, file_type) {
+        Some(node) => {
+            let umask = if let Some(pid) = crate::process::scheduler::current_pid() {
+                if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+                    task_arc.lock().umask
+                } else {
+                    0o022
+                }
+            } else {
+                0o022
+            };
+            let file_mode = ((mode & 0o7777) & !umask) as u16;
+            let _ = node.set_permissions(file_mode);
+            let current_uid = if let Some(pid) = crate::process::scheduler::current_pid() {
+                if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+                    let task = task_arc.lock();
+                    (task.euid, task.egid)
+                } else {
+                    (0, 0)
+                }
+            } else {
+                (0, 0)
+            };
+            let _ = node.set_owner(current_uid.0, current_uid.1);
+            crate::fs::vfs::invalidate_dentry(&resolved_path);
+            0
+        }
+        None => Errno::EACCES.into(),
+    }
+}
+
+/// `mknod(pathname, mode, dev)` — Create a filesystem node.
+pub fn sys_mknod(pathname: *const u8, mode: u32, dev: u64) -> SyscallResult {
+    sys_mknodat(-100, pathname, mode, dev)
+}
+
 /// `mkdirat(dfd, pathname, mode)` — Create a directory relative to a directory fd.
 pub fn sys_mkdirat(dfd: i32, pathname: *const u8, mode: u32) -> SyscallResult {
     if pathname.is_null() {

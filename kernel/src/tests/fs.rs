@@ -566,6 +566,53 @@ fn test_ext4_extent_mapping() {
 }
 
 #[test_case]
+fn test_mknod_and_mknodat() {
+    let tmp_dir_path = b"/tmp/mknod_test_dir\0";
+    let mkdir_res = crate::syscall::fs::sys_mkdir(tmp_dir_path.as_ptr(), 0o755);
+    assert_eq!(mkdir_res, 0);
+
+    // 1. Test sys_mknod to create a regular file
+    let file_path = b"/tmp/mknod_test_dir/file.txt\0";
+    let mknod_res = crate::syscall::fs::sys_mknod(file_path.as_ptr(), 0o100644, 0);
+    assert_eq!(mknod_res, 0);
+
+    // Verify lookup & file type
+    let file_node =
+        crate::fs::vfs::lookup("/tmp/mknod_test_dir/file.txt").expect("File lookup failed");
+    assert_eq!(
+        file_node.inode().file_type,
+        crate::fs::inode::FileType::Regular
+    );
+
+    // EEXIST on duplicate creation
+    let dup_res = crate::syscall::fs::sys_mknod(file_path.as_ptr(), 0o100644, 0);
+    assert_eq!(dup_res, crate::syscall::Errno::EEXIST as i64);
+
+    // 2. Test sys_mknodat to create a FIFO / Pipe
+    let dir_fd = crate::syscall::fs::sys_open(tmp_dir_path.as_ptr(), 0o20000, 0); // O_DIRECTORY
+    assert!(dir_fd >= 0);
+
+    let fifo_rel_path = b"fifo.pipe\0";
+    let mknodat_res =
+        crate::syscall::fs::sys_mknodat(dir_fd as i32, fifo_rel_path.as_ptr(), 0o010666, 0);
+    assert_eq!(mknodat_res, 0);
+
+    let fifo_node =
+        crate::fs::vfs::lookup("/tmp/mknod_test_dir/fifo.pipe").expect("FIFO lookup failed");
+    assert_eq!(
+        fifo_node.inode().file_type,
+        crate::fs::inode::FileType::Pipe
+    );
+
+    // 3. Cleanup
+    crate::syscall::fs::sys_close(dir_fd as i32);
+    let _ = crate::syscall::fs::sys_unlink(file_path.as_ptr());
+    let fifo_abs_path = b"/tmp/mknod_test_dir/fifo.pipe\0";
+    let _ = crate::syscall::fs::sys_unlink(fifo_abs_path.as_ptr());
+    let _ = crate::syscall::fs::sys_rmdir(tmp_dir_path.as_ptr());
+}
+
+#[test_case]
 fn test_lseek_espipe_on_pipe() {
     let mut pipefds = [0i32; 2];
     let res = crate::syscall::fs::sys_pipe(pipefds.as_mut_ptr());

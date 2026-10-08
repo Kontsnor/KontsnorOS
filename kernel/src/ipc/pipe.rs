@@ -48,6 +48,61 @@ struct PipeBuffer {
     count: usize,
 }
 
+impl PipeBuffer {
+    /// Push a slice of bytes into the ring buffer using bulk memory copies.
+    ///
+    /// Performance: Replaces byte-by-byte loop iterations and modulo division with at most two
+    /// `copy_from_slice` calls (vectorized bulk memory moves), reducing O(N) loop overheads
+    /// to O(1) bulk operations and maximizing CPU pipeline instruction throughput.
+    fn push_slice(&mut self, src: &[u8]) -> usize {
+        let available = PIPE_BUF_SIZE - self.count;
+        if available == 0 || src.is_empty() {
+            return 0;
+        }
+        let to_write = core::cmp::min(src.len(), available);
+
+        // First contiguous chunk: from write_pos to end of buffer
+        let first_chunk = core::cmp::min(to_write, PIPE_BUF_SIZE - self.write_pos);
+        self.data[self.write_pos..self.write_pos + first_chunk]
+            .copy_from_slice(&src[..first_chunk]);
+
+        // Second contiguous chunk: wrap around to start of ring buffer
+        let second_chunk = to_write - first_chunk;
+        if second_chunk > 0 {
+            self.data[..second_chunk].copy_from_slice(&src[first_chunk..to_write]);
+        }
+
+        self.write_pos = (self.write_pos + to_write) & (PIPE_BUF_SIZE - 1);
+        self.count += to_write;
+        to_write
+    }
+
+    /// Pop bytes from the ring buffer into a slice using bulk memory copies.
+    ///
+    /// Performance: Replaces byte-by-byte loop iterations and modulo division with at most two
+    /// `copy_from_slice` calls, drastically reducing IPC read latency.
+    fn pop_slice(&mut self, dst: &mut [u8]) -> usize {
+        if self.count == 0 || dst.is_empty() {
+            return 0;
+        }
+        let to_read = core::cmp::min(dst.len(), self.count);
+
+        // First contiguous chunk: from read_pos to end of buffer
+        let first_chunk = core::cmp::min(to_read, PIPE_BUF_SIZE - self.read_pos);
+        dst[..first_chunk].copy_from_slice(&self.data[self.read_pos..self.read_pos + first_chunk]);
+
+        // Second contiguous chunk: wrap around to start of ring buffer
+        let second_chunk = to_read - first_chunk;
+        if second_chunk > 0 {
+            dst[first_chunk..to_read].copy_from_slice(&self.data[..second_chunk]);
+        }
+
+        self.read_pos = (self.read_pos + to_read) & (PIPE_BUF_SIZE - 1);
+        self.count -= to_read;
+        to_read
+    }
+}
+
 impl Pipe {
     /// Create a new pipe.
     pub fn new() -> Arc<Self> {
@@ -85,16 +140,9 @@ impl Pipe {
 
             let space_available = {
                 let mut buf = self.buffer.lock();
-                let available = PIPE_BUF_SIZE - buf.count;
-                if available > 0 {
-                    let to_write = (data.len() - written).min(available);
-                    for &byte in &data[written..written + to_write] {
-                        let pos = buf.write_pos;
-                        buf.data[pos] = byte;
-                        buf.write_pos = (pos + 1) % PIPE_BUF_SIZE;
-                        buf.count += 1;
-                    }
-                    written += to_write;
+                let n = buf.push_slice(&data[written..]);
+                if n > 0 {
+                    written += n;
                     drop(buf);
                     self.wait_queue.wake_all();
                     true
@@ -125,16 +173,10 @@ impl Pipe {
             let mut buf = self.buffer.lock();
 
             if buf.count > 0 {
-                let to_read = out.len().min(buf.count);
-                for byte in &mut out[..to_read] {
-                    let pos = buf.read_pos;
-                    *byte = buf.data[pos];
-                    buf.read_pos = (pos + 1) % PIPE_BUF_SIZE;
-                    buf.count -= 1;
-                }
+                let count = buf.pop_slice(out);
                 drop(buf);
                 self.wait_queue.wake_all();
-                return Ok(to_read);
+                return Ok(count);
             }
 
             if !*self.write_open.lock() {

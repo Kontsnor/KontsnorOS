@@ -208,6 +208,65 @@ pub struct FdTable {
     pub next_free_fd: usize,
 }
 
+impl FdTable {
+    /// Allocate a slot in the file descriptor table for `file_desc`.
+    /// Uses `next_free_fd` hint for fast-path search starting from available slot.
+    pub fn alloc_slot(
+        &mut self,
+        file_desc: Arc<FileDescription>,
+        cloexec: bool,
+        rlimit: usize,
+    ) -> Option<usize> {
+        let start_idx = self.next_free_fd;
+
+        for i in start_idx..self.entries.len() {
+            if i >= rlimit {
+                return None;
+            }
+            if self.entries[i].is_none() {
+                self.entries[i] = Some(file_desc);
+                if i >= self.cloexec.len() {
+                    self.cloexec.resize(i + 1, false);
+                }
+                self.cloexec[i] = cloexec;
+                self.next_free_fd = i + 1;
+                return Some(i);
+            }
+        }
+
+        // Fallback scan if next_free_fd hint was stale
+        if start_idx > 0 {
+            let max_search = core::cmp::min(start_idx, self.entries.len());
+            for i in 0..max_search {
+                if i >= rlimit {
+                    return None;
+                }
+                if self.entries[i].is_none() {
+                    self.entries[i] = Some(file_desc);
+                    if i >= self.cloexec.len() {
+                        self.cloexec.resize(i + 1, false);
+                    }
+                    self.cloexec[i] = cloexec;
+                    self.next_free_fd = i + 1;
+                    return Some(i);
+                }
+            }
+        }
+
+        // Extend table up to rlimit
+        let next_idx = self.entries.len();
+        if next_idx < rlimit {
+            self.entries.push(Some(file_desc));
+            self.cloexec.resize(next_idx + 1, false);
+            self.cloexec[next_idx] = cloexec;
+            self.next_free_fd = next_idx + 1;
+            Some(next_idx)
+        } else {
+            None
+        }
+    }
+}
+
 /// A Task Control Block (TCB).
 ///
 /// Contains all the information the kernel needs to manage a task:

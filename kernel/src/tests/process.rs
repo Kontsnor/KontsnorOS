@@ -298,3 +298,30 @@ fn test_cr3_context_switch_tlb_benchmark() {
         "Optimized conditional CR3 write must be faster than unconditional reload"
     );
 }
+
+#[test_case]
+fn test_sigaction_query_sigkill_sigstop() {
+    let dummy_act = crate::process::task::SigAction::default();
+
+    // 1. Calling sys_rt_sigaction with act != NULL on SIGKILL (9) or SIGSTOP (19) must return -EINVAL (-22)
+    let res_kill_set = crate::syscall::signal::sys_rt_sigaction(
+        9, // SIGKILL
+        &dummy_act as *const _,
+        core::ptr::null_mut(),
+        8,
+    );
+    assert_eq!(res_kill_set, -22); // -EINVAL
+
+    let res_stop_set = crate::syscall::signal::sys_rt_sigaction(
+        19, // SIGSTOP
+        &dummy_act as *const _,
+        core::ptr::null_mut(),
+        8,
+    );
+    assert_eq!(res_stop_set, -22); // -EINVAL
+
+    // 2. Calling sys_rt_sigaction with invalid sigsetsize != 8 must return -EINVAL (-22)
+    let res_bad_size =
+        crate::syscall::signal::sys_rt_sigaction(9, core::ptr::null(), core::ptr::null_mut(), 4);
+    assert_eq!(res_bad_size, -22); // -EINVAL
+}

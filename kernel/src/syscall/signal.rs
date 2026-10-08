@@ -212,6 +212,11 @@ pub fn sys_kill(pid: i32, sig: i32) -> SyscallResult {
 }
 
 /// `rt_sigaction(signum, act, oldact, sigsetsize)` — Set signal handler.
+///
+/// POSIX.1-2017 / Linux sigaction(2) specification:
+/// Querying signal dispositions (act == NULL) for SIGKILL (9) or SIGSTOP (19) is allowed,
+/// but attempting to set or change the signal handler (act != NULL) for SIGKILL or SIGSTOP
+/// returns -EINVAL as they cannot be caught or ignored (Linux kernel/signal.c do_sigaction).
 pub fn sys_rt_sigaction(
     signum: i32,
     act: *const crate::process::task::SigAction,
@@ -221,24 +226,26 @@ pub fn sys_rt_sigaction(
     if signum < 1 || signum > 64 || sigsetsize != 8 {
         return Errno::EINVAL.into();
     }
-    if signum == 9 || signum == 19 {
-        // SIGKILL, SIGSTOP cannot be caught
+    if !act.is_null() && (signum == 9 || signum == 19) {
+        // POSIX.1-2017 / Linux sigaction(2): SIGKILL and SIGSTOP cannot be caught or ignored
         return Errno::EINVAL.into();
     }
 
     if !act.is_null()
-        && !crate::syscall::fs::validate_user_ptr(
+        && crate::syscall::validation::validate_user_ptr_read(
             act as *const u8,
             core::mem::size_of::<crate::process::task::SigAction>(),
         )
+        .is_err()
     {
         return Errno::EFAULT.into();
     }
     if !oldact.is_null()
-        && !crate::syscall::fs::validate_user_ptr(
-            oldact as *const u8,
+        && crate::syscall::validation::validate_user_ptr_write(
+            oldact as *mut u8,
             core::mem::size_of::<crate::process::task::SigAction>(),
         )
+        .is_err()
     {
         return Errno::EFAULT.into();
     }
@@ -281,12 +288,20 @@ pub fn sys_rt_sigprocmask(
     }
 
     if !set.is_null()
-        && !crate::syscall::fs::validate_user_ptr(set as *const u8, core::mem::size_of::<u64>())
+        && crate::syscall::validation::validate_user_ptr_read(
+            set as *const u8,
+            core::mem::size_of::<u64>(),
+        )
+        .is_err()
     {
         return Errno::EFAULT.into();
     }
     if !oldset.is_null()
-        && !crate::syscall::fs::validate_user_ptr(oldset as *const u8, core::mem::size_of::<u64>())
+        && crate::syscall::validation::validate_user_ptr_write(
+            oldset as *mut u8,
+            core::mem::size_of::<u64>(),
+        )
+        .is_err()
     {
         return Errno::EFAULT.into();
     }

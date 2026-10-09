@@ -272,6 +272,11 @@ pub trait InodeOps: Send + Sync {
         None
     }
 
+    /// Return the inner Unix domain socket if this inode is a Unix domain socket.
+    fn as_unix_socket(&self) -> Option<Arc<Mutex<crate::ipc::socket::UnixSocket>>> {
+        None
+    }
+
     /// Look up a child by name (for directories).
     fn lookup(&self, _name: &str) -> Option<Arc<dyn InodeOps>> {
         None
@@ -386,6 +391,9 @@ pub trait InodeOps: Send + Sync {
 
     /// Return the wait queue associated with this inode for event monitoring (poll / epoll).
     fn wait_queue(&self) -> Option<alloc::sync::Arc<crate::sync::wait_queue::WaitQueue>> {
+        if let Some(us) = self.as_unix_socket() {
+            return Some(us.lock().wait_queue.clone());
+        }
         if let Some(s) = self.as_socket() {
             return Some(s.lock().wait_queue.clone());
         }

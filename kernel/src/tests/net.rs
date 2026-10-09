@@ -221,3 +221,107 @@ fn test_socket_read_wait_queue_hoist() {
 
     kprintln!("[test] Socket read wait_queue hoist benchmark test PASSED!");
 }
+
+#[test_case]
+fn test_unix_domain_sockets() {
+    use crate::fs::inode::InodeOps;
+    use crate::ipc::socket::{UnixSocket, UnixSocketInode, UnixSocketState};
+
+    kprintln!("[test] Starting Unix Domain Socket unit tests...");
+
+    // ── 1. Socket Pairs (SOCK_STREAM) ───────────────────────────────────────
+    let (pair_a, pair_b) = UnixSocket::make_pair(1, false);
+    let inode_a = UnixSocketInode::new(pair_a.clone());
+    let inode_b = UnixSocketInode::new(pair_b.clone());
+
+    let write_bytes = b"Hello Unix Stream Socketpair!";
+    let written = inode_a
+        .write(0, write_bytes)
+        .expect("Write to pair_a failed");
+    assert_eq!(written, write_bytes.len());
+
+    let mut read_buf = [0u8; 64];
+    let read_cnt = inode_b
+        .read(0, &mut read_buf)
+        .expect("Read from pair_b failed");
+    assert_eq!(read_cnt, write_bytes.len());
+    assert_eq!(&read_buf[..read_cnt], write_bytes);
+
+    // ── 2. Socket Pairs (SOCK_DGRAM) ────────────────────────────────────────
+    let (dgram_a, dgram_b) = UnixSocket::make_pair(2, false);
+    let dgram_inode_a = UnixSocketInode::new(dgram_a.clone());
+    let dgram_inode_b = UnixSocketInode::new(dgram_b.clone());
+
+    let dg_msg = b"Datagram Socketpair Payload";
+    let dg_written = dgram_inode_a
+        .write(0, dg_msg)
+        .expect("Datagram write failed");
+    assert_eq!(dg_written, dg_msg.len());
+
+    let mut dg_buf = [0u8; 64];
+    let dg_read = dgram_inode_b
+        .read(0, &mut dg_buf)
+        .expect("Datagram read failed");
+    assert_eq!(dg_read, dg_msg.len());
+    assert_eq!(&dg_buf[..dg_read], dg_msg);
+
+    // ── 3. Named Stream Socket Server / Client Connection ───────────────────
+    let server_sock = alloc::sync::Arc::new(spin::Mutex::new(UnixSocket::new(1)));
+    let server_path = alloc::string::String::from("/tmp/test_unix_stream.sock");
+
+    let reg_res =
+        crate::ipc::socket::register_unix_socket(server_path.clone(), server_sock.clone());
+    assert!(reg_res.is_ok(), "Unix socket registration failed");
+
+    {
+        let mut s = server_sock.lock();
+        s.state = UnixSocketState::Listening;
+        s.max_backlog = 5;
+    }
+
+    let client_sock = alloc::sync::Arc::new(spin::Mutex::new(UnixSocket::new(1)));
+    let client_peer = alloc::sync::Arc::new(spin::Mutex::new(UnixSocket::new(1)));
+
+    {
+        let mut peer = client_peer.lock();
+        peer.state = UnixSocketState::Connected;
+        peer.peer = Some(client_sock.clone());
+    }
+    {
+        let mut client = client_sock.lock();
+        client.state = UnixSocketState::Connected;
+        client.peer = Some(client_peer.clone());
+    }
+
+    {
+        let mut s = server_sock.lock();
+        s.backlog.push(client_peer.clone());
+    }
+
+    let server_inode = UnixSocketInode::new(server_sock.clone());
+
+    let client_write = b"Data from client to server";
+    let client_inode = UnixSocketInode::new(client_sock.clone());
+    let c_written = client_inode
+        .write(0, client_write)
+        .expect("Client write failed");
+    assert_eq!(c_written, client_write.len());
+
+    let accepted_peer = {
+        let mut s = server_sock.lock();
+        assert_eq!(s.backlog.len(), 1);
+        s.backlog.remove(0)
+    };
+    let accepted_inode = UnixSocketInode::new(accepted_peer);
+
+    let mut srv_read_buf = [0u8; 64];
+    let srv_read_cnt = accepted_inode
+        .read(0, &mut srv_read_buf)
+        .expect("Server read failed");
+    assert_eq!(srv_read_cnt, client_write.len());
+    assert_eq!(&srv_read_buf[..srv_read_cnt], client_write);
+
+    crate::ipc::socket::unregister_unix_socket(&server_path);
+
+    kprintln!("[test] Unix Domain Socket unit tests PASSED!");
+}

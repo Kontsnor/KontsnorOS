@@ -51,3 +51,7 @@
 ## 2026-03-30 - SPSC Lock-Free RingBuffer Bulk Slice Operation
 **Learning:** In `kernel/src/util/ring_buffer.rs`, pushing or popping multiple elements from `RingBuffer` one by one incurred per-element atomic load/store instructions and loop branch overheads. Implementing `push_slice` and `pop_slice` with `core::ptr::copy_nonoverlapping` (`memcpy`/`rep movsb`) reduces stream transfers to at most two contiguous bulk memory moves and a single atomic release store on `head` or `tail`.
 **Action:** When transferring data slices into or out of lock-free circular ring buffers, prefer chunked `copy_nonoverlapping` memory operations over per-element push/pop loops.
+
+## 2026-03-30 - O(1) Scheduler Task Queue Membership Check
+**Learning:** In `kernel/src/process/scheduler.rs`, `wake_task` was scanning priority runqueues linearly (`!self.queues[priority].iter().any(|&p| p == pid)`) on every task wake event, introducing O(N) iteration overhead while holding the global scheduler lock. Checking the pre-existing `task.in_queue` boolean flag reduces queue membership validation to O(1) constant time, minimizing scheduler lock hold time and latency on task wakeups across I/O, timers, and IPC notifications.
+**Action:** Always prefer checking boolean flags embedded in task structs over linear scans of scheduler queues during task state transitions.

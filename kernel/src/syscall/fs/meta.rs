@@ -33,6 +33,13 @@ struct LinuxDirent64 {
     d_type: u8,
 }
 
+/// Helper to resolve parent directory and base filename from a path.
+pub fn resolve_parent(path: &str) -> Option<(Arc<dyn crate::fs::inode::InodeOps>, String)> {
+    let (parent_path, name) = crate::fs::path::split_path(path);
+    let parent_inode = crate::fs::vfs::lookup(parent_path)?;
+    Some((parent_inode, String::from(name)))
+}
+
 /// `getdents64(fd, dirp, count)` — Get directory entries.
 pub fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
     if fd < 0 || dirp.is_null() || count == 0 {

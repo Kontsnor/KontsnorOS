@@ -336,17 +336,19 @@ impl Scheduler {
             if task.state == TaskState::Blocked {
                 task.state = TaskState::Ready;
                 let priority = task.priority as usize;
-                if !self.queues[priority].iter().any(|&p| p == pid) {
+                // Fast O(1) queue check using `task.in_queue` rather than O(N) queue scanning.
+                // Reduces scheduler lock hold times and latency on every task wake event.
+                if !task.in_queue {
                     self.queues[priority].push_back(pid);
+                    task.in_queue = true;
                 }
-                task.in_queue = true;
                 return true;
             } else if task.state == TaskState::Ready && !task.is_idle {
                 let priority = task.priority as usize;
-                if !self.queues[priority].iter().any(|&p| p == pid) {
+                if !task.in_queue {
                     self.queues[priority].push_back(pid);
+                    task.in_queue = true;
                 }
-                task.in_queue = true;
                 return true;
             }
         }

@@ -167,23 +167,31 @@ impl BlockDevice for BlockCache {
         // 1. Acquire lock to check for cache hits
         let mut inner = self.inner.lock();
 
-        let mut all_hits = true;
-        for i in 0..num_blocks {
-            if !inner.entries.contains_key(&(block + i as u64)) {
-                all_hits = false;
-                break;
-            }
-        }
-
-        if all_hits {
-            for i in 0..num_blocks {
-                let curr_block = block + i as u64;
-                let offset = i * block_size;
-                let entry = inner.entries.get_mut(&curr_block).unwrap();
+        if num_blocks == 1 {
+            if let Some(entry) = inner.entries.get_mut(&block) {
                 entry.referenced = true;
-                buf[offset..offset + block_size].copy_from_slice(&entry.data);
+                buf[..block_size].copy_from_slice(&entry.data);
+                return Ok(());
             }
-            return Ok(());
+        } else {
+            let mut all_hits = true;
+            for i in 0..num_blocks {
+                if !inner.entries.contains_key(&(block + i as u64)) {
+                    all_hits = false;
+                    break;
+                }
+            }
+
+            if all_hits {
+                for i in 0..num_blocks {
+                    let curr_block = block + i as u64;
+                    let offset = i * block_size;
+                    let entry = inner.entries.get_mut(&curr_block).unwrap();
+                    entry.referenced = true;
+                    buf[offset..offset + block_size].copy_from_slice(&entry.data);
+                }
+                return Ok(());
+            }
         }
 
         // 2. Cache miss: release lock and read from underlying device.

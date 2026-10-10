@@ -92,6 +92,13 @@ impl InodeOps for TmpFsDir {
         Ok(())
     }
 
+    fn set_rdev(&self, rdev: u64) -> Result<(), i32> {
+        unsafe {
+            (*self.inode.get()).rdev = rdev;
+        }
+        Ok(())
+    }
+
     fn set_owner(&self, uid: u32, gid: u32) -> Result<(), i32> {
         // SAFETY: Direct pointer dereference of interior UnsafeCell is safe within synchronized methods.
         unsafe {
@@ -128,7 +135,12 @@ impl InodeOps for TmpFsDir {
 
     fn create(&self, name: &str, file_type: FileType) -> Option<Arc<dyn InodeOps>> {
         let node: Arc<dyn InodeOps> = match file_type {
-            FileType::Regular | FileType::Symlink => Arc::new(TmpFsFile {
+            FileType::Regular
+            | FileType::Symlink
+            | FileType::CharDevice
+            | FileType::BlockDevice
+            | FileType::Pipe
+            | FileType::Socket => Arc::new(TmpFsFile {
                 inode: core::cell::UnsafeCell::new(
                     Inode::new(alloc_ino(), file_type).with_dev(TMPFS_DEV_ID),
                 ),
@@ -140,7 +152,6 @@ impl InodeOps for TmpFsDir {
                 ),
                 entries: RwLock::new(BTreeMap::new()),
             }),
-            _ => return None,
         };
 
         self.entries
@@ -239,6 +250,13 @@ impl InodeOps for TmpFsFile {
     fn set_permissions(&self, mode: u16) -> Result<(), i32> {
         unsafe {
             (*self.inode.get()).permissions.mode = mode;
+        }
+        Ok(())
+    }
+
+    fn set_rdev(&self, rdev: u64) -> Result<(), i32> {
+        unsafe {
+            (*self.inode.get()).rdev = rdev;
         }
         Ok(())
     }

@@ -2771,6 +2771,96 @@ pub fn sys_setxattr(
     }
 }
 
+/// `mknodat(dfd, pathname, mode, dev)` — Create a special or ordinary file relative to a directory file descriptor.
+///
+/// Standard Linux x86_64 system call #259.
+pub fn sys_mknodat(dfd: i32, pathname: *const u8, mode: u32, dev: u64) -> SyscallResult {
+    use crate::fs::inode::FileType;
+
+    if pathname.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let raw_path = match unsafe { crate::syscall::validation::copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    if raw_path.is_empty() {
+        return Errno::ENOENT.into();
+    }
+
+    let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
+        Ok(path) => path,
+        Err(e) => return e.into(),
+    };
+
+    if crate::fs::vfs::lookup(&resolved_path).is_some() {
+        return Errno::EEXIST.into();
+    }
+
+    let (parent_path, name) = crate::fs::path::split_path(&resolved_path);
+    let parent_inode = match crate::fs::vfs::lookup(parent_path) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    if !parent_inode.inode().is_dir() {
+        return Errno::ENOTDIR.into();
+    }
+
+    if let Err(e) =
+        crate::fs::inode::check_permission(parent_inode.inode(), crate::fs::inode::MAY_WRITE)
+    {
+        return e as SyscallResult;
+    }
+    if let Err(e) =
+        crate::fs::inode::check_permission(parent_inode.inode(), crate::fs::inode::MAY_EXEC)
+    {
+        return e as SyscallResult;
+    }
+
+    // Decode file type from mode (S_IFMT = 0xF000)
+    let file_type = match mode & 0xF000 {
+        0 | 0x8000 => FileType::Regular,      // S_IFREG or 0
+        0x2000 => FileType::CharDevice,       // S_IFCHR
+        0x6000 => FileType::BlockDevice,      // S_IFBLK
+        0x1000 => FileType::Pipe,             // S_IFIFO
+        0xC000 => FileType::Socket,           // S_IFSOCK
+        0x4000 => return Errno::EPERM.into(), // S_IFDIR - mknod cannot create directories
+        _ => return Errno::EINVAL.into(),
+    };
+
+    let umask = if let Some(pid) = crate::process::scheduler::current_pid() {
+        if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+            task_arc.lock().umask
+        } else {
+            0o022
+        }
+    } else {
+        0o022
+    };
+
+    let file_mode = ((mode & 0o777) & !umask) as u16;
+
+    match parent_inode.create(name, file_type) {
+        Some(new_i) => {
+            let _ = new_i.set_permissions(file_mode);
+            if dev != 0 {
+                let _ = new_i.set_rdev(dev);
+            }
+            crate::fs::vfs::invalidate_dentry(&resolved_path);
+            0
+        }
+        None => Errno::ENOSPC.into(),
+    }
+}
+
+/// `mknod(pathname, mode, dev)` — Create a special or ordinary file.
+///
+/// Standard Linux x86_64 system call #133.
+pub fn sys_mknod(pathname: *const u8, mode: u32, dev: u64) -> SyscallResult {
+    sys_mknodat(-100, pathname, mode, dev) // AT_FDCWD = -100
+}
+
 pub fn sys_lsetxattr(
     path: *const u8,
     name: *const u8,

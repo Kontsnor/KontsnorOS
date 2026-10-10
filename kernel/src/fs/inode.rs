@@ -247,6 +247,11 @@ pub trait InodeOps: Send + Sync {
         Err(-1) // EPERM
     }
 
+    /// Set device ID (for special character/block device files).
+    fn set_rdev(&self, _rdev: u64) -> Result<(), i32> {
+        Ok(())
+    }
+
     /// Set owner and group.
     fn set_owner(&self, _uid: u32, _gid: u32) -> Result<(), i32> {
         Err(-1) // EPERM

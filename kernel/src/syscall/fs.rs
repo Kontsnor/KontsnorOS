@@ -32,11 +32,12 @@ pub use meta::{
     sys_fdatasync, sys_fgetxattr, sys_flistxattr, sys_fremovexattr, sys_fsetxattr, sys_fstat,
     sys_fstatfs, sys_getcwd, sys_getdents64, sys_getxattr, sys_lchown, sys_lgetxattr, sys_link,
     sys_linkat, sys_listxattr, sys_llistxattr, sys_lremovexattr, sys_lsetxattr, sys_lstat,
-    sys_mkdir, sys_mkdirat, sys_mount, sys_newfstatat, sys_poll, sys_ppoll, sys_pselect6,
-    sys_readlink, sys_readlinkat, sys_removexattr, sys_rename, sys_renameat, sys_renameat2,
-    sys_rmdir, sys_select, sys_setxattr, sys_stat, sys_statfs, sys_statx, sys_symlink,
-    sys_symlinkat, sys_umask, sys_umount2, sys_unlink, sys_unlinkat, sys_utime, sys_utimensat,
-    sys_utimes, LinuxStat, LinuxStatfs, StatX, StatxTimestamp, TimeSpec, TimeVal, UTimeBuf,
+    sys_mkdir, sys_mkdirat, sys_mknod, sys_mknodat, sys_mount, sys_newfstatat, sys_poll, sys_ppoll,
+    sys_pselect6, sys_readlink, sys_readlinkat, sys_removexattr, sys_rename, sys_renameat,
+    sys_renameat2, sys_rmdir, sys_select, sys_setxattr, sys_stat, sys_statfs, sys_statx,
+    sys_symlink, sys_symlinkat, sys_umask, sys_umount2, sys_unlink, sys_unlinkat, sys_utime,
+    sys_utimensat, sys_utimes, LinuxStat, LinuxStatfs, StatX, StatxTimestamp, TimeSpec, TimeVal,
+    UTimeBuf,
 };
 pub use open::{
     sys_chroot, sys_close, sys_close_range, sys_creat, sys_fchdir, sys_open, sys_openat,

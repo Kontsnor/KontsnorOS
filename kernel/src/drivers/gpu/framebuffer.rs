@@ -95,42 +95,100 @@ impl Framebuffer {
     /// Set a pixel at (x, y) to the given color.
     pub fn set_pixel(&mut self, x: u32, y: u32, color: Color) {
         if x < self.info.width && y < self.info.height {
-            let offset = (y * self.info.stride / 4 + x) as isize;
-            // SAFETY: We bounds-checked x and y above.
+            let stride_pixels = (self.info.stride / 4) as usize;
+            let offset = (y as usize) * stride_pixels + (x as usize);
+            // SAFETY: We bounds-checked x and y against framebuffer dimensions.
             unsafe {
-                self.buffer.offset(offset).write_volatile(color.to_argb32());
+                self.buffer.add(offset).write_volatile(color.to_argb32());
             }
         }
     }
 
     /// Fill the entire framebuffer with a color.
     pub fn clear(&mut self, color: Color) {
-        let pixel_value = color.to_argb32();
-        for y in 0..self.info.height {
-            for x in 0..self.info.width {
-                let offset = (y * self.info.stride / 4 + x) as isize;
-                // SAFETY: We are within the framebuffer bounds.
-                unsafe {
-                    self.buffer.offset(offset).write_volatile(pixel_value);
-                }
-            }
-        }
+        self.fill_rect(0, 0, self.info.width, self.info.height, color);
     }
 
     /// Draw a filled rectangle.
     pub fn fill_rect(&mut self, x: u32, y: u32, w: u32, h: u32, color: Color) {
+        let max_x = x.saturating_add(w).min(self.info.width);
+        let max_y = y.saturating_add(h).min(self.info.height);
+        if x >= max_x || y >= max_y {
+            return;
+        }
+
+        let stride_pixels = (self.info.stride / 4) as usize;
         let pixel_value = color.to_argb32();
-        for dy in 0..h {
-            for dx in 0..w {
-                let px = x + dx;
-                let py = y + dy;
-                if px < self.info.width && py < self.info.height {
-                    let offset = (py * self.info.stride / 4 + px) as isize;
-                    unsafe {
-                        self.buffer.offset(offset).write_volatile(pixel_value);
-                    }
+
+        for py in y..max_y {
+            let row_offset = (py as usize) * stride_pixels;
+            for px in x..max_x {
+                let offset = row_offset + (px as usize);
+                // SAFETY: x and y loops are pre-clamped within 0..info.width and 0..info.height.
+                unsafe {
+                    self.buffer.add(offset).write_volatile(pixel_value);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn test_color_argb32() {
+        let c = Color {
+            r: 0x12,
+            g: 0x34,
+            b: 0x56,
+            a: 0x78,
+        };
+        assert_eq!(c.to_argb32(), 0x78123456);
+
+        let rgb = Color::rgb(0xAA, 0xBB, 0xCC);
+        assert_eq!(rgb.a, 255);
+        assert_eq!(rgb.to_argb32(), 0xFFAABBCC);
+    }
+
+    #[test_case]
+    fn test_framebuffer_drawing() {
+        let mut storage = [0u32; 16 * 16];
+        let info = FramebufferInfo {
+            phys_addr: storage.as_mut_ptr() as u64,
+            width: 10,
+            height: 10,
+            stride: 16 * 4, // 16 pixels per row stride
+            bpp: 32,
+        };
+
+        let mut fb = unsafe { Framebuffer::new(info) };
+
+        // Test clear
+        fb.clear(Color::BLACK);
+        assert_eq!(storage[0], Color::BLACK.to_argb32());
+        assert_eq!(storage[9 * 16 + 9], Color::BLACK.to_argb32());
+
+        // Test set_pixel
+        fb.set_pixel(2, 3, Color::WHITE);
+        assert_eq!(storage[3 * 16 + 2], Color::WHITE.to_argb32());
+
+        // Test set_pixel out of bounds
+        fb.set_pixel(10, 10, Color::WHITE);
+        assert_eq!(storage[10 * 16 + 10], Color::BLACK.to_argb32());
+
+        // Test fill_rect within bounds
+        fb.fill_rect(1, 1, 3, 2, Color::BRAND_BLUE);
+        assert_eq!(storage[1 * 16 + 1], Color::BRAND_BLUE.to_argb32());
+        assert_eq!(storage[1 * 16 + 3], Color::BRAND_BLUE.to_argb32());
+        assert_eq!(storage[2 * 16 + 1], Color::BRAND_BLUE.to_argb32());
+        assert_eq!(storage[2 * 16 + 3], Color::BRAND_BLUE.to_argb32());
+        assert_eq!(storage[3 * 16 + 2], Color::WHITE.to_argb32()); // unchanged from set_pixel
+
+        // Test fill_rect clipping out of bounds
+        fb.fill_rect(8, 8, 5, 5, Color::BRAND_ACCENT);
+        assert_eq!(storage[8 * 16 + 8], Color::BRAND_ACCENT.to_argb32());
+        assert_eq!(storage[9 * 16 + 9], Color::BRAND_ACCENT.to_argb32());
     }
 }

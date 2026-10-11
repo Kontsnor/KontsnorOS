@@ -2064,6 +2064,94 @@ pub fn sys_mkdirat(dfd: i32, pathname: *const u8, mode: u32) -> SyscallResult {
     sys_mkdir_with_resolved_path(resolved_path, mode)
 }
 
+/// `mknod(pathname, mode, dev)` — Create a special or ordinary file.
+///
+/// Linux x86_64 system call #133.
+pub fn sys_mknod(pathname: *const u8, mode: u32, dev: u64) -> SyscallResult {
+    sys_mknodat(-100 /* AT_FDCWD */, pathname, mode, dev)
+}
+
+/// `mknodat(dfd, pathname, mode, dev)` — Create a special or ordinary file relative to a directory file descriptor.
+///
+/// Linux x86_64 system call #259.
+pub fn sys_mknodat(dfd: i32, pathname: *const u8, mode: u32, _dev: u64) -> SyscallResult {
+    if pathname.is_null() {
+        return Errno::EFAULT.into();
+    }
+    let raw_path = match unsafe { copy_string_from_user(pathname) } {
+        Some(p) => p,
+        None => return Errno::EFAULT.into(),
+    };
+    if raw_path.is_empty() {
+        return Errno::ENOENT.into();
+    }
+
+    let resolved_path = match crate::fs::vfs::resolve_relative_path_at(dfd, &raw_path) {
+        Ok(path) => path,
+        Err(e) => return e.into(),
+    };
+
+    sys_mknod_with_resolved_path(resolved_path, mode)
+}
+
+pub fn sys_mknod_with_resolved_path(resolved_path: String, mode: u32) -> SyscallResult {
+    // Check if destination already exists
+    if crate::fs::vfs::lookup(&resolved_path).is_some() {
+        return Errno::EEXIST.into();
+    }
+
+    // Split resolved_path into parent directory and base name
+    let (parent_path, name) = crate::fs::path::split_path(&resolved_path);
+
+    // Lookup parent directory
+    let parent_inode = match crate::fs::vfs::lookup(parent_path) {
+        Some(i) => i,
+        None => return Errno::ENOENT.into(),
+    };
+
+    // Make sure parent is a directory
+    if parent_inode.inode().file_type != FileType::Directory {
+        return Errno::ENOTDIR.into();
+    }
+
+    if let Err(e) = check_permission(parent_inode.inode(), MAY_WRITE) {
+        return e as SyscallResult;
+    }
+    if let Err(e) = check_permission(parent_inode.inode(), MAY_EXEC) {
+        return e as SyscallResult;
+    }
+
+    // Decode file type from mode bits (S_IFMT = 0170000 / 0xF000)
+    let file_type = match mode & 0o170000 {
+        0o100000 | 0 => FileType::Regular,
+        0o020000 => FileType::CharDevice,
+        0o060000 => FileType::BlockDevice,
+        0o010000 => FileType::Pipe,
+        0o140000 => FileType::Socket,
+        0o040000 => return Errno::EPERM.into(), // Creating directory via mknod returns EPERM per Linux mknod(2)
+        _ => return Errno::EINVAL.into(),
+    };
+
+    match parent_inode.create(name, file_type) {
+        Some(new_node) => {
+            let umask = if let Some(pid) = crate::process::scheduler::current_pid() {
+                if let Some(task_arc) = crate::process::scheduler::get_task_arc(pid) {
+                    task_arc.lock().umask
+                } else {
+                    0o022
+                }
+            } else {
+                0o022
+            };
+            let node_mode = ((mode & 0o0777) & !umask) as u16;
+            let _ = new_node.set_permissions(node_mode);
+            crate::fs::vfs::invalidate_dentry(&resolved_path);
+            0
+        }
+        None => Errno::EACCES.into(),
+    }
+}
+
 /// `renameat(olddirfd, oldpath, newdirfd, newpath)` — Rename relative to directory fds.
 pub fn sys_renameat(
     olddirfd: i32,

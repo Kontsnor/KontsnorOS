@@ -300,20 +300,34 @@ impl Vfs {
                     resolved_till_now.push_str(component);
                 }
 
-                let cached = self
-                    .dentry_cache
-                    .read()
-                    .get(resolved_till_now.as_str())
-                    .cloned();
-
-                let next = if let Some(n) = cached {
-                    n
+                // Bolt ⚡ Optimization Rationale:
+                // Check the 64-shard lock-free/sharded dcache first for (parent_ino, component).
+                // On a dcache hit (Some(Some(inode))), we bypass global VFS dentry_cache RwLock write/read contention,
+                // filesystem-specific lookup calls, and string allocations, returning the Arc<dyn InodeOps> in O(1) time.
+                let parent_ino = current.inode().ino;
+                let next = if let Some(Some(inode)) =
+                    crate::fs::dcache::dcache_lookup(parent_ino, component)
+                {
+                    inode
                 } else {
-                    let n = current.lookup(component)?;
-                    self.dentry_cache
-                        .write()
-                        .insert(resolved_till_now.clone(), n.clone());
-                    n
+                    let cached = self
+                        .dentry_cache
+                        .read()
+                        .get(resolved_till_now.as_str())
+                        .cloned();
+
+                    if let Some(n) = cached {
+                        crate::fs::dcache::dcache_insert(parent_ino, component, n.clone());
+                        n
+                    } else if let Some(n) = current.lookup(component) {
+                        self.dentry_cache
+                            .write()
+                            .insert(resolved_till_now.clone(), n.clone());
+                        crate::fs::dcache::dcache_insert(parent_ino, component, n.clone());
+                        n
+                    } else {
+                        return None;
+                    }
                 };
 
                 // Check if this component is a symlink
@@ -366,19 +380,37 @@ impl Vfs {
     /// Invalidate a dentry and all its descendants.
     pub fn invalidate_dentry(&self, path: &str) {
         let mut cache = self.dentry_cache.write();
-        cache.remove(path);
+        if let Some(inode) = cache.remove(path) {
+            crate::fs::dcache::dcache_invalidate_inode(inode.inode().ino);
+        }
         let prefix = if path.ends_with('/') {
             String::from(path)
         } else {
             alloc::format!("{}/", path)
         };
-        let to_remove: alloc::vec::Vec<String> = cache
+        let to_remove: alloc::vec::Vec<(String, Arc<dyn InodeOps>)> = cache
             .range(prefix.clone()..)
             .take_while(|(k, _)| k.starts_with(&prefix))
-            .map(|(k, _)| (*k).clone())
+            .map(|(k, v)| ((*k).clone(), v.clone()))
             .collect();
-        for k in to_remove {
+        for (k, inode) in to_remove {
             cache.remove(&k);
+            crate::fs::dcache::dcache_invalidate_inode(inode.inode().ino);
+        }
+        drop(cache);
+
+        // Bolt ⚡ Cache Coherence:
+        // Ensure the component is also invalidated from its parent's sharded dcache entry
+        // even if the parent path was a mount point or not present in dentry_cache.
+        if let Some((parent_path, name)) = path.rsplit_once('/') {
+            let parent_path = if parent_path.is_empty() {
+                "/"
+            } else {
+                parent_path
+            };
+            if let Some(parent_node) = self.lookup(parent_path) {
+                crate::fs::dcache::dcache_invalidate_entry(parent_node.inode().ino, name);
+            }
         }
     }
 }

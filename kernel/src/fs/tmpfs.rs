@@ -146,6 +146,9 @@ impl InodeOps for TmpFsDir {
         self.entries
             .write()
             .insert(String::from(name), node.clone());
+        // Bolt ⚡ Optimization Rationale: Populate 64-shard dcache on tmpfs node creation
+        // to fast-path subsequent VFS path component lookups without acquiring directory RwLock.
+        crate::fs::dcache::dcache_insert(self.inode().ino, name, node.clone());
         Some(node)
     }
 
@@ -155,17 +158,28 @@ impl InodeOps for TmpFsDir {
 
     fn unlink(&self, name: &str) -> Result<(), i32> {
         match self.entries.write().remove(name) {
-            Some(_) => Ok(()),
+            Some(_) => {
+                // Bolt ⚡ Cache Coherence: Invalidate sharded dcache entry on tmpfs unlink.
+                crate::fs::dcache::dcache_invalidate_entry(self.inode().ino, name);
+                Ok(())
+            }
             None => Err(-2), // ENOENT
         }
     }
 
     fn unlink_entry(&self, name: &str) -> Option<Arc<dyn InodeOps>> {
-        self.entries.write().remove(name)
+        let res = self.entries.write().remove(name);
+        if res.is_some() {
+            crate::fs::dcache::dcache_invalidate_entry(self.inode().ino, name);
+        }
+        res
     }
 
     fn link_entry(&self, name: &str, node: Arc<dyn InodeOps>) -> Result<(), i32> {
-        self.entries.write().insert(String::from(name), node);
+        self.entries
+            .write()
+            .insert(String::from(name), node.clone());
+        crate::fs::dcache::dcache_insert(self.inode().ino, name, node);
         Ok(())
     }
 
@@ -192,6 +206,7 @@ impl InodeOps for TmpFsDir {
         drop(entries);
 
         self.entries.write().remove(name);
+        crate::fs::dcache::dcache_invalidate_entry(self.inode().ino, name);
         Ok(())
     }
 

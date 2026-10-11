@@ -1,5 +1,9 @@
 # Bridge's Journal
 
+## 2026-04-12 - mknod (133) and mknodat (259) mode bit decoding and TmpFs inode creation
+**Learning:** Linux `mknod`/`mknodat` syscalls pass mode bits containing both permission bits (`0o777`) and file type bits (`S_IFMT` = `0o170000`). Decoding `mode & 0o170000` to map `S_IFIFO`, `S_IFCHR`, `S_IFBLK`, `S_IFSOCK`, and `S_IFREG` (or 0) to VFS `FileType` variants while returning `-EPERM` for `S_IFDIR` allows userspace binaries (like `mknod`, `tar`, and package managers) to create FIFOs and device nodes.
+**Action:** When implementing node creation syscalls, mask mode bits to decode POSIX `S_IFMT` types, check parent permissions, and update underlying in-memory filesystems (`TmpFsDir::create`) to handle non-regular/non-directory inode creation.
+
 ## 2026-03-30 - prctl PR_SET_NAME / PR_GET_NAME user pointer validation
 **Learning:** `prctl(PR_SET_NAME)` expects a pointer to a string up to 16 bytes (including null byte) while `prctl(PR_GET_NAME)` requires writing up to 16 bytes into user memory. Using explicit `validate_user_ptr_read` and `validate_user_ptr_write` checks on incoming buffers ensures memory safety and returns `-EFAULT` cleanly if invalid pointers are supplied by userspace.
 **Action:** Always wrap input/output pointers in read/write validation functions before dereferencing or copying bytes in syscall handlers.

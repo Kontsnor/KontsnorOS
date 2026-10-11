@@ -64,6 +64,8 @@ pub enum SyscallNumber {
     Rmdir = 84,
     Unlink = 87,
     Umask = 95,
+    Mknod = 133,
+    Mknodat = 259,
     Getuid = 102,
     Getgid = 104,
     Setuid = 105,
@@ -604,7 +606,9 @@ pub fn dispatch(
         213 => fs::sys_epoll_create(arg0 as i32),
         217 => fs::sys_getdents64(arg0 as i32, arg1 as *mut u8, arg2 as usize),
         257 => fs::sys_openat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as u32),
+        133 => fs::sys_mknod(arg0 as *const u8, arg1 as u32, arg2),
         258 => fs::sys_mkdirat(arg0 as i32, arg1 as *const u8, arg2 as u32),
+        259 => fs::sys_mknodat(arg0 as i32, arg1 as *const u8, arg2 as u32, arg3),
         260 => fs::sys_fchownat(
             arg0 as i32,
             arg1 as *const u8,

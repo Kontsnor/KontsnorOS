@@ -1266,3 +1266,85 @@ fn test_page_cache_eviction_and_dirty_stats() {
     assert_eq!(n2, 4096);
     assert_eq!(buf[..4096], buf2[..4096]);
 }
+
+#[test_case]
+fn test_mknod_and_mknodat() {
+    use crate::syscall::fs::{sys_mknod, sys_mknodat, sys_stat, sys_unlink, LinuxStat};
+    use crate::syscall::Errno;
+
+    let test_fifo = "/tmp/test_mknod_fifo\0";
+    let test_chr = "/tmp/test_mknod_chr\0";
+    let test_blk = "/tmp/test_mknod_blk\0";
+    let test_sock = "/tmp/test_mknod_sock\0";
+
+    // Cleanup previous runs if any
+    let _ = sys_unlink(test_fifo.as_ptr());
+    let _ = sys_unlink(test_chr.as_ptr());
+    let _ = sys_unlink(test_blk.as_ptr());
+    let _ = sys_unlink(test_sock.as_ptr());
+
+    // 1. Create FIFO special file using sys_mknod (mode 0o010644 = S_IFIFO | 0644)
+    let res = sys_mknod(test_fifo.as_ptr(), 0o010644, 0);
+    assert_eq!(res, 0, "mknod FIFO failed");
+
+    // Stat the created FIFO
+    let mut stat_buf = LinuxStat::default();
+    let stat_res = sys_stat(test_fifo.as_ptr(), &mut stat_buf);
+    assert_eq!(stat_res, 0);
+    assert_eq!(
+        stat_buf.st_mode & 0o170000,
+        0o010000,
+        "Expected S_IFIFO file type"
+    );
+
+    // Duplicate mknod on same path should fail with EEXIST (-17)
+    let res_dup = sys_mknod(test_fifo.as_ptr(), 0o010644, 0);
+    assert_eq!(res_dup, Errno::EEXIST as i64);
+
+    // 2. Create character device node using sys_mknodat (-100 = AT_FDCWD, mode 0o020666 = S_IFCHR | 0666)
+    let res_chr = sys_mknodat(-100, test_chr.as_ptr(), 0o020666, 0);
+    assert_eq!(res_chr, 0, "mknodat CharDevice failed");
+
+    let stat_res_chr = sys_stat(test_chr.as_ptr(), &mut stat_buf);
+    assert_eq!(stat_res_chr, 0);
+    assert_eq!(
+        stat_buf.st_mode & 0o170000,
+        0o020000,
+        "Expected S_IFCHR file type"
+    );
+
+    // 3. Create block device node (mode 0o060660 = S_IFBLK | 0660)
+    let res_blk = sys_mknod(test_blk.as_ptr(), 0o060660, 0);
+    assert_eq!(res_blk, 0, "mknod BlockDevice failed");
+
+    // 4. Create socket node (mode 0o140777 = S_IFSOCK | 0777)
+    let res_sock = sys_mknod(test_sock.as_ptr(), 0o140777, 0);
+    assert_eq!(res_sock, 0, "mknod Socket failed");
+
+    // 5. Test error cases
+    // Null pointer -> EFAULT (-14)
+    assert_eq!(
+        sys_mknod(core::ptr::null(), 0o010644, 0),
+        Errno::EFAULT as i64
+    );
+
+    // Empty string -> ENOENT (-2)
+    let empty_path = "\0";
+    assert_eq!(
+        sys_mknod(empty_path.as_ptr(), 0o010644, 0),
+        Errno::ENOENT as i64
+    );
+
+    // Directory mode (S_IFDIR = 0o040000) -> EPERM (-1)
+    let test_dir = "/tmp/test_mknod_dir\0";
+    assert_eq!(
+        sys_mknod(test_dir.as_ptr(), 0o040755, 0),
+        Errno::EPERM as i64
+    );
+
+    // Cleanup
+    let _ = sys_unlink(test_fifo.as_ptr());
+    let _ = sys_unlink(test_chr.as_ptr());
+    let _ = sys_unlink(test_blk.as_ptr());
+    let _ = sys_unlink(test_sock.as_ptr());
+}

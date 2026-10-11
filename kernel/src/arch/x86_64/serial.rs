@@ -130,7 +130,7 @@ pub fn try_read_byte() -> Option<u8> {
 /// Output a single byte to serial and graphics console.
 pub fn write_byte(byte: u8) {
     SERIAL1.with_lock(|port| {
-        let _ = port.write_fmt(format_args!("{}", byte as char));
+        port.send(byte);
     });
 
     if !crate::drivers::gpu::bochs::DISABLE_CONSOLE_MIRROR

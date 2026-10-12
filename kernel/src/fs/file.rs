@@ -108,6 +108,11 @@ impl FileDescription {
         }
 
         let file_type = self.inode.inode().file_type;
+        // POSIX.1-2017/2024 & Linux read(2): calling read on a directory descriptor shall fail with EISDIR (-21).
+        if file_type == crate::fs::inode::FileType::Directory {
+            return Err(-21); // EISDIR
+        }
+
         let is_seekable = file_type == crate::fs::inode::FileType::Regular;
 
         if is_seekable {

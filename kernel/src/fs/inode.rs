@@ -257,6 +257,11 @@ pub trait InodeOps: Send + Sync {
         Ok(())
     }
 
+    /// Set device ID (major/minor) for device special files.
+    fn set_rdev(&self, _rdev: u64) -> Result<(), i32> {
+        Ok(())
+    }
+
     /// Increment the link count of this inode (for hard links).
     fn inc_nlink(&self) -> Result<(), i32> {
         Ok(())

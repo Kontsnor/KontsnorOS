@@ -1266,3 +1266,71 @@ fn test_page_cache_eviction_and_dirty_stats() {
     assert_eq!(n2, 4096);
     assert_eq!(buf[..4096], buf2[..4096]);
 }
+
+#[test_case]
+fn test_mknod_and_mknodat_syscalls() {
+    // 1. Error cases: null pointer -> -EFAULT
+    let res = crate::syscall::fs::sys_mknod(core::ptr::null(), 0o100644, 0);
+    assert_eq!(res, -(crate::syscall::Errno::EFAULT as i64));
+
+    // 2. Error cases: empty string -> -ENOENT
+    let empty_path = b"\0";
+    let res = crate::syscall::fs::sys_mknod(empty_path.as_ptr(), 0o100644, 0);
+    assert_eq!(res, -(crate::syscall::Errno::ENOENT as i64));
+
+    // 3. Error cases: directory mode S_IFDIR (0o040000) -> -EINVAL
+    let dir_path = b"/tmp/mknod_dir_test\0";
+    let res = crate::syscall::fs::sys_mknod(dir_path.as_ptr(), 0o040755, 0);
+    assert_eq!(res, -(crate::syscall::Errno::EINVAL as i64));
+
+    // 4. Create regular file using sys_mknod
+    let file_path = b"/tmp/mknod_file.txt\0";
+    let res = crate::syscall::fs::sys_mknod(file_path.as_ptr(), 0o100644, 0);
+    assert_eq!(res, 0, "mknod regular file failed");
+
+    // Re-creating existing target should return -EEXIST
+    let res = crate::syscall::fs::sys_mknod(file_path.as_ptr(), 0o100644, 0);
+    assert_eq!(res, -(crate::syscall::Errno::EEXIST as i64));
+
+    // Verify lookup of created file
+    let inode = crate::fs::vfs::lookup("/tmp/mknod_file.txt");
+    assert!(inode.is_some(), "Lookup for mknod file failed");
+    assert!(inode.unwrap().inode().is_file());
+
+    // Clean up
+    let _ = crate::syscall::fs::sys_unlink(file_path.as_ptr());
+
+    // 5. Create FIFO (named pipe) using sys_mknodat
+    let fifo_path = b"mknod_fifo_test\0";
+    // -100 = AT_FDCWD
+    let res = crate::syscall::fs::sys_mknodat(-100, fifo_path.as_ptr(), 0o010666, 0);
+    assert_eq!(res, 0, "mknodat FIFO creation failed");
+
+    let fifo_node = crate::fs::vfs::lookup("mknod_fifo_test");
+    assert!(fifo_node.is_some());
+    assert_eq!(
+        fifo_node.unwrap().inode().file_type,
+        crate::fs::inode::FileType::Pipe
+    );
+
+    // Clean up
+    let _ = crate::syscall::fs::sys_unlink(fifo_path.as_ptr());
+
+    // 6. Create character device using sys_mknodat with device numbers
+    let dev_path = b"/tmp/mknod_chr_test\0";
+    let dev_id = (1u64 << 32) | 3u64; // Major 1, Minor 3
+    let res = crate::syscall::fs::sys_mknod(dev_path.as_ptr(), 0o020666, dev_id);
+    assert_eq!(res, 0, "mknod CharDevice creation failed");
+
+    let chr_node = crate::fs::vfs::lookup("/tmp/mknod_chr_test");
+    assert!(chr_node.is_some());
+    let node_ref = chr_node.unwrap();
+    assert_eq!(
+        node_ref.inode().file_type,
+        crate::fs::inode::FileType::CharDevice
+    );
+    assert_eq!(node_ref.inode().rdev, dev_id);
+
+    // Clean up
+    let _ = crate::syscall::fs::sys_unlink(dev_path.as_ptr());
+}

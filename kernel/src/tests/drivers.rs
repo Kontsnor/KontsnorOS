@@ -313,3 +313,56 @@ fn test_nvme_identify_controller_parsing() {
     assert_eq!(0x1000 + (2 * 1 + 0) * stride, 0x1008); // IO SQ
     assert_eq!(0x1000 + (2 * 1 + 1) * stride, 0x100C); // IO CQ
 }
+
+#[test_case]
+fn test_framebuffer_rendering() {
+    use crate::drivers::gpu::framebuffer::{Color, Framebuffer};
+    use crate::drivers::traits::FramebufferInfo;
+
+    const WIDTH: u32 = 16;
+    const HEIGHT: u32 = 16;
+    const STRIDE: u32 = WIDTH * 4;
+    let mut buffer = alloc::vec![0u32; (WIDTH * HEIGHT) as usize];
+
+    let info = FramebufferInfo {
+        phys_addr: buffer.as_mut_ptr() as u64,
+        size: (buffer.len() * 4) as u64,
+        width: WIDTH,
+        height: HEIGHT,
+        stride: STRIDE,
+        format: crate::drivers::traits::PixelFormat::Argb8888,
+    };
+
+    let mut fb = unsafe { Framebuffer::new(info) };
+
+    // Test clear
+    fb.clear(Color::WHITE);
+    for pixel in &buffer {
+        assert_eq!(*pixel, Color::WHITE.to_argb32());
+    }
+
+    // Test set_pixel
+    fb.set_pixel(2, 3, Color::BRAND_BLUE);
+    assert_eq!(
+        buffer[(3 * WIDTH + 2) as usize],
+        Color::BRAND_BLUE.to_argb32()
+    );
+
+    // Out of bounds set_pixel should be safely ignored
+    fb.set_pixel(WIDTH, HEIGHT, Color::BRAND_ACCENT);
+
+    // Test fill_rect
+    fb.fill_rect(4, 4, 4, 4, Color::BRAND_ACCENT);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let idx = (y * WIDTH + x) as usize;
+            if (4..8).contains(&x) && (4..8).contains(&y) {
+                assert_eq!(buffer[idx], Color::BRAND_ACCENT.to_argb32());
+            } else if x == 2 && y == 3 {
+                assert_eq!(buffer[idx], Color::BRAND_BLUE.to_argb32());
+            } else {
+                assert_eq!(buffer[idx], Color::WHITE.to_argb32());
+            }
+        }
+    }
+}

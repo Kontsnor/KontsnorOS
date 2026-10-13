@@ -401,13 +401,21 @@ pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> SyscallResult {
 }
 
 /// `dup(fd)` — Duplicate a file descriptor.
+///
+/// Ref: POSIX.1-2017 dup specification and Linux dup(2) man page:
+/// - Returns EBADF if `fd` is not a valid open file descriptor.
+/// - Returns EMFILE if the per-process limit on open file descriptors (RLIMIT_NOFILE)
+///   or maximum table capacity has been reached.
 pub fn sys_dup(fd: i32) -> SyscallResult {
     if fd < 0 {
         return Errno::EBADF.into();
     }
+    if proc_fd::current_task_get_file_desc(fd).is_none() {
+        return Errno::EBADF.into();
+    }
     match proc_fd::current_task_dup_fd(fd) {
         Some(newfd) => newfd as SyscallResult,
-        None => Errno::EBADF.into(),
+        None => Errno::EMFILE.into(),
     }
 }
 
@@ -599,6 +607,10 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
     match cmd {
         0 | 1030 => {
             // F_DUPFD or F_DUPFD_CLOEXEC
+            // Ref: POSIX.1-2017 fcntl specification and Linux fcntl(2) man page:
+            // - EINVAL if start_fd is negative or >= RLIMIT_NOFILE.
+            // - EBADF if fd is not a valid open file descriptor.
+            // - EMFILE if the per-process limit on open file descriptors has been reached.
             let start_fd = arg as i32;
             if start_fd < 0 {
                 return Errno::EINVAL.into();
@@ -613,6 +625,11 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                 None => return Errno::ESRCH.into(),
             };
             let task = task_arc.lock();
+            let rlimit = task.rlimit_nofile_cur as usize;
+            if start_fd as usize >= rlimit {
+                return Errno::EINVAL.into();
+            }
+
             let mut fd_table = task.fd_table.lock();
 
             let file_desc = match fd_table.entries.get(fd as usize) {
@@ -620,27 +637,25 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                 _ => return Errno::EBADF.into(),
             };
 
-            *file_desc.ref_count.lock() += 1;
-
-            let mut new_fd = start_fd;
-            while (new_fd as usize) < fd_table.entries.len()
-                && fd_table.entries[new_fd as usize].is_some()
-            {
+            let mut new_fd = start_fd as usize;
+            while new_fd < fd_table.entries.len() && fd_table.entries[new_fd].is_some() {
                 new_fd += 1;
             }
 
-            if (new_fd as usize) >= fd_table.entries.len() {
-                fd_table.entries.resize(new_fd as usize + 1, None);
+            if new_fd >= rlimit {
+                return Errno::EMFILE.into();
             }
-            if (new_fd as usize) >= fd_table.cloexec.len() {
-                fd_table.cloexec.resize(new_fd as usize + 1, false);
+
+            *file_desc.ref_count.lock() += 1;
+
+            if new_fd >= fd_table.entries.len() {
+                fd_table.entries.resize(new_fd + 1, None);
             }
-            fd_table.entries[new_fd as usize] = Some(file_desc);
-            if cmd == 1030 {
-                fd_table.cloexec[new_fd as usize] = true;
-            } else {
-                fd_table.cloexec[new_fd as usize] = false;
+            if new_fd >= fd_table.cloexec.len() {
+                fd_table.cloexec.resize(new_fd + 1, false);
             }
+            fd_table.entries[new_fd] = Some(file_desc);
+            fd_table.cloexec[new_fd] = cmd == 1030;
 
             if crate::syscall::DEBUG_SYSCALLS {
                 kprintln!(
@@ -1273,9 +1288,17 @@ pub fn sys_ftruncate(fd: i32, length: i64) -> SyscallResult {
 }
 
 /// `dup3(oldfd, newfd, flags)` — Duplicate a file descriptor onto newfd with flags.
+///
+/// Ref: Linux dup3(2) man page specification:
+/// - EINVAL if oldfd equals newfd.
+/// - EBADF if oldfd or newfd is negative or outside valid range.
+/// - EINVAL if flags contain unrecognised bits (anything other than O_CLOEXEC).
 pub fn sys_dup3(oldfd: i32, newfd: i32, flags: i32) -> SyscallResult {
-    if oldfd < 0 || newfd < 0 || oldfd == newfd {
+    if oldfd == newfd {
         return Errno::EINVAL.into();
+    }
+    if oldfd < 0 || newfd < 0 {
+        return Errno::EBADF.into();
     }
     let cloexec_flag = 0x80000; // O_CLOEXEC
     if (flags & !cloexec_flag) != 0 {

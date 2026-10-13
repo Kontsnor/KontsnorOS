@@ -174,3 +174,55 @@ fn test_krwlock_ttas_concurrency() {
         assert_eq!(*r, 25);
     }
 }
+
+#[test_case]
+fn test_sys_syslog() {
+    use crate::syscall::process::sys_syslog;
+    use crate::syscall::Errno;
+
+    crate::kprintln!("[test] Starting sys_syslog unit tests...");
+
+    // 1. Check size buffer query (type 10)
+    assert_eq!(sys_syslog(10, core::ptr::null_mut(), 0), 16384);
+
+    // 2. Check unread log size query (type 9)
+    assert_eq!(sys_syslog(9, core::ptr::null_mut(), 0), 0);
+
+    // 3. Check simple control actions (types 0, 1, 5, 6, 7)
+    assert_eq!(sys_syslog(0, core::ptr::null_mut(), 0), 0);
+    assert_eq!(sys_syslog(1, core::ptr::null_mut(), 0), 0);
+    assert_eq!(sys_syslog(5, core::ptr::null_mut(), 0), 0);
+    assert_eq!(sys_syslog(6, core::ptr::null_mut(), 0), 0);
+    assert_eq!(sys_syslog(7, core::ptr::null_mut(), 0), 0);
+
+    // 4. Check console level valid vs invalid bounds (type 8)
+    assert_eq!(sys_syslog(8, core::ptr::null_mut(), 1), 0);
+    assert_eq!(sys_syslog(8, core::ptr::null_mut(), 8), 0);
+    assert_eq!(
+        sys_syslog(8, core::ptr::null_mut(), 0),
+        Errno::EINVAL.into()
+    );
+    assert_eq!(
+        sys_syslog(8, core::ptr::null_mut(), 9),
+        Errno::EINVAL.into()
+    );
+
+    // 5. Check null or invalid pointer on read actions (type 2, 3, 4)
+    assert_eq!(
+        sys_syslog(2, core::ptr::null_mut(), 128),
+        Errno::EFAULT.into()
+    );
+    assert_eq!(sys_syslog(3, 0x1234 as *mut u8, 128), Errno::EFAULT.into());
+    assert_eq!(
+        sys_syslog(4, core::ptr::null_mut(), -10),
+        Errno::EINVAL.into()
+    );
+
+    // 6. Check invalid command type
+    assert_eq!(
+        sys_syslog(99, core::ptr::null_mut(), 0),
+        Errno::EINVAL.into()
+    );
+
+    crate::kprintln!("[test] sys_syslog unit tests PASSED!");
+}

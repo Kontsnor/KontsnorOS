@@ -1266,3 +1266,48 @@ fn test_page_cache_eviction_and_dirty_stats() {
     assert_eq!(n2, 4096);
     assert_eq!(buf[..4096], buf2[..4096]);
 }
+
+#[test_case]
+fn test_fd_dup_posix_errnos() {
+    use crate::syscall::fs::io::{sys_dup, sys_dup3, sys_fcntl};
+    use crate::syscall::Errno;
+
+    // 1. sys_dup with negative or invalid descriptor
+    let err_invalid = sys_dup(-1);
+    assert_eq!(err_invalid, Errno::EBADF.into());
+
+    let err_nonexistent = sys_dup(999);
+    assert_eq!(err_nonexistent, Errno::EBADF.into());
+
+    // 2. sys_dup3 specifications
+    // oldfd == newfd -> EINVAL
+    let err_same = sys_dup3(3, 3, 0);
+    assert_eq!(err_same, Errno::EINVAL.into());
+
+    // oldfd < 0 or newfd < 0 -> EBADF
+    let err_neg_old = sys_dup3(-1, 5, 0);
+    assert_eq!(err_neg_old, Errno::EBADF.into());
+
+    let err_neg_new = sys_dup3(3, -1, 0);
+    assert_eq!(err_neg_new, Errno::EBADF.into());
+
+    // invalid flag bits -> EINVAL
+    let err_bad_flags = sys_dup3(3, 4, 0x1);
+    assert_eq!(err_bad_flags, Errno::EINVAL.into());
+
+    // 3. sys_fcntl F_DUPFD / F_DUPFD_CLOEXEC specifications
+    // start_fd < 0 -> EINVAL
+    let err_neg_start = sys_fcntl(0, 0, (-1i64) as u64);
+    assert_eq!(err_neg_start, Errno::EINVAL.into());
+
+    // start_fd >= RLIMIT_NOFILE -> EINVAL
+    let err_large_start = sys_fcntl(0, 0, 1024);
+    assert_eq!(err_large_start, Errno::EINVAL.into());
+
+    let err_large_start_cloexec = sys_fcntl(0, 1030, 1024);
+    assert_eq!(err_large_start_cloexec, Errno::EINVAL.into());
+
+    // fd not open -> EBADF
+    let err_bad_fd_fcntl = sys_fcntl(999, 0, 0);
+    assert_eq!(err_bad_fd_fcntl, Errno::EBADF.into());
+}

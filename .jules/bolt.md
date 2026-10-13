@@ -51,3 +51,7 @@
 ## 2026-03-30 - SPSC Lock-Free RingBuffer Bulk Slice Operation
 **Learning:** In `kernel/src/util/ring_buffer.rs`, pushing or popping multiple elements from `RingBuffer` one by one incurred per-element atomic load/store instructions and loop branch overheads. Implementing `push_slice` and `pop_slice` with `core::ptr::copy_nonoverlapping` (`memcpy`/`rep movsb`) reduces stream transfers to at most two contiguous bulk memory moves and a single atomic release store on `head` or `tail`.
 **Action:** When transferring data slices into or out of lock-free circular ring buffers, prefer chunked `copy_nonoverlapping` memory operations over per-element push/pop loops.
+
+## 2026-03-30 - Page Cache Inode Truncation O(log N) BTreeMap Split Optimization
+**Learning:** In `kernel/src/memory/page_cache.rs`, `page_cache_truncate_inode` previously allocated a temporary `Vec<u64>` on the heap (`.collect()`) containing page offsets beyond `aligned_size` and performed iterative `BTreeMap::remove(&off)` calls, incurring $K$ separate $O(\log N)$ tree lookups and rebalances. Utilizing `inode_state.pages.split_off(&aligned_size)` isolates all truncated pages into a sub-tree in a single $O(\log N)$ operation, completely eliminating heap allocations and reducing lock hold time during file truncations.
+**Action:** When removing a contiguous key range $\ge K$ from a `BTreeMap` in hot path code, use `BTreeMap::split_off` to split the tree in $O(\log N)$ time rather than collecting key vectors for individual key removals.

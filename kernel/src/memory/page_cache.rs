@@ -186,25 +186,21 @@ pub fn page_cache_invalidate_inode(dev: u64, ino: u64) {
     }
 }
 
-/// Invalidate and remove cached pages for the given inode beyond `size` on a filesystem device in O(truncated pages).
+/// Invalidate and remove cached pages for the given inode beyond `size` on a filesystem device in O(log N) time.
 pub fn page_cache_truncate_inode(dev: u64, ino: u64, size: u64) {
     let aligned_size = (size + 4095) & !4095;
     let shard = shard_index(dev, ino);
     let mut guard = PAGE_CACHE_SHARDS[shard].lock();
     if let Some(inode_state) = guard.inodes.get_mut(&(dev, ino)) {
-        let to_remove: alloc::vec::Vec<u64> = inode_state
-            .pages
-            .range(aligned_size..)
-            .map(|(&off, _)| off)
-            .collect();
-        for off in to_remove {
-            if let Some(entry) = inode_state.pages.remove(&off) {
-                if entry.dirty {
-                    inode_state.dirty_count = inode_state.dirty_count.saturating_sub(1);
-                    GLOBAL_DIRTY_PAGES.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-                }
-                crate::memory::physical::deallocate_frame(entry.phys_addr);
+        // Bolt performance optimization: BTreeMap::split_off isolates all entries >= aligned_size
+        // in O(log N) time without temporary heap allocations (alloc::vec::Vec) or per-page O(log N) key removals.
+        let truncated_pages = inode_state.pages.split_off(&aligned_size);
+        for (_off, entry) in truncated_pages {
+            if entry.dirty {
+                inode_state.dirty_count = inode_state.dirty_count.saturating_sub(1);
+                GLOBAL_DIRTY_PAGES.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
             }
+            crate::memory::physical::deallocate_frame(entry.phys_addr);
         }
         if inode_state.pages.is_empty() {
             guard.inodes.remove(&(dev, ino));

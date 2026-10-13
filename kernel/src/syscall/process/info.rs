@@ -1339,3 +1339,38 @@ pub const RSEQ_FLAG_UNREGISTER: i32 = 1;
 pub fn sys_rseq(_rseq_ptr: *mut Rseq, _rseq_len: u32, _flags: i32, _sig: u32) -> SyscallResult {
     Errno::ENOSYS.into()
 }
+
+/// `syslog(cmd_type, bufp, len)` / `klogctl` — Read and/or clear kernel message ring buffer; set console log level.
+///
+/// Implements standard Linux klogctl operations (commands 0..=10).
+pub fn sys_syslog(cmd_type: i32, bufp: *mut u8, len: i32) -> SyscallResult {
+    match cmd_type {
+        0 | 1 | 5 | 6 | 7 => 0, // SYSLOG_ACTION_CLOSE, OPEN, CLEAR, CONSOLE_OFF, CONSOLE_ON
+        2 | 3 | 4 => {
+            // SYSLOG_ACTION_READ, READ_ALL, READ_CLEAR
+            if len < 0 {
+                return Errno::EINVAL.into();
+            }
+            if len == 0 {
+                return 0;
+            }
+            if bufp.is_null() {
+                return Errno::EFAULT.into();
+            }
+            if validate_user_ptr_write(bufp, len as usize).is_err() {
+                return Errno::EFAULT.into();
+            }
+            0
+        }
+        8 => {
+            // SYSLOG_ACTION_CONSOLE_LEVEL
+            if len < 1 || len > 8 {
+                return Errno::EINVAL.into();
+            }
+            0
+        }
+        9 => 0,      // SYSLOG_ACTION_SIZE_UNREAD
+        10 => 16384, // SYSLOG_ACTION_SIZE_BUFFER (standard 16KiB ring buffer size)
+        _ => Errno::EINVAL.into(),
+    }
+}

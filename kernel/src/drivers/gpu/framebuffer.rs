@@ -95,40 +95,40 @@ impl Framebuffer {
     /// Set a pixel at (x, y) to the given color.
     pub fn set_pixel(&mut self, x: u32, y: u32, color: Color) {
         if x < self.info.width && y < self.info.height {
-            let offset = (y * self.info.stride / 4 + x) as isize;
-            // SAFETY: We bounds-checked x and y above.
+            let stride_pixels = (self.info.stride / 4) as usize;
+            let offset = (y as usize) * stride_pixels + (x as usize);
+            // SAFETY: We bounds-checked x and y above and offset is within the mapped buffer.
             unsafe {
-                self.buffer.offset(offset).write_volatile(color.to_argb32());
+                self.buffer.add(offset).write_volatile(color.to_argb32());
             }
         }
     }
 
     /// Fill the entire framebuffer with a color.
     pub fn clear(&mut self, color: Color) {
-        let pixel_value = color.to_argb32();
-        for y in 0..self.info.height {
-            for x in 0..self.info.width {
-                let offset = (y * self.info.stride / 4 + x) as isize;
-                // SAFETY: We are within the framebuffer bounds.
-                unsafe {
-                    self.buffer.offset(offset).write_volatile(pixel_value);
-                }
-            }
-        }
+        self.fill_rect(0, 0, self.info.width, self.info.height, color);
     }
 
     /// Draw a filled rectangle.
     pub fn fill_rect(&mut self, x: u32, y: u32, w: u32, h: u32, color: Color) {
+        if w == 0 || h == 0 || x >= self.info.width || y >= self.info.height {
+            return;
+        }
+
+        let end_x = x.saturating_add(w).min(self.info.width) as usize;
+        let end_y = y.saturating_add(h).min(self.info.height) as usize;
+        let start_x = x as usize;
+        let start_y = y as usize;
+        let stride_pixels = (self.info.stride / 4) as usize;
         let pixel_value = color.to_argb32();
-        for dy in 0..h {
-            for dx in 0..w {
-                let px = x + dx;
-                let py = y + dy;
-                if px < self.info.width && py < self.info.height {
-                    let offset = (py * self.info.stride / 4 + px) as isize;
-                    unsafe {
-                        self.buffer.offset(offset).write_volatile(pixel_value);
-                    }
+
+        for py in start_y..end_y {
+            let row_offset = py * stride_pixels;
+            for px in start_x..end_x {
+                let offset = row_offset + px;
+                // SAFETY: start_x, start_y, end_x, and end_y are clamped to framebuffer dimensions.
+                unsafe {
+                    self.buffer.add(offset).write_volatile(pixel_value);
                 }
             }
         }

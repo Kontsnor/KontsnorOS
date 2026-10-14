@@ -138,6 +138,31 @@ pub struct PrngState {
     buf_idx: usize,
 }
 
+impl PrngState {
+    /// Generate a fresh 64-byte ChaCha20 block into internal buffer and reset buffer index.
+    fn generate_block(&mut self) {
+        let block = self.chacha.block();
+        for (j, &word) in block.iter().enumerate() {
+            self.buffer[j * 4..j * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        self.buf_idx = 0;
+    }
+
+    /// Fill destination slice using bulk contiguous slice copies (`copy_from_slice`).
+    fn fill_bytes(&mut self, mut dest: &mut [u8]) {
+        while !dest.is_empty() {
+            if self.buf_idx >= 64 {
+                self.generate_block();
+            }
+            let avail = 64 - self.buf_idx;
+            let take = core::cmp::min(dest.len(), avail);
+            dest[..take].copy_from_slice(&self.buffer[self.buf_idx..self.buf_idx + take]);
+            self.buf_idx += take;
+            dest = &mut dest[take..];
+        }
+    }
+}
+
 static PRNG: Mutex<Option<PrngState>> = Mutex::new(None);
 static HAS_ENTROPY: AtomicBool = AtomicBool::new(false);
 
@@ -150,14 +175,14 @@ pub fn seed(initial_entropy: &[u8; 32]) {
         buffer: [0u8; 64],
         buf_idx: 64,
     });
-    HAS_ENTROPY.store(true, Ordering::SeqCst);
+    HAS_ENTROPY.store(true, Ordering::Release);
 }
 
 /// Reset PRNG state for testing purposes.
 pub fn reset_for_test() {
     let mut lock = PRNG.lock();
     *lock = None;
-    HAS_ENTROPY.store(false, Ordering::SeqCst);
+    HAS_ENTROPY.store(false, Ordering::Release);
 }
 
 /// Periodic reseed to mix in fresh entropy.
@@ -166,16 +191,9 @@ pub fn reseed(entropy: &[u8; 32]) {
     if let Some(ref mut prng) = *lock {
         // Read 32 bytes from current generator to make new key, mixed with new entropy
         let mut new_key = [0u8; 32];
+        prng.fill_bytes(&mut new_key);
         for i in 0..32 {
-            if prng.buf_idx >= 64 {
-                let block = prng.chacha.block();
-                for (j, &word) in block.iter().enumerate() {
-                    prng.buffer[j * 4..j * 4 + 4].copy_from_slice(&word.to_le_bytes());
-                }
-                prng.buf_idx = 0;
-            }
-            new_key[i] = prng.buffer[prng.buf_idx] ^ entropy[i];
-            prng.buf_idx += 1;
+            new_key[i] ^= entropy[i];
         }
         let nonce = [0u8; 12];
         prng.chacha = ChaCha20::new(&new_key, &nonce);
@@ -185,22 +203,12 @@ pub fn reseed(entropy: &[u8; 32]) {
 /// Fill the buffer with cryptographically secure random bytes.
 /// Returns false if not enough entropy has been ingested yet.
 pub fn fill_bytes(dest: &mut [u8]) -> bool {
-    if !HAS_ENTROPY.load(Ordering::SeqCst) {
+    if !HAS_ENTROPY.load(Ordering::Acquire) {
         return false;
     }
     let mut lock = PRNG.lock();
     if let Some(ref mut prng) = *lock {
-        for b in dest.iter_mut() {
-            if prng.buf_idx >= 64 {
-                let block = prng.chacha.block();
-                for (j, &word) in block.iter().enumerate() {
-                    prng.buffer[j * 4..j * 4 + 4].copy_from_slice(&word.to_le_bytes());
-                }
-                prng.buf_idx = 0;
-            }
-            *b = prng.buffer[prng.buf_idx];
-            prng.buf_idx += 1;
-        }
+        prng.fill_bytes(dest);
         true
     } else {
         false

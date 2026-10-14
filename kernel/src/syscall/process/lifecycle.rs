@@ -943,6 +943,16 @@ pub fn sys_sched_yield() -> SyscallResult {
 pub fn sys_wait4(pid: i32, wstatus: *mut i32, options: i32, _rusage: *mut u8) -> SyscallResult {
     use crate::process::task::TaskState;
 
+    // According to POSIX.1-2017 / POSIX.1-2024 and Linux wait4(2) / waitpid(2) specifications,
+    // if options contains invalid or unsupported flag bits, wait4 must return -EINVAL.
+    // Valid options include WNOHANG (1), WUNTRACED (2), WCONTINUED (8), and Linux clone/thread flags
+    // __WCLONE (0x80000000), __WALL (0x40000000), __WNOTHREAD (0x20000000).
+    const VALID_WAIT4_OPTIONS: i32 =
+        0x1 | 0x2 | 0x8 | (0x80000000u32 as i32) | 0x40000000 | 0x20000000;
+    if (options & !VALID_WAIT4_OPTIONS) != 0 {
+        return Errno::EINVAL.into();
+    }
+
     if !wstatus.is_null()
         && validate_user_ptr_write(wstatus as *mut u8, core::mem::size_of::<i32>()).is_err()
     {

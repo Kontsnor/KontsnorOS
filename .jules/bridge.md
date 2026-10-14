@@ -1,9 +1,12 @@
 # Bridge's Journal
 
+## 2026-03-31 - mknod (133) and mknodat (259) System Call Integration
+**Learning:** `mknod` (#133) and `mknodat` (#259) decode POSIX `S_IFMT` mode bitmasks (`0o170000`) into filesystem node types (`FileType::Pipe`, `CharDevice`, `BlockDevice`, `Socket`, `Regular`) and apply process `umask` permissions. TmpFS `TmpFsDir::create` needs explicit support for non-regular/non-directory file types so node allocation succeeds.
+**Action:** When adding device/node creation syscalls, ensure the backing VFS filesystem `create` method supports creating the requested `FileType` variants.
+
 ## 2026-03-30 - prctl PR_SET_NAME / PR_GET_NAME user pointer validation
 **Learning:** `prctl(PR_SET_NAME)` expects a pointer to a string up to 16 bytes (including null byte) while `prctl(PR_GET_NAME)` requires writing up to 16 bytes into user memory. Using explicit `validate_user_ptr_read` and `validate_user_ptr_write` checks on incoming buffers ensures memory safety and returns `-EFAULT` cleanly if invalid pointers are supplied by userspace.
 **Action:** Always wrap input/output pointers in read/write validation functions before dereferencing or copying bytes in syscall handlers.
-
 
 ## 2026-03-29 - x86_64 Descriptor Syscalls and Timerfd Gettime Dispatch
 **Learning:** In x86_64 Linux ABI, legacy single-parameter or default-flag descriptor creation system calls like `eventfd` (#284) and `signalfd` (#282) are unhandled when runtimes invoke non-flagged variants, and `timerfd_gettime` (#287) was previously misrouted to `timerfd_settime` with `arg1 = 0`.

@@ -102,6 +102,14 @@ impl InodeOps for TmpFsDir {
         Ok(())
     }
 
+    fn set_rdev(&self, rdev: u64) -> Result<(), i32> {
+        unsafe {
+            let inode = &mut *self.inode.get();
+            inode.rdev = rdev;
+        }
+        Ok(())
+    }
+
     fn inc_nlink(&self) -> Result<(), i32> {
         // SAFETY: Interior UnsafeCell mutation.
         unsafe {
@@ -140,7 +148,13 @@ impl InodeOps for TmpFsDir {
                 ),
                 entries: RwLock::new(BTreeMap::new()),
             }),
-            _ => return None,
+            FileType::CharDevice | FileType::BlockDevice | FileType::Pipe | FileType::Socket => {
+                Arc::new(TmpFsSpecialNode {
+                    inode: core::cell::UnsafeCell::new(
+                        Inode::new(alloc_ino(), file_type).with_dev(TMPFS_DEV_ID),
+                    ),
+                })
+            }
         };
 
         self.entries
@@ -253,6 +267,14 @@ impl InodeOps for TmpFsFile {
         Ok(())
     }
 
+    fn set_rdev(&self, rdev: u64) -> Result<(), i32> {
+        unsafe {
+            let inode = &mut *self.inode.get();
+            inode.rdev = rdev;
+        }
+        Ok(())
+    }
+
     fn inc_nlink(&self) -> Result<(), i32> {
         // SAFETY: Interior UnsafeCell mutation.
         unsafe {
@@ -312,6 +334,62 @@ impl InodeOps for TmpFsFile {
         data.resize(size as usize, 0);
         unsafe {
             (*self.inode.get()).size = size;
+        }
+        Ok(())
+    }
+}
+
+/// A tmpfs special node (device file, fifo, socket).
+struct TmpFsSpecialNode {
+    inode: core::cell::UnsafeCell<Inode>,
+}
+
+unsafe impl Sync for TmpFsSpecialNode {}
+unsafe impl Send for TmpFsSpecialNode {}
+
+impl InodeOps for TmpFsSpecialNode {
+    fn inode(&self) -> &Inode {
+        unsafe { &*self.inode.get() }
+    }
+
+    fn set_permissions(&self, mode: u16) -> Result<(), i32> {
+        unsafe {
+            (*self.inode.get()).permissions.mode = mode;
+        }
+        Ok(())
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) -> Result<(), i32> {
+        unsafe {
+            let inode = &mut *self.inode.get();
+            inode.uid = uid;
+            inode.gid = gid;
+        }
+        Ok(())
+    }
+
+    fn set_rdev(&self, rdev: u64) -> Result<(), i32> {
+        unsafe {
+            let inode = &mut *self.inode.get();
+            inode.rdev = rdev;
+        }
+        Ok(())
+    }
+
+    fn inc_nlink(&self) -> Result<(), i32> {
+        unsafe {
+            let inode = &mut *self.inode.get();
+            inode.nlink = inode.nlink.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn dec_nlink(&self) -> Result<(), i32> {
+        unsafe {
+            let inode = &mut *self.inode.get();
+            if inode.nlink > 0 {
+                inode.nlink -= 1;
+            }
         }
         Ok(())
     }

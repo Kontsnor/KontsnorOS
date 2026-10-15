@@ -1,5 +1,9 @@
 # Bridge's Journal
 
+## 2026-03-31 - mknod / mknodat POSIX mode decoding and special node support
+**Learning:** `mknod` (#133) and `mknodat` (#259) require decoding POSIX mode bits (`S_IFMT`) into VFS `FileType` variants (`Regular`, `CharDevice`, `BlockDevice`, `Pipe`, `Socket`), checking parent directory permissions, applying task `umask`, and setting device IDs (`rdev`). Supporting special node types in in-memory filesystems (`TmpFsSpecialNode`) allows userspace tools like coreutils, busybox, and tar to create character/block device nodes and FIFOs cleanly.
+**Action:** When implementing filesystem node creation syscalls, verify that in-memory filesystems like `tmpfs` implement `create` for non-regular file types and support setting `rdev`.
+
 ## 2026-03-30 - prctl PR_SET_NAME / PR_GET_NAME user pointer validation
 **Learning:** `prctl(PR_SET_NAME)` expects a pointer to a string up to 16 bytes (including null byte) while `prctl(PR_GET_NAME)` requires writing up to 16 bytes into user memory. Using explicit `validate_user_ptr_read` and `validate_user_ptr_write` checks on incoming buffers ensures memory safety and returns `-EFAULT` cleanly if invalid pointers are supplied by userspace.
 **Action:** Always wrap input/output pointers in read/write validation functions before dereferencing or copying bytes in syscall handlers.

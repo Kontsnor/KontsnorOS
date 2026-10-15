@@ -387,29 +387,51 @@ pub fn send_packet(data: &[u8]) -> Result<(), DriverError> {
 }
 
 /// Handle interrupt triggered by the e1000 controller.
+///
+/// Uses a zero-allocation stack batch buffer (`batch_bufs`) to drain network packets
+/// from the Rx ring without allocating heap memory (`Vec<u8>`) on the interrupt path.
+/// Driver spinlocks are released prior to invoking `ethernet::handle_packet` to prevent
+/// lock inversion deadlocks if upper network layers transmit outbound responses.
 pub fn handle_interrupt() {
-    let mut packets = alloc::vec::Vec::new();
-    if let Some(dev_lock) = E1000_INSTANCE.try_lock() {
-        if let Some(ref dev) = *dev_lock {
-            if let Some(mut inner) = dev.inner.try_lock() {
-                let _cause = inner.read_reg(REG_ICR);
-                let mut buf = [0u8; 2048];
-                while let Ok(len) = inner.recv_packet(&mut buf) {
-                    if len > 0 {
-                        packets.push(buf[..len].to_vec());
-                    } else {
-                        break;
+    const BATCH_SIZE: usize = 2;
+    let mut batch_bufs = [[0u8; 2048]; BATCH_SIZE];
+    let mut batch_lens = [0usize; BATCH_SIZE];
+    let mut processed_any = false;
+
+    loop {
+        let mut count = 0;
+        if let Some(dev_lock) = E1000_INSTANCE.try_lock() {
+            if let Some(ref dev) = *dev_lock {
+                if let Some(mut inner) = dev.inner.try_lock() {
+                    let _cause = inner.read_reg(REG_ICR);
+                    while count < BATCH_SIZE {
+                        match inner.recv_packet(&mut batch_bufs[count]) {
+                            Ok(len) if len > 0 => {
+                                batch_lens[count] = len;
+                                count += 1;
+                            }
+                            _ => break,
+                        }
                     }
                 }
             }
         }
+
+        if count == 0 {
+            break;
+        }
+
+        processed_any = true;
+        for i in 0..count {
+            crate::net::ethernet::handle_packet(&batch_bufs[i][..batch_lens[i]]);
+        }
+
+        if count < BATCH_SIZE {
+            break;
+        }
     }
 
-    let had_packets = !packets.is_empty();
-    for packet in packets {
-        crate::net::ethernet::handle_packet(&packet);
-    }
-    if had_packets {
+    if processed_any {
         crate::fs::epoll::wake_all_epolls();
     }
 }

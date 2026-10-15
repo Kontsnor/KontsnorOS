@@ -252,6 +252,11 @@ pub trait InodeOps: Send + Sync {
         Err(-1) // EPERM
     }
 
+    /// Set device ID (rdev) for character or block device special files.
+    fn set_rdev(&self, _rdev: u64) -> Result<(), i32> {
+        Ok(())
+    }
+
     /// Set access and modification timestamps.
     fn set_times(&self, _atime: u64, _mtime: u64) -> Result<(), i32> {
         Ok(())

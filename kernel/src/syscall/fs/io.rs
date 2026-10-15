@@ -595,12 +595,27 @@ pub fn sys_memfd_create(name_ptr: *const u8, flags: u32) -> SyscallResult {
 }
 
 /// `fcntl(fd, cmd, arg)` — File control.
+///
+/// Complies with POSIX.1-2017/2024 and Linux `fcntl(2)` error semantics:
+/// - Returns `-EBADF` if `fd` is negative or not an open file descriptor.
+/// - Returns `-EINVAL` if `start_fd < 0` or `>= RLIMIT_NOFILE` (1024) for `F_DUPFD` / `F_DUPFD_CLOEXEC`.
+/// - Returns `-EMFILE` if no file descriptor slot `< 1024` is available.
+/// - Returns `-EINVAL` for unsupported or invalid `cmd` values.
 pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
+    if fd < 0 {
+        return Errno::EBADF.into();
+    }
+
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+
     match cmd {
         0 | 1030 => {
-            // F_DUPFD or F_DUPFD_CLOEXEC
+            // F_DUPFD (0) or F_DUPFD_CLOEXEC (1030)
             let start_fd = arg as i32;
-            if start_fd < 0 {
+            if start_fd < 0 || start_fd >= 1024 {
                 return Errno::EINVAL.into();
             }
 
@@ -615,18 +630,15 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             let task = task_arc.lock();
             let mut fd_table = task.fd_table.lock();
 
-            let file_desc = match fd_table.entries.get(fd as usize) {
-                Some(Some(desc)) => desc.clone(),
-                _ => return Errno::EBADF.into(),
-            };
-
-            *file_desc.ref_count.lock() += 1;
-
             let mut new_fd = start_fd;
             while (new_fd as usize) < fd_table.entries.len()
                 && fd_table.entries[new_fd as usize].is_some()
             {
                 new_fd += 1;
+            }
+
+            if new_fd >= 1024 {
+                return Errno::EMFILE.into();
             }
 
             if (new_fd as usize) >= fd_table.entries.len() {
@@ -635,12 +647,10 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             if (new_fd as usize) >= fd_table.cloexec.len() {
                 fd_table.cloexec.resize(new_fd as usize + 1, false);
             }
+
+            *file_desc.ref_count.lock() += 1;
             fd_table.entries[new_fd as usize] = Some(file_desc);
-            if cmd == 1030 {
-                fd_table.cloexec[new_fd as usize] = true;
-            } else {
-                fd_table.cloexec[new_fd as usize] = false;
-            }
+            fd_table.cloexec[new_fd as usize] = cmd == 1030;
 
             if crate::syscall::DEBUG_SYSCALLS {
                 kprintln!(
@@ -729,10 +739,6 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
         }
         5 | 6 | 7 | 36 | 37 | 38 => {
             // F_GETLK (5), F_SETLK (6), F_SETLKW (7), F_OFD_GETLK (36), F_OFD_SETLK (37), F_OFD_SETLKW (38)
-            let file_desc = match proc_fd::current_task_get_file_desc(fd) {
-                Some(d) => d,
-                None => return Errno::EBADF.into(),
-            };
 
             if arg == 0 {
                 return Errno::EFAULT.into();
@@ -885,13 +891,13 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
         _ => {
             if crate::syscall::DEBUG_SYSCALLS {
                 kprintln!(
-                    "[syscall] fcntl(fd={}, cmd={}, arg={}) -> ENOSYS",
+                    "[syscall] fcntl(fd={}, cmd={}, arg={}) -> EINVAL",
                     fd,
                     cmd,
                     arg
                 );
             }
-            Errno::ENOSYS.into()
+            Errno::EINVAL.into()
         }
     }
 }

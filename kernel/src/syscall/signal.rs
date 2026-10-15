@@ -70,12 +70,7 @@ pub fn deliver_signal(pid: crate::process::pid::Pid, sig: i32) {
         x86_64::instructions::interrupts::without_interrupts(|| {
             let sched_lock = scheduler::SCHEDULER.lock();
             if let Some(ref sched) = *sched_lock {
-                for core_id in 0..32 {
-                    if sched.current_cpus[core_id] == Some(pid) {
-                        target_core = Some(core_id);
-                        break;
-                    }
-                }
+                target_core = sched.current_cpus.iter().position(|&p| p == Some(pid));
             }
         });
 
@@ -479,17 +474,7 @@ pub fn handle_pending_signals(regs: *mut super::SavedRegisters) {
             return;
         }
 
-        let mut active_sig = 0;
-        for i in 1..=64 {
-            if (unblocked & (1 << (i - 1))) != 0 {
-                active_sig = i;
-                break;
-            }
-        }
-
-        if active_sig == 0 {
-            return;
-        }
+        let active_sig = (unblocked.trailing_zeros() + 1) as i32;
 
         task.pending_signals &= !(1 << (active_sig - 1));
 

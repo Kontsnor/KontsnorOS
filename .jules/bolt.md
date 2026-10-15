@@ -51,3 +51,7 @@
 ## 2026-03-30 - SPSC Lock-Free RingBuffer Bulk Slice Operation
 **Learning:** In `kernel/src/util/ring_buffer.rs`, pushing or popping multiple elements from `RingBuffer` one by one incurred per-element atomic load/store instructions and loop branch overheads. Implementing `push_slice` and `pop_slice` with `core::ptr::copy_nonoverlapping` (`memcpy`/`rep movsb`) reduces stream transfers to at most two contiguous bulk memory moves and a single atomic release store on `head` or `tail`.
 **Action:** When transferring data slices into or out of lock-free circular ring buffers, prefer chunked `copy_nonoverlapping` memory operations over per-element push/pop loops.
+
+## 2026-03-30 - Zero-Allocation Stack Batching for Network RX Interrupt Processing
+**Learning:** In `kernel/src/drivers/net/e1000.rs`, `handle_interrupt` was allocating a dynamic heap vector `Vec<Vec<u8>>` and performing `.to_vec()` heap allocations on every received Ethernet packet during interrupt handling, causing severe kernel allocator lock contention and latency overhead. Replaces heap allocations with a small stack-allocated batch buffer (`[[u8; 2048]; 2]`, 4 KiB stack total) to drain packets directly from the hardware Rx ring without heap memory operations, while keeping kernel stack usage safely bounded.
+**Action:** When handling hardware interrupts or ring buffer drains, use small stack-allocated batch buffers to eliminate heap allocation overhead without blowing past kernel thread stack limits.

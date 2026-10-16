@@ -1,5 +1,9 @@
 # Bridge's Journal
 
+## 2026-03-31 - sys_syslog / klogctl action parameter validation and buffer bounds
+**Learning:** `sys_syslog` / `klogctl` (x86_64 syscall #103) accepts action types 0..=10. Read actions (2, 3, 4) require validating `len >= 0` and validating user memory with `validate_user_ptr_write` before access. Action 8 requires validating loglevel bounds (`1..=8`), while query actions 9 and 10 return unread / total buffer sizes (e.g., 16384 bytes).
+**Action:** When implementing system log and control syscalls, validate action commands against standard Linux kernel `klogctl` specification and validate user memory destination pointers.
+
 ## 2026-03-30 - prctl PR_SET_NAME / PR_GET_NAME user pointer validation
 **Learning:** `prctl(PR_SET_NAME)` expects a pointer to a string up to 16 bytes (including null byte) while `prctl(PR_GET_NAME)` requires writing up to 16 bytes into user memory. Using explicit `validate_user_ptr_read` and `validate_user_ptr_write` checks on incoming buffers ensures memory safety and returns `-EFAULT` cleanly if invalid pointers are supplied by userspace.
 **Action:** Always wrap input/output pointers in read/write validation functions before dereferencing or copying bytes in syscall handlers.

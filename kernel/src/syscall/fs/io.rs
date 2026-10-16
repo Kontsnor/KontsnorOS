@@ -595,15 +595,23 @@ pub fn sys_memfd_create(name_ptr: *const u8, flags: u32) -> SyscallResult {
 }
 
 /// `fcntl(fd, cmd, arg)` — File control.
+///
+/// Ref: POSIX.1-2017 & Linux fcntl(2).
+/// Validates descriptor `fd` up front returning `-EBADF` if invalid.
+/// Returns `-EINVAL` for unsupported or unrecognized `cmd` values.
 pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
+    if fd < 0 {
+        return Errno::EBADF.into();
+    }
+    let file_desc = match proc_fd::current_task_get_file_desc(fd) {
+        Some(d) => d,
+        None => return Errno::EBADF.into(),
+    };
+
     match cmd {
         0 | 1030 => {
             // F_DUPFD or F_DUPFD_CLOEXEC
             let start_fd = arg as i32;
-            if start_fd < 0 {
-                return Errno::EINVAL.into();
-            }
-
             let current_pid = match crate::process::scheduler::current_pid() {
                 Some(p) => p,
                 None => return Errno::ESRCH.into(),
@@ -613,12 +621,13 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                 None => return Errno::ESRCH.into(),
             };
             let task = task_arc.lock();
-            let mut fd_table = task.fd_table.lock();
 
-            let file_desc = match fd_table.entries.get(fd as usize) {
-                Some(Some(desc)) => desc.clone(),
-                _ => return Errno::EBADF.into(),
-            };
+            // POSIX & Linux fcntl(2): Return EINVAL if arg < 0 or >= RLIMIT_NOFILE
+            if start_fd < 0 || start_fd as u64 >= task.rlimit_nofile_cur {
+                return Errno::EINVAL.into();
+            }
+
+            let mut fd_table = task.fd_table.lock();
 
             *file_desc.ref_count.lock() += 1;
 
@@ -629,6 +638,11 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                 new_fd += 1;
             }
 
+            if new_fd as u64 >= task.rlimit_nofile_cur {
+                *file_desc.ref_count.lock() -= 1;
+                return Errno::EMFILE.into();
+            }
+
             if (new_fd as usize) >= fd_table.entries.len() {
                 fd_table.entries.resize(new_fd as usize + 1, None);
             }
@@ -636,11 +650,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                 fd_table.cloexec.resize(new_fd as usize + 1, false);
             }
             fd_table.entries[new_fd as usize] = Some(file_desc);
-            if cmd == 1030 {
-                fd_table.cloexec[new_fd as usize] = true;
-            } else {
-                fd_table.cloexec[new_fd as usize] = false;
-            }
+            fd_table.cloexec[new_fd as usize] = cmd == 1030;
 
             if crate::syscall::DEBUG_SYSCALLS {
                 kprintln!(
@@ -662,12 +672,9 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
                 let task = task_arc.lock();
                 let fd_table = task.fd_table.lock();
-                if (fd as usize) < fd_table.entries.len() && fd_table.entries[fd as usize].is_some()
-                {
-                    let is_cloexec =
-                        (fd as usize) < fd_table.cloexec.len() && fd_table.cloexec[fd as usize];
-                    return if is_cloexec { 1 } else { 0 };
-                }
+                let is_cloexec =
+                    (fd as usize) < fd_table.cloexec.len() && fd_table.cloexec[fd as usize];
+                return if is_cloexec { 1 } else { 0 };
             }
             Errno::EBADF.into()
         }
@@ -680,60 +687,30 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
                 let task = task_arc.lock();
                 let mut fd_table = task.fd_table.lock();
-                if (fd as usize) < fd_table.entries.len() && fd_table.entries[fd as usize].is_some()
-                {
-                    if (fd as usize) >= fd_table.cloexec.len() {
-                        fd_table.cloexec.resize(fd as usize + 1, false);
-                    }
-                    fd_table.cloexec[fd as usize] = (arg & 1) != 0;
-                    return 0;
+                if (fd as usize) >= fd_table.cloexec.len() {
+                    fd_table.cloexec.resize(fd as usize + 1, false);
                 }
+                fd_table.cloexec[fd as usize] = (arg & 1) != 0;
+                return 0;
             }
             Errno::EBADF.into()
         }
         3 => {
             // F_GETFL
-            let current_pid = match crate::process::scheduler::current_pid() {
-                Some(p) => p,
-                None => return Errno::ESRCH.into(),
-            };
-            if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
-                let task = task_arc.lock();
-                let fd_table = task.fd_table.lock();
-                if let Some(Some(desc)) = fd_table.entries.get(fd as usize) {
-                    return desc.flags.lock().0 as i64;
-                }
-            }
-            Errno::EBADF.into()
+            file_desc.flags.lock().0 as i64
         }
         4 => {
             // F_SETFL
-            let current_pid = match crate::process::scheduler::current_pid() {
-                Some(p) => p,
-                None => return Errno::ESRCH.into(),
-            };
-            if let Some(task_arc) = crate::process::scheduler::get_task_arc(current_pid) {
-                let task = task_arc.lock();
-                let mut fd_table = task.fd_table.lock();
-                if let Some(Some(desc)) = fd_table.entries.get_mut(fd as usize) {
-                    let allowed_flags = OpenFlags::O_APPEND | OpenFlags::O_NONBLOCK;
-                    let mut flags = desc.flags.lock();
-                    let old_val = flags.0;
-                    let new_nonblock = (arg as u32 & OpenFlags::O_NONBLOCK) != 0;
-                    desc.inode.set_nonblocking(new_nonblock);
-                    flags.0 = (old_val & !allowed_flags) | (arg as u32 & allowed_flags);
-                    return 0;
-                }
-            }
-            Errno::EBADF.into()
+            let allowed_flags = OpenFlags::O_APPEND | OpenFlags::O_NONBLOCK;
+            let mut flags = file_desc.flags.lock();
+            let old_val = flags.0;
+            let new_nonblock = (arg as u32 & OpenFlags::O_NONBLOCK) != 0;
+            file_desc.inode.set_nonblocking(new_nonblock);
+            flags.0 = (old_val & !allowed_flags) | (arg as u32 & allowed_flags);
+            0
         }
         5 | 6 | 7 | 36 | 37 | 38 => {
             // F_GETLK (5), F_SETLK (6), F_SETLKW (7), F_OFD_GETLK (36), F_OFD_SETLK (37), F_OFD_SETLKW (38)
-            let file_desc = match proc_fd::current_task_get_file_desc(fd) {
-                Some(d) => d,
-                None => return Errno::EBADF.into(),
-            };
-
             if arg == 0 {
                 return Errno::EFAULT.into();
             }
@@ -883,15 +860,16 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             }
         }
         _ => {
+            // Linux fcntl(2) / POSIX.1-2017: Return EINVAL for unknown or unsupported cmd values.
             if crate::syscall::DEBUG_SYSCALLS {
                 kprintln!(
-                    "[syscall] fcntl(fd={}, cmd={}, arg={}) -> ENOSYS",
+                    "[syscall] fcntl(fd={}, cmd={}, arg={}) -> EINVAL",
                     fd,
                     cmd,
                     arg
                 );
             }
-            Errno::ENOSYS.into()
+            Errno::EINVAL.into()
         }
     }
 }

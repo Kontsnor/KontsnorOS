@@ -327,26 +327,23 @@ impl Scheduler {
     }
 
     /// Wake up a blocked task, making it ready to run.
-    /// Returns `true` if the task was in `TaskState::Blocked` and transitioned to `TaskState::Ready`.
+    /// Returns `true` if the task was in `TaskState::Blocked` and transitioned to `TaskState::Ready` or was enqueued as `Ready`.
     pub fn wake_task(&mut self, pid: Pid) -> bool {
         let idx = pid.as_u64() as usize;
         let tasks = TASKS.read();
         if let Some(Some(task_arc)) = tasks.get(idx) {
             let mut task = task_arc.lock();
-            if task.state == TaskState::Blocked {
-                task.state = TaskState::Ready;
-                let priority = task.priority as usize;
-                if !self.queues[priority].iter().any(|&p| p == pid) {
-                    self.queues[priority].push_back(pid);
+            let is_blocked = task.state == TaskState::Blocked;
+            if is_blocked || (task.state == TaskState::Ready && !task.is_idle) {
+                if is_blocked {
+                    task.state = TaskState::Ready;
                 }
-                task.in_queue = true;
-                return true;
-            } else if task.state == TaskState::Ready && !task.is_idle {
-                let priority = task.priority as usize;
-                if !self.queues[priority].iter().any(|&p| p == pid) {
+                // Use the O(1) in_queue boolean flag instead of scanning VecDeque with .iter().any()
+                if !task.in_queue {
+                    let priority = task.priority as usize;
                     self.queues[priority].push_back(pid);
+                    task.in_queue = true;
                 }
-                task.in_queue = true;
                 return true;
             }
         }

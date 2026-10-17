@@ -18,7 +18,7 @@
 //! Provides Unix-compatible IPC mechanisms:
 //! - Pipes (unidirectional byte streams)
 //! - Signals (asynchronous notifications)
-//! - Unix domain sockets (placeholder)
+//! - Unix domain sockets (bidirectional local IPC)
 
 use crate::kprintln;
 pub mod pipe;

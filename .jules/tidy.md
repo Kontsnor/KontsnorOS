@@ -5,3 +5,7 @@
 ## 2026-03-30 - Safe MaybeUninit array initialization and UnsafeCell interior mutability in no_std
 **Learning:** Initializing a `[MaybeUninit<T>; N]` array using `MaybeUninit::uninit().assume_init()` triggers immediate Undefined Behavior (UB) in Rust. Furthermore, mutating buffer slots through shared `&self` references requires wrapping the storage buffer in `core::cell::UnsafeCell` to respect Rust's aliasing rules and Stacked Borrows model.
 **Action:** Always initialize `[MaybeUninit<T>; N]` using const block evaluation `[const { core::mem::MaybeUninit::uninit() }; N]`, wrap shared-mutable raw buffers in `UnsafeCell`, and provide explicit `Send`/`Sync` implementations for lock-free datastructures.
+
+## 2026-03-30 - Runtime symbol definition lints for freestanding self-host memory stubs
+**Learning:** When compiling freestanding runtime memory symbol stubs (`memcpy`, `memset`, `memmove`, `memcmp`) for non-`none` host targets during workspace check operations (`cargo check --workspace --all-targets`), rustc emits `suspicious_runtime_symbol_definitions` warnings due to matching signatures against standard library runtime intrinsics.
+**Action:** Annotate freestanding memory stub functions in `self_host_stubs.rs` with `#[allow(suspicious_runtime_symbol_definitions)]` to maintain zero-warning workspace checks while retaining byte-by-byte loop safety against LLVM intrinsic recursion.

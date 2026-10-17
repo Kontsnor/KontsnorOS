@@ -13,13 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Unix domain sockets (placeholder).
+//! Unix domain sockets interface.
 //!
-//! Unix domain sockets provide bidirectional IPC between processes
-//! on the same machine. This is a placeholder for future implementation.
-
-// TODO: Implement Unix domain sockets
-// - Stream sockets (SOCK_STREAM) — reliable, ordered byte streams
-// - Datagram sockets (SOCK_DGRAM) — unreliable messages
-// - Socket pairs (socketpair)
-// - Named sockets (bind to filesystem path)
+//! Provides bidirectional IPC between processes on the same system.
+//! Active implementations (stream/datagram sockets, socketpair, VFS binding)
+//! are integrated via `crate::fs::pipe::UnixSocket` and socket system calls.

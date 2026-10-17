@@ -32,9 +32,10 @@ impl CharDevice for SerialConsole {
     }
 
     fn write(&self, data: &[u8]) -> Result<usize, DriverError> {
-        // Write each byte through the serial port
+        // Delegate byte transmission directly to serial::write_byte to avoid
+        // per-byte string formatting overhead and respect graphics console mirroring.
         for &byte in data {
-            crate::arch::x86_64::serial::_print(format_args!("{}", byte as char));
+            crate::arch::x86_64::serial::write_byte(byte);
         }
         Ok(data.len())
     }

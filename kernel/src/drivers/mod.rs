@@ -34,6 +34,7 @@ pub mod console;
 pub mod gpu;
 pub mod keyboard;
 pub mod net;
+pub mod ps2_mouse;
 pub mod ramdisk;
 pub mod traits;
 
@@ -53,6 +54,7 @@ pub fn init() {
 
     // Initialize built-in drivers
     keyboard::init();
+    ps2_mouse::init();
     console::init();
     gpu::init();
     net::init();

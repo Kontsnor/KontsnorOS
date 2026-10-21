@@ -31,6 +31,7 @@ busybox
 tools/init
 tools/init-ubuntu
 tcc-build/
+userland/tests/fbtest
 
 # Python cache
 __pycache__/

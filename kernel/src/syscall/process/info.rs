@@ -17,11 +17,12 @@
 
 use super::super::{Errno, SyscallResult};
 use crate::process::scheduler;
-use crate::syscall::validation::{validate_user_ptr, validate_user_ptr_write};
+use crate::syscall::validation::{copy_to_user, validate_user_ptr, validate_user_ptr_write};
 use alloc::string::String;
 
 /// Linux `uname` struct (sys/utsname.h), each field is 65 bytes.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct UtsName {
     sysname: [u8; 65],
     nodename: [u8; 65],
@@ -94,9 +95,8 @@ pub fn sys_uname(buf: *mut u8) -> SyscallResult {
         fill(&mut u.domainname, domainname.as_bytes());
     }
 
-    // SAFETY: buf has been validated above via validate_user_ptr_write.
-    unsafe {
-        core::ptr::write(buf as *mut UtsName, u);
+    if let Err(e) = copy_to_user(buf as *mut UtsName, &u) {
+        return e.into();
     }
     0
 }
@@ -111,6 +111,7 @@ pub struct TimeVal {
 
 /// `timezone` struct used by `gettimeofday`.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct TimeZone {
     tz_minuteswest: i32,
     tz_dsttime: i32,
@@ -168,31 +169,23 @@ pub struct TimeSpec {
 /// `gettimeofday(tv, tz)` — Return current time-of-day.
 pub fn sys_gettimeofday(tv: *mut u8, tz: *mut u8) -> SyscallResult {
     if !tv.is_null() {
-        if validate_user_ptr_write(tv, core::mem::size_of::<TimeVal>()).is_err() {
-            return Errno::EFAULT.into();
-        }
         let boot_sec = BOOT_REALTIME_SEC.load(core::sync::atomic::Ordering::Relaxed);
         let realtime_ns = boot_sec * 1_000_000_000 + get_monotonic_ns();
         let t = TimeVal {
             tv_sec: (realtime_ns / 1_000_000_000) as i64,
             tv_usec: ((realtime_ns % 1_000_000_000) / 1000) as i64,
         };
-        // SAFETY: The pointer was validated with validate_user_ptr_write and is safe to write.
-        unsafe {
-            core::ptr::write(tv as *mut TimeVal, t);
+        if let Err(e) = copy_to_user(tv as *mut TimeVal, &t) {
+            return e.into();
         }
     }
     if !tz.is_null() {
-        if validate_user_ptr_write(tz, core::mem::size_of::<TimeZone>()).is_err() {
-            return Errno::EFAULT.into();
-        }
         let z = TimeZone {
             tz_minuteswest: 0,
             tz_dsttime: 0,
         };
-        // SAFETY: The pointer was validated with validate_user_ptr_write and is safe to write.
-        unsafe {
-            core::ptr::write(tz as *mut TimeZone, z);
+        if let Err(e) = copy_to_user(tz as *mut TimeZone, &z) {
+            return e.into();
         }
     }
     0
@@ -200,13 +193,6 @@ pub fn sys_gettimeofday(tv: *mut u8, tz: *mut u8) -> SyscallResult {
 
 /// `clock_gettime(clockid, tp)` — Return current clock value.
 pub fn sys_clock_gettime(clockid: i32, tp: *mut u8) -> SyscallResult {
-    if tp.is_null() {
-        return Errno::EFAULT.into();
-    }
-    if validate_user_ptr_write(tp, core::mem::size_of::<TimeSpec>()).is_err() {
-        return Errno::EFAULT.into();
-    }
-
     let ts = match clockid {
         0 => {
             // CLOCK_REALTIME
@@ -245,9 +231,8 @@ pub fn sys_clock_gettime(clockid: i32, tp: *mut u8) -> SyscallResult {
         _ => return Errno::EINVAL.into(),
     };
 
-    // SAFETY: The pointer was validated with validate_user_ptr_write and is safe to write.
-    unsafe {
-        core::ptr::write(tp as *mut TimeSpec, ts);
+    if let Err(e) = copy_to_user(tp as *mut TimeSpec, &ts) {
+        return e.into();
     }
     0
 }
@@ -284,15 +269,12 @@ pub fn sleep_until(end_ns: u64, rem: *mut u8) -> SyscallResult {
     let mut now = get_monotonic_ns();
     if now >= end_ns {
         if !rem.is_null() {
-            if validate_user_ptr_write(rem, core::mem::size_of::<TimeSpec>()).is_err() {
-                return Errno::EFAULT.into();
-            }
             let zero_ts = TimeSpec {
                 tv_sec: 0,
                 tv_nsec: 0,
             };
-            unsafe {
-                core::ptr::write(rem as *mut TimeSpec, zero_ts);
+            if let Err(e) = copy_to_user(rem as *mut TimeSpec, &zero_ts) {
+                return e.into();
             }
         }
         return 0;
@@ -323,30 +305,23 @@ pub fn sleep_until(end_ns: u64, rem: *mut u8) -> SyscallResult {
         if unblocked != 0 && now < end_ns {
             let remaining_ns = end_ns.saturating_sub(now);
             if !rem.is_null() {
-                if validate_user_ptr_write(rem, core::mem::size_of::<TimeSpec>()).is_ok() {
-                    let remaining_ts = TimeSpec {
-                        tv_sec: (remaining_ns / 1_000_000_000) as i64,
-                        tv_nsec: (remaining_ns % 1_000_000_000) as i64,
-                    };
-                    unsafe {
-                        core::ptr::write(rem as *mut TimeSpec, remaining_ts);
-                    }
-                }
+                let remaining_ts = TimeSpec {
+                    tv_sec: (remaining_ns / 1_000_000_000) as i64,
+                    tv_nsec: (remaining_ns % 1_000_000_000) as i64,
+                };
+                let _ = copy_to_user(rem as *mut TimeSpec, &remaining_ts);
             }
             return Errno::EINTR.into();
         }
     }
 
     if !rem.is_null() {
-        if validate_user_ptr_write(rem, core::mem::size_of::<TimeSpec>()).is_err() {
-            return Errno::EFAULT.into();
-        }
         let zero_ts = TimeSpec {
             tv_sec: 0,
             tv_nsec: 0,
         };
-        unsafe {
-            core::ptr::write(rem as *mut TimeSpec, zero_ts);
+        if let Err(e) = copy_to_user(rem as *mut TimeSpec, &zero_ts) {
+            return e.into();
         }
     }
 
@@ -358,11 +333,8 @@ pub fn sys_time(tloc: *mut i64) -> SyscallResult {
     let boot_sec = BOOT_REALTIME_SEC.load(core::sync::atomic::Ordering::Relaxed);
     let sec = (boot_sec + get_monotonic_ns() / 1_000_000_000) as i64;
     if !tloc.is_null() {
-        if validate_user_ptr_write(tloc as *mut u8, core::mem::size_of::<i64>()).is_err() {
-            return Errno::EFAULT.into();
-        }
-        unsafe {
-            core::ptr::write(tloc, sec);
+        if let Err(e) = copy_to_user(tloc, &sec) {
+            return e.into();
         }
     }
     sec
@@ -370,6 +342,7 @@ pub fn sys_time(tloc: *mut i64) -> SyscallResult {
 
 /// `tms` struct used by `times`.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Tms {
     tms_utime: i64,
     tms_stime: i64,
@@ -380,17 +353,14 @@ struct Tms {
 /// `times(buf)` — Return process and children CPU usage times.
 pub fn sys_times(buf: *mut u8) -> SyscallResult {
     if !buf.is_null() {
-        if validate_user_ptr_write(buf, core::mem::size_of::<Tms>()).is_err() {
-            return Errno::EFAULT.into();
-        }
         let t = Tms {
             tms_utime: 0,
             tms_stime: 0,
             tms_cutime: 0,
             tms_cstime: 0,
         };
-        unsafe {
-            core::ptr::write(buf as *mut Tms, t);
+        if let Err(e) = copy_to_user(buf as *mut Tms, &t) {
+            return e.into();
         }
     }
     0
@@ -408,13 +378,6 @@ const RLIM_INFINITY: u64 = !0u64;
 
 /// `getrlimit(resource, rlim)` — Get resource limits.
 pub fn sys_getrlimit(resource: i32, rlim: *mut u8) -> SyscallResult {
-    if rlim.is_null() {
-        return Errno::EFAULT.into();
-    }
-    if validate_user_ptr_write(rlim, core::mem::size_of::<RLimit>()).is_err() {
-        return Errno::EFAULT.into();
-    }
-
     let limit = match resource {
         0 => RLimit {
             rlim_cur: RLIM_INFINITY,
@@ -477,8 +440,8 @@ pub fn sys_getrlimit(resource: i32, rlim: *mut u8) -> SyscallResult {
             rlim_max: RLIM_INFINITY,
         },
     };
-    unsafe {
-        core::ptr::write(rlim as *mut RLimit, limit);
+    if let Err(e) = copy_to_user(rlim as *mut RLimit, &limit) {
+        return e.into();
     }
     0
 }
@@ -516,6 +479,7 @@ pub fn sys_setrlimit(resource: i32, rlim: *const u8) -> SyscallResult {
 
 /// `sysinfo` struct (linux/sysinfo.h).
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct SysInfo {
     uptime: i64,
     loads: [u64; 3],
@@ -535,12 +499,6 @@ struct SysInfo {
 
 /// `sysinfo(info)` — Return overall system information.
 pub fn sys_sysinfo(info: *mut u8) -> SyscallResult {
-    if info.is_null() {
-        return Errno::EFAULT.into();
-    }
-    if validate_user_ptr_write(info, core::mem::size_of::<SysInfo>()).is_err() {
-        return Errno::EFAULT.into();
-    }
     let (total_frames, _allocated_frames, free_frames) = crate::memory::physical::stats();
     let uptime = (crate::arch::x86_64::interrupts::timer_ticks() / 18) as i64;
     let si = SysInfo {
@@ -559,8 +517,8 @@ pub fn sys_sysinfo(info: *mut u8) -> SyscallResult {
         mem_unit: 1,
         _pad2: [0u8; 4],
     };
-    unsafe {
-        core::ptr::write(info as *mut SysInfo, si);
+    if let Err(e) = copy_to_user(info as *mut SysInfo, &si) {
+        return e.into();
     }
     0
 }
@@ -615,9 +573,8 @@ pub fn sys_sigaltstack(ss_ptr: *const u8, old_ss_ptr: *mut u8, user_rsp: u64) ->
             ss_size: size,
         };
 
-        // SAFETY: old_ss_ptr is non-null and was verified writable with size_of::<StackT>() bytes above.
-        unsafe {
-            core::ptr::write(old_ss_ptr as *mut StackT, old_ss);
+        if let Err(e) = copy_to_user(old_ss_ptr as *mut StackT, &old_ss) {
+            return e.into();
         }
     }
 
@@ -691,9 +648,6 @@ pub fn sys_prlimit64(
     };
 
     if !old_limit.is_null() {
-        if validate_user_ptr_write(old_limit, core::mem::size_of::<RLimit>()).is_err() {
-            return Errno::EFAULT.into();
-        }
         let limit = match resource {
             7 => {
                 if let Some(task_arc) = crate::process::scheduler::get_task_arc(target_pid) {
@@ -751,9 +705,8 @@ pub fn sys_prlimit64(
                 rlim_max: RLIM_INFINITY,
             },
         };
-        // SAFETY: The pointer has been checked for nullity and validated using validate_user_ptr_write.
-        unsafe {
-            core::ptr::write(old_limit as *mut RLimit, limit);
+        if let Err(e) = copy_to_user(old_limit as *mut RLimit, &limit) {
+            return e.into();
         }
     }
 
@@ -859,21 +812,13 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: *mut *mut u8, len_ptr: *mut usize
     };
 
     if !head_ptr.is_null() {
-        if validate_user_ptr_write(head_ptr as *mut u8, core::mem::size_of::<*mut u8>()).is_err() {
-            return Errno::EFAULT.into();
-        }
-        // SAFETY: The pointer was validated using validate_user_ptr_write and is safe to write.
-        unsafe {
-            head_ptr.write(head as *mut u8);
+        if let Err(e) = copy_to_user(head_ptr, &(head as *mut u8)) {
+            return e.into();
         }
     }
     if !len_ptr.is_null() {
-        if validate_user_ptr_write(len_ptr as *mut u8, core::mem::size_of::<usize>()).is_err() {
-            return Errno::EFAULT.into();
-        }
-        // SAFETY: The pointer was validated using validate_user_ptr_write and is safe to write.
-        unsafe {
-            len_ptr.write(len);
+        if let Err(e) = copy_to_user(len_ptr, &len) {
+            return e.into();
         }
     }
     0
@@ -903,12 +848,6 @@ pub fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> Sy
 
 /// `sched_getparam(pid, param)` — Get scheduling parameters.
 pub fn sys_sched_getparam(pid: i32, param: *mut i32) -> SyscallResult {
-    if param.is_null() {
-        return Errno::EINVAL.into();
-    }
-    if validate_user_ptr_write(param as *mut u8, core::mem::size_of::<i32>()).is_err() {
-        return Errno::EFAULT.into();
-    }
     let target_pid = if pid == 0 {
         match scheduler::current_pid() {
             Some(p) => p,
@@ -920,8 +859,9 @@ pub fn sys_sched_getparam(pid: i32, param: *mut i32) -> SyscallResult {
     if scheduler::get_task_arc(target_pid).is_none() {
         return Errno::ESRCH.into();
     }
-    // SAFETY: Pointer validated with validate_user_ptr_write.
-    unsafe { core::ptr::write(param, 0) };
+    if let Err(e) = copy_to_user(param, &0) {
+        return e.into();
+    }
     0
 }
 
@@ -993,12 +933,6 @@ pub fn sys_sched_get_priority_min(policy: i32) -> SyscallResult {
 
 /// `sched_rr_get_interval(pid, tp)` — Get the SCHED_RR interval for the named process.
 pub fn sys_sched_rr_get_interval(pid: i32, tp: *mut u8) -> SyscallResult {
-    if tp.is_null() {
-        return Errno::EFAULT.into();
-    }
-    if validate_user_ptr_write(tp, core::mem::size_of::<TimeSpec>()).is_err() {
-        return Errno::EFAULT.into();
-    }
     let target_pid = if pid == 0 {
         match scheduler::current_pid() {
             Some(p) => p,
@@ -1015,8 +949,9 @@ pub fn sys_sched_rr_get_interval(pid: i32, tp: *mut u8) -> SyscallResult {
         tv_sec: 0,
         tv_nsec: 10_000_000,
     };
-    // SAFETY: Pointer validated with validate_user_ptr_write.
-    unsafe { core::ptr::write(tp as *mut TimeSpec, ts) };
+    if let Err(e) = copy_to_user(tp as *mut TimeSpec, &ts) {
+        return e.into();
+    }
     0
 }
 
@@ -1054,13 +989,6 @@ pub struct RUsage {
 
 /// `getrusage(who, usage)` — Get resource usage.
 pub fn sys_getrusage(who: i32, usage: *mut u8) -> SyscallResult {
-    if usage.is_null() {
-        return Errno::EFAULT.into();
-    }
-    if validate_user_ptr_write(usage, core::mem::size_of::<RUsage>()).is_err() {
-        return Errno::EFAULT.into();
-    }
-
     if who != 0 && who != -1 && who != 1 {
         // RUSAGE_SELF (0), RUSAGE_CHILDREN (-1), RUSAGE_THREAD (1)
         return Errno::EINVAL.into();
@@ -1088,9 +1016,8 @@ pub fn sys_getrusage(who: i32, usage: *mut u8) -> SyscallResult {
     };
     ru.ru_maxrss = 4096; // 4 MiB baseline
 
-    // SAFETY: Pointer validated with validate_user_ptr_write.
-    unsafe {
-        core::ptr::write(usage as *mut RUsage, ru);
+    if let Err(e) = copy_to_user(usage as *mut RUsage, &ru) {
+        return e.into();
     }
     0
 }
@@ -1099,18 +1026,14 @@ pub fn sys_getrusage(who: i32, usage: *mut u8) -> SyscallResult {
 pub fn sys_getcpu(cpup: *mut u32, nodep: *mut u32, _unused: *mut u8) -> SyscallResult {
     let lapic_id = crate::arch::x86_64::smp::current_lapic_id();
     if !cpup.is_null() {
-        if validate_user_ptr_write(cpup as *mut u8, core::mem::size_of::<u32>()).is_err() {
-            return Errno::EFAULT.into();
+        if let Err(e) = copy_to_user(cpup, &(lapic_id as u32)) {
+            return e.into();
         }
-        // SAFETY: Pointer validated with validate_user_ptr_write.
-        unsafe { core::ptr::write(cpup, lapic_id as u32) };
     }
     if !nodep.is_null() {
-        if validate_user_ptr_write(nodep as *mut u8, core::mem::size_of::<u32>()).is_err() {
-            return Errno::EFAULT.into();
+        if let Err(e) = copy_to_user(nodep, &0u32) {
+            return e.into();
         }
-        // SAFETY: Pointer validated with validate_user_ptr_write.
-        unsafe { core::ptr::write(nodep, 0) };
     }
     0
 }
@@ -1129,16 +1052,14 @@ pub fn sys_clock_getres(clock_id: i32, res: *mut u8) -> SyscallResult {
         return Errno::EINVAL.into();
     }
     if !res.is_null() {
-        if validate_user_ptr_write(res, core::mem::size_of::<TimeSpec>()).is_err() {
-            return Errno::EFAULT.into();
-        }
         // KontsnorOS clock resolution is 1 nanosecond (LAPIC/HPET timer backed)
         let ts = TimeSpec {
             tv_sec: 0,
             tv_nsec: 1,
         };
-        // SAFETY: Pointer validated with validate_user_ptr_write.
-        unsafe { core::ptr::write(res as *mut TimeSpec, ts) };
+        if let Err(e) = copy_to_user(res as *mut TimeSpec, &ts) {
+            return e.into();
+        }
     }
     0
 }
@@ -1223,16 +1144,11 @@ pub fn sys_getitimer(which: i32, curr_value: *mut u8) -> SyscallResult {
     if which < 0 || which > 2 {
         return Errno::EINVAL.into();
     }
-    if curr_value.is_null() {
-        return Errno::EFAULT.into();
-    }
-    if validate_user_ptr_write(curr_value, core::mem::size_of::<ITimerVal>()).is_err() {
-        return Errno::EFAULT.into();
-    }
     // Return disarmed timer
     let it = ITimerVal::default();
-    // SAFETY: Pointer validated with validate_user_ptr_write.
-    unsafe { core::ptr::write(curr_value as *mut ITimerVal, it) };
+    if let Err(e) = copy_to_user(curr_value as *mut ITimerVal, &it) {
+        return e.into();
+    }
     0
 }
 

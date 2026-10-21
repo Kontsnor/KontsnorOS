@@ -28,6 +28,7 @@ pub extern "C" fn _Unwind_Resume() -> ! {
 
 #[cfg(not(target_os = "none"))]
 #[no_mangle]
+#[allow(suspicious_runtime_symbol_definitions)]
 /// # Safety
 /// Caller must pass valid pointers for `dest` and `src` with at least `n` bytes.
 pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
@@ -44,6 +45,7 @@ pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut
 
 #[cfg(not(target_os = "none"))]
 #[no_mangle]
+#[allow(suspicious_runtime_symbol_definitions)]
 /// # Safety
 /// Caller must pass a valid pointer `s` with at least `n` bytes.
 pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
@@ -60,6 +62,7 @@ pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
 
 #[cfg(not(target_os = "none"))]
 #[no_mangle]
+#[allow(suspicious_runtime_symbol_definitions)]
 /// # Safety
 /// Caller must pass valid pointers for `dest` and `src` with at least `n` bytes.
 pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
@@ -81,6 +84,7 @@ pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mu
 
 #[cfg(not(target_os = "none"))]
 #[no_mangle]
+#[allow(suspicious_runtime_symbol_definitions)]
 /// # Safety
 /// Caller must pass valid pointers `s1` and `s2` with at least `n` bytes.
 pub unsafe extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {

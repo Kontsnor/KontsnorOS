@@ -372,3 +372,32 @@ fn test_unmap_range_geometric_cases_and_benchmark() {
 
     kprintln!("[test] AddressSpace::unmap_range geometric cases & benchmark test PASSED!");
 }
+
+#[test_case]
+fn test_mmap_flag_validation() {
+    kprintln!("[test] Starting sys_mmap flag and offset validation test...");
+
+    // Test 1: Invalid mapping type flags (e.g., flags = 0 or flags = 0x20 [MAP_ANONYMOUS without MAP_PRIVATE/SHARED])
+    let res_no_type = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x20, -1, 0);
+    assert_eq!(res_no_type, -22); // -EINVAL
+
+    let res_zero_flags = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x00, -1, 0);
+    assert_eq!(res_zero_flags, -22); // -EINVAL
+
+    let res_invalid_type = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x05, -1, 0);
+    assert_eq!(res_invalid_type, -22); // -EINVAL
+
+    // Test 2: Unaligned or negative offset
+    let res_unaligned_off = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 100);
+    assert_eq!(res_unaligned_off, -22); // -EINVAL
+
+    let res_neg_off = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, -4096);
+    assert_eq!(res_neg_off, -22); // -EINVAL
+
+    // Test 3: Valid anonymous mapping (MAP_PRIVATE | MAP_ANONYMOUS = 0x22)
+    let addr = crate::syscall::memory::sys_mmap(0, 4096, 3, 0x22, -1, 0);
+    assert!(addr > 0);
+    crate::syscall::memory::sys_munmap(addr as u64, 4096);
+
+    kprintln!("[test] sys_mmap flag and offset validation test PASSED!");
+}

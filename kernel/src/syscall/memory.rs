@@ -51,6 +51,11 @@ pub fn sys_mmap(
         return Errno::EINVAL.into();
     }
 
+    // POSIX.1-2017/2024 and Linux mmap(2): offset must be a multiple of the page size (4096 bytes).
+    if (offset as u64 & 4095) != 0 {
+        return Errno::EINVAL.into();
+    }
+
     // We support anonymous private mappings and private/shared file mappings
     let is_anon = (flags & 0x20) != 0 || fd == -1;
     let is_shared = (flags & 0x01) != 0;
